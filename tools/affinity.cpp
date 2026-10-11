@@ -913,9 +913,13 @@ int main(int argc, char** argv) {
 
 #ifdef AFF_WITH_HIP
   {
-    // Compressed rows per layer, by the same rule Model::init_state uses: a layer at ratio r emits
-    // a row every r positions, ratio 0 emits none. Only 21 of 43 layers are ratio 4, and sizing all
-    // of them for it costs 2.76 GiB a card at a 1M cache.
+    // Compressed rows per layer. Only a KV-SOURCE layer owns a compressed cache: a layer sharing a
+    // ratio reads the source's, and the source propagates its row count to its consumers
+    // (Model::kv_owner_ -> device `kvl()`, see model.cpp). Sizing EVERY ratio layer its own copy
+    // allocated 11.6x the rows the reference needs — 38 of 40 layers compress here but only
+    // [2,8,14,20] store, so 3.74 GiB a card reserved where 0.32 is used, at a 262144 cache. See the
+    // reference: "layers sharing a ratio also share one compressed KV ... produced by the first".
+    // V4 has no sharing (is_kv_source == ratio != 0), so its sizing is unchanged.
     std::string kerr;
     // The draft's stages get KV slots immediately after the model's layers. They are ratio 0, so
     // they cost one sliding window each and no compressed cache; sharing the array is what lets the
@@ -926,7 +930,7 @@ int main(int argc, char** argv) {
     uint64_t comp_total = 0;
     for (uint32_t l = 0; l < c.n_layer; ++l) {
       const uint32_t r = c.ratio_for(l);
-      comp_rows[l] = r ? (uint32_t)(kMaxKvPositions / r + 2) : 0u;
+      comp_rows[l] = (r && c.is_kv_source(l)) ? (uint32_t)(kMaxKvPositions / r + 2) : 0u;
       max_comp = std::max(max_comp, comp_rows[l]);
       comp_total += comp_rows[l];
     }
