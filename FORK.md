@@ -54,10 +54,11 @@ Plus `e6070f5` (V4.1 reasoning effort and `<｜System｜>` token, byte-identical
 `2dbb093` (stop retrying a KV growth the card cannot hold, the 64K decode cliff) and `5252ba5` (re-seed the engram
 look-back when a prefix-cache checkpoint is restored).
 
-**Known issue: tool calls do not work yet on V4.1.** In an agent session (pi, OpenAI tools) the model writes a malformed
-tool-call tag on the first turn (`<｜DSML｜ calls>` instead of `<｜DSML｜tool_calls>`), so the server returns it as text and no tool
-runs. Seen on every run, on builds with and without the message-parser fix, so it is not caused by that fix. Plain chat is unaffected.
-Use `v4-fixes` with the 0731 checkpoint for agent work.
+**Tool calls on V4.1 work** (fixed by the V4.1 DSML port in `91e78ba`). V4.1 renames the DSML tags to
+` calls` / ` invoke` / ` parameter` (leading-space names); the engine's encoder and output parser now
+emit and recognise them, checked against the checkpoint's own `encoding/encoding.py`. Single-turn,
+multi-turn and streaming tool calls all parse to structured `tool_calls`. Earlier builds knew only V4's
+`tool_calls` / `invoke` / `parameter`, so a V4.1 `<... calls>` block fell through as text and no tool ran.
 
 **More than two ranks is refused** (`AFF_ALLOW_NRANK=1` overrides it for debugging only). A fix for the 4-rank
 split is being validated on four real CUDA cards. The `AFF_LOGICAL_RANKS` oversubscription harness (several ranks

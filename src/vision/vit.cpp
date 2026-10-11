@@ -279,44 +279,50 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
       }
     });
 
-    // c. Scaled dot-product self-attention: softmax(Q @ K.T / sqrt(64)) @ V.
-    //    Both dots are AVX-512: the QK score over the 64-dim head, and the AV as a rank-1 update
-    //    over the 64 output dims. The scalar form this replaces was the O(N^2) tail of a big image.
+    // c. Scaled dot-product self-attention, blocked over queries so each key and value row is read
+    //    once per query-block instead of once per query. The previous form re-read all of K (and V)
+    //    for every query, an O(N^2) memory blow-up that dominated a 74x74 patch grid; here a block
+    //    of BQ queries shares those reads through L1. j is the outer loop in both phases so the
+    //    K[j] and V[j] head slices are loaded once and reused across the block.
     const float attn_scale = 1.0f / std::sqrt((float)HD);
-    parallel_for(N, 4, [&](uint64_t b0, uint64_t b1) {
-      std::vector<float> scores(N);
-      for (uint64_t i = b0; i < b1; ++i) {
-        float* out_tok = Attn_out.data() + i * D;
-        for (uint32_t h = 0; h < NH; ++h) {
-          const float* qi = Q.data() + i * D + h * HD;
-          float max_sc = -1e30f;
+    constexpr uint32_t BQ = 32;
+    const uint32_t n_block = (N + BQ - 1) / BQ;
+    // One task per (query-block, head): a grid of BQ x N scores fits L2, and splitting by head as
+    // well as block keeps the pool busy at small N (n_block alone is 23 tasks at 729 patches).
+    parallel_for((uint64_t)n_block * NH, 1, [&](uint64_t t0, uint64_t t1) {
+      std::vector<float> S((size_t)BQ * N);
+      std::vector<float> acc((size_t)BQ * HD);
+      for (uint64_t t = t0; t < t1; ++t) {
+        const uint32_t qb = (uint32_t)(t / NH) * BQ;
+        const uint32_t h = (uint32_t)(t % NH);
+        const uint32_t qn = std::min(BQ, N - qb);
+        const uint32_t hoff = h * HD;
+        for (uint32_t j = 0; j < N; ++j) {
+          const float* kj = K.data() + (size_t)j * D + hoff;
+          for (uint32_t r = 0; r < qn; ++r)
+            S[(size_t)r * N + j] =
+                dot_f32(Q.data() + (size_t)(qb + r) * D + hoff, kj, HD) * attn_scale;
+        }
+        for (uint32_t r = 0; r < qn; ++r) {
+          float* row = S.data() + (size_t)r * N;
+          float m = -1e30f;
+          for (uint32_t j = 0; j < N; ++j) m = std::max(m, row[j]);
+          float s = 0.0f;
+          for (uint32_t j = 0; j < N; ++j) { row[j] = std::exp(row[j] - m); s += row[j]; }
+          const float inv_sum = 1.0f / s;
+          float* ao = acc.data() + (size_t)r * HD;
+          std::memset(ao, 0, (size_t)HD * sizeof(float));
           for (uint32_t j = 0; j < N; ++j) {
-            float sc = dot_f32(qi, K.data() + (size_t)j * D + h * HD, HD) * attn_scale;
-            scores[j] = sc;
-            if (sc > max_sc) max_sc = sc;
+            const __m512 pv = _mm512_set1_ps(row[j] * inv_sum);
+            const float* vj = V.data() + (size_t)j * D + hoff;
+            for (uint32_t c = 0; c < HD; c += 16) {
+              __m512 a = _mm512_loadu_ps(ao + c);
+              a = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + c), a);
+              _mm512_storeu_ps(ao + c, a);
+            }
           }
-          float sum_exp = 0.0f;
-          for (uint32_t j = 0; j < N; ++j) {
-            scores[j] = std::exp(scores[j] - max_sc);
-            sum_exp += scores[j];
-          }
-          const float inv_sum = 1.0f / sum_exp;
-
-          float* out_head = out_tok + h * HD;
-          __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
-          __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
-          for (uint32_t j = 0; j < N; ++j) {
-            const __m512 pv = _mm512_set1_ps(scores[j] * inv_sum);
-            const float* vj = V.data() + (size_t)j * D + h * HD;
-            a0 = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj), a0);
-            a1 = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + 16), a1);
-            a2 = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + 32), a2);
-            a3 = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + 48), a3);
-          }
-          _mm512_storeu_ps(out_head, a0);
-          _mm512_storeu_ps(out_head + 16, a1);
-          _mm512_storeu_ps(out_head + 32, a2);
-          _mm512_storeu_ps(out_head + 48, a3);
+          std::memcpy(Attn_out.data() + (size_t)(qb + r) * D + hoff, ao,
+                      (size_t)HD * sizeof(float));
         }
       }
     });

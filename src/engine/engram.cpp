@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <fcntl.h>
@@ -211,6 +212,14 @@ bool EngramTables::open(const EngramConsts* c, const std::string& dir, std::stri
     }
     m_[l].rows = c->rows[l];
     bytes_ += t.w_bytes + t.s_bytes;
+    // Opt-in page-cache warm. The mapping is MADV_RANDOM, so without this each first-touch row is
+    // its own 4 KiB demand read from NVMe; a decode step gathers 24 rows a layer and pays that
+    // latency on the host. RAM is sized for it (2 x 91.6 GiB against a box already holding a
+    // 150 GiB expert pool), at the cost of reading the tables once at startup.
+    if (std::getenv("AFF_ENGRAM_WARM")) {
+      ::madvise(m_[l].wbase, m_[l].wlen, MADV_WILLNEED);
+      ::madvise(m_[l].sbase, m_[l].slen, MADV_WILLNEED);
+    }
     // The mapping keeps the file alive; the descriptor does not have to.
     ::close(fd);
   }
