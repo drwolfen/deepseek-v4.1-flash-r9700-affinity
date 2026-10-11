@@ -1799,6 +1799,13 @@ int main(int argc, char** argv) {
     uint64_t tap_hash_prev = 0, kv_hash_prev = 0;
     const uint32_t dbg_layer = dense_gpu.kv_layers_debug() ? dense_gpu.kv_layers_debug() - 1u : 0u;
     uint32_t my_blocks = 0, my_accepted = 0;   // LOCAL, not model.profile(): uncontaminated
+    // Optional speculative backoff (AFF_SPEC_BACKOFF=N, default 0 = off). After N consecutive
+    // drafted blocks that accepted nothing, take one plain undrafted step: the draft's three stages
+    // and the 6-wide verify cost the most exactly where the draft predicts worst, and a run it
+    // cannot follow pays for both. One skipped block then retries, so a lone hit is not missed.
+    const char* backoff_env = std::getenv("AFF_SPEC_BACKOFF");
+    const uint32_t kBackoff = backoff_env ? (uint32_t)std::strtoul(backoff_env, nullptr, 10) : 0u;
+    uint32_t zero_run = 0;
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
     uint32_t next = first, generated = 0;
     bool stop = false;
@@ -1833,13 +1840,15 @@ int main(int argc, char** argv) {
       // Position 0 leaves the draft's window nothing to look at, which happens only for a
       // single-token prompt. One unspeculated block gets past it.
       uint32_t nd = 0;
-      if (draft_on && st.pos) {
+      const bool skip_draft = kBackoff && zero_run >= kBackoff;
+      if (draft_on && st.pos && !skip_draft) {
         if (!model.dspark_draft(next, &st, draft.data())) {
           aff::ui::fatal("fatal: dspark_draft refused at position %u\n", st.pos);
           std::abort();
         }
         nd = B;
       }
+      if (skip_draft) zero_run = 0;   // this step was the backoff; draft again next block
       const uint32_t P = st.pos;
       if (slot_dbg && nd) {
         std::string ds;
@@ -1915,6 +1924,7 @@ int main(int argc, char** argv) {
         aff::ui::err("slot %u VERIFY P=%u k=%u target=[%s]\n", slot, P, k, gs.c_str());
       }
       my_blocks++; my_accepted += k;
+      zero_run = (nd && k == 0) ? zero_run + 1u : 0u;   // streak of drafted blocks that accepted none
       model.note_block(nd, k, match.data());
       // Positions P..P+k are real; P+k+1 holds vb.greedy[k] and is fed by the next block.
       model.rollback(&st, P + k + 1);
