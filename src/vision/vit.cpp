@@ -3,7 +3,6 @@
 #include "quant/source_dtypes.h"
 
 #include <immintrin.h>
-#include "engine/matvec_bf16.inc"
 
 #include <cmath>
 #include <cstring>
@@ -24,10 +23,53 @@ static inline float gelu(float x) {
   return 0.5f * x * (1.0f + std::erff(x * 0.7071067811865475f));
 }
 
-static void matvec_dot_bf16(const uint16_t* W, const float* x, uint64_t cols, float* out_val) {
-  // Single output row: the AVX-512 bf16 kernel already runs at the DRAM wall, and the scalar
-  // bf16->f32 loop this replaces left the whole ViT memory-bound. See engine/matvec_bf16.inc.
-  matvec_bf16_v2(W, x, 1, cols, out_val);
+static inline float dot_f32(const float* a, const float* b, uint32_t n) {
+  __m512 acc = _mm512_setzero_ps();
+  uint32_t i = 0;
+  for (; i + 16 <= n; i += 16)
+    acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+  float s = _mm512_reduce_add_ps(acc);
+  for (; i < n; ++i) s += a[i] * b[i];
+  return s;
+}
+
+// out[k*R + r] = dot(W_row_r, X_row_k); W is [R,C] bf16, X is [N,C] f32, out is [N,R] f32.
+//
+// Weight-stationary and row-blocked: a block of RB weight rows is streamed through L1 and reused
+// across every token, so W is read from DRAM once. The per-token matvec this replaces read every
+// weight row once PER TOKEN, which bounds the whole ViT on weight bandwidth for a large image.
+static void gemm_nt(const uint16_t* W, const float* X, uint32_t N, uint32_t R, uint32_t C,
+                    float* out) {
+  constexpr uint32_t RB = 8;
+  const uint32_t nrb = (R + RB - 1) / RB;
+  parallel_for(nrb, 1, [&](uint64_t rb0, uint64_t rb1) {
+    for (uint64_t rb = rb0; rb < rb1; ++rb) {
+      const uint32_t r0 = (uint32_t)rb * RB;
+      const uint32_t nr = std::min<uint32_t>(RB, R - r0);
+      __m512 acc[RB];
+      for (uint32_t k = 0; k < N; ++k) {
+        const float* xk = X + (size_t)k * C;
+        for (uint32_t r = 0; r < nr; ++r) acc[r] = _mm512_setzero_ps();
+        uint32_t c = 0;
+        for (; c + 16 <= C; c += 16) {
+          const __m512 xv = _mm512_loadu_ps(xk + c);
+          for (uint32_t r = 0; r < nr; ++r) {
+            const uint16_t* wr = W + (size_t)(r0 + r) * C + c;
+            const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wr));
+            const __m512 wv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
+            acc[r] = _mm512_fmadd_ps(wv, xv, acc[r]);
+          }
+        }
+        float* ok = out + (size_t)k * R + r0;
+        for (uint32_t r = 0; r < nr; ++r) {
+          float s = _mm512_reduce_add_ps(acc[r]);
+          const uint16_t* wr = W + (size_t)(r0 + r) * C;
+          for (uint32_t cc = c; cc < C; ++cc) s += bf16_val(wr[cc]) * xk[cc];
+          ok[r] = s;
+        }
+      }
+    }
+  });
 }
 
 bool ViT::load(const std::string& model_dir, std::string* err) {
@@ -118,35 +160,31 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
   const uint32_t NH = 16;
   const uint32_t HD = 64;
 
-  // 1. Patch Embedding: project 588 inputs -> 1024 dims
-  std::vector<float> X((size_t)N * D);
-  std::vector<float> patch_buf(588);
-
+  // 1. Patch Embedding: one GEMM over every patch, so the projection weight is read once.
+  std::vector<float> patch_in((size_t)N * 588);
   parallel_for(N, 16, [&](uint64_t b0, uint64_t b1) {
-    std::vector<float> pbuf(588);
     for (uint64_t p = b0; p < b1; ++p) {
       int pr = (int)p / wp;
       int pc = (int)p % wp;
-
-      // Extract 14x14x3 patch in channel-first order: c * 196 + kh * 14 + kw
+      float* dst = patch_in.data() + p * 588;
+      // 14x14x3 patch in channel-first order: c * 196 + kh * 14 + kw
       for (int c = 0; c < 3; ++c) {
         for (int kh = 0; kh < 14; ++kh) {
           int y = pr * 14 + kh;
           for (int kw = 0; kw < 14; ++kw) {
             int x = pc * 14 + kw;
-            pbuf[(size_t)c * 196 + kh * 14 + kw] = img.data[((size_t)y * img.width + x) * 3 + c];
+            dst[c * 196 + kh * 14 + kw] = img.data[((size_t)y * img.width + x) * 3 + c];
           }
         }
       }
-
-      float* x_out = X.data() + p * D;
-      for (uint32_t d = 0; d < D; ++d) {
-        float bias = bf16_val(weights_.patch_proj_b[d]);
-        float dot = 0.0f;
-        const uint16_t* w_row = weights_.patch_proj_w + (size_t)d * 588;
-        matvec_dot_bf16(w_row, pbuf.data(), 588, &dot);
-        x_out[d] = bias + dot;
-      }
+    }
+  });
+  std::vector<float> X((size_t)N * D);
+  gemm_nt(weights_.patch_proj_w, patch_in.data(), N, D, 588, X.data());
+  parallel_for(N, 64, [&](uint64_t b0, uint64_t b1) {
+    for (uint64_t i = b0; i < b1; ++i) {
+      float* x = X.data() + i * D;
+      for (uint32_t d = 0; d < D; ++d) x[d] += bf16_val(weights_.patch_proj_b[d]);
     }
   });
 
@@ -172,10 +210,13 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
     }
   }
 
-  // Intermediate buffers for transformer block
+  // Intermediate buffers for the transformer block.
   std::vector<float> X_norm((size_t)N * D);
+  std::vector<float> QKV((size_t)N * 3072);
   std::vector<float> Q((size_t)N * D), K((size_t)N * D), V((size_t)N * D);
   std::vector<float> Attn_out((size_t)N * D);
+  std::vector<float> GU((size_t)N * 5632), H((size_t)N * 2816);
+  std::vector<float> TMP((size_t)N * D);
 
   // 2. Iterate through 32 ViT blocks
   for (uint32_t blk = 0; blk < 32; ++blk) {
@@ -195,27 +236,20 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
       }
     });
 
-    // b. QKV projection + bias + 2D RoPE
+    // b. QKV projection (one GEMM) + bias + 2D RoPE
+    gemm_nt(bw.attn_wqkv_w, X_norm.data(), N, 3072, D, QKV.data());
     parallel_for(N, 16, [&](uint64_t b0, uint64_t b1) {
-      std::vector<float> qkv(3072);
       for (uint64_t i = b0; i < b1; ++i) {
-        const float* x_in = X_norm.data() + i * D;
+        const float* qkv = QKV.data() + i * 3072;
         int pr = (int)i / wp;
         int pc = (int)i % wp;
-
-        for (uint32_t d = 0; d < 3072; ++d) {
-          float bias = bf16_val(bw.attn_wqkv_b[d]);
-          float dot = 0.0f;
-          matvec_dot_bf16(bw.attn_wqkv_w + (size_t)d * D, x_in, D, &dot);
-          qkv[d] = bias + dot;
-        }
 
         float* qi = Q.data() + i * D;
         float* ki = K.data() + i * D;
         float* vi = V.data() + i * D;
-        std::memcpy(qi, qkv.data(), D * sizeof(float));
-        std::memcpy(ki, qkv.data() + D, D * sizeof(float));
-        std::memcpy(vi, qkv.data() + 2 * D, D * sizeof(float));
+        for (uint32_t d = 0; d < D; ++d) qi[d] = qkv[d] + bf16_val(bw.attn_wqkv_b[d]);
+        for (uint32_t d = 0; d < D; ++d) ki[d] = qkv[D + d] + bf16_val(bw.attn_wqkv_b[D + d]);
+        for (uint32_t d = 0; d < D; ++d) vi[d] = qkv[2 * D + d] + bf16_val(bw.attn_wqkv_b[2 * D + d]);
 
         // Apply 2D RoPE to Q and K
         const float* cr = cos_r.data() + pr * 16;
@@ -245,9 +279,11 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
       }
     });
 
-    // c. Scaled dot-product self-attention: softmax(Q @ K.T / sqrt(64)) @ V
+    // c. Scaled dot-product self-attention: softmax(Q @ K.T / sqrt(64)) @ V.
+    //    Both dots are AVX-512: the QK score over the 64-dim head, and the AV as a rank-1 update
+    //    over the 64 output dims. The scalar form this replaces was the O(N^2) tail of a big image.
     const float attn_scale = 1.0f / std::sqrt((float)HD);
-    parallel_for(N, 16, [&](uint64_t b0, uint64_t b1) {
+    parallel_for(N, 4, [&](uint64_t b0, uint64_t b1) {
       std::vector<float> scores(N);
       for (uint64_t i = b0; i < b1; ++i) {
         float* out_tok = Attn_out.data() + i * D;
@@ -255,10 +291,7 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
           const float* qi = Q.data() + i * D + h * HD;
           float max_sc = -1e30f;
           for (uint32_t j = 0; j < N; ++j) {
-            const float* kj = K.data() + j * D + h * HD;
-            float dot = 0.0f;
-            for (uint32_t d = 0; d < HD; ++d) dot += qi[d] * kj[d];
-            float sc = dot * attn_scale;
+            float sc = dot_f32(qi, K.data() + (size_t)j * D + h * HD, HD) * attn_scale;
             scores[j] = sc;
             if (sc > max_sc) max_sc = sc;
           }
@@ -267,32 +300,34 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
             scores[j] = std::exp(scores[j] - max_sc);
             sum_exp += scores[j];
           }
-          float inv_sum = 1.0f / sum_exp;
-          for (uint32_t j = 0; j < N; ++j) scores[j] *= inv_sum;
+          const float inv_sum = 1.0f / sum_exp;
 
           float* out_head = out_tok + h * HD;
-          for (uint32_t d = 0; d < HD; ++d) {
-            float val = 0.0f;
-            for (uint32_t j = 0; j < N; ++j) {
-              val += scores[j] * (V.data() + j * D + h * HD)[d];
-            }
-            out_head[d] = val;
+          __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+          __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+          for (uint32_t j = 0; j < N; ++j) {
+            const __m512 pv = _mm512_set1_ps(scores[j] * inv_sum);
+            const float* vj = V.data() + (size_t)j * D + h * HD;
+            a0 = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj), a0);
+            a1 = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + 16), a1);
+            a2 = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + 32), a2);
+            a3 = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + 48), a3);
           }
+          _mm512_storeu_ps(out_head, a0);
+          _mm512_storeu_ps(out_head + 16, a1);
+          _mm512_storeu_ps(out_head + 32, a2);
+          _mm512_storeu_ps(out_head + 48, a3);
         }
       }
     });
 
-    // d. Attention Out projection + residual add
-    parallel_for(N, 32, [&](uint64_t b0, uint64_t b1) {
+    // d. Attention Out projection (one GEMM) + bias + residual add
+    gemm_nt(bw.attn_wo_w, Attn_out.data(), N, D, D, TMP.data());
+    parallel_for(N, 64, [&](uint64_t b0, uint64_t b1) {
       for (uint64_t i = b0; i < b1; ++i) {
-        const float* attn_tok = Attn_out.data() + i * D;
-        float* x_tok = X.data() + i * D;
-        for (uint32_t d = 0; d < D; ++d) {
-          float bias = bf16_val(bw.attn_wo_b[d]);
-          float dot = 0.0f;
-          matvec_dot_bf16(bw.attn_wo_w + (size_t)d * D, attn_tok, D, &dot);
-          x_tok[d] += bias + dot;
-        }
+        const float* t = TMP.data() + i * D;
+        float* x = X.data() + i * D;
+        for (uint32_t d = 0; d < D; ++d) x[d] += bf16_val(bw.attn_wo_b[d]) + t[d];
       }
     });
 
@@ -310,29 +345,21 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
       }
     });
 
-    // f. SwiGLU MLP: w1 is [5632, 1024] (gate 2816, up 2816), w2 is [1024, 2816] + residual add
-    parallel_for(N, 16, [&](uint64_t b0, uint64_t b1) {
-      std::vector<float> gu(5632);
-      std::vector<float> h(2816);
+    // f. SwiGLU MLP (two GEMMs): w1 [5632,1024] (gate 2816, up 2816), w2 [1024,2816] + residual.
+    gemm_nt(bw.mlp_w1_w, X_norm.data(), N, 5632, D, GU.data());
+    parallel_for(N, 64, [&](uint64_t b0, uint64_t b1) {
       for (uint64_t i = b0; i < b1; ++i) {
-        const float* x_in = X_norm.data() + i * D;
-        float* x_tok = X.data() + i * D;
-
-        for (uint32_t d = 0; d < 5632; ++d) {
-          float dot = 0.0f;
-          matvec_dot_bf16(bw.mlp_w1_w + (size_t)d * D, x_in, D, &dot);
-          gu[d] = dot;
-        }
-
-        for (uint32_t d = 0; d < 2816; ++d) {
-          h[d] = silu(gu[d]) * gu[2816 + d];
-        }
-
-        for (uint32_t d = 0; d < D; ++d) {
-          float dot = 0.0f;
-          matvec_dot_bf16(bw.mlp_w2_w + (size_t)d * 2816, h.data(), 2816, &dot);
-          x_tok[d] += dot;
-        }
+        const float* gu = GU.data() + i * 5632;
+        float* h = H.data() + i * 2816;
+        for (uint32_t d = 0; d < 2816; ++d) h[d] = silu(gu[d]) * gu[2816 + d];
+      }
+    });
+    gemm_nt(bw.mlp_w2_w, H.data(), N, D, 2816, TMP.data());
+    parallel_for(N, 64, [&](uint64_t b0, uint64_t b1) {
+      for (uint64_t i = b0; i < b1; ++i) {
+        const float* t = TMP.data() + i * D;
+        float* x = X.data() + i * D;
+        for (uint32_t d = 0; d < D; ++d) x[d] += t[d];
       }
     });
   }
@@ -379,27 +406,21 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
     }
   }
 
-  // 5. Aligner MLP: w1 [5120, 9216] -> GELU -> w2 [5120, 5120] -> 5120 output
-  std::vector<float> Aligned((size_t)M * LLM_DIM);
+  // 5. Aligner MLP (two GEMMs): w1 [5120, 9216] -> GELU -> w2 [5120, 5120] -> 5120 output.
+  std::vector<float> A1((size_t)M * LLM_DIM);
+  gemm_nt(weights_.aligner_w1_w, X_down.data(), M, LLM_DIM, IN_DIM, A1.data());
   parallel_for(M, 8, [&](uint64_t b0, uint64_t b1) {
-    std::vector<float> a1(LLM_DIM);
     for (uint64_t i = b0; i < b1; ++i) {
-      const float* x_in = X_down.data() + i * IN_DIM;
-      float* out_tok = Aligned.data() + i * LLM_DIM;
-
-      for (uint32_t d = 0; d < LLM_DIM; ++d) {
-        float bias = bf16_val(weights_.aligner_w1_b[d]);
-        float dot = 0.0f;
-        matvec_dot_bf16(weights_.aligner_w1_w + (size_t)d * IN_DIM, x_in, IN_DIM, &dot);
-        a1[d] = gelu(bias + dot);
-      }
-
-      for (uint32_t d = 0; d < LLM_DIM; ++d) {
-        float bias = bf16_val(weights_.aligner_w2_b[d]);
-        float dot = 0.0f;
-        matvec_dot_bf16(weights_.aligner_w2_w + (size_t)d * LLM_DIM, a1.data(), LLM_DIM, &dot);
-        out_tok[d] = bias + dot;
-      }
+      float* a = A1.data() + i * LLM_DIM;
+      for (uint32_t d = 0; d < LLM_DIM; ++d) a[d] = gelu(a[d] + bf16_val(weights_.aligner_w1_b[d]));
+    }
+  });
+  std::vector<float> Aligned((size_t)M * LLM_DIM);
+  gemm_nt(weights_.aligner_w2_w, A1.data(), M, LLM_DIM, LLM_DIM, Aligned.data());
+  parallel_for(M, 8, [&](uint64_t b0, uint64_t b1) {
+    for (uint64_t i = b0; i < b1; ++i) {
+      float* o = Aligned.data() + i * LLM_DIM;
+      for (uint32_t d = 0; d < LLM_DIM; ++d) o[d] += bf16_val(weights_.aligner_w2_b[d]);
     }
   });
 
