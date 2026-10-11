@@ -988,7 +988,7 @@ int main(int argc, char** argv) {
     if (prefill_chunk > 0) {
       // max_mid is the widest intermediate that is not the query block: 8*o_lora_rank.
       if (dense_gpu.batch_init(prefill_chunk, c.n_embd, c.hc_mult, c.n_head, c.head_dim,
-                               8 * c.o_lora_rank, c.vocab, &berr)) {
+                               8 * c.o_lora_rank, c.vocab, c.index_topk, &berr)) {
         model.set_batch_ops(dense_gpu.batch_ops());
         aff::ui::out("prefill: batched, up to %u tokens per chunk\n", dense_gpu.batch_cap());
       } else {

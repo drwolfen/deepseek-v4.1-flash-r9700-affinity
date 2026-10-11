@@ -290,7 +290,8 @@ public:
   // batched prefill runs exactly the code it always did — the two paths share only the weights and
   // the KV cache. ~170 MiB a card at 256 tokens, so it too must precede StaticPlacement.
   bool batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_head,
-                  uint32_t width, uint32_t max_mid, uint32_t vocab, std::string* err);
+                  uint32_t width, uint32_t max_mid, uint32_t vocab, uint32_t index_topk,
+                  std::string* err);
   Model::BatchOps batch_ops();
   uint32_t batch_cap() const { return b_cap_; }
 
@@ -551,6 +552,7 @@ private:
   bool     a_idx_gather_[kMaxSlots];  // ...and whether it also left the compacted list beside it
   uint32_t a_idx_topk_[kMaxSlots];    // that layer's index_topk, the list's largest possible length
   uint32_t i_tile_ = 1;              // tokens a pass through the indexer's score plane; see idx_grow
+  bool     b_allow_dense_ = false;   // b_allow holds nb x a_maxcomp_ (dense) rather than an i_tile_ tile
   bool     idx_want_qrn_ = false;    // attn_q keeps qr_norm in VRAM for the single-token indexer
   uint32_t b_norm_rows_ = 0;            // n_embd, remembered by hc_pre for the lazy norm fetch
   uint32_t a_ring_ = 0;                 // raw slots = sliding + kAttnBatch - 1; see attention_gpu.h

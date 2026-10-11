@@ -3233,7 +3233,8 @@ void DenseGpu::mvg(int32_t h, const float* x, uint32_t n_groups, uint64_t group_
 // exists, it is not repeated.
 
 bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_head,
-                          uint32_t width, uint32_t max_mid, uint32_t vocab, std::string* err) {
+                          uint32_t width, uint32_t max_mid, uint32_t vocab, uint32_t index_topk,
+                          std::string* err) {
   if (!impl_ || impl_->dev.empty() || !max_tokens) return false;
   const size_t R = impl_->dev.size();
   if (n_head % R) { if (err) *err = "n_head does not split across ranks"; return false; }
@@ -3328,10 +3329,20 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
                  "hipHostMalloc batch staging", err))
       return false;
     // One mask slot per token in the chunk, device only: `batch_indexer` writes this in place on
-    // the same stream, so the mask never crosses the bus. There is no host staging buffer — at a
-    // large KV cache it would be the biggest single allocation here, and nothing reads it.
+    // the same stream, so the mask never crosses the bus. When attention will read the compacted
+    // gather list (flash kernel + index_topk <= kAdmCap, both fixed for V4.1) the byte mask is
+    // consumed INSIDE idx_topk_mask by compact_row and never read again, so it is sized to the score
+    // plane's tile rather than to the whole chunk — nb x a_maxcomp_ (2.95 GiB/card at a 1M cache)
+    // down to an i_tile_ x a_maxcomp_ tile, the same 256 MiB budget the score plane uses. Otherwise
+    // (a model whose top-k overflows the gather, or a non-flash attention path that keeps the mask)
+    // it stays the full plane.
+    const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
+    b_allow_dense_ = !(flash_ok && index_topk && index_topk <= kAdmCap);
     if (a_maxcomp_) {
-      if (!hip_try(hipMalloc(&D.b_allow, (size_t)nb * a_maxcomp_), "hipMalloc batch masks", err))
+      const size_t row = (size_t)a_maxcomp_ * sizeof(float);
+      const uint32_t tile = b_allow_dense_ ? nb
+                          : (uint32_t)std::min<uint64_t>(nb, std::max<uint64_t>(1, ((size_t)256 << 20) / row));
+      if (!hip_try(hipMalloc(&D.b_allow, (size_t)tile * a_maxcomp_), "hipMalloc batch masks", err))
         return false;
     }
     if (!hip_try(hipMalloc(&D.b_ncomp, (size_t)nb * sizeof(uint32_t)), "hipMalloc ncomp", err))
@@ -4790,7 +4801,13 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
       // Straight into b_allow at the CHUNK's own token indexing; batch_attend then offsets by its
       // sub-batch. The mask never leaves the card.
       const bool gather = topk <= kAdmCap;
-      idx_topk_mask_hip(D.i_sc, D.b_allow + (size_t)t0 * a_maxcomp_, D.i_nc + t0, nt, n_keys,
+      // The byte mask is consumed by compact_row inside this launch; when the gather list is what
+      // attention reads it is a tile-local scratch (`i_tile_` rows, reused every tile), otherwise it
+      // is the chunk-indexed full plane. See batch_init.
+      uint8_t* const mrow = D.b_allow ? (b_allow_dense_ ? D.b_allow + (size_t)t0 * a_maxcomp_
+                                                        : D.b_allow)
+                                      : nullptr;
+      idx_topk_mask_hip(D.i_sc, mrow, D.i_nc + t0, nt, n_keys,
                         a_maxcomp_, n_mask, topk, st, nullptr,
                         gather ? D.b_adm + (size_t)t0 * kAdmCap : nullptr,
                         gather ? D.b_admn + t0 : nullptr, kAdmCap);
@@ -4851,6 +4868,12 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
     // difference between running and not at long context.
     const bool flash = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
     const bool gather = dev_mask && a_idx_gather_[slot_];
+    // With the tile-sized mask (batch_init) attention MUST read the compacted gather list; a path
+    // that dereferences the chunk-indexed full plane would read a tile row as if it were the
+    // chunk's. That is exactly `use_dense` below. When it is false attention is handed nullptr and
+    // attends every compressed row (a short prompt whose indexer never ran), which is unchanged.
+    const bool use_dense = !gather && (dev_mask || (allowed && n_comp_max));
+    if (!b_allow_dense_ && use_dense) return false;
     if (flash)
       mqa_attend_flash_hip(D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][kvl(layer)],
                            gather ? nullptr
