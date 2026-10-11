@@ -28,7 +28,7 @@ const char* const kEffortMax =
 
 // TOOLS_TEMPLATE with dsml_token/think tokens already substituted. Every space and newline here is
 // load-bearing: the fixtures compare byte for byte.
-std::string tools_block(const std::vector<ToolDef>& tools);
+std::string tools_block(const std::vector<ToolDef>& tools, bool v41 = false);
 std::string response_format_block(const std::string& schema_json);
 
 // ---- JSON, only as much as the format needs -----------------------------------------------------
@@ -43,6 +43,7 @@ std::string response_format_block(const std::string& schema_json);
 // every number survive untouched, because none of them is ever re-derived.
 //
 // The one thing it cannot reproduce is Python renormalising a number's spelling (1e5 -> 100000.0).
+
 // Tool schemas are objects, strings and arrays; no fixture contains a float, and a schema that did
 // would differ only in the digits of a number the model reads as text.
 std::string json_compact(const std::string& s) {
@@ -203,23 +204,27 @@ std::string response_format_block(const std::string& schema_json) {
          json_compact(schema_json);
 }
 
-std::string tools_block(const std::vector<ToolDef>& tools) {
+std::string tools_block(const std::vector<ToolDef>& tools, bool v41) {
   std::string schemas;
   for (size_t i = 0; i < tools.size(); ++i) {
     if (i) schemas += "\n";
     schemas += json_compact(tools[i].function_json);
   }
+  const std::string tag_calls = v41 ? " calls" : "tool_calls";
+  const std::string tag_inv   = v41 ? " invoke" : "invoke";
+  const std::string tag_param = v41 ? " parameter" : "parameter";
+
   std::string s = "## Tools\n\nYou have access to a set of tools to help answer the user's question. "
                   "You can invoke tools by writing a \"<";
-  s += kDsml; s += "tool_calls>\" block like the following:\n\n<";
-  s += kDsml; s += "tool_calls>\n<";
-  s += kDsml; s += "invoke name=\"$TOOL_NAME\">\n<";
-  s += kDsml; s += "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</";
-  s += kDsml; s += "parameter>\n...\n</";
-  s += kDsml; s += "invoke>\n<";
-  s += kDsml; s += "invoke name=\"$TOOL_NAME2\">\n...\n</";
-  s += kDsml; s += "invoke>\n</";
-  s += kDsml; s += "tool_calls>\n\nString parameters should be specified as is and set "
+  s += kDsml; s += tag_calls; s += ">\" block like the following:\n\n<";
+  s += kDsml; s += tag_calls; s += ">\n<";
+  s += kDsml; s += tag_inv; s += " name=\"$TOOL_NAME\">\n<";
+  s += kDsml; s += tag_param; s += " name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</";
+  s += kDsml; s += tag_param; s += ">\n...\n</";
+  s += kDsml; s += tag_inv; s += ">\n<";
+  s += kDsml; s += tag_inv; s += " name=\"$TOOL_NAME2\">\n...\n</";
+  s += kDsml; s += tag_inv; s += ">\n</";
+  s += kDsml; s += tag_calls; s += ">\n\nString parameters should be specified as is and set "
                   "`string=\"true\"`. For all other types (numbers, booleans, arrays, objects), "
                   "pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is "
                   "enabled (triggered by ";
@@ -234,12 +239,16 @@ std::string tools_block(const std::vector<ToolDef>& tools) {
 }
 
 // One assistant turn's DSML block, from `encode_arguments_to_dsml` and `tool_call_template`.
-std::string render_tool_calls(const std::vector<ToolCall>& tcs) {
+std::string render_tool_calls(const std::vector<ToolCall>& tcs, bool v41 = false) {
+  const std::string tag_calls = v41 ? " calls" : "tool_calls";
+  const std::string tag_inv   = v41 ? " invoke" : "invoke";
+  const std::string tag_param = v41 ? " parameter" : "parameter";
+
   std::string out = "\n\n<";
-  out += kDsml; out += "tool_calls>\n";
+  out += kDsml; out += tag_calls; out += ">\n";
   for (size_t i = 0; i < tcs.size(); ++i) {
     if (i) out += "\n";
-    out += "<"; out += kDsml; out += "invoke name=\"" + tcs[i].name + "\">\n";
+    out += "<"; out += kDsml; out += tag_inv; out += " name=\"" + tcs[i].name + "\">\n";
     // Arguments that are not a JSON object are wrapped under an "arguments" key, exactly as the
     // reference's except-branch does, rather than dropped.
     auto members = json_members(tcs[i].arguments);
@@ -252,16 +261,16 @@ std::string render_tool_calls(const std::vector<ToolCall>& tcs) {
     for (size_t m = 0; m < members.size(); ++m) {
       if (m) out += "\n";
       const bool is_str = json_is_string(members[m].second);
-      out += "<"; out += kDsml;
-      out += "parameter name=\"" + members[m].first + "\" string=\"";
+      out += "<"; out += kDsml; out += tag_param;
+      out += " name=\"" + members[m].first + "\" string=\"";
       out += is_str ? "true" : "false";
       out += "\">";
       out += is_str ? json_unquote(members[m].second) : json_compact(members[m].second);
-      out += "</"; out += kDsml; out += "parameter>";
+      out += "</"; out += kDsml; out += tag_param; out += ">";
     }
-    out += "\n</"; out += kDsml; out += "invoke>";
+    out += "\n</"; out += kDsml; out += tag_inv; out += ">";
   }
-  out += "\n</"; out += kDsml; out += "tool_calls>";
+  out += "\n</"; out += kDsml; out += tag_calls; out += ">";
   return out;
 }
 
@@ -311,9 +320,10 @@ std::vector<ChatMsg> merge_tool_messages(const std::vector<ChatMsg>& in) {
 
 }  // namespace
 
-const char* const kToolCallsOpen = "\n\n<｜DSML｜tool_calls";
-const char* const kThinkEnd      = "</think>";
-const char* const kEosStr        = "<｜end▁of▁sentence｜>";
+const char* const kToolCallsOpen    = "\n\n<｜DSML｜tool_calls";
+const char* const kToolCallsOpenV41 = "\n\n<｜DSML｜ calls";
+const char* const kThinkEnd         = "</think>";
+const char* const kEosStr           = "<｜end▁of▁sentence｜>";
 
 std::string encode_messages(const std::vector<ChatMsg>& in, const EncodeOpts& opts) {
   std::vector<ChatMsg> msgs = merge_tool_messages(in);
@@ -347,12 +357,12 @@ std::string encode_messages(const std::vector<ChatMsg>& in, const EncodeOpts& op
 
     if (m.role == "system") {
       out += m.content;
-      if (!m.tools.empty()) out += "\n\n" + tools_block(m.tools);
+      if (!m.tools.empty()) out += "\n\n" + tools_block(m.tools, opts.v41);
       if (!m.response_format.empty()) out += "\n\n" + response_format_block(m.response_format);
     } else if (m.role == "developer") {
       out += kUser;
       out += m.content;
-      if (!m.tools.empty()) out += "\n\n" + tools_block(m.tools);
+      if (!m.tools.empty()) out += "\n\n" + tools_block(m.tools, opts.v41);
       if (!m.response_format.empty()) out += "\n\n" + response_format_block(m.response_format);
     } else if (m.role == "user") {
       out += kUser;
@@ -366,7 +376,7 @@ std::string encode_messages(const std::vector<ChatMsg>& in, const EncodeOpts& op
       if (thinking && !prev_task && (!drop || (int)idx > last_user))
         out += m.reasoning_content + kThinkEnd;
       out += m.content;
-      if (!m.tool_calls.empty()) out += render_tool_calls(m.tool_calls);
+      if (!m.tool_calls.empty()) out += render_tool_calls(m.tool_calls, opts.v41);
       out += kEosStr;
     }
 
@@ -416,12 +426,10 @@ size_t read_until(size_t i, const std::string& t, const std::vector<std::string>
 ParsedMessage parse_completion(const std::string& text, ThinkingMode mode) {
   ParsedMessage out;
   const std::string dsml = kDsml;
-  const std::string tc_open  = std::string("\n\n<") + dsml + "tool_calls";
-  const std::string tc_close = std::string("</") + dsml + "tool_calls>";
-  const std::string inv_open = std::string("<") + dsml + "invoke";
-  const std::string inv_close= std::string("</") + dsml + "invoke";
-  const std::string par_open = std::string("<") + dsml + "parameter";
-  const std::string par_close= std::string("/") + dsml + "parameter";
+  const std::string tc_open_v4  = std::string("\n\n<") + dsml + "tool_calls";
+  const std::string tc_open_v41 = std::string("\n\n<") + dsml + " calls";
+  const std::string tc_open_v41_raw = std::string("<") + dsml + " calls";
+  const std::string tc_open_v4_raw  = std::string("<") + dsml + "tool_calls";
 
   auto fail = [&](const char* why) {
     out.ok = false;
@@ -435,16 +443,35 @@ ParsedMessage parse_completion(const std::string& text, ThinkingMode mode) {
   size_t i = 0;
   std::string chunk, stop;
 
+  const std::vector<std::string> open_markers = {tc_open_v4, tc_open_v41, tc_open_v4_raw, tc_open_v41_raw};
+
   if (mode == ThinkingMode::Thinking) {
-    i = read_until(i, text, {kThinkEnd, tc_open}, &chunk, &stop);
+    std::vector<std::string> think_stops = {kThinkEnd};
+    think_stops.insert(think_stops.end(), open_markers.begin(), open_markers.end());
+    i = read_until(i, text, think_stops, &chunk, &stop);
     if (stop != kThinkEnd) return fail("missing </think>");
     out.reasoning_content = chunk;
   }
 
-  i = read_until(i, text, {kEosStr, tc_open}, &chunk, &stop);
+  std::vector<std::string> content_stops = {kEosStr};
+  content_stops.insert(content_stops.end(), open_markers.begin(), open_markers.end());
+  i = read_until(i, text, content_stops, &chunk, &stop);
   out.content = chunk;
 
-  if (stop == tc_open) {
+  const bool is_tool_open = std::find(open_markers.begin(), open_markers.end(), stop) != open_markers.end();
+
+  if (is_tool_open) {
+    const bool is_v41 = (stop == tc_open_v41 || stop == tc_open_v41_raw);
+    const std::string tag_calls = is_v41 ? " calls" : "tool_calls";
+    const std::string tag_inv   = is_v41 ? " invoke" : "invoke";
+    const std::string tag_param = is_v41 ? " parameter" : "parameter";
+
+    const std::string tc_close  = std::string("</") + dsml + tag_calls + ">";
+    const std::string inv_open  = std::string("<") + dsml + tag_inv;
+    const std::string inv_close = std::string("</") + dsml + tag_inv;
+    const std::string par_open  = std::string("<") + dsml + tag_param;
+    const std::string par_close = std::string("/") + dsml + tag_param;
+
     // Inside the block: alternating `invoke` headers and `parameter` bodies until the close.
     while (i < text.size()) {
       i = read_until(i, text, {inv_open, tc_close}, &chunk, &stop);

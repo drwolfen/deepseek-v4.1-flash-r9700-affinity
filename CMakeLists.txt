@@ -125,8 +125,10 @@ add_library(aff_format STATIC
   src/server/server.cpp
   src/engine/model.cpp
   src/engine/engram.cpp
+  src/vision/image_decode.cpp
+  src/vision/vit.cpp
 )
-target_include_directories(aff_format PUBLIC src)
+target_include_directories(aff_format PUBLIC src src/vision)
 find_package(Threads REQUIRED)
 target_link_libraries(aff_format PUBLIC Threads::Threads aff_ui)
 target_compile_options(aff_format PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -176,6 +178,7 @@ aff_tool(aff-quantlab tools/aff_quantlab.cpp aff_format)
 # The n-gram hash, printed, so it can be diffed against the reference's own NgramHashState. It
 # needs no model and no card: the constants come out of tools/v41/engram_prep.py.
 aff_tool(aff-engramcheck tools/aff_engramcheck.cpp aff_format)
+aff_tool(aff-vitcheck    tools/aff_vitcheck.cpp    aff_format)
 aff_tool(aff-predict  tools/aff_predict.cpp)
 aff_tool(aff-profile  tools/aff_profile.cpp)
 

@@ -1530,7 +1530,7 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
 bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
                             ExpertFetch fetch, void* fetch_ctx,
                             std::vector<float>* logits, bool routed_experts,
-                            BlockOut* blk) const {
+                            BlockOut* blk, const PrefillVision* vision) const {
   if (!bops_.cap || !bops_.begin || !embed_ || !n) return false;
   const uint32_t cap = bops_.cap(bops_.ctx);
   if (cap < 2) return false;
@@ -1618,14 +1618,34 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
   // trailing window the caller asked to keep.
   const uint32_t tap_first = tap_rows ? (n - tap_rows) : n;
 
-  for (uint32_t base = 0; base < n; base += chunk) {
-    const uint32_t live = std::min(chunk, n - base);
+  for (uint32_t base = 0; base < n; ) {
+    uint32_t live = std::min(chunk, n - base);
+    if (vision && vision->count > 0 && vision->embeddings) {
+      const uint32_t v_start = vision->start;
+      const uint32_t v_end = vision->start + vision->count;
+      if (base < v_start && base + live > v_start) {
+        live = v_start - base;
+      } else if (base >= v_start && base < v_end && base + live > v_end) {
+        live = v_end - base;
+      }
+    }
+    const bool is_image_chunk = (vision && vision->count > 0 &&
+                                 base >= vision->start &&
+                                 base < vision->start + vision->count);
     // Before the chunk, not after: a display should name what is being worked on, and the last
     // chunk's completion is this function returning.
     if (pp_) pp_(pp_ctx_, base, n);
     const uint32_t pos0 = s->pos;
-    for (uint32_t b = 0; b < live; ++b)
-      bf16_dequant(embed_ + (size_t)ids[base + b] * E, E, emb.data() + (size_t)b * E);
+    for (uint32_t b = 0; b < live; ++b) {
+      uint32_t g = base + b;
+      if (vision && vision->count > 0 && vision->embeddings &&
+          g >= vision->start && g < vision->start + vision->count) {
+        const float* src = vision->embeddings + (size_t)(g - vision->start) * E;
+        std::memcpy(emb.data() + (size_t)b * E, src, E * sizeof(float));
+      } else {
+        bf16_dequant(embed_ + (size_t)ids[g] * E, E, emb.data() + (size_t)b * E);
+      }
+    }
     // Not `return false`: every reason this can refuse was checked once before the loop, and by
     // the time base > 0 the KV cache already holds the earlier chunks — the caller's per-token
     // retry would then re-append them. A refusal here is a bug, and the shape of the bug is a
@@ -1921,7 +1941,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
           for (uint32_t e = 0; e < NE; ++e) residentb[e] = res_(res_ctx_, l, e) ? 1 : 0;
           res = residentb.data();
         }
-        if (!bops_.router_topk(bops_.ctx, w.router_gpu, NE, E, KS, w.router_b, res,
+        const float* cur_bias = (is_image_chunk && w.router_b_vl) ? w.router_b_vl : w.router_b;
+        if (!bops_.router_topk(bops_.ctx, w.router_gpu, NE, E, KS, cur_bias, res,
                                cfg_.norm_topk_prob ? 1 : 0, cfg_.routed_scaling,
                                dev_plan ? nullptr : selb.data(),
                                dev_plan ? nullptr : swb.data(),
@@ -1975,7 +1996,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
           }
         } else if (w.router_w) {
           RouterOut ro;
-          route_topk(rlogb.data() + (size_t)b * NE, w.router_b, NE, cfg_.n_expert_used,
+          const float* cur_bias = (is_image_chunk && w.router_b_vl) ? w.router_b_vl : w.router_b;
+          route_topk(rlogb.data() + (size_t)b * NE, cur_bias, NE, cfg_.n_expert_used,
                      cfg_.norm_topk_prob, cfg_.routed_scaling, &ro);
           n_sel = ro.n;
           for (uint32_t k = 0; k < n_sel; ++k) { sel[k] = ro.expert[k]; sw[k] = ro.weight[k]; }
@@ -2217,6 +2239,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       if (head_) dense_mv(head_, norm.data(), cfg_.vocab, E, logits->data());
       AFF_PH(head);
     }
+    base += live;
   }
   (void)fetch; (void)fetch_ctx;
   return true;

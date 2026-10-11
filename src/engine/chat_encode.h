@@ -81,8 +81,9 @@ ParsedMessage parse_completion(const std::string& text, ThinkingMode mode);
 
 // Exposed for the tests and for the streaming path, which has to hold back any prefix that might
 // still turn into a tool-call marker.
-extern const char* const kToolCallsOpen;   // "\n\n<｜DSML｜tool_calls"
-extern const char* const kThinkEnd;        // "</think>"
-extern const char* const kEosStr;          // "<｜end▁of▁sentence｜>"
+extern const char* const kToolCallsOpen;      // "\n\n<｜DSML｜tool_calls"
+extern const char* const kToolCallsOpenV41;   // "\n\n<｜DSML｜ calls"
+extern const char* const kThinkEnd;           // "</think>"
+extern const char* const kEosStr;             // "<｜end▁of▁sentence｜>"
 
 } // namespace aff

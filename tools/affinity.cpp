@@ -16,6 +16,7 @@
 #include "server/server.h"
 #include "engine/chat_encode.h"
 #include "engine/prefix_cache.h"
+#include "vision/vit.h"
 
 #include "ui/dashboard.h"
 #include "ui/log.h"
@@ -739,6 +740,22 @@ int main(int argc, char** argv) {
                  (double)model.engram_bytes() / (1024.0 * 1024 * 1024), engram_dir);
   }
   if (max_layers) model.set_max_layers(max_layers);
+
+  aff::ViT vit;
+  std::string vision_dir = engram_dir ? engram_dir : "";
+  if (vision_dir.empty() && !tok_path.empty()) {
+    std::string tp = tok_path;
+    size_t slash = tp.find_last_of("/\\");
+    if (slash != std::string::npos) vision_dir = tp.substr(0, slash);
+  }
+  if (!vision_dir.empty()) {
+    std::string verr;
+    if (vit.load(vision_dir, &verr)) {
+      aff::ui::out("vision: DeepSeek ViT loaded from %s (32 layers, BF16)\n", vision_dir.c_str());
+    } else {
+      aff::ui::out("vision: ViT not enabled (%s)\n", verr.c_str());
+    }
+  }
 #ifdef AFF_WITH_HIP
   // Dense goes to VRAM first; placement sizes the expert slabs from what is left. Reversed,
   // placement claims nearly all of it and every dense tensor falls back to the CPU.
@@ -2289,6 +2306,13 @@ int main(int argc, char** argv) {
   const bool ok = srv.start(host, port, [&](const CompletionRequest& req, const TokenSink& sink,
                                             GenResult* res, uint32_t slot) {
     std::vector<ChatMsg> msgs;
+    std::string req_image_b64;
+    for (const ChatMessage& in : req.messages) {
+      if (in.has_image && !in.image_data.empty()) {
+        req_image_b64 = in.image_data;
+        break;
+      }
+    }
     if (req.messages.empty()) {
       // The legacy completions endpoint: a raw prompt with no roles, so it is encoded as a bare
       // user turn rather than smuggled past the template.
@@ -2299,6 +2323,9 @@ int main(int argc, char** argv) {
         ChatMsg m;
         m.role = in.role;
         m.content = in.content;
+        if (in.has_image && !req_image_b64.empty() && m.content.find("<｜deepseek_image｜>") == std::string::npos) {
+          m.content = "<｜deepseek_image｜>\n" + m.content;
+        }
         m.reasoning_content = in.reasoning_content;
         m.tool_call_id = in.tool_call_id;
         for (const ToolCallIO& t : in.tool_calls) m.tool_calls.push_back({t.id, t.name, t.arguments});
@@ -2384,6 +2411,33 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> ids = tok.vocab_size() ? tok.encode(prompt, false)
                                                  : std::vector<uint32_t>{1};
 
+    std::vector<float> vision_embeddings;
+    uint32_t n_vision_tokens = 0;
+    Model::PrefillVision pv;
+    if (!req_image_b64.empty() && vit.ready()) {
+      std::string verr;
+      if (!vit.process_base64_image(req_image_b64, &vision_embeddings, &n_vision_tokens, &verr)) {
+        res->error = "vision processing error: " + verr;
+        return;
+      }
+      size_t img_idx = std::string::npos;
+      for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] == 129264) { img_idx = i; break; }
+      }
+      if (img_idx != std::string::npos && n_vision_tokens > 0) {
+        std::vector<uint32_t> new_ids;
+        new_ids.reserve(ids.size() + n_vision_tokens - 1);
+        new_ids.insert(new_ids.end(), ids.begin(), ids.begin() + img_idx);
+        new_ids.insert(new_ids.end(), n_vision_tokens, 129264);
+        new_ids.insert(new_ids.end(), ids.begin() + img_idx + 1, ids.end());
+        ids = std::move(new_ids);
+
+        pv.embeddings = vision_embeddings.data();
+        pv.start = (uint32_t)img_idx;
+        pv.count = n_vision_tokens;
+      }
+    }
+
     // ---- what max_tokens bounds ------------------------------------------------------------------
     //
     // EVERY generated token counts, reasoning included. That is what the OpenAI schema says for a
@@ -2423,7 +2477,7 @@ int main(int argc, char** argv) {
     const uint32_t n_pre = ids.empty() ? 0u : (uint32_t)ids.size() - 1;
     uint32_t from = 0;
     uint32_t matched_blocks = 0;              // read again below, by the promotion boundary
-    if (prefix_cache.ready() && n_pre) {
+    if (prefix_cache.ready() && n_pre && pv.count == 0) {
       uint32_t& matched = matched_blocks;
       std::string rerr;
       uint32_t hit = 0;
@@ -2478,7 +2532,7 @@ int main(int argc, char** argv) {
     // seeds the draft with fewer rows and changes what it proposes. A boundary that close to the
     // end is also worth nothing, so it is simply not taken.
     uint32_t promote = 0;
-    if (prefix_cache.ready()) {
+    if (prefix_cache.ready() && pv.count == 0) {
       const uint64_t b = (uint64_t)matched_blocks * prefix_cache.block_tokens();
       if (b > from && b + c.sliding <= n_pre) promote = (uint32_t)b;
     }
@@ -2510,7 +2564,8 @@ int main(int argc, char** argv) {
       kv_reserve_for(st.pos + (uint64_t)ids.size() + 2);
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
-                                                nullptr, &logits, true, &blk);
+                                                nullptr, &logits, true, &blk,
+                                                pv.count > 0 ? &pv : nullptr);
       if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       watch_prefill(false);
       if (!pre_ok) {
@@ -2607,13 +2662,15 @@ int main(int argc, char** argv) {
     // The raw turn, kept whole. Tool markup is not content and cannot be understood a piece at a
     // time, so what streams is text and what is parsed is the whole thing.
     std::string raw;
-    const std::string marker = kToolCallsOpen;
     const std::string think_end = kThinkEnd;
     size_t streamed = 0;
     bool saw_marker = false;
     // Every string that must be recognised whole before any of it is emitted.
     std::vector<std::string> sentinels = req.stop;
     sentinels.push_back(kToolCallsOpen);
+    sentinels.push_back(kToolCallsOpenV41);
+    sentinels.push_back(std::string("<") + "｜DSML｜ calls");
+    sentinels.push_back(std::string("<") + "｜DSML｜tool_calls");
     // In thinking mode the reasoning streams on its OWN channel. It must not go out as
     // `delta.content` — that puts the model's deliberation, and then a bare </think>, into the
     // client's transcript as if it were the reply — but dropping it is just as wrong, because a
@@ -2675,7 +2732,15 @@ int main(int argc, char** argv) {
       if (saw_marker) return true;
       // Hold back anything that might still become the tool-call marker. Without this the opening
       // "\n\n<" of a tool call is streamed as content and the client renders markup.
-      const size_t at = raw.find(marker, streamed);
+      size_t at = std::string::npos;
+      for (const char* m : {kToolCallsOpen, kToolCallsOpenV41}) {
+        const size_t pos = raw.find(m, streamed);
+        if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
+      }
+      for (const std::string& m : {std::string("<") + "｜DSML｜ calls", std::string("<") + "｜DSML｜tool_calls"}) {
+        const size_t pos = raw.find(m, streamed);
+        if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
+      }
       if (at != std::string::npos) { saw_marker = true; }
       size_t safe = saw_marker ? at : raw.size();
       // A stop string is sought in the accumulated text, not in the piece: one that straddles two

@@ -272,18 +272,35 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
           if (*z == '[') {
             std::string joined;
             for (const std::string& blk : raw_elements(raw_value(sub, "content"))) {
-              const char* t = find_top_key(blk, "text");
-              if (!t) continue;
-              const char* w = t;
-              const std::string piece = read_json_string(w);
-              if (piece.empty()) continue;
-              if (!joined.empty()) joined += "\n\n";
-              joined += piece;
+              if (const char* t = find_top_key(blk, "text")) {
+                const char* w = t;
+                const std::string piece = read_json_string(w);
+                if (!piece.empty()) {
+                  if (!joined.empty()) joined += "\n\n";
+                  joined += piece;
+                }
+              }
+              if (const char* img = find_top_key(blk, "image_url")) {
+                (void)img;
+                std::string img_obj = raw_value(blk, "image_url");
+                if (img_obj.empty()) img_obj = blk;
+                if (const char* u = find_top_key(img_obj, "url")) {
+                  const char* w = u;
+                  m.image_data = read_json_string(w);
+                  m.has_image = !m.image_data.empty();
+                }
+              }
             }
             m.content = joined;
           } else {
             const char* w = c;
             m.content = read_json_string(w);
+            size_t b64_pos = m.content.find("data:image/");
+            if (b64_pos != std::string::npos) {
+              size_t end_pos = m.content.find_first_of(" \t\r\n)]}\"", b64_pos);
+              m.image_data = m.content.substr(b64_pos, end_pos == std::string::npos ? std::string::npos : (end_pos - b64_pos));
+              m.has_image = !m.image_data.empty();
+            }
           }
         }
         if (const char* c = find_top_key(sub, "reasoning_content")) { const char* z = c; m.reasoning_content = read_json_string(z); }

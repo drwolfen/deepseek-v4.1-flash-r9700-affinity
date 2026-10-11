@@ -914,10 +914,17 @@ public:
   //
   // With `blk` non-null `logits` is left alone: the caller wanted every position, and the block head
   // returns ids rather than 3.1 MB of logits a block.
+  struct PrefillVision {
+    const float* embeddings = nullptr; // [count * n_embd]
+    uint32_t start = 0;                // prompt token index where image tokens begin
+    uint32_t count = 0;                // number of image tokens
+  };
+
   bool forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
                        ExpertFetch fetch, void* fetch_ctx,
                        std::vector<float>* logits, bool routed_experts = true,
-                       BlockOut* blk = nullptr) const;
+                       BlockOut* blk = nullptr,
+                       const PrefillVision* vision = nullptr) const;
 
   // The draft's 768 experts are 6.48 GiB in a SECOND container with its own pool, so they are a
   // second StaticPlacement and cannot go through ffnb_/res_, which address the target's.

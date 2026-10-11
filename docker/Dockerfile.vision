@@ -1,0 +1,9 @@
+FROM affinity:v41
+COPY . /opt/affinity-src
+RUN cd /opt/affinity-src \
+ && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAFF_HIP=ON -DAFF_GPU_ARCH=gfx1201 -DAFF_NATIVE=ON \
+      -DAFF_HIPCC=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipcc -DCMAKE_CXX_COMPILER=g++ \
+ && ninja -C build -j 16 \
+ && ls -l build/affinity build/aff-vitcheck
+ENV PATH=/opt/affinity-src/build:$PATH
+ENTRYPOINT ["/opt/affinity-src/build/affinity"]

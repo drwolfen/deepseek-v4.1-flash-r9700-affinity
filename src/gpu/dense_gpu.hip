@@ -488,7 +488,7 @@ struct DenseGpu::Impl {
     // The router's top-k, rank 0 only. sel/wt/nsel come back; bias and the residency mask go out.
     uint32_t* b_rsel = nullptr;  float* b_rwt = nullptr;  uint32_t* b_rn = nullptr;
     float* b_rbias = nullptr;                    // [n_router][n_expert], one slice a layer
-    std::vector<uint8_t> rbias_up;               // which slices have been filled
+    std::vector<const float*> rbias_src;         // tracks which bias pointer is currently on device
     size_t r_back = 0, r_woff = 0, r_noff = 0;   // the sel/wt/n block and its interior offsets
     uint8_t* b_rres = nullptr;
     // ---- THE SELECTION, ON EVERY CARD ------------------------------------------------------------
@@ -5035,7 +5035,7 @@ bool DenseGpu::router_scratch(size_t rank, uint32_t n_expert, uint32_t k) {
   uint8_t* const hb = (uint8_t*)p[3];
   D.b_rsel = (uint32_t*)db; D.b_rwt = (float*)(db + o_wt); D.b_rn = (uint32_t*)(db + o_n);
   D.b_rbias = (float*)p[1]; D.b_rres = (uint8_t*)p[2];
-  D.rbias_up.assign(n_router_, 0u);
+  D.rbias_src.assign(n_router_, nullptr);
   D.r_back = back; D.r_woff = o_wt; D.r_noff = o_n;
   D.h_rsel = (uint32_t*)hb; D.h_rwt = (float*)(hb + o_wt);
   D.b_rsel_m = D.b_rsel; D.b_rwt_m = D.b_rwt;        // rank 0 reads its own block
@@ -5241,10 +5241,10 @@ bool DenseGpu::batch_router_topk(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   const float* dbias = nullptr;
   if (bias) {
     float* const slot = D.b_rbias + (size_t)h * n_expert;
-    if (!D.rbias_up[(size_t)h]) {
+    if (D.rbias_src[(size_t)h] != bias) {
       AFF_HIP_CHECK(hipMemcpyAsync(slot, bias, n_expert * sizeof(float), hipMemcpyHostToDevice,
                                    D.stream));
-      D.rbias_up[(size_t)h] = 1;                 // ordered on D.stream against the top-k below
+      D.rbias_src[(size_t)h] = bias;             // ordered on D.stream against the top-k below
     }
     dbias = slot;
   }

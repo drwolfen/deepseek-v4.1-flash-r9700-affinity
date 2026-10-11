@@ -27,6 +27,8 @@ struct ChatMessage {
   std::string reasoning_content;          // assistant turns, echoed back on the next request
   std::string tool_call_id;               // role == "tool"
   std::vector<ToolCallIO> tool_calls;     // role == "assistant"
+  std::string image_data;                 // base64 payload if message contains image
+  bool has_image = false;
 };
 
 struct CompletionRequest {
