@@ -330,6 +330,19 @@ public:
   void snapshot_plane(std::vector<float>* heat, std::vector<uint8_t>* tier,
                       std::vector<uint32_t>* per_layer) const;
 
+  // ---- PERSISTENCE: the learned heat plane, saved and restored across a restart ----------------
+  //
+  // `save_heat_profile` writes the engine's current heat plane to `path` in the `aff-profile` side
+  // file format (magic "affprof1", n_layer, n_expert, then n_layer*n_expert float32 layer-major) —
+  // the SAME format `--expert-profile` reads, so a saved plane loads straight back as the profile
+  // override and both the initial upload and the engine start from learned popularity. Written to
+  // `path.tmp` and renamed, so a crash mid-write cannot leave a half file for the next boot to
+  // rank by. False (with `err`) when the engine is not running — there is no learned plane then.
+  bool save_heat_profile(const std::string& path, std::string* err) const;
+  // Seed the engine's heat plane from a plane loaded off disk. No-op when the engine is not running
+  // or the size does not match this model. Call after placement_engine_init.
+  void seed_heat(const float* p, size_t n);
+
   const PlacementEngineStats& engine_stats() const { return estats_; }
   bool engine_running() const { return engine_on_; }
   // Which model this placement belongs to, for the routing trace. 'D' (the target) unless the

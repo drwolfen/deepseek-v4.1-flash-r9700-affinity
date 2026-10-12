@@ -43,6 +43,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -148,6 +149,21 @@ public:
   bool pick_demand(uint32_t* promote, uint32_t* demote);
 
   float heat(uint32_t idx) const { return heat_[idx]; }
+
+  // ---- PERSISTENCE: carry the learned plane across a restart ------------------------------------
+  //
+  // The plane is the engine's whole memory of what the router actually did, and it is destroyed
+  // when the process exits. Saving it (as an `aff-profile` side file) and seeding it on the next
+  // load means a restart resumes from the heat it converged to rather than from all-zero, so the
+  // initial upload is ranked by learned popularity and the engine does not spend the first prompt
+  // rediscovering the working set. Both are dispatch-thread only, the same rule as every other read
+  // of this object. `seed` is a no-op on a size mismatch — a profile fitted for another model is
+  // caught at load, and this refuses rather than reinterpreting it.
+  void snapshot(std::vector<float>* out) const { *out = heat_; }
+  void seed(const float* p, size_t n) {
+    if (!p || n != heat_.size()) return;
+    std::copy(p, p + n, heat_.begin());
+  }
   // How many of each layer's experts are in VRAM. The whole diagnosis above is one histogram of
   // this, so the engine prints it at exit and this is where it comes from.
   void resident_per_layer(std::vector<uint32_t>* out) const;

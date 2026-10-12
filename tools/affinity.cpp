@@ -366,6 +366,16 @@ int main(int argc, char** argv) {
   // Fitted by `aff-profile` from --route-trace records; overrides the container's imatrix-derived
   // profile for BOTH consumers. See AffReader::profile().
   std::string expert_profile_path;
+  // Where the placement engine writes its learned heat plane at exit (and periodically while
+  // serving), in the same `aff-profile` format `--expert-profile` reads. On the NEXT boot, when no
+  // --expert-profile is given and this file exists, it is loaded back as the profile override AND
+  // used to seed the engine, so a restart resumes from learned placement instead of all-zero. Empty
+  // disables both directions. See StaticPlacement::save_heat_profile / seed_heat.
+  std::string placement_save_path;
+  // Interval between periodic saves while serving. The heat plane is ~60 KiB, so this is a cheap
+  // fwrite; frequent enough that a kill -9 loses at most this much convergence, rare enough not to
+  // touch the dispatch path meaningfully.
+  uint32_t placement_save_secs = 30;
   // Repeat the prefill in-process and report the steady state. See the block that uses it.
   uint32_t prefill_reps = 1;
   // A second prompt to rotate in, so convergence is measured against a union rather than one set.
@@ -474,6 +484,8 @@ int main(int argc, char** argv) {
     else if (a == "--placement-lead") pcfg.max_lead_blocks = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--route-trace") route_trace_path = nxt();
     else if (a == "--expert-profile") expert_profile_path = nxt();
+    else if (a == "--placement-save") placement_save_path = nxt();
+    else if (a == "--placement-save-secs") placement_save_secs = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--prefill-reps") prefill_reps = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--prefill-alt") prefill_alt = nxt();
 #endif
@@ -643,6 +655,13 @@ int main(int argc, char** argv) {
         "                              layer-major. The container's own is derived from the\n"
         "                              imatrix, which ranks weights by importance rather than by\n"
         "                              how often the router picks them.\n"
+        "      --placement-save FILE   persist the placement engine's learned heat plane to FILE (the\n"
+        "                              same aff-profile format) periodically while serving and at\n"
+        "                              exit. On the next boot, if no --expert-profile is given and\n"
+        "                              FILE exists, it is loaded back as the profile AND seeds the\n"
+        "                              engine, so a restart resumes learned placement instead of\n"
+        "                              re-learning from zero. See --placement-save-secs.\n"
+        "      --placement-save-secs N seconds between periodic saves while serving (default 30)\n"
         "      --dump-logits K         print the top-K logits after --tokens and exit\n"
         "      --tokens a,b,c          explicit token ids for --dump-logits\n"
         "      --logits-out FILE       also write the full float32 logit vector\n"
@@ -1249,6 +1268,14 @@ int main(int argc, char** argv) {
   // rather than being passed to either. Here is simply the last point before the first of them
   // runs. Fatal on a bad file: falling through to the container's profile would run the baseline
   // arm under the flag's name, which is the one failure an A/B cannot detect.
+  // A saved heat plane (--placement-save from a previous run) is the learned replacement for the
+  // container profile: load it back automatically when the operator did not name one explicitly.
+  // Same format, so it rides the exact same path and both consumers see it.
+  std::vector<float> learned_profile;
+  if (expert_profile_path.empty() && !placement_save_path.empty()) {
+    std::FILE* probe = std::fopen(placement_save_path.c_str(), "rb");
+    if (probe) { std::fclose(probe); expert_profile_path = placement_save_path; }
+  }
   if (!expert_profile_path.empty()) {
     std::vector<float> prof;
     std::string perr;
@@ -1264,6 +1291,9 @@ int main(int argc, char** argv) {
     }
     aff::ui::out("expert profile: %zu entries from %s, overriding the container's\n",
                 prof.size(), expert_profile_path.c_str());
+    // Kept to seed the placement engine after it starts, so a learned plane is not only the initial
+    // upload ranking but the engine's warm start.
+    learned_profile = std::move(prof);
   }
   dash.stage(aff::ui::Stage::LoadExperts, "uploading the hottest experts");
   // The chunk has to reach placement: the routed arena scales with it, placement allocates that
@@ -1463,7 +1493,25 @@ int main(int argc, char** argv) {
       aff::ui::err("placement engine: %s\n", eerr.c_str());
       return 1;
     }
+    // Resume from a learned plane if one was loaded: the engine starts from the heat it converged to
+    // last run rather than all-zero, so it does not rediscover the working set on the first prompt.
+    if (!learned_profile.empty()) {
+      placement.seed_heat(learned_profile.data(), learned_profile.size());
+      aff::ui::out("placement engine: seeded from a learned heat plane (%zu entries)\n",
+                  learned_profile.size());
+    }
   }
+
+  // One-shot save for the batch (non-serving) paths, which return rather than run the periodic
+  // saver. Serving persists through the periodic saver in publish_run.
+  auto persist_placement = [&]() {
+    if (placement_save_path.empty() || !placement.engine_running()) return;
+    std::string serr;
+    if (placement.save_heat_profile(placement_save_path, &serr))
+      aff::ui::out("placement: saved the learned heat plane to %s\n", placement_save_path.c_str());
+    else
+      aff::ui::err("placement: save to %s failed: %s\n", placement_save_path.c_str(), serr.c_str());
+  };
 
   // Load is over; both budgets are final. Printed together because they are coupled: the KV cache
   // and the expert slabs share VRAM, and what does not fit there has to live in host RAM.
@@ -1484,6 +1532,20 @@ int main(int argc, char** argv) {
   // It is called whether or not a dashboard is running. With no reader the copy still happens, and
   // one code path that is always taken is worth more than a branch that is only exercised under a
   // flag nobody sets when it matters.
+  // Periodic saver for the learned heat plane. Called once per decode block, NOT from publish_run,
+  // because publish_run only runs when a dashboard is attached and a serving process usually has
+  // none — the checkpoint must not depend on the dashboard. Cheap: a 60 KiB fwrite every
+  // --placement-save-secs at most, and the heat plane is only read on this (the dispatch) thread.
+  std::chrono::steady_clock::time_point placement_saved_at{};
+  auto maybe_save_placement = [&]() {
+    if (placement_save_path.empty() || !placement.engine_running()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (placement_saved_at.time_since_epoch().count() != 0 &&
+        now - placement_saved_at < std::chrono::seconds(placement_save_secs))
+      return;
+    std::string serr;
+    if (placement.save_heat_profile(placement_save_path, &serr)) placement_saved_at = now;
+  };
   auto publish_run = [&](uint64_t generated, uint64_t target, uint64_t prompt_tokens, uint64_t pos,
                          double decode_tok_s, double prefill_tok_s, double ms_block) {
     if (!dash.running()) return;
@@ -1974,6 +2036,8 @@ int main(int argc, char** argv) {
                     el > 0 ? (double)g / el : 0.0, run_view.prefill_rate,
                     nb ? 1000.0 * el / (double)nb : 0.0);
       }
+      // Persist the learned placement, dashboard or not. See maybe_save_placement.
+      maybe_save_placement();
       // Where the sequence has reached, for the KV grower. A relaxed store of one word — the
       // growing happens on its own thread precisely so that none of it lands here.
       dense_gpu.kv_note_position(st.pos);
@@ -2170,6 +2234,7 @@ int main(int argc, char** argv) {
       // and this is the mode where the placement counters matter MOST, since the whole point of the
       // flag is to watch the engine converge.
       placement.engine_report();
+      persist_placement();
       return 0;
     }
 
@@ -2271,6 +2336,7 @@ int main(int argc, char** argv) {
     if (const double hwm = peak_rss_gib(); hwm > 0.0)
       aff::ui::out("peak host RSS %.1f GiB, of which %.1f GiB is the expert pool\n",
                   hwm, host_pool.stats().bytes / 1073741824.0);
+    persist_placement();
     return 0;
   }
 

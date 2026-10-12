@@ -2463,6 +2463,47 @@ void StaticPlacement::snapshot_plane(std::vector<float>* heat, std::vector<uint8
   }
 }
 
+bool StaticPlacement::save_heat_profile(const std::string& path, std::string* err) const {
+  if (!engine_on_) {
+    if (err) *err = "placement engine not running";
+    return false;
+  }
+  std::vector<float> plane;
+  heat_.snapshot(&plane);
+  const size_t want = (size_t)n_layer_ * (size_t)n_expert_;
+  if (plane.size() != want) {
+    if (err) *err = "heat plane is not layer x expert";
+    return false;
+  }
+  // Temp + rename: a crash or a kill mid-write must not leave a short file the next boot would rank
+  // by (the loader checks the header count, but a torn body would still load a prefix).
+  const std::string tmp = path + ".tmp";
+  std::FILE* f = std::fopen(tmp.c_str(), "wb");
+  if (!f) {
+    if (err) *err = "cannot open " + tmp;
+    return false;
+  }
+  struct { char magic[8]; uint32_t n_layer, n_expert; } h{};
+  std::memcpy(h.magic, "affprof1", 8);
+  h.n_layer = n_layer_;
+  h.n_expert = n_expert_;
+  bool ok = std::fwrite(&h, sizeof h, 1, f) == 1;
+  if (ok) ok = std::fwrite(plane.data(), sizeof(float), plane.size(), f) == plane.size();
+  ok = (std::fclose(f) == 0) && ok;
+  if (ok) ok = (std::rename(tmp.c_str(), path.c_str()) == 0);
+  if (!ok) {
+    if (err) *err = "write failed for " + path;
+    std::remove(tmp.c_str());
+    return false;
+  }
+  return true;
+}
+
+void StaticPlacement::seed_heat(const float* p, size_t n) {
+  if (!engine_on_) return;
+  heat_.seed(p, n);
+}
+
 void StaticPlacement::engine_report() const {
   if (std::getenv("AFF_MOVE_VERIFY"))
     aff::ui::err("move-verify: %llu promoted shards read back, %llu mismatched\n", mv_verified_, mv_bad_);
