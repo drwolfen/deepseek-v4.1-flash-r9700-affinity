@@ -697,6 +697,19 @@ bool Model::load_dspark(const std::string& path, std::string* err) {
     for (const auto& [ptr, name] : required)
       if (!ptr) { if (err) *err = std::string("draft container is missing ") + name; return false; }
   }
+  // The confidence projection, upcast to fp32 and registered for the device kernel. The reference
+  // keeps proj in fp32 and casts the hidden to fp32 before the Linear, so upcasting here (rather
+  // than reading the bf16 in the kernel) matches it. Optional: no consumer unless the device ops
+  // expose draft_confidence, and the run does not ask for confidence gating.
+  d.confidence_n = cfg_.n_embd + cfg_.dspark_markov_rank;
+  // reg_vec lives in DenseOps, which is set before load_dspark; BatchOps (which carries
+  // draft_confidence) is set later, so it cannot gate this registration. The runtime call site
+  // checks bops_.draft_confidence instead.
+  if (dops_.reg_vec && d.confidence) {
+    std::vector<float> cw(d.confidence_n);
+    bf16_dequant(d.confidence, d.confidence_n, cw.data());
+    d.confidence_gpu = dops_.reg_vec(dops_.ctx, cw.data(), d.confidence_n);
+  }
   // The projection's width is the tap count times n_embd, and getting that wrong reads the wrong
   // slice of a concatenation rather than failing — so it is checked against the config that named
   // the taps, not against the container that stored it.
@@ -2462,6 +2475,17 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
                         D.markov_w2.gpu, cfg_.dspark_markov_rank, first_id, out))
     return false;
   AFF_PH(draft_head);
+  // The confidence head, when bound. Advisory only: the accept rule never reads it, so a scoring
+  // failure drops the policy and cannot change the output. b_ids now holds [first_id, draft...] and
+  // b_cur still holds the un-normed collapsed hidden the head was built on.
+  if (dspark_conf_on_ && D.confidence_gpu >= 0 && bops_.draft_confidence) {
+    dspark_conf_.assign(B, 0.0f);
+    if (!bops_.draft_confidence(bops_.ctx, D.confidence_gpu, D.markov_w1.gpu, E,
+                                cfg_.dspark_markov_rank, B, dspark_conf_.data()))
+      dspark_conf_.clear();
+  } else {
+    dspark_conf_.clear();
+  }
   return true;
 }
 

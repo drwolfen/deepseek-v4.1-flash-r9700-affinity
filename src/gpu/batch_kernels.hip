@@ -3158,6 +3158,42 @@ void markov_combine_hip(const uint64_t* own, const uint64_t* peers, uint32_t npe
               (const unsigned long long*)own, (const unsigned long long*)peers, npeer, ids, col);
 }
 
+// One fp32 confidence score a token. `cw` is [n_embd + rank] fp32 (the checkpoint's bf16 upcast at
+// load), `hidden_dm` is the un-normed collapsed hidden dim-major [n_embd][nb], `w1` is [vocab][rank]
+// bf16 replicated. Block b reduces over n_embd + rank with a shared tree; a block a token.
+__global__ void dspark_confidence_kernel(const float* __restrict__ cw,
+                                         const uint16_t* __restrict__ w1,
+                                         const float* __restrict__ hidden_dm,
+                                         const uint32_t* __restrict__ ids,
+                                         float* __restrict__ out, uint32_t n_embd, uint32_t rank,
+                                         uint32_t nb) {
+  __shared__ float s[256];
+  const uint32_t b = blockIdx.x;
+  const uint32_t token = ids[b];
+  float acc = 0.0f;
+  for (uint32_t d = threadIdx.x; d < n_embd; d += blockDim.x)
+    acc = fmaf(cw[d], hidden_dm[(size_t)d * nb + b], acc);
+  const uint16_t* emb = w1 + (size_t)token * rank;
+  for (uint32_t i = threadIdx.x; i < rank; i += blockDim.x)
+    acc = fmaf(cw[n_embd + i], wmma::bf16_to_f32(emb[i]), acc);
+  s[threadIdx.x] = acc;
+  __syncthreads();
+  for (uint32_t o = blockDim.x / 2; o; o >>= 1) {
+    if (threadIdx.x < o) s[threadIdx.x] += s[threadIdx.x + o];
+    __syncthreads();
+  }
+  if (!threadIdx.x) out[b] = s[0];
+}
+
+void dspark_confidence_hip(const float* cw, const uint16_t* w1, const float* hidden_dm,
+                           const uint32_t* ids, float* out, uint32_t n, uint32_t n_embd,
+                           uint32_t rank, uint32_t nb, void* stream) {
+  if (!n || !cw || !w1 || !hidden_dm || !ids || !out) return;
+  AFF_BLAUNCH(dspark_confidence_kernel, dim3(n), dim3(256), 0, (hipStream_t)stream, cw, w1,
+              hidden_dm, ids, out, n_embd, rank, nb);
+}
+
+
 void batch_head_combine_hip(const float* own, const float* peers, uint32_t npeer, uint32_t* ids,
                             uint32_t n, uint32_t nb, void* stream) {
   AFF_BLAUNCH(batch_head_combine_kernel, dim3(1), dim3(kNarrowTok), 0, (hipStream_t)stream, own,

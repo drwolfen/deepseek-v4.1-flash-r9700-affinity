@@ -920,6 +920,14 @@ int main(int argc, char** argv) {
     for (int32_t t : c.dspark_taps) taps += sfmt(" %d", t);
     aff::ui::out("dspark: %zu stages, block %u, taps%s, %.2f GiB\n", d.stage.size(),
                  c.dspark_block, taps.c_str(), model.dspark_bytes() / 1073741824.0);
+    // Enable the confidence head only when a caller will use it: the gating threshold or the
+    // calibration print. Off, the draft skips the scoring kernel and its readback entirely.
+    {
+      const char* ct = std::getenv("AFF_SPEC_CONF_T");
+      const bool want_conf = (ct && std::strtod(ct, nullptr) > 0.0) ||
+                             (std::getenv("AFF_SPEC_CONF_DEBUG") != nullptr);
+      if (want_conf) model.set_dspark_confidence_enabled(true);
+    }
 #ifdef AFF_WITH_HIP
     vram.mark("draft dense weights");
 #endif
@@ -1867,6 +1875,15 @@ int main(int argc, char** argv) {
     // cannot follow pays for both. One skipped block then retries, so a lone hit is not missed.
     const char* backoff_env = std::getenv("AFF_SPEC_BACKOFF");
     const uint32_t kBackoff = backoff_env ? (uint32_t)std::strtoul(backoff_env, nullptr, 10) : 0u;
+    // Optional confidence gating (AFF_SPEC_CONF_T=T, default 0 = off). The DSpark confidence head
+    // scores each drafted token; verifying only the prefix the draft is confident about narrows the
+    // target's block. Output-identical by construction — the accept rule is still exact agreement,
+    // and a proposal dropped here would at most have lengthened the block — so this only trades
+    // tokens-per-block against target compute. AFF_SPEC_CONF_DEBUG prints the raw scores to
+    // calibrate T. Off unless T > 0, and the head must be bound.
+    const char* conf_env = std::getenv("AFF_SPEC_CONF_T");
+    const float kConfT = conf_env ? (float)std::strtod(conf_env, nullptr) : 0.0f;
+    const bool conf_dbg = std::getenv("AFF_SPEC_CONF_DEBUG") != nullptr;
     uint32_t zero_run = 0;
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
     uint32_t next = first, generated = 0;
@@ -1909,6 +1926,23 @@ int main(int argc, char** argv) {
           std::abort();
         }
         nd = B;
+        // Confidence gating: verify only the prefix the draft is confident about. `nd` may fall to
+        // 0, which is a plain one-token step through the same code. See the note at kConfT.
+        if (kConfT > 0.0f) {
+          const std::vector<float>& conf = model.dspark_confidence();
+          if (conf.size() >= B) {
+            uint32_t n2 = 0;
+            while (n2 < B && conf[n2] >= kConfT) ++n2;
+            nd = n2;
+          }
+        }
+        if (conf_dbg) {
+          const std::vector<float>& conf = model.dspark_confidence();
+          std::string cs;
+          for (uint32_t i = 0; i < conf.size(); ++i)
+            cs += std::to_string(conf[i]) + (i + 1 < conf.size() ? "," : "");
+          aff::ui::err("spec-conf P=%u nd=%u conf=[%s]\n", st.pos, nd, cs.c_str());
+        }
       }
       if (skip_draft) zero_run = 0;   // this step was the backoff; draft again next block
       const uint32_t P = st.pos;

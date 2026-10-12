@@ -697,6 +697,13 @@ private:
                           uint32_t n_hc, float hc_eps, float rms_eps);
   bool     draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
                       int32_t h_w1, int32_t h_w2, uint32_t rank, uint32_t first_id, uint32_t* ids);
+  // The DSpark confidence head: score the block's drafted tokens from the un-normed collapsed hidden
+  // `collapse_pre`/`draft_collapse` left in b_cur and the Markov embedding of each step's input
+  // token (b_ids). `cw` is the fp32 [n_embd + rank] projection (registered via reg_vec), `h_w1` the
+  // replicated [vocab][rank] bf16 Markov embedding table. Call AFTER draft_head, which fills b_ids;
+  // b_cur is untouched by it. One small readback, drained here. Drives a heuristic only.
+  bool     draft_confidence(int32_t cw, int32_t h_w1, uint32_t n_embd, uint32_t rank, uint32_t n,
+                            float* out_host);
   // One dim-major [n][b_nb_] buffer on rank r to a token-major host array, staged through pinned
   // memory at `off` rows into the arena. Enqueued, not waited on.
   void     batch_stage_out(size_t r, const float* src_dm, uint32_t n, uint32_t off);

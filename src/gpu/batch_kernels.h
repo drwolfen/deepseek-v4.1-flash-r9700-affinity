@@ -352,6 +352,18 @@ void markov_step_hip(const uint16_t* w1, const uint16_t* w2, const uint32_t* ids
 void markov_combine_hip(const uint64_t* own, const uint64_t* peers, uint32_t npeer, uint32_t* ids,
                         uint32_t col, void* stream);
 
+// The DSpark confidence head: one fp32 score a drafted token, from the block's UN-NORMED collapsed
+// hidden (dim-major [n_embd][nb], the same plane `collapse_pre` leaves in b_cur) and the Markov
+// embedding of the token that entered the step. `cw` is the [n_embd + rank] fp32 projection — the
+// checkpoint stores it bf16, upcast at load, exactly as the reference casts hidden to fp32 before
+// the Linear. `w1` is [vocab][rank] bf16 and replicated, so any card can serve the lookup; `ids[b]`
+// is the token entering step b (ids[0] is the block's first token). One block a token, a tree
+// reduce over n_embd + rank. Not bit-identical to the reference's fp32 matmul (tree vs serial), but
+// this only ever drives a heuristic: the accept rule stays exact agreement with the target.
+void dspark_confidence_hip(const float* cw, const uint16_t* w1, const float* hidden_dm,
+                           const uint32_t* ids, float* out, uint32_t n, uint32_t n_embd,
+                           uint32_t rank, uint32_t nb, void* stream);
+
 // The same exchange for the TARGET's head: `own` and each of the `npeer` planes in `peers` are
 // [2][nb] argmax planes (value at [t], absolute id at [nb + t]) and the winner per position lands
 // in `ids[t]`. A card with no band of the vocabulary contributes no plane.

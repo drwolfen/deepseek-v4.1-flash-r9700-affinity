@@ -278,6 +278,11 @@ struct DsparkWeights {
   // score. Left in the container's contract because the moment a variable block length is worth
   // measuring, the missing piece should be the policy and not the weight.
   const uint16_t* confidence = nullptr; // [1][n_embd + rank] bf16
+  // The same projection upcast to fp32 and registered on the device (the reference casts hidden to
+  // fp32 before the Linear and keeps proj fp32), so the confidence kernel can read it. `confidence_n`
+  // is n_embd + rank. Bound only when the device ops expose draft_confidence.
+  int32_t confidence_gpu = -1;
+  uint32_t confidence_n = 0;
   bool ready() const {
     return !stage.empty() && main_proj && markov_w1 && markov_w2 && main_norm_gpu >= 0 && norm;
   }
@@ -724,6 +729,10 @@ public:
     bool (*draft_head)(void* ctx, int32_t h_head, uint64_t vocab, uint64_t n_embd, uint32_t n,
                        const float* x, int32_t w1, int32_t w2, uint32_t rank, uint32_t first_id,
                        uint32_t* ids) = nullptr;
+    // The confidence head, scored on the card after draft_head. Optional: null leaves the draft's
+    // confidence unused, which is the default (the accept rule needs no score).
+    bool (*draft_confidence)(void* ctx, int32_t cw, int32_t w1, uint32_t n_embd, uint32_t rank,
+                             uint32_t n, float* out) = nullptr;
     void* ctx = nullptr;
   };
   void set_batch_ops(const BatchOps& b) { bops_ = b; }
@@ -959,6 +968,15 @@ public:
   // target's state is untouched: the draft has its own ring, its own stages and its own experts.
   bool dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const;
 
+  // Per-token confidence for the LAST dspark_draft block, or empty when the confidence head is not
+  // bound. A drafted-token acceptance predictor: higher means the draft's proposal is likelier to
+  // agree with the target. Advisory only — the accept rule never reads it.
+  const std::vector<float>& dspark_confidence() const { return dspark_conf_; }
+  // Whether dspark_draft should score the block. Off by default: the score costs a kernel and a
+  // readback a block, so it is computed only when a caller will use it (--spec-confidence gating or
+  // the calibration print).
+  void set_dspark_confidence_enabled(bool on) { dspark_conf_on_ = on; }
+
   // Unwinds the KV cache to `keep` positions, after a speculative block whose tail was rejected.
   //
   // Cheaper than it looks, and the reason is a property of both caches rather than an optimisation:
@@ -1017,6 +1035,10 @@ private:
   // The draft block's seed embeddings, sized once on the first block and then only row 0 rewritten.
   // See dspark_draft: rows 1..B-1 are the noise token in every block there will ever be.
   mutable std::vector<float> dspark_emb_;
+  // Per-token confidence of the last draft block; empty when the head is unbound. See
+  // dspark_confidence().
+  mutable std::vector<float> dspark_conf_;
+  bool dspark_conf_on_ = false;
   // layer -> the layer whose compressed KV it reads; see LayerWeights::kv_owner.
   std::vector<uint32_t> kv_owner_;
   // layer -> the index-source layer whose top-k it reads. V4.1 only; identity on V4, where every

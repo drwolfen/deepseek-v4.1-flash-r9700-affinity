@@ -378,6 +378,8 @@ struct DenseGpu::Impl {
     float* b_mix = nullptr;
     float* b_pre = nullptr;  float* b_post = nullptr;    float* b_comb = nullptr;
     float* b_cur = nullptr;  float* b_norm = nullptr;    float* b_block = nullptr;
+    // DSpark confidence head: one fp32 score a drafted token, [1][nb], and its pinned readback.
+    float* b_conf = nullptr; float* h_conf = nullptr;
     // The narrow hc path's cross-block partials, [kHcnChunks][kNarrowTok] — 2 KiB, so the reduction
     // can span a grid instead of a workgroup.
     float* b_hcp = nullptr;
@@ -590,6 +592,7 @@ DenseGpu::~DenseGpu() {
     if (D.b_mpeer) (void)hipFree(D.b_mpeer);
     if (D.b_ids) (void)hipFree(D.b_ids);
     if (D.h_ids) (void)hipHostFree(D.h_ids);
+    if (D.h_conf) (void)hipHostFree(D.h_conf);
     for (hipEvent_t& e : D.ev_mk) if (e) (void)hipEventDestroy(e);
     if (D.ev_amx) (void)hipEventDestroy(D.ev_amx);
     if (D.b_apeer) (void)hipFree(D.b_apeer);
@@ -3255,6 +3258,7 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       {&D.b_mix, nout, "mix"},
       {&D.b_pre, n_hc, "pre"}, {&D.b_pre_prev, n_hc, "pre prev"}, {&D.b_post, n_hc, "post"}, {&D.b_comb, (uint64_t)n_hc * n_hc, "comb"},
       {&D.b_cur, n_embd, "cur"}, {&D.b_norm, n_embd, "norm"}, {&D.b_block, n_embd, "block"},
+      {&D.b_conf, 1, "dspark confidence"},
       // Rows, not tokens: TWO [kHcnChunks][nb] planes and the loop below multiplies by nb. Two,
       // because the expand kernel reads one to re-derive the gates and writes the other.
       {&D.b_hcp, 2 * kHcnChunks, "hc partials"},
@@ -3415,6 +3419,9 @@ bool DenseGpu::draft_init(uint32_t n_embd, uint32_t tap_in, uint32_t vocab, uint
       return false;
     if (!hip_try(hipHostMalloc(&D.h_ids, (size_t)kNarrowTok * sizeof(uint32_t),
                                hipHostMallocDefault), "markov ids readback", err))
+      return false;
+    if (!hip_try(hipHostMalloc(&D.h_conf, (size_t)kNarrowTok * sizeof(float),
+                               hipHostMallocDefault), "dspark confidence readback", err))
       return false;
     for (hipEvent_t& e : D.ev_mk)
       if (!hip_try(hipEventCreateWithFlags(&e, hipEventDisableTiming), "markov event", err))
@@ -6043,6 +6050,29 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
   return true;
 }
 
+bool DenseGpu::draft_confidence(int32_t cw, int32_t h_w1, uint32_t n_embd, uint32_t rank,
+                                uint32_t n, float* out_host) {
+  if (!out_host || !n || n > kNarrowTok) return false;
+  if (cw < 0 || (size_t)cw >= n_vec_) return false;
+  if (h_w1 < 0 || (size_t)h_w1 >= ent_.size()) return false;
+  const Entry& W1 = ent_[h_w1];
+  if (W1.split != Split::Rep || W1.quant != AFF_BF16 || W1.cols != rank) return false;
+  // One card computes the whole block: the collapsed hidden and the Markov table are both
+  // replicated, so the score does not depend on which card runs it. Card 0 because it owns the
+  // single readback the head already uses.
+  Impl::Dev& D = impl_->dev[0];
+  if (!D.b_conf || !D.b_cur || !D.b_ids || !D.h_conf) return false;
+  AFF_HIP_CHECK(hipSetDevice(D.id));
+  dspark_confidence_hip(D.vec[cw], (const uint16_t*)W1.sh[0].data, D.b_cur, D.b_ids, D.b_conf,
+                        n, n_embd, rank, kNarrowTok, D.stream);
+  AFF_HIP_CHECK(hipMemcpyAsync(D.h_conf, D.b_conf, (size_t)n * sizeof(float),
+                               hipMemcpyDeviceToHost, D.stream));
+  AFF_DRAIN_AT(D, aff::BlockSite::DraftHead);
+  std::memcpy(out_host, D.h_conf, (size_t)n * sizeof(float));
+  ++st_.calls;
+  return true;
+}
+
 Model::BatchOps DenseGpu::batch_ops() {
   Model::BatchOps o;
   o.ctx = this;
@@ -6103,6 +6133,10 @@ Model::BatchOps DenseGpu::batch_ops() {
   o.draft_head = [](void* c, int32_t h, uint64_t v, uint64_t ne, uint32_t n, const float* x,
                     int32_t w1, int32_t w2, uint32_t rk, uint32_t fid, uint32_t* ids) {
     return static_cast<DenseGpu*>(c)->draft_head(h, v, ne, n, x, w1, w2, rk, fid, ids);
+  };
+  o.draft_confidence = [](void* c, int32_t cw, int32_t w1, uint32_t ne, uint32_t rk, uint32_t n,
+                          float* out) {
+    return static_cast<DenseGpu*>(c)->draft_confidence(cw, w1, ne, rk, n, out);
   };
   o.kv_commit = [](void* c, uint32_t l, uint32_t b0, uint32_t n, uint32_t p0, uint32_t w,
                    uint32_t nr) {
