@@ -201,6 +201,31 @@ static bool load_expert_profile(const std::string& path, std::vector<float>* out
   return true;
 }
 
+// ---- marker-less (bare) tool-call support ---------------------------------------------------
+//
+// The model occasionally drops the DSML marker character and writes a bare `<invoke name="X">`
+// block. The stream hold-back keys on the marker, so without this the block streams as content and
+// a model that does not EOS after the call rambles for thousands of tokens. This returns the END
+// index of the matching close — the marked tool_calls wrapper for a wrapped block, otherwise the
+// bare `</invoke>` — so the turn can be truncated there and generation stopped. The marker char is
+// built from its UTF-8 bytes (U+FF5C) rather than typed, so this file needs no exotic literals.
+static std::size_t tool_block_close_end(const std::string& s, std::size_t at) {
+  const std::string M = "\xef\xbd\x9c";                       // U+FF5C DSML bar
+  const bool wrapped = s.find(std::string("<") + M + "tool_calls", at) != std::string::npos ||
+                       s.find(std::string("<") + M + " calls", at) != std::string::npos;
+  if (wrapped) {
+    for (const std::string& cl : {std::string("</") + M + "tool_calls>",
+                                  std::string("</") + M + " calls>"}) {
+      const std::size_t p = s.find(cl, at);
+      if (p != std::string::npos) return p + cl.size();
+    }
+    return std::string::npos;
+  }
+  // Marker-less form: the first </invoke> after the open (the bare form has no wrapper close).
+  const std::size_t p = s.find("</invoke>", at);
+  return p == std::string::npos ? std::string::npos : p + std::string("</invoke>").size();
+}
+
 int main(int argc, char** argv) {
   aff::print_build_stamp("affinity");
   // dspark_path empty means "<model>.dspark.aff if present". Naming one explicitly makes a load
@@ -2779,12 +2804,14 @@ int main(int argc, char** argv) {
     const std::string think_end = kThinkEnd;
     size_t streamed = 0;
     bool saw_marker = false;
+    size_t marker_at = std::string::npos;   // where the tool-call block opened (for the close search)
     // Every string that must be recognised whole before any of it is emitted.
     std::vector<std::string> sentinels = req.stop;
     sentinels.push_back(kToolCallsOpen);
     sentinels.push_back(kToolCallsOpenV41);
     sentinels.push_back(std::string("<") + "｜DSML｜ calls");
     sentinels.push_back(std::string("<") + "｜DSML｜tool_calls");
+    sentinels.push_back("<invoke");            // marker-less open (see tool_block_close_end)
     // In thinking mode the reasoning streams on its OWN channel. It must not go out as
     // `delta.content` — that puts the model's deliberation, and then a bare </think>, into the
     // client's transcript as if it were the reply — but dropping it is just as wrong, because a
@@ -2847,7 +2874,14 @@ int main(int argc, char** argv) {
       // An empty, not-done piece is a heartbeat: the server turns it into an SSE keep-alive comment when the
       // stream has been silent too long. Without it a long call (a big `write`) exceeds a client's body-idle
       // timeout (Node/undici: 300 s) and the client aborts the turn while the engine is still generating it.
-      if (saw_marker) return sink(std::string(), Delta::Content, false);
+      if (saw_marker) {
+        // The block opened; stop the turn the moment it closes. The model does not always EOS after
+        // a tool call (and a marker-less near-miss defeats the marker, so nothing else stops it),
+        // which is what turns a single call into a thousands-of-tokens ramble of stray tags.
+        const size_t ce = tool_block_close_end(raw, marker_at);
+        if (ce != std::string::npos) { raw.resize(ce); return false; }
+        return sink(std::string(), Delta::Content, false);
+      }
       // Hold back anything that might still become the tool-call marker. Without this the opening
       // "\n\n<" of a tool call is streamed as content and the client renders markup.
       size_t at = std::string::npos;
@@ -2859,7 +2893,13 @@ int main(int argc, char** argv) {
         const size_t pos = raw.find(m, streamed);
         if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
       }
-      if (at != std::string::npos) { saw_marker = true; }
+      // Marker-less open: the model sometimes drops the DSML bar and writes <invoke name="X">.
+      // Recognise it so the block is held back and stopped at its close (see tool_block_close_end).
+      {
+        const size_t pos = raw.find("<invoke", streamed);
+        if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
+      }
+      if (at != std::string::npos) { saw_marker = true; if (marker_at == std::string::npos) marker_at = at; }
       size_t safe = saw_marker ? at : raw.size();
       // A stop string is sought in the accumulated text, not in the piece: one that straddles two
       // tokens appears in neither. It also CUTS the reply — the stop text is not part of the answer

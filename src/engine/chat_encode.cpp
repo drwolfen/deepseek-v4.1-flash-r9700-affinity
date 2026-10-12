@@ -423,8 +423,53 @@ size_t read_until(size_t i, const std::string& t, const std::vector<std::string>
 
 }  // namespace
 
-ParsedMessage parse_completion(const std::string& text, ThinkingMode mode) {
+// ---- marker-less (bare) DSML repair ---------------------------------------------------------
+//
+// The model occasionally drops the DSML marker character and emits a bare `<invoke name="X">`
+// block. Every marker below keys on that character, so such a turn matches nothing and is returned
+// as raw content — and a model that does not EOS after the call then rambles for thousands of
+// tokens. Rewrite the bare tags into the marked form, wrapped in a tool_calls block, so the single
+// shape parse_completion already reads applies. Called ONLY when the marker is absent from the
+// whole turn, so a well-formed turn is never touched.
+std::string repair_bare_dsml(const std::string& s) {
+  const std::string ds(kDsml);
+  std::string t = s;
+  auto rep = [&](const char* from, const std::string& to) {
+    const size_t fl = std::string(from).size();
+    size_t p = 0;
+    while ((p = t.find(from, p)) != std::string::npos) { t.replace(p, fl, to); p += to.size(); }
+  };
+  rep("<invoke name=", "<" + ds + "invoke name=");
+  rep("</invoke>", "</" + ds + "invoke>");
+  rep("<parameter name=", "<" + ds + "parameter name=");
+  rep("</parameter>", "</" + ds + "parameter>");
+  const std::string wrapper = "<" + ds + "tool_calls";
+  if (t.find(wrapper) == std::string::npos) {
+    const std::string io = "<" + ds + "invoke";
+    const std::string ic = "</" + ds + "invoke>";
+    const size_t o = t.find(io);
+    const size_t c = t.rfind(ic);
+    if (o != std::string::npos && c != std::string::npos && c >= o) {
+      t.resize(c + ic.size());                 // drop whatever the model rambled after the close
+      t.insert(o, "\n\n" + wrapper + ">\n");
+      t += "\n</" + ds + "tool_calls>";
+    }
+  }
+  return t;
+}
+
+ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
   ParsedMessage out;
+  // One repaired shape for the whole function: see repair_bare_dsml. Guarded on the MARKED
+  // tool_calls wrapper being absent — NOT on the marker char, which also lives inside kEosStr that
+  // every caller appends, so a marker-char test would never fire.
+  const std::string M = "\xef\xbd\x9c";
+  const bool bare_invoke =
+      text_in.find("<invoke name=") != std::string::npos &&
+      text_in.find("<" + M + "tool_calls") == std::string::npos &&
+      text_in.find("<" + M + " calls") == std::string::npos;
+  const std::string repaired = bare_invoke ? repair_bare_dsml(text_in) : std::string();
+  const std::string text = repaired.empty() ? text_in : repaired;
   const std::string dsml = kDsml;
   const std::string tc_open_v4  = std::string("\n\n<") + dsml + "tool_calls";
   const std::string tc_open_v41 = std::string("\n\n<") + dsml + " calls";
