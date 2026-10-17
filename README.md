@@ -8,6 +8,10 @@ This repository is the *setup*: the engine source (fork + our patches), the depl
 quantisation recipe, and the measurements, all captured on one machine. It exists so the exact
 combination that produced the numbers below can be rebuilt.
 
+The affinity engine was transformed into this **R9700-tweaked version with the help of
+DeepSeek-V4.1-Flash and Gemini 4 Argon** (used to port, patch and tune the engine — see *Rework and
+patches*).
+
 > **Tested on exactly two R9700s.** Every number here was measured on a two-card box. The engine
 > upstream supports one card, but that configuration was not benchmarked for this setup.
 
@@ -68,6 +72,7 @@ Nothing here is the model author's or the engine author's endorsement; this is a
 |---|---|---|
 | Inference engine | [StillDeadcode/affinity](https://codeberg.org/StillDeadcode/affinity) by Yoshi Exeler | MIT. Upstream of everything. |
 | Engine fork (this tree) | `neuromaniacMD/affinity` (our GitHub) | MIT. Adds the rework listed below. Kept as provenance; this repo is the deployable copy. |
+| Optimization ports | [Luce-Org/lucebox](https://github.com/Luce-Org/lucebox) · [lucebox.com](https://www.lucebox.com/) — **Lucebox AI**, Apache-2.0 | Three of the local knobs are **ports from Lucebox's `ds41-gorgon` work**: bounded replay, adaptive verify width (`AdaptiveSpecWidth`) and the protected massive/outlier expert set; the port's quality gate also uses Lucebox's 8,184-token fineweb-edu eval corpus. |
 | Base model | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | DeepSeek license. Source of the reference `inference/` and `encoding/` code. |
 | Uncensored weights (`-uc`) | [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8) | FP8 checkpoint that we re-quantised to 2.875 bpw. |
 | Abliterated weights (alt) | [pqhaz/DeepSeek-V4.1-Flash-heretic](https://huggingface.co/pqhaz/DeepSeek-V4.1-Flash-heretic) | Directional ablation of refusal behaviour; lower KL than `-uc`. A `model-heretic.aff` was built but `-uc` is what is served. |
@@ -111,6 +116,15 @@ agentic-robustness come from.
 | [`2779348`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2779348) · [`patches/AFF_NOBUDGET_MAX_TOKENS.patch`](patches/AFF_NOBUDGET_MAX_TOKENS.patch) | bound the default when a request sends **no** `max_tokens` (was: the whole remaining context) | a gateway reasoning loop can no longer hold the single slot for 37 min / 55k tokens; explicit `max_tokens` untouched |
 
 Every commit message carries the same measurement detail as the table, with the exact before/after.
+
+**Ported from [Lucebox](https://github.com/Luce-Org/lucebox)** (Apache-2.0, by **Lucebox AI** / `Luce-Org`,
+in `2a4478f` and its neighbours): the V4.1 decoder SWA bounded replay (`AFF_BOUNDED_REPLAY`, from
+Lucebox's `ds41-gorgon` profile — see `src/engine/model.cpp`), the cost-aware adaptive verify width
+(`AFF_ADAPTIVE_WIDTH`, from Lucebox's `AdaptiveSpecWidth` — `tools/affinity.cpp`), and the protected
+massive/outlier expert set (from Lucebox's `share/deepseek41/massive_experts.json` —
+`src/gpu/static_placement.hip`). The port's quality gate also reuses Lucebox's 8,184-token
+fineweb-edu eval corpus. Credit and thanks to Lucebox for these; the code comments mark each site.
+(`ds41-gorgon` is Lucebox's launch profile — DeepSeek-V4.1 on an R9700 beside a 192 GB Ryzen AI Max+.)
 
 ### V4.1 / multimodal port (fork `v41` branch, also in this history)
 
@@ -194,6 +208,10 @@ docker run --name deepseek-affinity \
 
 ## Credits
 
-DeepSeek for the model; Yoshi Exeler / StillDeadcode for affinity; `dealignai` and `pqhaz` for the
-uncensored builds; the friends whose fixes landed in the fork's `v4-fixes`. Engine code remains MIT;
-see [`LICENSE`](LICENSE) and [`FORK.md`](FORK.md).
+DeepSeek for the model; Yoshi Exeler / StillDeadcode for affinity; **Lucebox AI
+([Luce-Org/lucebox](https://github.com/Luce-Org/lucebox), Apache-2.0) for the bounded-replay,
+adaptive-width and protected-expert optimizations we ported (and the eval corpus)**; `dealignai` and
+`pqhaz` for the uncensored builds; the friends whose fixes landed in the fork's `v4-fixes`. **The
+transformation of affinity into this R9700-tweaked engine was done with the help of
+DeepSeek-V4.1-Flash and Gemini 4 Argon.** Engine code remains MIT; see [`LICENSE`](LICENSE) and
+[`FORK.md`](FORK.md).
