@@ -152,6 +152,10 @@ The quantisation recipe is in [`model/QUANT.md`](model/QUANT.md); checks that mu
 
 ## Build and run
 
+**Prebuilt package:** [release `v1.0.0`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v1.0.0)
+carries `affinity-r9700-1.0.0.tar.gz` — the patched engine binary for `gfx1201` plus `deploy/`,
+`model/` and `patches/`.
+
 Build the engine image (needs Docker; the host needs no ROCm):
 
 ```sh
