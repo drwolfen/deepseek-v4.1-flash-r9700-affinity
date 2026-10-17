@@ -1,0 +1,41 @@
+From 277934826e4236ab28028dd942ba77fae5987fb6 Mon Sep 17 00:00:00 2001
+From: drwolfen <ydjager@pm.me>
+Date: Sat, 17 Oct 2026 16:59:01 +0200
+Subject: [PATCH] server: bound the no-max_tokens default
+ (AFF_NOBUDGET_MAX_TOKENS)
+
+A request with no max_tokens fell back to the whole remaining context, so a
+client that sends none (the messaging gateway) let one reasoning loop hold the
+single slot for 37 minutes / 55k tokens with no answer. Bound the default at
+16384, overridable via AFF_NOBUDGET_MAX_TOKENS; an explicit max_tokens is
+untouched.
+---
+ tools/affinity.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/tools/affinity.cpp b/tools/affinity.cpp
+index dd9ae77..e8c11ca 100644
+--- a/tools/affinity.cpp
++++ b/tools/affinity.cpp
+@@ -2774,7 +2774,17 @@ int main(int argc, char** argv) {
+     // never lowers it, and the context still bounds the result.
+     const uint64_t ctx_room = kMaxKvPositions > ids.size() + 32
+                             ? kMaxKvPositions - ids.size() - 32 : 0;
+-    const uint64_t asked = req.has_max_tokens ? (uint64_t)req.max_tokens : ctx_room;
++    // A request that names no `max_tokens` used to fall back to the whole remaining context, so a
++    // client that sends none — the messaging gateway does not — let one reasoning loop hold the
++    // single slot for 37 minutes and 55k tokens with no answer. Bound that default; a client that
++    // does set `max_tokens` is untouched. Override the bound with AFF_NOBUDGET_MAX_TOKENS.
++    uint64_t nobudget_tokens = 16384;
++    if (const char* v = std::getenv("AFF_NOBUDGET_MAX_TOKENS")) {
++      const uint64_t t = std::strtoull(v, nullptr, 10);
++      if (t) nobudget_tokens = t;
++    }
++    const uint64_t asked = req.has_max_tokens ? (uint64_t)req.max_tokens
++                                              : std::min<uint64_t>(ctx_room, nobudget_tokens);
+     const bool floored = req.has_max_tokens && asked < (uint64_t)max_tokens_floor;
+     const uint32_t total_budget = (uint32_t)std::min<uint64_t>(
+         ctx_room, std::max<uint64_t>(asked, (uint64_t)max_tokens_floor));
+-- 
+2.43.0
+
