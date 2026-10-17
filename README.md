@@ -22,9 +22,8 @@ combination that produced the numbers below can be rebuilt.
 | GPU | **2 × AMD Radeon AI PRO R9700**, `gfx1201` (RDNA4), 32 GiB each |
 | CPU | Intel Xeon Platinum 8160 (Skylake-SP), 2 sockets × 24 cores / 48 threads = 96 threads |
 | RAM | 754 GiB DDR4 (2 NUMA nodes) |
-| Storage | ~5.9 TB RAID for the model + prefix cache |
 | PCIe | GPUs link at **Gen5 ×16**, but the switch **uplink runs Gen3 ×16 (8.0 GT/s)** — the host Xeon is a PCIe-3.0 CPU. See *Performance notes*. |
-| Host OS | Ubuntu, kernel 7.0.0, ROCm 7.2.4 |
+| Host OS | **Ubuntu 24.04.5 LTS** (Noble Numbat), kernel 7.0.0, ROCm 7.2.4 |
 | Engine build | AMD TheRock ROCm 7.14 image (no host ROCm needed) |
 
 ### Minimum RAM
@@ -82,37 +81,45 @@ licensed (`LICENSE`, `FORK.md`, `UPSTREAM-README.md` kept unchanged).
 
 ## Rework and patches (with measured effect)
 
-Branches: `v4-fixes` and `v41` are the fork's published branches (mirroring upstream `a48b72e` plus the
-fork's robustness fixes and the V4.1 port). This repository additionally carries the **unpublished
-local work** that produced the served binary: ten commits ahead of `v41` plus one dirty-tree commit and
-one patch.
+> **Every commit below is traceable.** Click the short SHA to open the full diff on GitHub. All of the
+> local work lives in this repository's history, so you can read the actual code change behind each
+> claim — the vision port, the KV sizing, the tool-call recovery, the imatrix calibration, the
+> `AFF_NOBUDGET` patch.
 
-### V4.1 / multimodal port (fork `v41` branch)
+Branches: this repository's history is the fork's `v41-tool-fix` line (mirroring upstream `a48b72e`
+plus the V4.1 port) with ten further commits of **unpublished local work** that produced the served
+binary, plus one commit capturing the on-GPU imatrix/placement working tree and one patch commit.
 
-| commit | change | improvement |
+### ⭐ Local work — the part that is ours
+
+These are the changes that are not in the fork's published branches. This is where the speed and the
+agentic-robustness come from.
+
+| diff | change | measured effect |
 |---|---|---|
-| `e6070f5` | V4.1 reasoning-effort prefix + `<｜tool▁outputs▁begin｜>` token, byte-identical to the reference `encoding.py` | correct V4.1 chat encoding |
-| `774aa6a`, `4165fce`, `4bc938b`, `e03a05b` | engram gate/stride, engram bf16 weights, V4.1 has no per-head RMS on q | four bugs that produced fluent-but-wrong text; fixes make the port correct |
-| `d91ae9d` … `4bc938b` | engram n-gram layers 1 and 14 (91.6 GiB tables), indexer, compressor | V4.1 architecture support |
-| `2dbb093` | stop retrying a KV growth the card cannot hold | removes the 64k decode cliff |
-| `91e78ba` … | DeepSeek ViT on the CPU (see vision, below) | image input |
+| [`91e78ba`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/91e78ba) | **DeepSeek ViT on the CPU**, wired into prefill and the chat endpoint. Three reference discrepancies fixed (2D-RoPE half rotation, channel-major aligner, aspect-preserving pad) | embedding cosine vs reference 0.31 → 0.85; end-to-end image grounding works |
+| [`cbb3f07`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cbb3f07) | ViT **weight-stationary GEMM + AVX-512 attention** | 546×546: 13.2 s → 3.25 s; 1024×1024: minutes → 38 s |
+| [`e1a2025`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e1a2025) | ViT **query-blocked attention**; opt-in engram page-cache warm (`AFF_ENGRAM_WARM`) | 74×74: 38.4 s → 23.3 s, numerically identical |
+| [`cac0510`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cac0510) | size the compressed KV cache **per kv source, not per layer** | KV 1016 → 100 MiB/card; resident experts 2206 → 2357 |
+| [`997489c`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/997489c) | **tile the indexer byte mask** over the prefill chunk | prefill arena 2068 → 1426 MiB/card; resident experts 2357 → 2462 |
+| [`78244dc`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/78244dc) | **persist the learned placement heat plane** across restarts (`--placement-save`) | residency survives restarts (no re-learn from zero) |
+| [`a4c9f85`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/a4c9f85) | recover **marker-less ("bare") DSML tool calls** and stop at the block close | a poisoned 117k-token replay dropped 4360 → 195 completion tokens; stops the agent runaway/confabulation |
+| [`bc42be2`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/bc42be2) | DSpark **confidence head** + opt-in gating (`AFF_SPEC_CONF_T`) | wash on 2 cards — kept as a calibration instrument |
+| [`27ec8fa`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/27ec8fa) | opt-in DSpark backoff after a zero-accept streak (`AFF_SPEC_BACKOFF=N`) | wash on 2 cards (verify dominates, not the draft) — kept as a knob |
+| [`1ae7c09`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/1ae7c09) | **SSE keep-alive** while a tool call is withheld | long tool calls no longer trip client body-idle timeouts (300 s) |
+| [`2a4478f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2a4478f) | working tree captured: **on-GPU imatrix calibration** (`--calibrate-tokens/-chunk-size/-max-chunks`, `--imatrix-in/out`, `imatrix_accum_*` kernels), **bounded replay** (`AFF_BOUNDED_REPLAY`), **soft resident bias** (`AFF_RESIDENT_BIAS`), pinned sampler staging, async peer-copy overlap, `AFF_BLOCK_AT` hooks | the engine can emit its own imatrix from the model's own activations; host↔device copies overlap |
+| [`2779348`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2779348) · [`patches/AFF_NOBUDGET_MAX_TOKENS.patch`](patches/AFF_NOBUDGET_MAX_TOKENS.patch) | bound the default when a request sends **no** `max_tokens` (was: the whole remaining context) | a gateway reasoning loop can no longer hold the single slot for 37 min / 55k tokens; explicit `max_tokens` untouched |
 
-### Local work (this repo's tip, ahead of the fork's published branches)
+Every commit message carries the same measurement detail as the table, with the exact before/after.
 
-| commit | change | measured effect |
+### V4.1 / multimodal port (fork `v41` branch, also in this history)
+
+| diff | change | improvement |
 |---|---|---|
-| `91e78ba` | **DeepSeek ViT on the CPU**, wired into prefill and the chat endpoint. 3 discrepancies fixed (2D-RoPE half rotation, channel-major aligner, aspect-preserving pad) | embedding cosine vs reference 0.31 → 0.85; end-to-end image grounding works |
-| `cbb3f07` | ViT **weight-stationary GEMM + AVX-512 attention** | 546×546: 13.2 s → 3.25 s; 1024×1024: minutes → 38 s |
-| `e1a2025` | ViT query-blocked attention; opt-in engram page-cache warm (`AFF_ENGRAM_WARM`) | 74×74: 38.4 s → 23.3 s, numerically identical |
-| `cac0510` | size the compressed KV cache **per kv source**, not per layer | KV 1016 → 100 MiB/card; resident experts 2206 → 2357 |
-| `997489c` | tile the indexer byte mask over the prefill chunk | prefill arena 2068 → 1426 MiB/card; resident experts 2357 → 2462 |
-| `27ec8fa` | opt-in DSpark backoff after a zero-accept streak (`AFF_SPEC_BACKOFF=N`) | wash on 2 cards (verify dominates, not the draft) — kept as a knob |
-| `1ae7c09` | SSE keep-alive while a tool call is withheld | long tool calls no longer trip client body-idle timeouts (300 s) |
-| `78244dc` | persist the learned placement heat plane (`--placement-save`) | residency survives restarts (no re-learn from zero) |
-| `bc42be2` | DSpark **confidence head** + opt-in gating (`AFF_SPEC_CONF_T`) | wash on 2 cards — kept as a calibration instrument |
-| `a4c9f85` | recover marker-less ("bare") DSML tool calls and stop at the block close | a poisoned 117k-token replay dropped 4360 → 195 completion tokens; stops the agent runaway/confabulation |
-| *(dirty)* | on-GPU **imatrix calibration** (`--calibrate-tokens/-chunk-size/-max-chunks`, `--imatrix-in/out`), bounded replay (`AFF_BOUNDED_REPLAY`), soft resident bias (`AFF_RESIDENT_BIAS`), pinned sampler staging, async peer-copy overlap, `AFF_BLOCK_AT` hooks | engine can emit its own imatrix from the model's own activations; overlap of host↔device copies |
-| `AFF_NOBUDGET_MAX_TOKENS` (`patches/`) | bound the default when a request sends **no** `max_tokens` (was: the whole remaining context) | a gateway reasoning loop can no longer hold the single slot for 37 min / 55k tokens; explicit `max_tokens` untouched |
+| [`e6070f5`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e6070f5) | V4.1 reasoning-effort prefix + `陪同下` token, byte-identical to the reference `encoding.py` | correct V4.1 chat encoding |
+| [`e03a05b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e03a05b), [`774aa6a`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/774aa6a), [`4165fce`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/4165fce), [`4bc938b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/4bc938b) | engram gate/stride, engram bf16 weights, V4.1 has no per-head RMS on q | four bugs that produced fluent-but-wrong text; fixes make the port correct |
+| [`d91ae9d`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/d91ae9d) | engram n-gram layers 1 and 14 (91.6 GiB tables), indexer, compressor | V4.1 architecture support |
+| [`2dbb093`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2dbb093) | stop retrying a KV growth the card cannot hold | removes the 64k decode cliff |
 
 ### Environment knobs used in the served unit
 
