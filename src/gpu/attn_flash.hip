@@ -147,7 +147,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     const float* __restrict__ sinks, float* __restrict__ out, uint32_t b0, uint32_t pos0,
     uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head, float scale,
     int q_bf16, float* __restrict__ part_o, float* __restrict__ part_ml, uint32_t part_tok,
-    const uint32_t* __restrict__ adm, uint32_t adm_stride) {
+    const uint32_t* __restrict__ adm, uint32_t adm_stride, uint32_t raw_floor) {
 
   constexpr uint32_t NH = NT * 16u;                   // query heads a block
 
@@ -167,7 +167,8 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
   const uint32_t h0 = blockIdx.y * NH;
   const uint32_t tk = blockIdx.x;
   const uint32_t pos = pos0 + tk;
-  const uint32_t n_raw = (pos + 1u < sliding) ? pos + 1u : sliding;
+  const uint32_t raw_avail = (pos >= raw_floor) ? (pos - raw_floor + 1u) : 0u;
+  const uint32_t n_raw = (raw_avail < sliding) ? raw_avail : sliding;
   const uint32_t raw0 = (pos + 1u - n_raw) % ring;
   const uint32_t n_comp = n_comp_v ? n_comp_v[tk] : n_comp1;
   const uint32_t n_keys = n_raw + n_comp;
@@ -626,7 +627,8 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
                           float* out, uint32_t b0, uint32_t n, uint32_t /*nb*/, uint32_t pos0,
                           uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head,
                           float scale, void* stream, bool q_bf16, const FlashSplit* split,
-                          uint32_t n_comp_hint, const uint32_t* adm, uint32_t adm_stride) {
+                          uint32_t n_comp_hint, const uint32_t* adm, uint32_t adm_stride,
+                          uint32_t raw_floor) {
   if (!n || !n_head) return;
   hipStream_t st = (hipStream_t)stream;
   const uint8_t* r8 = (const uint8_t*)raw;
@@ -649,7 +651,8 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
   // plus the widest compressed run in it. Both are lower bounds on later tokens, and the kernel
   // recomputes its own cut from its own count anyway, so an underestimate costs a slightly coarse
   // grid and nothing else.
-  const uint32_t nraw0 = (pos0 + 1u < sliding) ? pos0 + 1u : sliding;
+  const uint32_t raw_avail0 = (pos0 >= raw_floor) ? (pos0 - raw_floor + 1u) : 0u;
+  const uint32_t nraw0 = (raw_avail0 < sliding) ? raw_avail0 : sliding;
   const uint32_t nkeys = nraw0 + (n_comp_v ? n_comp_hint : n_comp1);
   const uint32_t nsp = flash_split_slices(n, ntiles, nkeys, split);
   float* po = nsp > 1u ? split->o : nullptr;
@@ -659,7 +662,7 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
 #define AFF_LAUNCH(T, S, M)                                                                      \
   hipLaunchKernelGGL((flash_kernel<T, S, M>), g, b, 0, st, q, r8, c8, allowed, n_comp_v, n_comp1,  \
                      sinks, out, b0, pos0, sliding, ring, max_comp, n_head, scale, q_bf16 ? 1 : 0, \
-                     po, pm, ptok, adm, adm_stride)
+                     po, pm, ptok, adm, adm_stride, raw_floor)
 #define AFF_PICK(T)                                                    \
   do {                                                                 \
     if (sinks && allowed)  AFF_LAUNCH(T, true, true);                  \

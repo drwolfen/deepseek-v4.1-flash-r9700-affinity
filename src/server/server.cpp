@@ -205,8 +205,36 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
     p = skip_ws(p);
     out->include_usage = std::strncmp(p, "true", 4) == 0;
   }
-  if (const char* p = find_top_key(body, "reasoning_effort")) { const char* q = p; out->reasoning_effort = read_json_string(q); }
+  if (const char* p = find_top_key(body, "reasoning_effort")) {
+    const char* q = skip_ws(p);
+    if (*q == '"') out->reasoning_effort = read_json_string(q);
+    else if (std::isdigit((unsigned char)*q)) out->reasoning_effort = std::to_string(std::strtoul(q, nullptr, 10));
+  }
   if (const char* p = find_top_key(body, "thinking_mode")) { const char* q = p; out->thinking_mode = read_json_string(q); }
+  const std::string ctk = raw_value(body, "chat_template_kwargs");
+  if (out->reasoning_effort.empty() && !ctk.empty()) {
+    if (const char* p = find_top_key(ctk, "reasoning_effort")) {
+      const char* q = skip_ws(p);
+      if (*q == '"') out->reasoning_effort = read_json_string(q);
+      else if (std::isdigit((unsigned char)*q)) out->reasoning_effort = std::to_string(std::strtoul(q, nullptr, 10));
+    }
+  }
+  if (out->thinking_mode.empty()) {
+    auto check_bool_think = [&](const std::string& obj) {
+      for (const char* k : {"enable_thinking", "thinking"}) {
+        if (const char* p = find_top_key(obj, k)) {
+          p = skip_ws(p);
+          if (std::strncmp(p, "false", 5) == 0) out->thinking_mode = "chat";
+          else if (std::strncmp(p, "true", 4) == 0) out->thinking_mode = "thinking";
+        }
+      }
+    };
+    if (!ctk.empty()) check_bool_think(ctk);
+    if (out->thinking_mode.empty()) check_bool_think(body);
+    if (out->thinking_mode.empty() &&
+        (out->reasoning_effort == "none" || out->reasoning_effort == "off" || out->reasoning_effort == "0"))
+      out->thinking_mode = "chat";
+  }
   if (const char* p = find_top_key(body, "tool_choice")) { const char* q = p; out->tool_choice = read_json_string(q); }
   out->response_format = raw_value(body, "response_format");
 
@@ -281,14 +309,16 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
                   joined += piece;
                 }
               }
-              if (const char* img = find_top_key(blk, "image_url")) {
-                (void)img;
-                std::string img_obj = raw_value(blk, "image_url");
-                if (img_obj.empty()) img_obj = blk;
-                if (const char* u = find_top_key(img_obj, "url")) {
-                  const char* w = u;
-                  m.image_data = read_json_string(w);
-                  m.has_image = !m.image_data.empty();
+              if (m.role == "user") {
+                if (const char* img = find_top_key(blk, "image_url")) {
+                  (void)img;
+                  std::string img_obj = raw_value(blk, "image_url");
+                  if (img_obj.empty()) img_obj = blk;
+                  if (const char* u = find_top_key(img_obj, "url")) {
+                    const char* w = u;
+                    m.image_data = read_json_string(w);
+                    m.has_image = !m.image_data.empty();
+                  }
                 }
               }
             }
@@ -296,11 +326,13 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
           } else {
             const char* w = c;
             m.content = read_json_string(w);
-            size_t b64_pos = m.content.find("data:image/");
-            if (b64_pos != std::string::npos) {
-              size_t end_pos = m.content.find_first_of(" \t\r\n)]}\"", b64_pos);
-              m.image_data = m.content.substr(b64_pos, end_pos == std::string::npos ? std::string::npos : (end_pos - b64_pos));
-              m.has_image = !m.image_data.empty();
+            if (m.role == "user" && m.content.find("<｜deepseek_image｜>") != std::string::npos) {
+              size_t b64_pos = m.content.find("data:image/");
+              if (b64_pos != std::string::npos) {
+                size_t end_pos = m.content.find_first_of(" \t\r\n)]}\"", b64_pos);
+                m.image_data = m.content.substr(b64_pos, end_pos == std::string::npos ? std::string::npos : (end_pos - b64_pos));
+                m.has_image = !m.image_data.empty();
+              }
             }
           }
         }

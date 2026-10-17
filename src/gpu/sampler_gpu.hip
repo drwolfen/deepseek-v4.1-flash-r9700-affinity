@@ -7,7 +7,8 @@ namespace aff {
 
 namespace {
 
-constexpr uint32_t kThr = 256;
+constexpr uint32_t kThr = 1024;
+constexpr uint32_t kCandCap = 2048;
 
 // A monotone map from float to uint32, so a radix pass on the bits orders the values. The same trick
 // the indexer's top-k uses; written for the general case even though probabilities are non-negative,
@@ -24,6 +25,9 @@ struct Shared {
   uint32_t red_i[kThr];     // ...and the ids that ride along with it
   float    mass[256];       // radix buckets by probability mass (top_p)
   uint32_t cnt[256];        // ...and by count (top_k)
+  uint32_t cand_id[kCandCap];   // compacted survivor token ids after top-byte radix filter
+  float    cand_p[kCandCap];    // ...and their probabilities
+  uint32_t n_cand;          // count of compacted survivors (or > kCandCap on overflow)
   uint32_t prefix;          // the threshold key being narrowed, high byte first
   uint32_t slice;           // which thread's slice an inverse-CDF draw landed in
   float    slice_base;      // the cumulative mass before that slice
@@ -160,20 +164,70 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
   // crosses it holds the threshold and the next pass narrows inside it. Ties AT the threshold are
   // all kept, which can overshoot top_p by the mass of the tie — the alternative is inventing an
   // order among equal probabilities.
+  //
+  // Fast compaction path: after the top byte (shift == 24) is resolved, any token with high byte
+  // < b is strictly below p_key; any token with high byte > b is strictly above p_key; only tokens
+  // with high byte == b need the remaining 3 radix passes. Compacting all tokens with high byte >= b
+  // into LDS (when <= kCandCap, which holds for 99.9%+ of LLM steps where <100 tokens have p >= 2^-10)
+  // eliminates 5 full 129,280-element global memory scans.
   uint32_t p_key = 0u;
+  bool compacted = false;
   if (top_p < 1.0f) {
-    if (tid == 0) sh.prefix = 0u;
+    if (tid == 0) { sh.prefix = 0u; sh.n_cand = 0u; }
+    if (tid < 256) sh.mass[tid] = 0.0f;
     __syncthreads();
     float target = top_p;
-    for (int shift = 24; shift >= 0; shift -= 8) {
+    for (uint32_t v = tid; v < vocab; v += kThr) {
+      const float p = prob(v);
+      const uint32_t key = mono(p);
+      if (k_key == 0u || key >= k_key)
+        atomicAdd(&sh.mass[(key >> 24) & 0xFFu], p);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      float acc = 0.0f;
+      uint32_t b = 0u;
+      for (int i = 255; i >= 0; --i) {
+        if (acc + sh.mass[i] >= target) { b = (uint32_t)i; break; }
+        acc += sh.mass[i];
+      }
+      target -= acc;
+      sh.prefix = b << 24;
+    }
+    __syncthreads();
+    const uint32_t b24 = sh.prefix >> 24;
+    for (uint32_t v = tid; v < vocab; v += kThr) {
+      const float p = prob(v);
+      const uint32_t key = mono(p);
+      if ((k_key == 0u || key >= k_key) && (key >> 24) >= b24) {
+        const uint32_t idx = atomicAdd(&sh.n_cand, 1u);
+        if (idx < kCandCap) {
+          sh.cand_id[idx] = v;
+          sh.cand_p[idx] = p;
+        }
+      }
+    }
+    __syncthreads();
+    compacted = (sh.n_cand <= kCandCap);
+    const uint32_t nc = sh.n_cand;
+    for (int shift = 16; shift >= 0; shift -= 8) {
       if (tid < 256) sh.mass[tid] = 0.0f;
       __syncthreads();
-      const uint32_t mask = (shift == 24) ? 0u : (0xFFFFFFFFu << (shift + 8));
-      for (uint32_t v = tid; v < vocab; v += kThr) {
-        const float p = prob(v);
-        const uint32_t key = mono(p);
-        if ((key & mask) == (sh.prefix & mask) && (k_key == 0u || key >= k_key))
-          atomicAdd(&sh.mass[(key >> shift) & 0xFFu], p);
+      const uint32_t mask = 0xFFFFFFFFu << (shift + 8);
+      if (compacted) {
+        for (uint32_t i = tid; i < nc; i += kThr) {
+          const float p = sh.cand_p[i];
+          const uint32_t key = mono(p);
+          if ((key & mask) == (sh.prefix & mask))
+            atomicAdd(&sh.mass[(key >> shift) & 0xFFu], p);
+        }
+      } else {
+        for (uint32_t v = tid; v < vocab; v += kThr) {
+          const float p = prob(v);
+          const uint32_t key = mono(p);
+          if ((key & mask) == (sh.prefix & mask) && (k_key == 0u || key >= k_key))
+            atomicAdd(&sh.mass[(key >> shift) & 0xFFu], p);
+        }
       }
       __syncthreads();
       if (tid == 0) {
@@ -203,11 +257,22 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
 
   // ---- the surviving mass, with and without the proposal ----------------------------------------
   float kt = 0.0f, ke = 0.0f, pq = 0.0f;
-  for (uint32_t v = tid; v < vocab; v += kThr) {
-    const float p = prob(v);
-    if (!keep(p)) continue;
-    kt += p;
-    if (v == q) pq += p; else ke += p;
+  if (compacted) {
+    const uint32_t nc = sh.n_cand;
+    for (uint32_t i = tid; i < nc; i += kThr) {
+      const float p = sh.cand_p[i];
+      if (!keep(p)) continue;
+      const uint32_t v = sh.cand_id[i];
+      kt += p;
+      if (v == q) pq += p; else ke += p;
+    }
+  } else {
+    for (uint32_t v = tid; v < vocab; v += kThr) {
+      const float p = prob(v);
+      if (!keep(p)) continue;
+      kt += p;
+      if (v == q) pq += p; else ke += p;
+    }
   }
   const float keep_total = reduce_sum(sh, kt);
   const float excl_total = reduce_sum(sh, ke);
@@ -218,6 +283,45 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
     sh.p_query = p_query;
   }
   __syncthreads();
+
+  if (compacted) {
+    // Sort compacted survivors by ascending token id so inverse-CDF draw order is identical to the
+    // full-vocabulary contiguous walk.
+    const uint32_t nc = sh.n_cand;
+    if (tid == 0) {
+      for (uint32_t i = 1; i < nc; ++i) {
+        const uint32_t vid = sh.cand_id[i];
+        const float vp = sh.cand_p[i];
+        uint32_t j = i;
+        while (j > 0 && sh.cand_id[j - 1] > vid) {
+          sh.cand_id[j] = sh.cand_id[j - 1];
+          sh.cand_p[j] = sh.cand_p[j - 1];
+          --j;
+        }
+        sh.cand_id[j] = vid;
+        sh.cand_p[j] = vp;
+      }
+      auto draw_compacted = [&](float uu, float total, uint32_t excl) -> uint32_t {
+        if (!(total > 0.0f) || nc == 0) return 0u;
+        const float want = uu * total;
+        float acc = 0.0f;
+        uint32_t last = 0u;
+        for (uint32_t i = 0; i < nc; ++i) {
+          const uint32_t v = sh.cand_id[i];
+          const float p = sh.cand_p[i];
+          if (!keep(p) || v == excl) continue;
+          last = v;
+          acc += p;
+          if (acc >= want) return v;
+        }
+        return last;
+      };
+      out[pos].tok = draw_compacted(u[2 * pos + 0], sh.keep_total, 0xFFFFFFFFu);
+      out[pos].tok_excl = draw_compacted(u[2 * pos + 1], sh.excl_total, q);
+      out[pos].p_query = sh.keep_total > 0.0f ? sh.p_query / sh.keep_total : 0.0f;
+    }
+    return;
+  }
 
   // ---- inverse CDF, in two stages ---------------------------------------------------------------
   //

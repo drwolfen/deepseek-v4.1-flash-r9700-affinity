@@ -326,14 +326,15 @@ __global__ __launch_bounds__(kAttnThreads) void mqa_attend_batch_kernel(
     const float* __restrict__ sinks, float* __restrict__ out, uint32_t b0, uint32_t pos0,
     uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head, uint32_t width,
     uint32_t nope, uint32_t stride, float scale, uint32_t nhb, uint32_t flat_n,
-    uint32_t flat_raw0) {
+    uint32_t flat_raw0, uint32_t raw_floor) {
 
   extern __shared__ float s_score[];
   const uint32_t h0 = blockIdx.x * nhb, t = blockIdx.y;
   const uint32_t pos = pos0 + t;
   // Causal by construction: the window IS [pos-sliding+1, pos], so there is no mask to apply. The
   // DSpark draft is the one caller that wants the same window for every token — see the header.
-  const uint32_t n_raw = flat_n ? flat_n : ((pos + 1u < sliding) ? pos + 1u : sliding);
+  const uint32_t raw_avail = (pos >= raw_floor) ? (pos - raw_floor + 1u) : 0u;
+  const uint32_t n_raw = flat_n ? flat_n : ((raw_avail < sliding) ? raw_avail : sliding);
   const uint32_t raw0 = flat_n ? flat_raw0 : ((pos + 1u - n_raw) % ring);
   const uint32_t n_comp = n_comp_v ? n_comp_v[t] : 0u;
   const size_t tok = (size_t)(b0 + t) * n_head * width + (size_t)h0 * width;
@@ -664,13 +665,15 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
                           float* out, uint32_t b0, uint32_t n, uint32_t /*nb*/, uint32_t pos0,
                           uint32_t sliding, uint32_t ring, uint32_t n_comp_max, uint32_t max_comp,
                           uint32_t n_head, uint32_t width, uint32_t n_rot, float scale,
-                          void* stream, bool q_bf16, uint32_t flat_n, uint32_t flat_raw0) {
+                          void* stream, bool q_bf16, uint32_t flat_n, uint32_t flat_raw0,
+                          uint32_t raw_floor) {
   if (!n_head || !n) return;
   require_width(width, "mqa_attend_batch_hip");
   // Sized for the WORST token in the sub-batch. Every block allocates the same LDS, so this is the
   // batch max of n_raw + n_comp, not each token's own; a block simply leaves the tail unused.
   const uint32_t last = pos0 + n - 1;
-  const uint32_t n_raw_max = flat_n ? flat_n : ((last + 1u < sliding) ? last + 1u : sliding);
+  const uint32_t last_avail = (last >= raw_floor) ? (last - raw_floor + 1u) : 0u;
+  const uint32_t n_raw_max = flat_n ? flat_n : ((last_avail < sliding) ? last_avail : sliding);
   // Batched: n tokens already give the grid its width, so spend head-grouping on K/V reuse.
   const uint32_t nhb = kHeadsPerBlk;
   const size_t lds = ((size_t)nhb * (n_raw_max + n_comp_max) + nhb) * sizeof(float);
@@ -681,7 +684,7 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
 #define AFF_ATTB(DTV, QBV)                                                                     \
   hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV>), g, b, lds, st, q, raw, comp, allowed,   \
                      n_comp_v, sinks, out, b0, pos0, sliding, ring, max_comp, n_head, width,      \
-                     nope, sd, scale, nhb, flat_n, flat_raw0)
+                     nope, sd, scale, nhb, flat_n, flat_raw0, raw_floor)
 #define AFF_ATTQ(DTV) do { if (q_bf16) AFF_ATTB(DTV, true); else AFF_ATTB(DTV, false); } while (0)
   switch (dt) {
     case KvDtype::F32:   AFF_ATTQ(0); break;

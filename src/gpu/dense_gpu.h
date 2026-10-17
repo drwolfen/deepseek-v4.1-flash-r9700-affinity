@@ -640,7 +640,7 @@ private:
   // [n][mask_stride] plane or null; `n_comp` is a host array of n counts.
   bool     batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t pos0,
                         const uint8_t* allowed, uint32_t mask_stride, const uint32_t* n_comp,
-                        float scale);
+                        float scale, uint32_t raw_floor = 0);
   // `norm` on demand rather than every FFN sublayer: 13.4 MB a layer out of pageable memory at 818
   // tokens, which in the all-resident case nothing on the host reads.
   bool     batch_norm_fetch(float* norm_host);
@@ -672,6 +672,9 @@ private:
   void*    smp_q_ = nullptr;
   void*    smp_u_ = nullptr;
   void*    smp_out_ = nullptr;
+  void*    smp_h_q_ = nullptr;
+  void*    smp_h_u_ = nullptr;
+  void*    smp_h_out_ = nullptr;
   uint32_t smp_cap_ = 0;
   bool     batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
                              const uint32_t* query, const float* u, float temperature, float top_p,

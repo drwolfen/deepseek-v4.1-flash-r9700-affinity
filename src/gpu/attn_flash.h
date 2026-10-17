@@ -84,6 +84,7 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
                           uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head,
                           float scale, void* stream, bool q_bf16 = false,
                           const FlashSplit* split = nullptr, uint32_t n_comp_hint = 0,
-                          const uint32_t* adm = nullptr, uint32_t adm_stride = 0);
+                          const uint32_t* adm = nullptr, uint32_t adm_stride = 0,
+                          uint32_t raw_floor = 0);
 
 }  // namespace aff

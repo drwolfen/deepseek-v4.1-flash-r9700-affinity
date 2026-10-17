@@ -405,7 +405,14 @@ int main(int argc, char** argv) {
   uint32_t prefill_reps = 1;
   // A second prompt to rotate in, so convergence is measured against a union rather than one set.
   std::string prefill_alt;
+  std::string calibrate_tokens_path;
+  uint32_t calibrate_chunk_size = 4096;
+  uint32_t calibrate_max_chunks = 0;
+  std::string imatrix_out_path;
+  std::string imatrix_in_path;
+  uint32_t imatrix_save_chunks = 100;
 #endif
+  int default_effort = 75;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto nxt = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -414,6 +421,7 @@ int main(int argc, char** argv) {
     else if (a == "--host") host = nxt();
     else if (a == "--port") port = (uint16_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--max-tokens-floor") max_tokens_floor = (uint32_t)std::strtoul(nxt(), nullptr, 10);
+    else if (a == "--default-effort") default_effort = std::max(1, std::min(100, std::atoi(nxt())));
     else if (a == "-p" || a == "--prompt") { prompt = nxt(); one_shot = true; }
     else if (a == "--temp") { sample_cfg.temperature = std::strtof(nxt(), nullptr); sampling_set = true; }
     else if (a == "--top-k") { sample_cfg.top_k = (uint32_t)std::strtoul(nxt(), nullptr, 10); sampling_set = true; }
@@ -513,6 +521,12 @@ int main(int argc, char** argv) {
     else if (a == "--placement-save-secs") placement_save_secs = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--prefill-reps") prefill_reps = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--prefill-alt") prefill_alt = nxt();
+    else if (a == "--calibrate-tokens") calibrate_tokens_path = nxt();
+    else if (a == "--calibrate-chunk-size") calibrate_chunk_size = (uint32_t)std::strtoul(nxt(), nullptr, 10);
+    else if (a == "--calibrate-max-chunks") calibrate_max_chunks = (uint32_t)std::strtoul(nxt(), nullptr, 10);
+    else if (a == "--imatrix-out") imatrix_out_path = nxt();
+    else if (a == "--imatrix-in") imatrix_in_path = nxt();
+    else if (a == "--imatrix-save-chunks") imatrix_save_chunks = (uint32_t)std::strtoul(nxt(), nullptr, 10);
 #endif
     else if (a == "-h" || a == "--help") {
       aff::ui::out(
@@ -945,11 +959,14 @@ int main(int argc, char** argv) {
     for (int32_t t : c.dspark_taps) taps += sfmt(" %d", t);
     aff::ui::out("dspark: %zu stages, block %u, taps%s, %.2f GiB\n", d.stage.size(),
                  c.dspark_block, taps.c_str(), model.dspark_bytes() / 1073741824.0);
-    // Enable the confidence head only when a caller will use it: the gating threshold or the
-    // calibration print. Off, the draft skips the scoring kernel and its readback entirely.
+    // Enable the confidence head when adaptive width (default on) or explicit confidence gating is
+    // active. AFF_ADAPTIVE_WIDTH=0 and AFF_SPEC_CONF_T=0 without AFF_SPEC_CONF_DEBUG skips the
+    // scoring kernel and its readback entirely.
     {
       const char* ct = std::getenv("AFF_SPEC_CONF_T");
-      const bool want_conf = (ct && std::strtod(ct, nullptr) > 0.0) ||
+      const char* aw = std::getenv("AFF_ADAPTIVE_WIDTH");
+      const bool adaptive_on = !aw || !*aw || std::strcmp(aw, "0") != 0;
+      const bool want_conf = adaptive_on || (ct && std::strtod(ct, nullptr) > 0.0) ||
                              (std::getenv("AFF_SPEC_CONF_DEBUG") != nullptr);
       if (want_conf) model.set_dspark_confidence_enabled(true);
     }
@@ -1211,11 +1228,13 @@ int main(int argc, char** argv) {
   bool draft_wants_pool = false;
   if (c.dspark_block && dspark_on) {
     const uint32_t n_stage = (uint32_t)model.dspark().stage.size();
+    const uint32_t d_n_expert = c.dspark_n_expert ? c.dspark_n_expert : c.n_expert;
+    const uint32_t d_n_used = c.dspark_n_expert_used ? c.dspark_n_expert_used : c.n_expert_used;
     // What the slab needs plus a little, never greedy: everything it takes is an expert the target
     // does not get.
     const double shard_gib = (double)model.dspark_reader().layer(0).stride /
                              (double)std::max<size_t>(1, dense_gpu.ranks()) / 1073741824.0;
-    const double need = shard_gib * c.n_expert * n_stage * 1.05;
+    const double need = shard_gib * d_n_expert * n_stage * 1.05;
     // Under `ram` the slab is not empty but token: a placement with no slots at all cannot
     // initialise, and this is the smallest one that can. Those few experts are under a percent of
     // the draft and the pool holds the rest.
@@ -1225,8 +1244,8 @@ int main(int argc, char** argv) {
     std::string derr;
     draft_placement.set_rank_plan(rank_plan.data(), rank_plan.size());
     draft_placement.set_route_trace_tag('S');
-    if (!draft_placement.init(&model.dspark_reader(), model.codebook(), want, n_stage, c.n_expert,
-                              kSpecTok, c.n_expert_used, &derr)) {
+    if (!draft_placement.init(&model.dspark_reader(), model.codebook(), want, n_stage, d_n_expert,
+                              kSpecTok, d_n_used, &derr)) {
       aff::ui::err("dspark: draft expert placement: %s\n", derr.c_str());
       return 1;
     }
@@ -1292,6 +1311,8 @@ int main(int argc, char** argv) {
   // compares two amounts of free VRAM as well as two placements.
   if (pcfg.strategy != PlacementEngineConfig::Strategy::Static)
     placement.reserve_shadow_slots(placement_shadow);
+  if (!imatrix_out_path.empty())
+    gpu_headroom_mib = std::max(gpu_headroom_mib, 512.0) + 420.0;
   placement.set_driver_headroom_mib(gpu_headroom_mib);
   // ---- the expert profile override, and it must land BEFORE both consumers --------------------
   //
@@ -1376,6 +1397,15 @@ int main(int argc, char** argv) {
     if (Model::force_resident_routing())
       aff::ui::out("AFF_FORCE_RESIDENT: routing restricted to VRAM-resident experts. "
                   "THE OUTPUT IS WRONG ON PURPOSE — this measures the all-resident ceiling.\n");
+    if (!imatrix_out_path.empty()) {
+      std::string ierr;
+      if (!placement.imatrix_init(c.n_embd, c.moe_inter, imatrix_in_path, &ierr)) {
+        aff::ui::err("fatal: imatrix_init failed: %s\n", ierr.c_str());
+        return 1;
+      }
+      aff::ui::out("imatrix producer: initialized (hidden=%u, inter=%u, loaded_chunks=%u) -> %s\n",
+                  c.n_embd, c.moe_inter, placement.imatrix_loaded_chunks(), imatrix_out_path.c_str());
+    }
   } else {
     aff::ui::out("static placement: disabled (%s)\n", cerr.c_str());
   }
@@ -1434,15 +1464,17 @@ int main(int argc, char** argv) {
   // one — which matters because a staging slot is only released by the events of the layer that
   // claimed it, and a layer wanting more slots than exist cannot wait its way out.
   if (draft_wants_pool && draft_placement.enabled()) {
+    const uint32_t d_n_expert = c.dspark_n_expert ? c.dspark_n_expert : c.n_expert;
+    const uint32_t d_n_used = c.dspark_n_expert_used ? c.dspark_n_expert_used : c.n_expert_used;
     const uint64_t missing = draft_placement.stats().total_experts -
                              draft_placement.stats().resident_experts;
-    const uint64_t ring = (uint64_t)c.dspark_block * c.n_expert_used;
+    const uint64_t ring = (uint64_t)c.dspark_block * d_n_used;
     const uint64_t stride = draft_placement.pool_out_stride();
     std::string perr;
     if (draft_pool.init(&model.dspark_reader(), (missing + ring) * stride,
                         [](void* v, uint32_t l, uint32_t e) {
                           return !((StaticPlacement*)v)->resident(l, e);
-                        }, &draft_placement, (uint32_t)model.dspark().stage.size(), c.n_expert,
+                        }, &draft_placement, (uint32_t)model.dspark().stage.size(), d_n_expert,
                         &perr, &StaticPlacement::pool_tf, &draft_placement, stride, ring,
                         (uint64_t)(host_pool_reserve_mib * 1048576.0)) &&
         draft_placement.set_host_pool(&draft_pool)) {
@@ -1729,6 +1761,70 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+#ifdef AFF_WITH_HIP
+  if (!calibrate_tokens_path.empty()) {
+    std::FILE* cf = std::fopen(calibrate_tokens_path.c_str(), "rb");
+    if (!cf) {
+      aff::ui::err("fatal: cannot open --calibrate-tokens %s\n", calibrate_tokens_path.c_str());
+      return 1;
+    }
+    std::fseek(cf, 0, SEEK_END);
+    const long fbytes = std::ftell(cf);
+    std::fseek(cf, 0, SEEK_SET);
+    const uint64_t total_toks = fbytes > 0 ? (uint64_t)fbytes / sizeof(uint32_t) : 0;
+    uint64_t total_chunks = calibrate_chunk_size ? (total_toks / calibrate_chunk_size) : 0;
+    if (calibrate_max_chunks > 0 && total_chunks > calibrate_max_chunks)
+      total_chunks = calibrate_max_chunks;
+    const uint32_t start_chunk = placement.imatrix_loaded_chunks();
+    if (start_chunk > 0 && start_chunk < total_chunks) {
+      std::fseek(cf, (long)((uint64_t)start_chunk * calibrate_chunk_size * sizeof(uint32_t)), SEEK_SET);
+      aff::ui::out("calibrate: resuming at chunk %u/%llu\n", start_chunk, (unsigned long long)total_chunks);
+    }
+    std::vector<uint32_t> chunk(calibrate_chunk_size);
+    std::vector<float> logits;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t toks_done = 0;
+    kv_reserve_for(calibrate_chunk_size + 16);
+    for (uint32_t ci = start_chunk; ci < total_chunks; ++ci) {
+      if (std::fread(chunk.data(), sizeof(uint32_t), calibrate_chunk_size, cf) != calibrate_chunk_size)
+        break;
+      SeqState st;
+      model.init_state(&st, calibrate_chunk_size + 16);
+      if (!model.forward_prefill(chunk.data(), calibrate_chunk_size, &st, nullptr, nullptr, &logits, true)) {
+        aff::ui::err("fatal: forward_prefill failed at calibration chunk %u\n", ci);
+        std::fclose(cf);
+        return 1;
+      }
+      placement.imatrix_flush_chunk();
+      toks_done += calibrate_chunk_size;
+      const uint32_t done_chunks = ci + 1;
+      const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      if (done_chunks % 5 == 0 || done_chunks == total_chunks) {
+        aff::ui::err("calibrate: chunk %u/%llu (%llu tok, %.1f tok/s, %.1f s elapsed)\n",
+                     done_chunks, (unsigned long long)total_chunks,
+                     (unsigned long long)((uint64_t)done_chunks * calibrate_chunk_size),
+                     toks_done / std::max(el, 1e-6), el);
+      }
+      if (!imatrix_out_path.empty() && imatrix_save_chunks > 0 &&
+          (done_chunks % imatrix_save_chunks == 0 || done_chunks == total_chunks)) {
+        std::string serr;
+        if (!placement.imatrix_save_gguf(imatrix_out_path, calibrate_tokens_path,
+                                         done_chunks, calibrate_chunk_size, &serr)) {
+          aff::ui::err("calibrate: save failed: %s\n", serr.c_str());
+          std::fclose(cf);
+          return 1;
+        }
+        aff::ui::err("calibrate: saved %s (%u chunks, %llu tokens)\n",
+                     imatrix_out_path.c_str(), done_chunks,
+                     (unsigned long long)((uint64_t)done_chunks * calibrate_chunk_size));
+      }
+    }
+    std::fclose(cf);
+    persist_placement();
+    return 0;
+  }
+#endif
+
   // The phase breakdown, for whichever half of the run just finished. A single dump at the end of
   // a run only ever describes decode, because prefill's counters are reset unread, which leaves the
   // longer of the two phases undecomposed.
@@ -1909,6 +2005,21 @@ int main(int argc, char** argv) {
     const char* conf_env = std::getenv("AFF_SPEC_CONF_T");
     const float kConfT = conf_env ? (float)std::strtod(conf_env, nullptr) : 0.0f;
     const bool conf_dbg = std::getenv("AFF_SPEC_CONF_DEBUG") != nullptr;
+    // Cost-aware adaptive verify width (ported from Lucebox AdaptiveSpecWidth).
+    // Width q = nd + 1 (seed + nd draft candidates, q in [2, B+1]).
+    // Online per-depth calibration tracks EMA of predicted confidence vs actual acceptance,
+    // and online per-width cost EMA tracks step latency (ms) per width q.
+    const char* aw_env = std::getenv("AFF_ADAPTIVE_WIDTH");
+    const bool adaptive_width_on = (!aw_env || !*aw_env || std::strcmp(aw_env, "0") != 0) && kConfT <= 0.0f;
+    constexpr uint32_t kMaxQ = 8;
+    float surv_ema[kMaxQ] = {1.0f, 0.75f, 0.60f, 0.48f, 0.38f, 0.30f, 0.24f, 0.19f};
+    float conf_pred_ema[kMaxQ] = {1.0f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f};
+    float conf_act_ema[kMaxQ]  = {1.0f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f};
+    // Seed relative step costs (ms) for q = 0..7 on dual R9700 hybrid PCIe tier:
+    // narrower verify touches proportionally fewer non-resident PCIe experts per layer.
+    float cost_ema[kMaxQ] = {0.0f, 48.0f, 68.0f, 82.0f, 95.0f, 108.0f, 120.0f, 132.0f};
+    uint32_t cost_samples[kMaxQ] = {};
+    bool last_clean_accept = false;
     uint32_t zero_run = 0;
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
     uint32_t next = first, generated = 0;
@@ -1918,6 +2029,7 @@ int main(int argc, char** argv) {
       // thing in the iteration that touches the device: everything below it is host bookkeeping and
       // the emit callback, and emit writes to a socket.
       std::unique_lock<std::mutex> step(engine_mu);
+      const auto step_t0 = std::chrono::steady_clock::now();
       if (!dense_gpu.set_slot(slot)) {
         aff::ui::fatal("fatal: slot %u out of range\n", slot);
         std::abort();
@@ -1951,18 +2063,50 @@ int main(int argc, char** argv) {
           std::abort();
         }
         nd = B;
+        const std::vector<float>& conf = model.dspark_confidence();
         // Confidence gating: verify only the prefix the draft is confident about. `nd` may fall to
         // 0, which is a plain one-token step through the same code. See the note at kConfT.
         if (kConfT > 0.0f) {
-          const std::vector<float>& conf = model.dspark_confidence();
           if (conf.size() >= B) {
             uint32_t n2 = 0;
             while (n2 < B && conf[n2] >= kConfT) ++n2;
             nd = n2;
           }
+        } else if (adaptive_width_on && B >= 2) {
+          // Cost-aware adaptive width selection over q = 2 .. B+1 (nd = 1 .. B).
+          const uint32_t max_q = std::min<uint32_t>(B + 1, kMaxQ - 1);
+          float util[kMaxQ] = {};
+          float best_u = -1.0f;
+          uint32_t best_q = max_q;
+          float survival = 1.0f;
+          float exp_commits = 1.0f; // target bonus token at the accept frontier
+          for (uint32_t q = 2; q <= max_q; ++q) {
+            const uint32_t d = q - 1; // candidate index 1..B (conf[d-1])
+            float p_cond = 0.0f;
+            if (d - 1 < conf.size()) {
+              const float scale = std::clamp(
+                  conf_act_ema[d] / std::max(conf_pred_ema[d], 0.05f), 0.25f, 1.50f);
+              p_cond = std::clamp(conf[d - 1] * scale, 0.0f, 1.0f);
+              survival *= p_cond;
+            } else {
+              const float prev_s = std::max(surv_ema[d - 1], 0.05f);
+              p_cond = std::clamp(surv_ema[d] / prev_s, 0.0f, 1.0f);
+              survival *= p_cond;
+            }
+            exp_commits += survival;
+            const float c_ms = std::max(cost_ema[q], 1.0f);
+            util[q] = exp_commits / c_ms;
+            if (util[q] > best_u) {
+              best_u = util[q];
+              best_q = q;
+            }
+          }
+          // After a clean all-accepted block, explore one wider width if within 3% utility.
+          if (last_clean_accept && best_q < max_q && util[best_q + 1] >= best_u * 0.97f)
+            best_q += 1;
+          nd = best_q - 1;
         }
         if (conf_dbg) {
-          const std::vector<float>& conf = model.dspark_confidence();
           std::string cs;
           for (uint32_t i = 0; i < conf.size(); ++i)
             cs += std::to_string(conf[i]) + (i + 1 < conf.size() ? "," : "");
@@ -2052,7 +2196,35 @@ int main(int argc, char** argv) {
       if (n_slots_gt1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       if (slot_dbg) { tap_hash_prev = dense_gpu.tap_hash_debug();
                       kv_hash_prev = dense_gpu.kv_hash_debug(dbg_layer); }
+      const double step_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_t0).count();
       step.unlock();                    // the cards are free from here; the rest is host-side
+      if (adaptive_width_on && nd > 0) {
+        const uint32_t q_off = std::min<uint32_t>(nd + 1, kMaxQ - 1);
+        last_clean_accept = (k == nd);
+        // Update step cost EMA after warmup (ignore first 2 cold steps per width, clamp outliers).
+        if (++cost_samples[q_off] > 2 && step_ms > 1.0) {
+          const float clamped_ms = std::min((float)step_ms, cost_ema[q_off] * 1.25f);
+          cost_ema[q_off] = 0.85f * cost_ema[q_off] + 0.15f * clamped_ms;
+        }
+        // Update prefix survival EMAs and per-depth confidence calibration.
+        const std::vector<float>& conf = model.dspark_confidence();
+        for (uint32_t d = 1; d <= nd && d < kMaxQ; ++d) {
+          const float survived = (k >= d) ? 1.0f : 0.0f;
+          surv_ema[d] = 0.80f * surv_ema[d] + 0.20f * survived;
+          // Conditional acceptance at depth d is observed when depth d-1 was accepted.
+          if (d - 1 <= k && d - 1 < conf.size()) {
+            const float cond_hit = (k >= d) ? 1.0f : 0.0f;
+            conf_pred_ema[d] = 0.90f * conf_pred_ema[d] + 0.10f * conf[d - 1];
+            conf_act_ema[d]  = 0.90f * conf_act_ema[d]  + 0.10f * cond_hit;
+          }
+        }
+        // If rejected at depth k+1, deeper prefix survival gets a zero observation.
+        if (k < nd) {
+          for (uint32_t d = nd + 1; d <= B && d < kMaxQ; ++d)
+            surv_ema[d] = 0.80f * surv_ema[d];
+        }
+      }
       seed_n = vb.tap_rows ? k + 1 : 0u;
       seed_pos0 = P;
       // The token at position k: the target's own, from whichever rule applied above.
@@ -2447,9 +2619,20 @@ int main(int argc, char** argv) {
     std::vector<ChatMsg> msgs;
     std::string req_image_b64;
     for (const ChatMessage& in : req.messages) {
-      if (in.has_image && !in.image_data.empty()) {
+      if (in.role == "user" && in.has_image && !in.image_data.empty()) {
         req_image_b64 = in.image_data;
         break;
+      }
+    }
+    std::vector<float> vision_embeddings;
+    uint32_t n_vision_tokens = 0;
+    if (!req_image_b64.empty() && vit.ready()) {
+      std::string verr;
+      if (!vit.process_base64_image(req_image_b64, &vision_embeddings, &n_vision_tokens, &verr)) {
+        aff::ui::err("warning: vision processing failed (%s) — continuing as text-only\n", verr.c_str());
+        req_image_b64.clear();
+        vision_embeddings.clear();
+        n_vision_tokens = 0;
       }
     }
     if (req.messages.empty()) {
@@ -2462,7 +2645,8 @@ int main(int argc, char** argv) {
         ChatMsg m;
         m.role = in.role;
         m.content = in.content;
-        if (in.has_image && !req_image_b64.empty() && m.content.find("<｜deepseek_image｜>") == std::string::npos) {
+        if (in.role == "user" && in.has_image && !req_image_b64.empty() && n_vision_tokens > 0 &&
+            m.content.find("<｜deepseek_image｜>") == std::string::npos) {
           m.content = "<｜deepseek_image｜>\n" + m.content;
         }
         m.reasoning_content = in.reasoning_content;
@@ -2527,7 +2711,7 @@ int main(int argc, char** argv) {
     eo.v41 = model.config().v41;
     if (eo.v41) {
       const std::string& e = req.reasoning_effort;
-      int b = e == "low" ? 50 : e == "high" ? 75 : 100;
+      int b = e == "low" ? 50 : e == "medium" ? 60 : e == "high" ? 75 : e == "xhigh" ? 90 : e == "max" ? 100 : default_effort;
       if (!e.empty() && e.find_first_not_of("0123456789") == std::string::npos && e.size() <= 3)
         b = std::max(1, std::min(100, std::atoi(e.c_str())));
       eo.effort_budget = b;
@@ -2550,15 +2734,8 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> ids = tok.vocab_size() ? tok.encode(prompt, false)
                                                  : std::vector<uint32_t>{1};
 
-    std::vector<float> vision_embeddings;
-    uint32_t n_vision_tokens = 0;
     Model::PrefillVision pv;
-    if (!req_image_b64.empty() && vit.ready()) {
-      std::string verr;
-      if (!vit.process_base64_image(req_image_b64, &vision_embeddings, &n_vision_tokens, &verr)) {
-        res->error = "vision processing error: " + verr;
-        return;
-      }
+    if (!req_image_b64.empty() && n_vision_tokens > 0 && vit.ready()) {
       size_t img_idx = std::string::npos;
       for (size_t i = 0; i < ids.size(); ++i) {
         if (ids[i] == 129264) { img_idx = i; break; }
@@ -2627,6 +2804,7 @@ int main(int argc, char** argv) {
         std::unique_lock<std::mutex> step(engine_mu);
         dense_gpu.set_slot(slot);
         hit = prefix_cache.lookup(ids.data(), n_pre, &matched);   // index only, no I/O
+        if (hit) kv_reserve_for((uint64_t)hit + 2);
         if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
           model.restore_state(&st, hit, ids.data());
           from = hit;
@@ -2678,7 +2856,7 @@ int main(int argc, char** argv) {
     if (promote) {
       std::unique_lock<std::mutex> step(engine_mu);
       dense_gpu.set_slot(slot);
-      kv_reserve_for(st.pos + (uint64_t)ids.size() + 2);
+      kv_reserve_for((uint64_t)promote + 2);
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, promote - from, &st, nullptr,
                                                 nullptr, nullptr, true, &blk);
@@ -2700,7 +2878,7 @@ int main(int argc, char** argv) {
     if (n_pre > from) {
       std::unique_lock<std::mutex> step(engine_mu);
       dense_gpu.set_slot(slot);
-      kv_reserve_for(st.pos + (uint64_t)ids.size() + 2);
+      kv_reserve_for((uint64_t)ids.size() + 2);
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
                                                 nullptr, &logits, true, &blk,
@@ -2998,8 +3176,10 @@ int main(int argc, char** argv) {
       ParsedMessage recovered = parse_completion(raw + kEosStr, ThinkingMode::Chat);
       if (recovered.ok && !recovered.tool_calls.empty()) {
         res->reasoning_content = recovered.content;
+        static std::atomic<uint64_t> tc_seq{0};
+        const uint64_t tseq = ++tc_seq;
         for (size_t i = 0; i < recovered.tool_calls.size(); ++i)
-          res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(i),
+          res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(tseq) + "_" + std::to_string(i),
                                                recovered.tool_calls[i].name,
                                                recovered.tool_calls[i].arguments});
         res->finish_reason = "tool_calls";
@@ -3026,8 +3206,11 @@ int main(int argc, char** argv) {
     } else {
       res->content = pm.content;
       res->reasoning_content = pm.reasoning_content;
+      static std::atomic<uint64_t> tc_seq_ok{0};
+      const uint64_t tseq = pm.tool_calls.empty() ? 0 : ++tc_seq_ok;
       for (size_t i = 0; i < pm.tool_calls.size(); ++i)
-        res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(i), pm.tool_calls[i].name,
+        res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(tseq) + "_" + std::to_string(i),
+                                             pm.tool_calls[i].name,
                                              pm.tool_calls[i].arguments});
       res->finish_reason = pm.tool_calls.empty() ? "stop" : "tool_calls";
     }

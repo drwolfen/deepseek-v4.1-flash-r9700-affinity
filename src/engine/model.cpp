@@ -768,7 +768,7 @@ void Model::rollback(SeqState* s, uint32_t keep) const {
       // One row per `ratio` positions: emitted at p when (p+1) % ratio == 0, so `keep` positions
       // have produced keep/ratio of them. min() because the cache can have been capacity-capped.
       st.n_comp = std::min(st.n_comp, keep / ratio);
-      if (ratio == 4) st.n_idx_comp = std::min(st.n_idx_comp, keep / ratio);
+      if (ratio == 4 || cfg_.v41) st.n_idx_comp = std::min(st.n_idx_comp, keep / ratio);
     }
   }
   s->pos = keep;
@@ -790,7 +790,7 @@ void Model::restore_state(SeqState* s, uint32_t pos, const uint32_t* ids) const 
     // positions have produced pos/ratio of them.
     if (ratio) {
       st.n_comp = pos / ratio;
-      if (ratio == 4) st.n_idx_comp = pos / ratio;
+      if (ratio == 4 || cfg_.v41) st.n_idx_comp = pos / ratio;
     }
   }
   s->pos = pos;
@@ -813,6 +813,27 @@ ExpertMatrixView Model::expert_view(uint32_t layer, uint32_t expert, int which) 
 // ------------------------------------------------------------------------------------------
 // AFF_FORCE_RESIDENT — see the comment on set_resident_pred
 // ------------------------------------------------------------------------------------------
+
+namespace {
+bool is_v41_protected_expert(uint32_t n_layer, uint32_t n_expert, uint32_t l, uint32_t e) {
+  if (n_layer != 40u || n_expert != 384u) return false;
+  static constexpr uint16_t kMassive[79][2] = {
+    {0, 79}, {1, 382}, {2, 222}, {8, 237}, {10, 102}, {14, 199}, {15, 355}, {16, 3},
+    {17, 311}, {18, 350}, {19, 370}, {20, 180}, {21, 320}, {22, 121}, {23, 268}, {24, 339},
+    {25, 244}, {26, 157}, {26, 170}, {27, 223}, {28, 7}, {29, 243}, {30, 50}, {31, 280},
+    {31, 370}, {33, 332}, {34, 344}, {35, 316}, {35, 364}, {36, 7}, {36, 53}, {36, 335},
+    {36, 370}, {37, 123}, {37, 127}, {37, 224}, {37, 288}, {37, 290}, {38, 67}, {38, 100},
+    {38, 121}, {38, 173}, {38, 222}, {38, 239}, {38, 250}, {38, 383}, {39, 4}, {39, 7},
+    {39, 12}, {39, 13}, {39, 33}, {39, 62}, {39, 82}, {39, 83}, {39, 87}, {39, 92},
+    {39, 103}, {39, 105}, {39, 118}, {39, 119}, {39, 139}, {39, 178}, {39, 180}, {39, 182},
+    {39, 188}, {39, 190}, {39, 229}, {39, 269}, {39, 307}, {39, 312}, {39, 318}, {39, 331},
+    {39, 350}, {39, 351}, {39, 356}, {39, 359}, {39, 366}, {39, 375}, {39, 378}
+  };
+  if (l == 39u && e == 382u) return true;
+  for (const auto& p : kMassive) if (p[0] == l && p[1] == e) return true;
+  return false;
+}
+} // namespace
 
 bool Model::force_resident_routing() {
   static const bool on = [] {
@@ -1631,8 +1652,43 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
   // trailing window the caller asked to keep.
   const uint32_t tap_first = tap_rows ? (n - tap_rows) : n;
 
+  // ---- V4.1 Decoder SWA Bounded Replay (ported from Lucebox ds41-gorgon) ------------------------
+  // In V4.1, the last KV-source layer is layer 20 and the last Engram layer is layer 14; layers
+  // 21..39 only read layer 20's compressed KV plus their own 128-token sliding window (cfg_.sliding).
+  // For prompt rows before the final sliding window (replay_from = n - cfg_.sliding), layers 21..39
+  // need not run at all; only the final cfg_.sliding tokens run all 40 layers, with their raw SWA
+  // window on layers > 20 floored at replay_from_pos.
+  uint32_t replay_cut = cfg_.n_layer;
+  uint32_t replay_from = 0;
+  uint32_t replay_floor_pos = 0;
+  {
+    static const bool bounded_replay_on = [] {
+      const char* v = std::getenv("AFF_BOUNDED_REPLAY");
+      return !v || !*v || std::strcmp(v, "0") != 0;
+    }();
+    if (bounded_replay_on && cfg_.v41 && !(blk && blk->per_position_head) &&
+        !(vision && vision->count > 0) && cfg_.sliding > 0 && n > cfg_.sliding + 128u) {
+      int32_t cut = -1;
+      for (uint32_t l = 0; l < cfg_.n_layer; ++l)
+        if (cfg_.is_kv_source(l)) cut = (int32_t)l;
+      for (uint32_t l = (uint32_t)(cut + 1); cut >= 0 && l < cfg_.n_layer; ++l)
+        if (eng_on_ && l < eng_slot_.size() && eng_slot_[l] >= 0) { cut = -1; break; }
+      for (int32_t t : cfg_.dspark_taps) {
+        const int32_t at = cfg_.v41 ? t - 1 : t;
+        if (cut >= 0 && at <= cut) { cut = -1; break; }
+      }
+      if (cut >= 0 && (uint32_t)(cut + 1) < cfg_.n_layer) {
+        replay_cut = (uint32_t)cut;
+        replay_from = n - cfg_.sliding;
+        replay_floor_pos = s->pos + replay_from;
+      }
+    }
+  }
+
   for (uint32_t base = 0; base < n; ) {
     uint32_t live = std::min(chunk, n - base);
+    if (replay_cut < cfg_.n_layer && base < replay_from && base + live > replay_from)
+      live = replay_from - base;
     if (vision && vision->count > 0 && vision->embeddings) {
       const uint32_t v_start = vision->start;
       const uint32_t v_end = vision->start + vision->count;
@@ -1669,16 +1725,45 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
     }
     AFF_PH(hyper);
 
-    // ---- Engram: this chunk's hash ids, before any layer runs ---------------------------------
-    // See the decode path: the look-back state advances once a POSITION, not once a layer.
+    // ---- Engram: this chunk's hash ids AND dequantised table rows, before any layer runs ------
+    // Gathering all Engram layers (1 and 14) upfront in one parallel_for sweep eliminates two
+    // mid-chunk barrier stalls between Layer 0->1 and Layer 13->14.
+    const uint32_t eng_in_dim = eng_c_.n_cols * eng_c_.head_dim;
     if (eng_on_) {
       if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
       eng_ids_.resize((size_t)live * eng_c_.n_layer * eng_c_.n_cols);
-      eng_rows_.resize((size_t)live * eng_c_.n_cols * eng_c_.head_dim);
+      eng_rows_.resize((size_t)eng_c_.n_layer * live * eng_in_dim);
       eng_h_.push(ids + base, live, pos0, eng_ids_.data());
+      parallel_for((uint64_t)eng_c_.n_layer * live, 64, [&](uint64_t j0, uint64_t j1) {
+        for (uint64_t j = j0; j < j1; ++j) {
+          const uint32_t i = (uint32_t)(j / live);
+          const uint64_t t = j % live;
+          eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
+                        eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+        }
+      });
     }
 
-    for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
+    const bool early_replay_chunk = (replay_cut < cfg_.n_layer && base + live <= replay_from);
+    const uint32_t layer_limit = early_replay_chunk ? (replay_cut + 1u) : cfg_.n_layer;
+    if (early_replay_chunk) {
+      for (uint32_t l = layer_limit; l < cfg_.n_layer; ++l) {
+        LayerState& st_skip = s->layer[l];
+        const uint32_t r_skip = layers_[l].ratio;
+        for (uint32_t b = 0; b < live; ++b) {
+          const uint32_t pos = pos0 + b;
+          st_skip.raw_head = (st_skip.raw_head + 1) % cfg_.sliding;
+          if (st_skip.n_raw < cfg_.sliding) ++st_skip.n_raw;
+          if (r_skip && layers_[l].kv_owner != l && (pos + 1) % r_skip == 0 &&
+              st_skip.n_comp < s->layer[layers_[l].kv_owner].n_comp) {
+            if (cfg_.v41) ++st_skip.n_idx_comp;
+            ++st_skip.n_comp;
+          }
+        }
+      }
+    }
+
+    for (uint32_t l = 0; l < layer_limit; ++l) {
       const LayerWeights& w = layers_[l];
       LayerState& st = s->layer[l];
 
@@ -1688,19 +1773,10 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // that genuinely costs -- `live * n_cols` random rows of a 91.6 GiB mmap.
       if (eng_on_ && eng_slot_[l] >= 0 && bops_.engram) {
         const uint32_t i = (uint32_t)eng_slot_[l];
-        const uint32_t in_dim = eng_c_.n_cols * eng_c_.head_dim;
-        // ★ THE expensive half, and it parallelises perfectly. Each token's 24 rows land in a
-        // different part of a 91.6 GiB mapping, so a cold one is 24 independent page faults — the
-        // thread is asleep on NVMe, not busy. Serially that is the single largest cost engram adds
-        // to a long prompt; the work itself is a memcpy and a multiply.
-        parallel_for(live, 64, [&](uint64_t b0, uint64_t b1) {
-          for (uint64_t t = b0; t < b1; ++t)
-            eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
-                          eng_rows_.data() + (size_t)t * in_dim);
-        });
+        const float* layer_rows = eng_rows_.data() + (size_t)i * live * eng_in_dim;
         // Fatal, not a refusal: a `false` here would fall through to the per-token prefill, which
         // does not run engram at all, and the run would silently become the model without it.
-        if (!bops_.engram(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], eng_rows_.data(), live, in_dim,
+        if (!bops_.engram(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], layer_rows, live, eng_in_dim,
                           E, HC, cfg_.rms_eps)) {
           aff::ui::fatal("fatal: engram refused at layer %u in batched prefill — this write is "
                        "part of the model, not an optimisation\n", l);
@@ -1885,11 +1961,13 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
 
       // Pass two: the ring, and attention. kAttnBatch tokens per launch, and the ring is wide
       // enough that committing all of them first cannot overwrite a row one of them still needs.
+      const uint32_t raw_floor = (replay_cut < cfg_.n_layer && l > replay_cut) ? replay_floor_pos : 0u;
       for (uint32_t g0 = 0; g0 < live; g0 += kAttnBatch) {
         const uint32_t gn = std::min<uint32_t>(kAttnBatch, live - g0);
         if (!bops_.kv_commit(bops_.ctx, l, g0, gn, pos0 + g0, W, ROT)) return false;
         // Null `allowed`: the indexer left the admission mask on device, in the buffer this reads.
-        if (!bops_.attend(bops_.ctx, l, g0, gn, pos0 + g0, nullptr, mstride, ncompb.data() + g0, kq))
+        if (!bops_.attend(bops_.ctx, l, g0, gn, pos0 + g0, nullptr, mstride, ncompb.data() + g0, kq,
+                          raw_floor))
           return false;
       }
       AFF_PH(attention);
@@ -1949,9 +2027,18 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       const bool dev_plan = ddp_ && ddp_(ddp_ctx_, l) && !prof_on;
       if (dev_route && routed_experts) {
         const uint8_t* res = nullptr;
-        if (force_resident_routing() && res_) {
+        static const bool soft_res_bias_cfg = [] {
+          const char* v = std::getenv("AFF_RESIDENT_BIAS");
+          return v && *v && std::strtod(v, nullptr) > 0.0;
+        }();
+        const bool soft_res_bias = soft_res_bias_cfg && live > kSpecTok;
+        if ((force_resident_routing() || soft_res_bias) && res_) {
           if (residentb.size() < (size_t)NE) residentb.resize(NE);
-          for (uint32_t e = 0; e < NE; ++e) residentb[e] = res_(res_ctx_, l, e) ? 1 : 0;
+          for (uint32_t e = 0; e < NE; ++e) {
+            uint8_t m = res_(res_ctx_, l, e) ? 1u : 0u;
+            if (soft_res_bias && is_v41_protected_expert(cfg_.n_layer, NE, l, e)) m |= 2u;
+            residentb[e] = m;
+          }
           res = residentb.data();
         }
         const float* cur_bias = (is_image_chunk && w.router_b_vl) ? w.router_b_vl : w.router_b;

@@ -629,7 +629,7 @@ public:
     // capacity and the two have no reason to agree.
     bool (*attend)(void* ctx, uint32_t layer, uint32_t b0, uint32_t n, uint32_t pos0,
                    const uint8_t* allowed, uint32_t mask_stride, const uint32_t* n_comp,
-                   float scale) = nullptr;
+                   float scale, uint32_t raw_floor) = nullptr;
     // The indexer's query projection, left on device for `indexer` to consume. `h_proj` is V4.1's
     // head weights, issued on the same launch because on V4.1 this is the only hook that runs on
     // every index-source layer — see IndexArgs::h_proj. V4 passes -1 and its compressor does it.
