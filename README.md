@@ -11,6 +11,8 @@ combination that produced the numbers below can be rebuilt.
 > **Tested on exactly two R9700s.** Every number here was measured on a two-card box. The engine
 > upstream supports one card, but that configuration was not benchmarked for this setup.
 
+**Model files (weights):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
+
 ---
 
 ## Hardware (the machine the numbers come from)
@@ -122,17 +124,19 @@ one patch.
 ## Model files
 
 Built from the uncensored FP8 checkpoint with affinity's own `aff-quantize`. The weights are hosted on
-the Hugging Face Hub (see the link at the top / the model repo README):
+the Hugging Face Hub:
 
-| file | size | role |
+**[`Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)**
+
+| file (HF repo) | size | role |
 |---|---|---|
-| `model-uc.aff` | **191.32 GiB** | the container (routed experts 2.875 bpw, dense FP8, embedding/head bf16). Split into 5 parts for the Hub's per-file limit. |
-| `model-uc.dspark.aff` | 5.22 GiB | DSpark speculative-decoding draft head |
-| `model-uc.engram` | 506 KiB | engram n-gram sidecar |
-| `uc-v41cb.raw` | 32 KiB | the 2×1024-entry codebook the experts were encoded against |
+| [`model-uc.aff.part-00 … part-04`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw/tree/main) | **191.32 GiB** total | the container (routed experts 2.875 bpw, dense FP8, embedding/head bf16). Split into 5 parts for the Hub's per-file limit. |
+| [`model-uc.dspark.aff`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw/blob/main/model-uc.dspark.aff) | 5.22 GiB | DSpark speculative-decoding draft head |
+| [`model-uc.engram`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw/blob/main/model-uc.engram) | 506 KiB | engram n-gram sidecar |
+| [`uc-v41cb.raw`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw/blob/main/uc-v41cb.raw) | 32 KiB | the 2×1024-entry codebook the experts were encoded against |
 
-Reassemble the main container with `cat model-uc.aff.part-* > model-uc.aff` and verify with
-`sha256sum -c SHA256SUMS`.
+Reassemble the main container with `cat model-uc.aff.part-* > model-uc.aff`; the parts' hashes are in
+`SHA256SUMS.parts`.
 
 The quantisation recipe is in [`model/QUANT.md`](model/QUANT.md); checks that must pass: `aff-info`,
 `aff-cfgcheck`, `aff-fp8check`, `aff-exphash` (15360 distinct experts), `aff-gpucheck --dq`.
