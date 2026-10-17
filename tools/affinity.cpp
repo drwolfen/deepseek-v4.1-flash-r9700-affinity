@@ -2774,7 +2774,17 @@ int main(int argc, char** argv) {
     // never lowers it, and the context still bounds the result.
     const uint64_t ctx_room = kMaxKvPositions > ids.size() + 32
                             ? kMaxKvPositions - ids.size() - 32 : 0;
-    const uint64_t asked = req.has_max_tokens ? (uint64_t)req.max_tokens : ctx_room;
+    // A request that names no `max_tokens` used to fall back to the whole remaining context, so a
+    // client that sends none — the messaging gateway does not — let one reasoning loop hold the
+    // single slot for 37 minutes and 55k tokens with no answer. Bound that default; a client that
+    // does set `max_tokens` is untouched. Override the bound with AFF_NOBUDGET_MAX_TOKENS.
+    uint64_t nobudget_tokens = 16384;
+    if (const char* v = std::getenv("AFF_NOBUDGET_MAX_TOKENS")) {
+      const uint64_t t = std::strtoull(v, nullptr, 10);
+      if (t) nobudget_tokens = t;
+    }
+    const uint64_t asked = req.has_max_tokens ? (uint64_t)req.max_tokens
+                                              : std::min<uint64_t>(ctx_room, nobudget_tokens);
     const bool floored = req.has_max_tokens && asked < (uint64_t)max_tokens_floor;
     const uint32_t total_budget = (uint32_t)std::min<uint64_t>(
         ctx_room, std::max<uint64_t>(asked, (uint64_t)max_tokens_floor));
