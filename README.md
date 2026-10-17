@@ -215,3 +215,6 @@ adaptive-width and protected-expert optimizations we ported (and the eval corpus
 transformation of affinity into this R9700-tweaked engine was done with the help of
 DeepSeek-V4.1-Flash and Gemini 4 Argon.** Engine code remains MIT; see [`LICENSE`](LICENSE) and
 [`FORK.md`](FORK.md).
+
+Third-party components and their licences (affinity MIT; Lucebox Apache-2.0 with the exact ported
+sites; stb_image dual MIT/public-domain) are listed in [`THIRD_PARTY.md`](THIRD_PARTY.md).
