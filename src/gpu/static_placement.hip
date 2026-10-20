@@ -13,6 +13,7 @@
 #include "engine/ops.h"
 #include "engine/route_trace.h"
 #include "engine/threadpool.h"
+#include "quant/imatrix.h"
 
 #include "ui/log.h"
 #include <algorithm>
@@ -28,6 +29,35 @@
 #include <unistd.h>
 
 namespace aff {
+
+namespace {
+// V4.1 (40 layers x 384 experts) protected massive/outlier experts (from Lucebox
+// share/deepseek41/massive_experts.json). Always admitted to primary VRAM at load and never
+// demoted by the placement engine.
+bool is_v41_massive_expert(uint32_t n_layer, uint32_t n_expert, uint32_t idx) {
+  if (n_layer != 40u || n_expert != 384u) return false;
+  static constexpr uint16_t kMassive[74][2] = {
+    {0, 79}, {1, 382}, {2, 222}, {8, 237}, {10, 102}, {14, 199}, {15, 355}, {16, 3},
+    {17, 311}, {18, 350}, {19, 370}, {20, 180}, {21, 320}, {22, 121}, {23, 268}, {24, 339},
+    {25, 244}, {26, 157}, {26, 170}, {27, 223}, {28, 7}, {29, 243}, {30, 50}, {31, 280},
+    {31, 370}, {33, 332}, {34, 344}, {35, 316}, {35, 364}, {36, 7}, {36, 53}, {36, 335},
+    {36, 370}, {37, 123}, {37, 127}, {37, 224}, {37, 288}, {37, 290}, {38, 67}, {38, 100},
+    {38, 121}, {38, 173}, {38, 222}, {38, 239}, {38, 250}, {38, 383}, {39, 4}, {39, 7},
+    {39, 12}, {39, 13}, {39, 33}, {39, 62}, {39, 82}, {39, 83}, {39, 87}, {39, 92},
+    {39, 103}, {39, 105}, {39, 118}, {39, 119}, {39, 139}, {39, 178}, {39, 180}, {39, 182},
+    {39, 188}, {39, 190}, {39, 229}, {39, 269}, {39, 307}, {39, 312}, {39, 318}, {39, 331},
+    {39, 350}, {39, 351}
+  };
+  static constexpr uint16_t kMassiveTail[5][2] = {
+    {39, 356}, {39, 359}, {39, 366}, {39, 375}, {39, 378}
+  };
+  const uint32_t l = idx / 384u, e = idx % 384u;
+  if (l == 39u && e == 382u) return true;
+  for (const auto& p : kMassive) if (p[0] == l && p[1] == e) return true;
+  for (const auto& p : kMassiveTail) if (p[0] == l && p[1] == e) return true;
+  return false;
+}
+} // namespace
 
 struct StaticPlacement::Impl {
   // One big slab per card rather than 7000 small allocations: the expert stride is uniform, so a
@@ -159,8 +189,14 @@ StaticPlacement::~StaticPlacement() {
   plc_.clear();
   for (size_t i = 0; i < devs_.size() && i < 8; ++i) {
     (void)hipSetDevice(devs_[i]);
-    for (void* p : {(void*)plan_col_[i], (void*)plan_cnt_[i], (void*)plan_st_[i]})
+    for (void* p : {(void*)plan_col_[i], (void*)plan_cnt_[i], (void*)plan_st_[i], (void*)d_imat_w2_[i]})
       if (p) (void)hipFree(p);
+    d_imat_w2_[i] = nullptr;
+  }
+  if (!devs_.empty()) {
+    (void)hipSetDevice(devs_[0]);
+    if (d_imat_w13_) { (void)hipFree(d_imat_w13_); d_imat_w13_ = nullptr; }
+    if (d_imat_cnt_) { (void)hipFree(d_imat_cnt_); d_imat_cnt_ = nullptr; }
   }
   if (pool_registered_ && pool_ && pool_->base())
     (void)hipHostUnregister(const_cast<uint8_t*>(pool_->base()));
@@ -909,9 +945,12 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   const float* prof = aff->profile();
   std::vector<uint32_t> order((size_t)n_layer * n_expert);
   std::iota(order.begin(), order.end(), 0u);
-  if (prof)
-    std::stable_sort(order.begin(), order.end(),
-                     [&](uint32_t a, uint32_t b) { return prof[a] > prof[b]; });
+  std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+    const bool ma = is_v41_massive_expert(n_layer, n_expert, a);
+    const bool mb = is_v41_massive_expert(n_layer, n_expert, b);
+    if (ma != mb) return ma > mb;
+    return prof ? (prof[a] > prof[b]) : (a < b);
+  });
 
   const uint64_t n_resident = std::min<uint64_t>(total_slots, order.size());
 
@@ -1344,6 +1383,47 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
   (void)nb_tok;
   return true;
 }
+
+namespace {
+__global__ __launch_bounds__(256) void imatrix_accum_x_kernel(
+    const uint32_t* __restrict__ sel, const uint32_t* __restrict__ slot_col,
+    const float* __restrict__ d_x, uint32_t nb_tok, uint32_t k, uint32_t n_expert,
+    uint32_t hidden, uint32_t nb_stride, float* __restrict__ sum2, float* __restrict__ counts) {
+  const uint32_t s = blockIdx.x;
+  if (s >= nb_tok * k) return;
+  const uint32_t e = sel[s];
+  const uint32_t col = slot_col[s];
+  if (e >= n_expert || col == 0xFFFFFFFFu) return;
+  if (threadIdx.x == 0) atomicAdd(&counts[e], 1.0f);
+  const uint32_t t = s / k;
+  float* dst = sum2 + (size_t)e * hidden;
+  for (uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+    const float v = d_x[(size_t)i * nb_stride + t];
+    atomicAdd(&dst[i], v * v);
+  }
+}
+
+__global__ __launch_bounds__(256) void imatrix_accum_swiglu_kernel(
+    const uint32_t* __restrict__ sel, const uint32_t* __restrict__ slot_col,
+    const uint16_t* __restrict__ bg, const uint16_t* __restrict__ bu,
+    uint32_t nb_tok, uint32_t k, uint32_t n_expert, uint32_t inter, uint32_t taken,
+    float limit, float* __restrict__ sum2_half) {
+  const uint32_t s = blockIdx.x;
+  if (s >= nb_tok * k) return;
+  const uint32_t e = sel[s];
+  const uint32_t col = slot_col[s];
+  if (e >= n_expert || col >= taken) return;
+  float* dst = sum2_half + (size_t)e * inter;
+  for (uint32_t i = threadIdx.x; i < inter; i += blockDim.x) {
+    const size_t o = (size_t)i * taken + col;
+    float gv = __uint_as_float((uint32_t)bg[o] << 16);
+    float uv = __uint_as_float((uint32_t)bu[o] << 16);
+    if (limit > 0.0f) { gv = fminf(gv, limit); uv = fminf(limit, fmaxf(-limit, uv)); }
+    const float v = (gv / (1.0f + expf(-gv))) * uv;
+    atomicAdd(&dst[i], v * v);
+  }
+}
+} // namespace
 
 uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, const float* w,
                                            uint32_t nb_tok, uint32_t k, const float* const* d_x,
@@ -1852,6 +1932,13 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       // stream — the DSpark draft's, whose experts are all resident — skips the block in init() that
       // sizes them, and indexing an empty vector here segfaulted inside the draft.
       const uint32_t es = split ? (uint32_t)(I.ev_seq[dv]++ % Impl::kEvSlots) : 0u;
+      if (imat_on_ && route_tag_ == 'D' && plan_on && dv == 0 && d_imat_w13_ && d_imat_cnt_) {
+        hipLaunchKernelGGL(imatrix_accum_x_kernel, dim3(nb_tok * k), dim3(256), 0, st,
+                           route[0].sel, plan_col_[0], d_x[0], nb_tok, k, n_expert_, hidden,
+                           nb_stride, d_imat_w13_ + (size_t)layer * n_expert_ * hidden,
+                           d_imat_cnt_ + (size_t)layer * n_expert_);
+        AFF_HIP_CHECK(hipGetLastError());
+      }
       { AFF_XTRACE((int)dv, 2, st);
       batch_quant_fp8_hip(d_x[dv], (uint8_t*)bq8_[dv], (float*)bqs_[dv], hidden, nb_stride, 0, st); }
       if (split) {
@@ -1890,6 +1977,13 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       expert_swiglu_quant_hip((const uint16_t*)bg_[dv], (const uint16_t*)bu_[dv],
                               (const float*)bwt_[dv], (uint8_t*)ba8_[dv], (float*)bas_[dv], inter,
                               taken, limit, st); }
+      if (imat_on_ && route_tag_ == 'D' && plan_on && dv < 8 && d_imat_w2_[dv]) {
+        hipLaunchKernelGGL(imatrix_accum_swiglu_kernel, dim3(nb_tok * k), dim3(256), 0, st,
+                           route[dv].sel, plan_col_[dv], (const uint16_t*)bg_[dv],
+                           (const uint16_t*)bu_[dv], nb_tok, k, n_expert_, inter, taken, limit,
+                           d_imat_w2_[dv] + (size_t)layer * n_expert_ * inter);
+        AFF_HIP_CHECK(hipGetLastError());
+      }
       if (split) {
         AFF_HIP_CHECK(hipEventRecord(I.ev_sw[dv][es], st));
         AFF_HIP_CHECK(hipStreamWaitEvent(hyb, I.ev_sw[dv][es], 0));
@@ -2019,6 +2113,7 @@ bool StaticPlacement::placement_engine_init(HostExpertPool* pool,
   for (uint32_t l = 0; l < n_layer_; ++l)
     for (uint32_t e = 0; e < n_expert_; ++e) {
       const uint32_t idx = l * n_expert_ + e;
+      if (is_v41_massive_expert(n_layer_, n_expert_, idx)) heat_.set_protected(idx, true);
       if (device_of_[idx] >= 0) { heat_.set_tier(idx, ExpertTier::Vram); ++resident_now_; }
       else if (pool->slot_of(l, e) >= 0) { heat_.set_tier(idx, ExpertTier::Pool); ++pooled; }
       else { heat_.set_tier(idx, ExpertTier::Ssd); ++ssd; }
@@ -2694,4 +2789,237 @@ uint64_t aff::StaticPlacement::digest_invariants(std::vector<std::pair<std::stri
   }
   (void)hipSetDevice(prev);
   return total;
+}
+
+bool aff::StaticPlacement::imatrix_init(uint32_t hidden, uint32_t inter_full,
+                                        const std::string& in_path, std::string* err) {
+  if (!enabled_ || devs_.empty()) {
+    if (err) *err = "placement not enabled";
+    return false;
+  }
+  imat_hidden_ = hidden;
+  imat_inter_full_ = inter_full;
+  imat_inter_shard_ = shard_inter(inter_full);
+  const size_t n_le = (size_t)n_layer_ * n_expert_;
+  h_imat_w13_.assign(n_le * hidden, 0.0);
+  h_imat_w2_.assign(n_le * inter_full, 0.0);
+  h_imat_cnt_.assign(n_le, 0.0);
+  imat_loaded_chunks_ = 0;
+
+  if (!in_path.empty()) {
+    ImatrixFile im;
+    std::string ierr;
+    if (!im.open(in_path, &ierr)) {
+      if (err) *err = "imatrix-in " + in_path + ": " + ierr;
+      return false;
+    }
+    imat_loaded_chunks_ = im.chunk_count();
+    for (uint32_t l = 0; l < n_layer_; ++l) {
+      const ImatrixEntry* e1 = im.find(ImatrixFile::gguf_name_for_expert(l, "w1"));
+      const ImatrixEntry* e2 = im.find(ImatrixFile::gguf_name_for_expert(l, "w2"));
+      if (e1 && e1->sum2 && e1->counts && e1->cols == hidden && e1->n_expert == n_expert_) {
+        for (uint32_t ex = 0; ex < n_expert_; ++ex) {
+          h_imat_cnt_[(size_t)l * n_expert_ + ex] = (double)e1->counts[ex];
+          const float* s = e1->sum2 + (size_t)ex * hidden;
+          double* d = h_imat_w13_.data() + ((size_t)l * n_expert_ + ex) * hidden;
+          for (uint32_t c = 0; c < hidden; ++c) d[c] = (double)s[c];
+        }
+      }
+      if (e2 && e2->sum2 && e2->cols == inter_full && e2->n_expert == n_expert_) {
+        for (uint32_t ex = 0; ex < n_expert_; ++ex) {
+          const float* s = e2->sum2 + (size_t)ex * inter_full;
+          double* d = h_imat_w2_.data() + ((size_t)l * n_expert_ + ex) * inter_full;
+          for (uint32_t c = 0; c < inter_full; ++c) d[c] = (double)s[c];
+        }
+      }
+    }
+  }
+
+  int prev = 0;
+  (void)hipGetDevice(&prev);
+  (void)hipSetDevice(devs_[0]);
+  const size_t b_w13 = n_le * hidden * sizeof(float);
+  const size_t b_cnt = n_le * sizeof(float);
+  if (hipMalloc(&d_imat_w13_, b_w13) != hipSuccess ||
+      hipMalloc(&d_imat_cnt_, b_cnt) != hipSuccess) {
+    (void)hipSetDevice(prev);
+    if (err) *err = "hipMalloc failed for d_imat_w13 / d_imat_cnt on card 0";
+    return false;
+  }
+  (void)hipMemset(d_imat_w13_, 0, b_w13);
+  (void)hipMemset(d_imat_cnt_, 0, b_cnt);
+
+  const size_t b_w2 = n_le * imat_inter_shard_ * sizeof(float);
+  for (size_t dv = 0; dv < devs_.size() && dv < 8; ++dv) {
+    (void)hipSetDevice(devs_[dv]);
+    if (hipMalloc(&d_imat_w2_[dv], b_w2) != hipSuccess) {
+      (void)hipSetDevice(prev);
+      if (err) *err = "hipMalloc failed for d_imat_w2 on card " + std::to_string(dv);
+      return false;
+    }
+    (void)hipMemset(d_imat_w2_[dv], 0, b_w2);
+  }
+  (void)hipSetDevice(prev);
+  imat_on_ = true;
+  return true;
+}
+
+void aff::StaticPlacement::imatrix_flush_chunk() {
+  if (!imat_on_ || devs_.empty()) return;
+  int prev = 0;
+  (void)hipGetDevice(&prev);
+  const size_t n_le = (size_t)n_layer_ * n_expert_;
+  std::vector<float> tmp_w13(n_le * imat_hidden_);
+  std::vector<float> tmp_cnt(n_le);
+  (void)hipSetDevice(devs_[0]);
+  (void)hipDeviceSynchronize();
+  (void)hipMemcpy(tmp_w13.data(), d_imat_w13_, tmp_w13.size() * sizeof(float), hipMemcpyDeviceToHost);
+  (void)hipMemcpy(tmp_cnt.data(), d_imat_cnt_, tmp_cnt.size() * sizeof(float), hipMemcpyDeviceToHost);
+  (void)hipMemset(d_imat_w13_, 0, tmp_w13.size() * sizeof(float));
+  (void)hipMemset(d_imat_cnt_, 0, tmp_cnt.size() * sizeof(float));
+  for (size_t i = 0; i < tmp_w13.size(); ++i) h_imat_w13_[i] += (double)tmp_w13[i];
+  for (size_t i = 0; i < tmp_cnt.size(); ++i) h_imat_cnt_[i] += (double)tmp_cnt[i];
+
+  std::vector<float> tmp_w2(n_le * imat_inter_shard_);
+  for (size_t dv = 0; dv < devs_.size() && dv < 8; ++dv) {
+    (void)hipSetDevice(devs_[dv]);
+    (void)hipDeviceSynchronize();
+    (void)hipMemcpy(tmp_w2.data(), d_imat_w2_[dv], tmp_w2.size() * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemset(d_imat_w2_[dv], 0, tmp_w2.size() * sizeof(float));
+    const size_t col0 = dv * imat_inter_shard_;
+    for (size_t le = 0; le < n_le; ++le) {
+      const float* src = tmp_w2.data() + le * imat_inter_shard_;
+      double* dst = h_imat_w2_.data() + le * imat_inter_full_ + col0;
+      for (uint32_t c = 0; c < imat_inter_shard_; ++c) dst[c] += (double)src[c];
+    }
+  }
+  (void)hipSetDevice(prev);
+}
+
+bool aff::StaticPlacement::imatrix_save_gguf(const std::string& path, const std::string& dataset,
+                                             uint32_t chunk_count, uint32_t chunk_size,
+                                             std::string* err) const {
+  if (!imat_on_) {
+    if (err) *err = "imatrix not initialized";
+    return false;
+  }
+  const std::string tmp = path + ".tmp";
+  std::FILE* f = std::fopen(tmp.c_str(), "wb");
+  if (!f) {
+    if (err) *err = "cannot open " + tmp + " for write";
+    return false;
+  }
+  auto wr = [&](const void* p, size_t n) -> bool { return std::fwrite(p, 1, n, f) == n; };
+  auto u32 = [&](uint32_t v) -> bool { return wr(&v, 4); };
+  auto u64 = [&](uint64_t v) -> bool { return wr(&v, 8); };
+  auto wstr = [&](const std::string& s) -> bool {
+    return u64((uint64_t)s.size()) && (s.empty() || wr(s.data(), s.size()));
+  };
+
+  const uint64_t ntensor = (uint64_t)n_layer_ * 6ull;
+  const uint64_t nkv = 4ull;
+  if (!wr("GGUF", 4) || !u32(3u) || !u64(ntensor) || !u64(nkv)) {
+    std::fclose(f); return false;
+  }
+  // KV 1: general.alignment = 32 (GT_U32 = 4)
+  if (!wstr("general.alignment") || !u32(4u) || !u32(32u)) { std::fclose(f); return false; }
+  // KV 2: imatrix.chunk_count (GT_U32 = 4)
+  if (!wstr("imatrix.chunk_count") || !u32(4u) || !u32(chunk_count)) { std::fclose(f); return false; }
+  // KV 3: imatrix.chunk_size (GT_U32 = 4)
+  if (!wstr("imatrix.chunk_size") || !u32(4u) || !u32(chunk_size)) { std::fclose(f); return false; }
+  // KV 4: imatrix.datasets (GT_ARR = 9, elem GT_STR = 8, count = 1)
+  if (!wstr("imatrix.datasets") || !u32(9u) || !u32(8u) || !u64(1ull) || !wstr(dataset)) {
+    std::fclose(f); return false;
+  }
+
+  struct TDesc {
+    std::string name;
+    uint64_t d0, d1;
+    uint64_t bytes;
+    uint64_t off;
+    int kind; // 0=w13_sum2, 1=w2_sum2, 2=counts
+    uint32_t layer;
+  };
+  std::vector<TDesc> tds;
+  tds.reserve(ntensor);
+  uint64_t cur_off = 0;
+  auto align32 = [](uint64_t x) { return (x + 31ull) & ~31ull; };
+
+  const char* names[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+  for (uint32_t l = 0; l < n_layer_; ++l) {
+    for (int m = 0; m < 3; ++m) {
+      const std::string base = "blk." + std::to_string(l) + "." + names[m] + ".weight";
+      const uint64_t cols = (m < 2) ? imat_hidden_ : imat_inter_full_;
+      {
+        TDesc t;
+        t.name = base + ".in_sum2";
+        t.d0 = cols;
+        t.d1 = n_expert_;
+        t.bytes = cols * n_expert_ * sizeof(float);
+        cur_off = align32(cur_off);
+        t.off = cur_off;
+        cur_off += t.bytes;
+        t.kind = (m < 2) ? 0 : 1;
+        t.layer = l;
+        tds.push_back(std::move(t));
+      }
+      {
+        TDesc t;
+        t.name = base + ".counts";
+        t.d0 = 1;
+        t.d1 = n_expert_;
+        t.bytes = (uint64_t)n_expert_ * sizeof(float);
+        cur_off = align32(cur_off);
+        t.off = cur_off;
+        cur_off += t.bytes;
+        t.kind = 2;
+        t.layer = l;
+        tds.push_back(std::move(t));
+      }
+    }
+  }
+
+  for (const TDesc& t : tds) {
+    if (!wstr(t.name) || !u32(2u) || !u64(t.d0) || !u64(t.d1) || !u32(0u) || !u64(t.off)) {
+      std::fclose(f); return false;
+    }
+  }
+
+  const long pos = std::ftell(f);
+  if (pos < 0) { std::fclose(f); return false; }
+  const uint64_t data_start = align32((uint64_t)pos);
+  const uint8_t zero[32] = {};
+  if (data_start > (uint64_t)pos && !wr(zero, (size_t)(data_start - (uint64_t)pos))) {
+    std::fclose(f); return false;
+  }
+
+  std::vector<float> fbuf;
+  uint64_t written = 0;
+  for (const TDesc& t : tds) {
+    if (t.off > written) {
+      if (!wr(zero, (size_t)(t.off - written))) { std::fclose(f); return false; }
+      written = t.off;
+    }
+    const size_t n_elem = (size_t)(t.d0 * t.d1);
+    fbuf.resize(n_elem);
+    if (t.kind == 0) {
+      const double* src = h_imat_w13_.data() + (size_t)t.layer * n_expert_ * imat_hidden_;
+      for (size_t i = 0; i < n_elem; ++i) fbuf[i] = (float)src[i];
+    } else if (t.kind == 1) {
+      const double* src = h_imat_w2_.data() + (size_t)t.layer * n_expert_ * imat_inter_full_;
+      for (size_t i = 0; i < n_elem; ++i) fbuf[i] = (float)src[i];
+    } else {
+      const double* src = h_imat_cnt_.data() + (size_t)t.layer * n_expert_;
+      for (size_t i = 0; i < n_elem; ++i) fbuf[i] = (float)src[i];
+    }
+    if (!wr(fbuf.data(), t.bytes)) { std::fclose(f); return false; }
+    written += t.bytes;
+  }
+  std::fflush(f);
+  std::fclose(f);
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (err) *err = "rename " + tmp + " -> " + path + " failed";
+    return false;
+  }
+  return true;
 }

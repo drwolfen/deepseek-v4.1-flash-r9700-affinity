@@ -154,7 +154,7 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
                           uint32_t sliding, uint32_t ring, uint32_t n_comp_max, uint32_t max_comp,
                           uint32_t n_head, uint32_t width, uint32_t n_rot, float scale,
                           void* stream, bool q_bf16 = false, uint32_t flat_n = 0,
-                          uint32_t flat_raw0 = 0);
+                          uint32_t flat_raw0 = 0, uint32_t raw_floor = 0);
 
 // QAT + f16 round + cache encode for `n` consecutive tokens, one block per token, ONE launch.
 // `kv` is the chunk's DIM-MAJOR [width][nb] latent buffer; token `b0 + t` goes to ring slot

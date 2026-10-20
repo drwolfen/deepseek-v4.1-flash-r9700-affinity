@@ -105,6 +105,8 @@ public:
   void set_tier(uint32_t idx, ExpertTier t);
   ExpertTier tier(uint32_t idx) const { return tier_[idx]; }
   void set_busy(uint32_t idx, bool b) { busy_[idx] = b ? 1u : 0u; }
+  void set_protected(uint32_t idx, bool p) { if (idx < protected_.size()) protected_[idx] = p ? 1u : 0u; }
+  bool is_protected(uint32_t idx) const { return idx < protected_.size() && protected_[idx] != 0; }
 
   // One layer dispatch: decay that layer's plane, then credit the DISTINCT experts it selected.
   // Distinct, not per slot — the dispatch reads an expert's weights once however many of the block's
@@ -175,6 +177,7 @@ private:
   std::vector<float> heat_;
   std::vector<ExpertTier> tier_;
   std::vector<uint8_t> busy_;
+  std::vector<uint8_t> protected_;
   // ---- THE TIE-BREAK, and it is not cosmetic ---------------------------------------------------
   //
   // Most resident experts are cold — the resident set answers a far smaller share of activations

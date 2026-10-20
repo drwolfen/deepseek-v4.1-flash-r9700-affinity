@@ -392,7 +392,7 @@ void batch_column_bf16_hip(const uint16_t* src, float* dst, uint32_t n, uint32_t
 void router_topk_hip(const float* logits, const float* bias, const uint8_t* resident,
                      uint32_t* sel, float* wt, uint32_t* nsel, uint32_t n_expert, uint32_t nb,
                      uint32_t live, uint32_t k, int norm_topk_prob, float routed_scaling,
-                     void* stream);
+                     void* stream, float res_bias = 0.0f);
 
 // The WEIGHTING half of the router, for a selection somebody else already made.
 //

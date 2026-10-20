@@ -13,6 +13,7 @@ void ExpertHeat::init(uint32_t n_layer, uint32_t n_expert, const HeatParams& p) 
   heat_.assign(n, 0.0f);
   tier_.assign(n, ExpertTier::Ssd);
   busy_.assign(n, 0u);
+  protected_.assign(n, 0u);
   res_count_.assign(n_layer, 0u);
   demand_.clear();
   demand_.reserve(n_expert);
@@ -63,7 +64,7 @@ bool ExpertHeat::pick(uint32_t* promote, uint32_t* demote) const {
       if (hot == UINT32_MAX || h > hot_h || (h == hot_h && rc < hot_res)) {
         hot = (uint32_t)i; hot_h = h; hot_res = rc;
       }
-    } else if (tier_[i] == ExpertTier::Vram) {
+    } else if (tier_[i] == ExpertTier::Vram && !protected_[i]) {
       // Colder wins; on an exact tie, take from the layer holding the MOST, which is the one that
       // can spare it. Both halves of this are the same statement about where capacity should sit.
       if (cold == UINT32_MAX || h < cold_h || (h == cold_h && rc > cold_res)) {
@@ -109,7 +110,7 @@ bool ExpertHeat::pick_demand(uint32_t* promote, uint32_t* demote) {
     uint32_t cold = UINT32_MAX, cold_res = 0;
     float cold_h = 0.0f;
     for (size_t i = 0; i < n; ++i) {
-      if (busy_[i] || tier_[i] != ExpertTier::Vram) continue;
+      if (busy_[i] || protected_[i] || tier_[i] != ExpertTier::Vram) continue;
       const float h = heat_[i];
       const uint32_t rc = res_count_[i / n_expert_];
       // Identical to `pick`'s victim half, tie-break included: on an exact tie take from the layer

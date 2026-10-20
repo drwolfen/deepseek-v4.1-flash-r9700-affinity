@@ -2994,7 +2994,7 @@ __global__ __launch_bounds__(256) void router_topk_kernel(
     const float* __restrict__ logits, const float* __restrict__ bias,
     const uint8_t* __restrict__ resident, uint32_t* __restrict__ sel, float* __restrict__ wt,
     uint32_t* __restrict__ nsel, uint32_t n_expert, uint32_t nb, uint32_t k, int norm_topk_prob,
-    float routed_scaling) {
+    float routed_scaling, float res_bias) {
 
   extern __shared__ float s_rt[];                 // [n_expert] score, [n_expert] selection value
   float* s_score = s_rt;
@@ -3003,20 +3003,62 @@ __global__ __launch_bounds__(256) void router_topk_kernel(
   __shared__ uint32_t r_idx[256];
   __shared__ uint32_t s_best[kTopKMax];
   __shared__ float s_bscore[kTopKMax];
+  __shared__ uint32_t s_has_prot;
 
   const uint32_t b = blockIdx.x;
   const uint32_t tid = threadIdx.x;
   const float NEG = -3.0e38f;
 
-  for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
-    const float x = logits[(size_t)e * nb + b];
-    // sqrtsoftplus, with the same large-x guard the host uses. log1pf/expf, not the fast intrinsic:
-    // this feeds a discrete choice.
-    const float sp = (x > 20.0f) ? x : log1pf(expf(x));
-    const float sc = sqrtf(sp);
-    s_score[e] = sc;
-    const bool live = !resident || resident[e];
-    s_sel[e] = live ? sc + (bias ? bias[e] : 0.0f) : NEG;
+  // Soft residency bias (res_bias > 0) with protected-expert guard:
+  // resident[e] bit 0 = VRAM resident, bit 1 = protected massive expert.
+  // If any unbiased top-k pick is a protected expert, keep the unbiased top-k; otherwise add
+  // +res_bias to VRAM-resident experts during selection while preserving unbiased s_score for
+  // mixing weights.
+  if (res_bias > 0.0f && resident) {
+    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+      const float x = logits[(size_t)e * nb + b];
+      const float sp = (x > 20.0f) ? x : log1pf(expf(x));
+      const float sc = sqrtf(sp);
+      s_score[e] = sc;
+      s_sel[e] = sc + (bias ? bias[e] : 0.0f);
+    }
+    if (tid == 0) s_has_prot = 0u;
+    __syncthreads();
+    for (uint32_t r = 0; r < k; ++r) {
+      float bv = NEG; uint32_t bi = 0xFFFFFFFFu;
+      for (uint32_t e = tid; e < n_expert; e += blockDim.x)
+        if (s_sel[e] != NEG && topk_better(s_sel[e], e, bv, bi)) { bv = s_sel[e]; bi = e; }
+      r_val[tid] = bv; r_idx[tid] = bi;
+      __syncthreads();
+      for (uint32_t o = blockDim.x >> 1; o; o >>= 1) {
+        if (tid < o && r_idx[tid + o] != 0xFFFFFFFFu &&
+            topk_better(r_val[tid + o], r_idx[tid + o], r_val[tid], r_idx[tid]))
+          { r_val[tid] = r_val[tid + o]; r_idx[tid] = r_idx[tid + o]; }
+        __syncthreads();
+      }
+      if (r_idx[0] == 0xFFFFFFFFu) break;
+      if (tid == 0) {
+        if (resident[r_idx[0]] & 2u) s_has_prot = 1u;
+        s_sel[r_idx[0]] = NEG;
+      }
+      __syncthreads();
+    }
+    const float eff_bias = s_has_prot ? 0.0f : res_bias;
+    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+      const float bonus = (resident[e] & 1u) ? eff_bias : 0.0f;
+      s_sel[e] = s_score[e] + (bias ? bias[e] : 0.0f) + bonus;
+    }
+  } else {
+    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+      const float x = logits[(size_t)e * nb + b];
+      // sqrtsoftplus, with the same large-x guard the host uses. log1pf/expf, not the fast intrinsic:
+      // this feeds a discrete choice.
+      const float sp = (x > 20.0f) ? x : log1pf(expf(x));
+      const float sc = sqrtf(sp);
+      s_score[e] = sc;
+      const bool live = !resident || resident[e];
+      s_sel[e] = live ? sc + (bias ? bias[e] : 0.0f) : NEG;
+    }
   }
   __syncthreads();
 
@@ -3100,12 +3142,12 @@ void router_hash_wt_hip(const float* logits, const uint32_t* sel, const uint32_t
 void router_topk_hip(const float* logits, const float* bias, const uint8_t* resident,
                      uint32_t* sel, float* wt, uint32_t* nsel, uint32_t n_expert, uint32_t nb,
                      uint32_t live, uint32_t k, int norm_topk_prob, float routed_scaling,
-                     void* stream) {
+                     void* stream, float res_bias) {
   if (!live || !n_expert || !k || k > kTopKMax) return;
   const size_t lds = (size_t)n_expert * 2 * sizeof(float);
   hipLaunchKernelGGL(router_topk_kernel, dim3(live), dim3(256), lds, (hipStream_t)stream, logits,
                      bias, resident, sel, wt, nsel, n_expert, nb, k, norm_topk_prob,
-                     routed_scaling);
+                     routed_scaling, res_bias);
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -3182,7 +3224,7 @@ __global__ void dspark_confidence_kernel(const float* __restrict__ cw,
     if (threadIdx.x < o) s[threadIdx.x] += s[threadIdx.x + o];
     __syncthreads();
   }
-  if (!threadIdx.x) out[b] = s[0];
+  if (!threadIdx.x) out[b] = 1.0f / (1.0f + __expf(-s[0]));
 }
 
 void dspark_confidence_hip(const float* cw, const uint16_t* w1, const float* hidden_dm,

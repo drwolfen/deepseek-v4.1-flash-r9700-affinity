@@ -350,7 +350,23 @@ public:
   // container, and an untagged trace merges them with the target's layers 0-2. See route_trace.h.
   void set_route_trace_tag(char t) { route_tag_ = t; }
 
+  // ---- IMATRIX PRODUCER: per-(layer, expert) E[x_j^2] and E[swiglu_j^2] + counts ----------------
+  bool imatrix_init(uint32_t hidden, uint32_t inter_full, const std::string& in_path, std::string* err);
+  void imatrix_flush_chunk();
+  bool imatrix_save_gguf(const std::string& path, const std::string& dataset,
+                         uint32_t chunk_count, uint32_t chunk_size, std::string* err) const;
+  uint32_t imatrix_loaded_chunks() const { return imat_loaded_chunks_; }
+
 private:
+  bool imat_on_ = false;
+  uint32_t imat_hidden_ = 0, imat_inter_full_ = 0, imat_inter_shard_ = 0;
+  uint32_t imat_loaded_chunks_ = 0;
+  float* d_imat_w13_ = nullptr;
+  float* d_imat_cnt_ = nullptr;
+  float* d_imat_w2_[8] = {};
+  std::vector<double> h_imat_w13_;
+  std::vector<double> h_imat_w2_;
+  std::vector<double> h_imat_cnt_;
   const AffReader* aff_ = nullptr;
   Codebook cb_;
   bool enabled_ = false;
