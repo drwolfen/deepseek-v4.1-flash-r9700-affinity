@@ -31,7 +31,8 @@ poisoned before).
 | `a4f1fec` | engine: clear the compressor/indexer history rings on every sequence reset |
 | `1f00675` | gpu: check every kernel launch (`hipGetLastError`) |
 | `6dc42ae` | placement: swallowed HIP failures in the slab load are fatal (upstream PR #5) |
-| `772f76f` | server: braces inside strings no longer split the message list (upstream PR #3). Before it, a tool result with an unbalanced `{` silently dropped every later message, and agents looped |
+| `df8dc70` | server: braces inside strings no longer split the message list (upstream PR #3). Before it, a tool result with an unbalanced `{` silently dropped every later message, and agents looped |
+| `ee62896` | server: SSE `: keep-alive` comments while a tool call is withheld. Tool calls are sent in one chunk once complete, so a long one (a ~10K-token `write`) streamed nothing for >300 s and Node's `fetch` (undici body timeout, 300 s) aborted the turn (`terminated`) while the engine was still generating it. Verified on a real agent run: a 10,091-token `write` generated silently for ~308 s arrived intact |
 | `9585712`, `921ca87`, `f369a38`, `a12ee7b`, `a473c28` | opt-in verifiers: `AFF_MALLOC_TRACE`, `AFF_WEIGHT_VERIFY`, `AFF_PLC_VERIFY`, `AFF_MOVE_VERIFY` |
 
 The first five are also offered upstream on Codeberg (issue #6, PRs #7–#11).
@@ -137,6 +138,12 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt label=disable
 ```
 
 - `--security-opt label=disable` is required on SELinux hosts, or the model read is denied.
+- Two cards need working GPU peer access (P2P), because the all-reduce writes straight into the other card's memory. If the
+  driver refuses peer access, the server stops at startup and names the pair. The worse case is a platform that grants
+  it and then fails under load. One user reported a hard reset on the first request with two R9700s behind a PCIe switch
+  on an EPYC Milan board (reset reason `0x08000800`, "data fabric sync flood"). Not reproduced here, where both cards
+  sit on CPU root ports of an AM5 (X670E) board. If the first request crashes or resets the machine, move the cards to
+  CPU-attached slots or run one card with `--gpus 1`.
 - `--kv-commit` equal to `--kv-size` backs the whole context at load. Growing it mid-request instead comes out of
   the small driver reserve.
 - Thinking is on by default, and the server raises any request's `max_tokens` to at least 256,000 so reasoning
