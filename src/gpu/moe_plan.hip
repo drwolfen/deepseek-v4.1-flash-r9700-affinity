@@ -295,7 +295,12 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a) {
     const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
     const uint32_t q = c / kExpertWmmaTok, r = c % kExpertWmmaTok;
     const uint64_t pv = plc[e];
-    uint8_t* const base = (uint8_t*)(uintptr_t)(pv & ~1ull);
+    uint8_t* base = (uint8_t*)(uintptr_t)(pv & ~1ull);
+    if (cls == 1u && a.pref_slab && a.pref_src && (j - n_res) < a.pref_cap) {
+      const uint32_t pidx = j - n_res;
+      a.pref_src[pidx] = base;
+      base = a.pref_slab + (size_t)pidx * a.shard.stride;
+    }
     // gate, up, down for one tile, at the same index in each of the three planes. `grp` is the
     // (class, NT bucket) region — EIGHT of them, not two, because the bucket decides the template
     // the launch is instantiated for and the templates are not bit-identical to each other. A single
@@ -417,6 +422,35 @@ bool moe_plan_hip(const MoePlanArgs& a, void* stream) {
   if (lds > device_lds_per_block()) return false;
   hipLaunchKernelGGL(moe_plan_kernel, dim3(1), dim3(kPlanThreads), lds, (hipStream_t)stream, a);
   return hipGetLastError() == hipSuccess;   // amdnas-fixes: an unbuilt plan must not be dispatched
+}
+
+__global__ __launch_bounds__(256) void moe_prefetch_pack_kernel(
+    uint8_t* __restrict__ pref_slab, const uint8_t* const* __restrict__ pref_src,
+    const MoePlanStatus* __restrict__ status, uint32_t stride, uint32_t pref_cap) {
+  const uint32_t n_pool = status->n_uniq > status->n_res ? (status->n_uniq - status->n_res) : 0u;
+  const uint32_t n = n_pool < pref_cap ? n_pool : pref_cap;
+  const uint32_t pidx = blockIdx.y;
+  if (pidx >= n) return;
+  const uint8_t* __restrict__ src = pref_src[pidx];
+  if (!src) return;
+  uint8_t* __restrict__ dst = pref_slab + (size_t)pidx * stride;
+  const uint32_t n_vec = stride >> 4;
+  const uint4* __restrict__ s4 = reinterpret_cast<const uint4*>(src);
+  uint4* __restrict__ d4 = reinterpret_cast<uint4*>(dst);
+  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_vec;
+       i += gridDim.x * blockDim.x) {
+    d4[i] = s4[i];
+  }
+}
+
+void moe_prefetch_pack_hip(uint8_t* pref_slab, const uint8_t* const* pref_src,
+                           const MoePlanStatus* status, uint32_t stride, uint32_t pref_cap,
+                           void* stream) {
+  if (!pref_slab || !pref_src || !status || !stride || !pref_cap) return;
+  const uint32_t gx = std::min<uint32_t>(128u, ((stride >> 4) + 255u) / 256u);
+  hipLaunchKernelGGL(moe_prefetch_pack_kernel, dim3(gx, pref_cap), dim3(256), 0,
+                     (hipStream_t)stream, pref_slab, pref_src, status, stride, pref_cap);
+  AFF_HIP_CHECK(hipGetLastError());
 }
 
 } // namespace aff

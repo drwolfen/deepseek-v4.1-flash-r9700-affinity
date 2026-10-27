@@ -547,6 +547,9 @@ private:
   uint32_t* plan_col_[8] = {}; uint32_t plan_col_n_[8] = {};
   uint32_t* plan_cnt_[8] = {};
   struct MoePlanStatus* plan_st_[8] = {};
+  uint8_t* d_pref_slab_[8] = {};
+  const uint8_t** d_pref_src_[8] = {};
+  uint32_t pref_cap_ = 0;
   uint64_t plan_calls_ = 0, plan_bad_ = 0, plan_over_ = 0;
   uint64_t plan_dispatch_ = 0, host_dispatch_ = 0;
 public:

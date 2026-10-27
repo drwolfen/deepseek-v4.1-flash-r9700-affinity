@@ -170,6 +170,11 @@ struct MoePlanArgs {
   uint16_t* bu = nullptr;
   uint16_t* bydn = nullptr;
   uint32_t tile_cap = 0;              // per-class capacity; see moe_plan_tile_cap
+
+  // Optional VRAM prefetch ring for pooled (cls == 1) experts (AFF_PREFETCH_RING=N).
+  uint8_t*        pref_slab = nullptr;
+  const uint8_t** pref_src  = nullptr;
+  uint32_t        pref_cap  = 0;
 };
 
 // One workgroup. `nb_tok` is handled in groups of 64 tokens, so decode is one group and a 1408-token
@@ -179,6 +184,12 @@ struct MoePlanArgs {
 // the LDS block over what the device gives a workgroup), in which case the caller keeps the host
 // pass. Refusing is deliberate: a silent fallback is how an A/B measures one arm twice.
 bool moe_plan_hip(const MoePlanArgs& a, void* stream);
+
+// Linear uint4 coalesced burst copy of pooled expert shards from `pref_src[i]` into
+// `pref_slab + i * stride` on `stream` (the hybrid stream).
+void moe_prefetch_pack_hip(uint8_t* pref_slab, const uint8_t* const* pref_src,
+                           const MoePlanStatus* status, uint32_t stride, uint32_t pref_cap,
+                           void* stream);
 
 // The dynamic LDS the kernel needs, so the caller can refuse before launching rather than after.
 size_t moe_plan_lds_bytes(uint32_t n_expert, uint32_t nb_tok);

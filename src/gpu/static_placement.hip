@@ -189,9 +189,12 @@ StaticPlacement::~StaticPlacement() {
   plc_.clear();
   for (size_t i = 0; i < devs_.size() && i < 8; ++i) {
     (void)hipSetDevice(devs_[i]);
-    for (void* p : {(void*)plan_col_[i], (void*)plan_cnt_[i], (void*)plan_st_[i], (void*)d_imat_w2_[i]})
+    for (void* p : {(void*)plan_col_[i], (void*)plan_cnt_[i], (void*)plan_st_[i],
+                    (void*)d_imat_w2_[i], (void*)d_pref_slab_[i], (void*)d_pref_src_[i]})
       if (p) (void)hipFree(p);
     d_imat_w2_[i] = nullptr;
+    d_pref_slab_[i] = nullptr;
+    d_pref_src_[i] = nullptr;
   }
   if (!devs_.empty()) {
     (void)hipSetDevice(devs_[0]);
@@ -888,6 +891,25 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     shard_ = ExpertShardLayout{};
   }
   const uint64_t slot_stride = this->slot_stride();
+
+  pref_cap_ = 0;
+  if (const char* pr = std::getenv("AFF_PREFETCH_RING"); pr && *pr) {
+    const int want_pref = std::atoi(pr);
+    if (want_pref > 0 && tp_parts_ > 1) {
+      pref_cap_ = std::min<uint32_t>((uint32_t)want_pref, 64u);
+      for (size_t i = 0; i < devs_.size() && i < 8; ++i) {
+        AFF_HIP_CHECK(hipSetDevice(devs_[i]));
+        if (hipMalloc((void**)&d_pref_slab_[i], (size_t)pref_cap_ * slot_stride) != hipSuccess ||
+            hipMalloc((void**)&d_pref_src_[i], (size_t)pref_cap_ * sizeof(uint8_t*)) != hipSuccess) {
+          pref_cap_ = 0;
+          break;
+        }
+      }
+      if (pref_cap_)
+        aff::ui::err("prefetch ring: %u slots/card (%.1f MiB/card) allocated on hybrid stream\n",
+                     pref_cap_, (double)pref_cap_ * (double)slot_stride / 1048576.0);
+    }
+  }
 
   std::vector<uint64_t> per_gpu(devs_.size(), 0);
   uint64_t total_slots = 0;
@@ -1736,6 +1758,9 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         A.shard = shard_;
         A.bg = (uint16_t*)bg_[dv]; A.bu = (uint16_t*)bu_[dv]; A.bydn = (uint16_t*)bydn_[dv];
         A.tile_cap = cap;
+        A.pref_slab = d_pref_slab_[dv];
+        A.pref_src  = d_pref_src_[dv];
+        A.pref_cap  = pref_cap_;
         if (!moe_plan_hip(A, st)) {
           aff::ui::fatal("fatal: the plan kernel refused nb_tok %u k %u experts %u on card "
                        "%zu\n", nb_tok, k, n_expert_, dv);
@@ -1954,6 +1979,10 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       // the host can name the base without seeing the routing — and this is the ONE place where
       // that has to stop mattering, because this is where the bits get computed.
       { AFF_XTRACE((int)dv, 8, hyb);
+      if (plan_on && pref_cap_ && d_pref_slab_[dv] && d_pref_src_[dv]) {
+        moe_prefetch_pack_hip(d_pref_slab_[dv], d_pref_src_[dv], plan_st_[dv],
+                              shard_.stride, pref_cap_, hyb);
+      }
       for (uint32_t b = 4; b < 8; ++b) {
         if (!GRP.n[b]) continue;
         expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], (const uint8_t*)bq8_[dv],
