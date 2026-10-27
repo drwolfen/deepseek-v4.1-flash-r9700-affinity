@@ -12,6 +12,7 @@
 #include "quant/source_dtypes.h"
 #include "quant/blockquant.h"
 #include "quant/imatrix.h"
+#include "quant/hadamard.h"
 
 #include <cstdio>
 #include <cstring>
@@ -242,7 +243,7 @@ int main(int argc, char** argv) {
   std::string cb_out, cb_raw, ex_dir, ex_from;
   int want_layers = -1, nthread = (int)std::thread::hardware_concurrency();
   int lr_begin = 0, lr_end = -1;
-  bool dspark = false, cb_spread = false;
+  bool dspark = false, cb_spread = false, use_hadamard = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto nx = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -252,6 +253,7 @@ int main(int argc, char** argv) {
     else if (a == "--imatrix") imat_path = nx();
     else if (a == "--threads") nthread = std::atoi(nx());
     else if (a == "--dspark") dspark = true;
+    else if (a == "--hadamard") use_hadamard = true;
     else if (a == "--codebook") cb_from = nx();
     else if (a == "--codebook-out") cb_out = nx();
     else if (a == "--codebook-raw") cb_raw = nx();
@@ -703,6 +705,7 @@ int main(int argc, char** argv) {
         const uint64_t rows = (uint64_t)wt->shape[0], cols = (uint64_t)wt->shape[1] * 2;
         deq.assign(rows * cols, 0.0f);
         if (!mxfp4_dequant(wt->data, sc->data, rows, cols, deq.data(), NibbleOrder::LowFirst)) continue;
+        if (use_hadamard) randomized_hadamard_block32_rows(deq.data(), rows, cols);
         samples.clear();
         // The budget scales with the table, so each centroid keeps a few hundred quads to fit
         // against. At 1024 entries x 4 variants the pair form's 2^17 would leave about thirty,
@@ -760,6 +763,7 @@ int main(int argc, char** argv) {
       const uint64_t cols = (uint64_t)wt->shape[1] * 2;   // nibble-packed
       deq.assign(rows * cols, 0.0f);
       if (!mxfp4_dequant(wt->data, sc->data, rows, cols, deq.data(), NibbleOrder::LowFirst)) return false;
+      if (use_hadamard) randomized_hadamard_block32_rows(deq.data(), rows, cols);
 
       const float* imp = nullptr;
       std::vector<float> impv;

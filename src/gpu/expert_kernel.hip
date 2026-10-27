@@ -882,6 +882,7 @@ __global__ void expert_swiglu_tile_kernel(const float* __restrict__ g, const flo
 // the dense SwiGLU so the two cannot drift by someone editing the other file.
 constexpr uint32_t kSQTok = 32, kSQThreads = 256;
 
+template <bool Hadamard32 = false>
 __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
     const uint16_t* __restrict__ g, const uint16_t* __restrict__ u, const float* __restrict__ w,
     uint8_t* __restrict__ out, float* __restrict__ scales, uint32_t dim, uint32_t total,
@@ -913,8 +914,34 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
         if (limit > 0.0f) { gv = fminf(gv, limit); uv = fminf(limit, fmaxf(-limit, uv)); }
         v = (gv / (1.0f + expf(-gv))) * uv * wv;
       }
+      if constexpr (Hadamard32) {
+        constexpr uint32_t kSignMask = 0x96696996u ^ 0xA53C965Au;
+        if ((kSignMask >> (k & 31u)) & 1u) v = -v;
+      }
       tile[k][tt] = v;
-      m = fmaxf(m, fabsf(v));
+      if constexpr (!Hadamard32) m = fmaxf(m, fabsf(v));
+    }
+    if constexpr (Hadamard32) {
+      __syncthreads();
+      for (uint32_t stride = 1; stride < 32u; stride <<= 1) {
+#pragma unroll
+        for (uint32_t b32 = 0; b32 < 4u; ++b32) {
+          for (uint32_t pair_idx = kk; pair_idx < 16u; pair_idx += 8u) {
+            const uint32_t base = b32 * 32u + (pair_idx / stride) * (2u * stride) + (pair_idx % stride);
+            const float a = tile[base][tt], b = tile[base + stride][tt];
+            tile[base][tt] = a + b;
+            tile[base + stride][tt] = a - b;
+          }
+        }
+        __syncthreads();
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < 16; ++i) {
+        const uint32_t k = kk + i * 8;
+        const float v = tile[k][tt] * 0.17677669529663689f;
+        tile[k][tt] = v;
+        m = fmaxf(m, fabsf(v));
+      }
     }
     part[kk][tt] = m;
     __syncthreads();
@@ -2849,9 +2876,19 @@ void expert_swiglu_quant_hip(const uint16_t* g, const uint16_t* u, const float* 
   const uint32_t slot_blocks = (total + kSQTok - 1) / kSQTok;
   const uint32_t bands = dim >> 7;
   const uint32_t gy = bands ? std::min(bands, std::max(1u, 64u / std::max(1u, slot_blocks))) : 1u;
-  hipLaunchKernelGGL(expert_swiglu_quant_kernel, dim3(slot_blocks, gy),
-                     dim3(kSQThreads), 0, (hipStream_t)stream, g, u, w, out, scales, dim, total,
-                     limit);
+  static const bool had = [] {
+    const char* s = std::getenv("AFF_HADAMARD_ROT");
+    return s && *s && *s != '0';
+  }();
+  if (had) {
+    hipLaunchKernelGGL((expert_swiglu_quant_kernel<true>), dim3(slot_blocks, gy),
+                       dim3(kSQThreads), 0, (hipStream_t)stream, g, u, w, out, scales, dim, total,
+                       limit);
+  } else {
+    hipLaunchKernelGGL((expert_swiglu_quant_kernel<false>), dim3(slot_blocks, gy),
+                       dim3(kSQThreads), 0, (hipStream_t)stream, g, u, w, out, scales, dim, total,
+                       limit);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 

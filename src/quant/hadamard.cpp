@@ -47,6 +47,23 @@ void randomized_hadamard_rows(float* x, uint64_t rows, uint64_t n,
   }
 }
 
+void randomized_hadamard_block32_rows(float* x, uint64_t rows, uint64_t cols,
+                                      uint32_t sign_mask) noexcept {
+  if (cols % 32 != 0) return;
+  constexpr float kInvSqrt32 = 0.17677669529663689f; // 1 / sqrt(32)
+  for (uint64_t r = 0; r < rows; ++r) {
+    float* row = x + r * cols;
+    for (uint64_t c0 = 0; c0 < cols; c0 += 32) {
+      float* b = row + c0;
+      for (uint32_t i = 0; i < 32; ++i) {
+        if ((sign_mask >> i) & 1u) b[i] = -b[i];
+      }
+      fwht(b, 32);
+      for (uint32_t i = 0; i < 32; ++i) b[i] *= kInvSqrt32;
+    }
+  }
+}
+
 IncoherenceStats incoherence_stats(const float* x, uint64_t n, uint64_t block) noexcept {
   IncoherenceStats s;
   if (n == 0) return s;

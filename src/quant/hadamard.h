@@ -41,6 +41,15 @@ void random_signs(int8_t* s, uint64_t n, uint64_t seed) noexcept;
 void randomized_hadamard_rows(float* x, uint64_t rows, uint64_t n,
                               const int8_t* signs, bool normalized = true) noexcept;
 
+// Fixed 32-bit SplitMix64 sign mask (bit k == 1 means -1.0f, 0 means +1.0f) shared by CPU
+// aff-quantize (--hadamard) and GPU activation quantizers (AFF_HADAMARD_ROT=1).
+constexpr uint32_t kHadamardBlock32Mask = 0x96696996u ^ 0xA53C965Au;
+
+// Applies diag(s_32) then 32-element normalized FWHT to every 32-column block of `x` ([rows][cols]).
+// Requires cols % 32 == 0 (holds for 1152, 2304, 5120).
+void randomized_hadamard_block32_rows(float* x, uint64_t rows, uint64_t cols,
+                                      uint32_t sign_mask = kHadamardBlock32Mask) noexcept;
+
 // --- diagnostics -------------------------------------------------------------------------------
 // These are what actually predict block-quantisation error.
 struct IncoherenceStats {
