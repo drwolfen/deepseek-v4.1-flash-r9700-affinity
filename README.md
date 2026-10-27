@@ -15,7 +15,8 @@ patches*).
 > **Tested on exactly two R9700s.** Every number here was measured on a two-card box. The engine
 > upstream supports one card, but that configuration was not benchmarked for this setup.
 
-**Model files (weights):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
+**Model files (1017 revision):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
+**Model files (legacy 0925):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
 
 **Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v1.1.0`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v1.1.0)
 
@@ -148,20 +149,22 @@ See [`CHANGELOG.md`](CHANGELOG.md) for full version history, benchmarks, and com
 
 ## Model files
 
-Built from the uncensored FP8 checkpoint with affinity's own `aff-quantize`. The weights are hosted on
+Built from the uncensored FP8 checkpoints with affinity's own `aff-quantize`. The weights are hosted on
 the Hugging Face Hub:
 
-**[`Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)**
+- **1017 revision (Current, recommended):** [**`Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw`**](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
+- **Legacy 0925 release:** [**`Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw`**](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
+
+### 1017 Container Files
 
 | file (HF repo) | size | role |
 |---|---|---|
-| [`model-uc.aff.part-00 … part-04`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw/tree/main) | **191.32 GiB** total | the container (routed experts 2.875 bpw, dense FP8, embedding/head bf16). Split into 5 parts for the Hub's per-file limit. |
-| [`model-uc.dspark.aff`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw/blob/main/model-uc.dspark.aff) | 5.22 GiB | DSpark speculative-decoding draft head |
-| [`model-uc.engram`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw/blob/main/model-uc.engram) | 506 KiB | engram n-gram sidecar |
-| [`uc-v41cb.raw`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw/blob/main/uc-v41cb.raw) | 32 KiB | the 2×1024-entry codebook the experts were encoded against |
+| [`model-uc-1017.aff.part-00 … part-04`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/tree/main) | **191.32 GiB** total | the 1017 container (routed experts 2.875 bpw codebook quant, dense FP8, embedding/head bf16). Split into 5 parts. |
+| [`model-uc-1017.dspark.aff`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/model-uc-1017.dspark.aff) | 5.22 GiB | DSpark speculative-decoding draft head |
+| [`model-uc-1017.engram`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/model-uc-1017.engram) | 506 KiB | engram n-gram sidecar |
+| [`uc-1017-cb.raw`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/uc-1017-cb.raw) | 32 KiB | the 2×1024-entry codebook the experts were encoded against |
 
-Reassemble the main container with `cat model-uc.aff.part-* > model-uc.aff`; the parts' hashes are in
-`SHA256SUMS.parts`.
+Reassemble the main container with `cat model-uc-1017.aff.part-* > model-uc-1017.aff`; verify with `sha256sum -c SHA256SUMS.parts`.
 
 The quantisation recipe is in [`model/QUANT.md`](model/QUANT.md); checks that must pass: `aff-info`,
 `aff-cfgcheck`, `aff-fp8check`, `aff-exphash` (15360 distinct experts), `aff-gpucheck --dq`.
