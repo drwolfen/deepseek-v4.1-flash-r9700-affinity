@@ -160,10 +160,16 @@ function(aff_tool name src)
   endif()
 endfunction()
 
-set(AFF_HAVE_TESTS FALSE)
-if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_tokenizer.cpp")
-  set(AFF_HAVE_TESTS TRUE)
-endif()
+set(AFF_HAVE_TESTS TRUE)
+
+function(aff_cpu_test tgt name)
+  if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tests/${tgt}.cpp")
+    return()
+  endif()
+  add_executable(${tgt} tests/${tgt}.cpp)
+  target_link_libraries(${tgt} PRIVATE aff_format)
+  add_test(NAME ${name} COMMAND ${tgt})
+endfunction()
 
 # ---- tools --------------------------------------------------------------------------------------
 # The first three are the user-facing path: quantise a checkpoint, look at what came out, run it.
@@ -184,53 +190,21 @@ aff_tool(aff-profile  tools/aff_profile.cpp)
 
 # ---- tests --------------------------------------------------------------------------------------
 if(AFF_HAVE_TESTS)
-  add_executable(test_tokenizer tests/test_tokenizer.cpp)
-  target_link_libraries(test_tokenizer PRIVATE aff_format)
-  add_test(NAME tokenizer COMMAND test_tokenizer)
-  set_tests_properties(tokenizer PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-  add_executable(test_aff_format tests/test_aff_format.cpp)
-  target_link_libraries(test_aff_format PRIVATE aff_format)
-  add_test(NAME aff_format COMMAND test_aff_format)
-
-  add_executable(test_ldlq tests/test_ldlq.cpp)
-  target_link_libraries(test_ldlq PRIVATE aff_format)
-  add_test(NAME ldlq COMMAND test_ldlq)
-
-  add_executable(test_expert_kernel tests/test_expert_kernel.cpp)
-  target_link_libraries(test_expert_kernel PRIVATE aff_format)
-  add_test(NAME expert_kernel COMMAND test_expert_kernel)
-
-  add_executable(test_attention tests/test_attention.cpp)
-  target_link_libraries(test_attention PRIVATE aff_format)
-  add_test(NAME attention COMMAND test_attention)
-
-  add_executable(test_expert_heat tests/test_expert_heat.cpp)
-  target_link_libraries(test_expert_heat PRIVATE aff_format)
-  add_test(NAME expert_heat COMMAND test_expert_heat)
-
-  add_executable(test_ops tests/test_ops.cpp)
-  target_link_libraries(test_ops PRIVATE aff_format)
-  add_test(NAME ops COMMAND test_ops)
-
-  add_executable(test_prefix_cache tests/test_prefix_cache.cpp)
-  target_link_libraries(test_prefix_cache PRIVATE aff_format)
-  add_test(NAME prefix_cache COMMAND test_prefix_cache)
-
-  add_executable(test_server tests/test_server.cpp)
-  target_link_libraries(test_server PRIVATE aff_format)
-  add_test(NAME server COMMAND test_server)
-
-  add_executable(test_quant tests/test_quant.cpp)
-  target_link_libraries(test_quant PRIVATE aff_format)
-  add_test(NAME quant COMMAND test_quant)
-
-  # The fixtures are the container's own, so the test needs their path rather than a copy.
-  add_executable(test_chat_encode tests/test_chat_encode.cpp)
-  target_link_libraries(test_chat_encode PRIVATE aff_format)
-  add_test(NAME chat_encode
-           COMMAND test_chat_encode ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat)
-  set_tests_properties(chat_encode PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  aff_cpu_test(test_tokenizer tokenizer)
+  aff_cpu_test(test_aff_format aff_format)
+  aff_cpu_test(test_ldlq ldlq)
+  aff_cpu_test(test_expert_kernel expert_kernel)
+  aff_cpu_test(test_attention attention)
+  aff_cpu_test(test_expert_heat expert_heat)
+  aff_cpu_test(test_ops ops)
+  aff_cpu_test(test_prefix_cache prefix_cache)
+  aff_cpu_test(test_server server)
+  aff_cpu_test(test_quant quant)
+  aff_cpu_test(test_cactus_accept cactus_accept)
+  aff_cpu_test(test_o_fp8_qdq o_fp8_qdq)
+  aff_cpu_test(test_tool_namespace tool_namespace)
+  aff_cpu_test(test_w4_head w4_head)
+  aff_cpu_test(test_hadamard_block32 hadamard_block32)
 endif()
 
 if(AFF_HIP)
@@ -278,41 +252,16 @@ if(AFF_HIP)
       add_test(NAME ${name} COMMAND ${tgt})
     endfunction()
 
-    add_executable(test_tp tests/test_tp.hip)
-    set_source_files_properties(tests/test_tp.hip PROPERTIES LANGUAGE HIP)
-    target_link_libraries(test_tp PRIVATE aff_gpu)
-    add_test(NAME tp_allreduce COMMAND test_tp)
-
-    add_executable(test_hip_expert tests/test_hip_expert.hip)
-    set_source_files_properties(tests/test_hip_expert.hip PROPERTIES LANGUAGE HIP)
-    target_link_libraries(test_hip_expert PRIVATE aff_gpu aff_format)
-    add_test(NAME hip_expert COMMAND test_hip_expert)
-
-    add_executable(test_attn_gpu tests/test_attn_gpu.hip)
-    set_source_files_properties(tests/test_attn_gpu.hip PROPERTIES LANGUAGE HIP)
-    target_link_libraries(test_attn_gpu PRIVATE aff_gpu aff_format)
-    add_test(NAME attn_gpu COMMAND test_attn_gpu)
-
-    add_executable(test_sampler_gpu tests/test_sampler_gpu.hip)
-    set_source_files_properties(tests/test_sampler_gpu.hip PROPERTIES LANGUAGE HIP)
-    target_link_libraries(test_sampler_gpu PRIVATE aff_gpu)
-    add_test(NAME sampler_gpu COMMAND test_sampler_gpu)
-
-    # The N-way split is bytes, not arithmetic — see the file. It runs without a GPU, so it is the
-    # first thing to check when a rank count above two produces wrong text.
+    aff_hip_test(test_tp tp_allreduce)
+    aff_hip_test(test_hip_expert hip_expert)
+    aff_hip_test(test_attn_gpu attn_gpu)
+    aff_hip_test(test_sampler_gpu sampler_gpu)
     aff_hip_test(test_expert_shard expert_shard)
-
-    add_executable(test_moe_plan tests/test_moe_plan.hip)
-    set_source_files_properties(tests/test_moe_plan.hip PROPERTIES LANGUAGE HIP)
-    target_link_libraries(test_moe_plan PRIVATE aff_gpu)
-    add_test(NAME moe_plan COMMAND test_moe_plan)
-
-    # Guards the WMMA fragment layout every matrix kernel in src/gpu depends on. AMD does not
-    # document the accumulator mapping, so this test IS the documentation.
-    add_executable(test_wmma tests/test_wmma.hip)
-    set_source_files_properties(tests/test_wmma.hip PROPERTIES LANGUAGE HIP)
-    target_link_libraries(test_wmma PRIVATE aff_gpu)
-    add_test(NAME wmma COMMAND test_wmma)
+    aff_hip_test(test_gpu_ports gpu_ports)
+    aff_hip_test(test_moe_recon_tiles moe_recon_tiles)
+    aff_hip_test(test_moe_plan moe_plan)
+    aff_hip_test(test_prefetch_ring prefetch_ring)
+    aff_hip_test(test_wmma wmma)
   endif()
 
   # ---- benches ----------------------------------------------------------------------------------

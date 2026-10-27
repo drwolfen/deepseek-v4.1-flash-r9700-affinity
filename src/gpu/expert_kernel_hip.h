@@ -227,6 +227,9 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
                           uint32_t cols, float wscale, void* stream = nullptr,
                           bool y_bf16 = false);
 
+void expert_set_recon_tiles(uint32_t max_tiles);
+uint32_t expert_recon_tiles();
+
 // SwiGLU over a [dim][total] arena AND the requantise to E4M3, in one pass. `g` and `u` are the
 // gate and up GEMM outputs, `w` the per-slot router weight, `out` is token-major [total][dim] with
 // `scales` one f32 per (slot, 128-column block) — exactly what the down GEMM consumes.

@@ -547,11 +547,21 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
         // Under TR the same five dwords are still one aligned span, so the widened load survives the
         // reorder untouched.
         constexpr bool kWide = kETPR == 1 && kEBPT == 4;
+        constexpr bool kHalfTR = TR && (kETPR == 2 && kEBPT == 2);
         uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0, w4 = 0, f24 = 0;
         if (kWide) {
           const auto* cp32 = (const AFF_GLOBAL uint32_t*)cp0;
           w0 = ld_nt(&cp32[0]); w1 = ld_nt(&cp32[1]); w2 = ld_nt(&cp32[2]);
           w3 = ld_nt(&cp32[3]); w4 = ld_nt(&cp32[4]);
+        } else if (kHalfTR) {
+          const size_t g = (size_t)(c0 / kEK) * rows + row;
+          const auto* g32 = (const AFF_GLOBAL uint32_t*)as_global(data + g * (kEK / 16 * 5));
+          const auto* g16 = (const AFF_GLOBAL uint16_t*)g32;
+          if (sblk == 0u) {
+            w0 = ld_nt(&g32[0]); w1 = ld_nt(&g32[1]); w2 = (uint32_t)ld_nt(&g16[4]);
+          } else {
+            w0 = (uint32_t)ld_nt(&g16[5]); w1 = ld_nt(&g32[3]); w2 = ld_nt(&g32[4]);
+          }
         }
         // Row-major reaches this only when kWide made 6*b0 a multiple of 24; TR always can, because
         // the group's three bytes are a unit by construction.
@@ -570,6 +580,17 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
             const uint32_t lo = bb == 0 ? w0 : bb == 1 ? w1 : bb == 2 ? w2 : w3;
             const uint32_t hi = bb == 0 ? w1 : bb == 1 ? w2 : bb == 2 ? w3 : w4;
             win = ((((uint64_t)hi) << 32) | lo) >> (((bb * 5) & 3u) * 8);
+          } else if (kHalfTR) {
+            field = (f24 >> (fsh0 + bb * 6)) & 63u;
+            if (sblk == 0u) {
+              win = (bb == 0u)
+                        ? ((uint64_t)w0 | ((uint64_t)(w1 & 0xFFu) << 32))
+                        : ((uint64_t)(w1 >> 8) | ((uint64_t)w2 << 24));
+            } else {
+              win = (bb == 0u)
+                        ? ((uint64_t)w0 | ((uint64_t)(w1 & 0xFFFFFFu) << 16))
+                        : ((uint64_t)(w1 >> 24) | ((uint64_t)w2 << 8));
+            }
           } else if (TR) {
             // MT=1: a thread owns half a group, so its span starts 10 bytes in and is only 2-byte
             // aligned. Bytes, not dwords — but the field still comes out of the group's f24.
@@ -3022,20 +3043,37 @@ void expert_transpose_planes_host(uint8_t* buf, const AffLayerDesc& L,
   }
 }
 
+static int g_recon_tiles = -1;
+
+void expert_set_recon_tiles(uint32_t max_tiles) { g_recon_tiles = (int)max_tiles; }
+
+uint32_t expert_recon_tiles() {
+  if (g_recon_tiles < 0) {
+    const char* s = std::getenv("AFF_MOE_RECON_TILES");
+    g_recon_tiles = (s && *s) ? std::max(0, std::atoi(s)) : 0;
+  }
+  return (uint32_t)g_recon_tiles;
+}
+
 void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t max_nt,
                           const uint8_t* x8, const float* xs, const float* cb, uint32_t rows,
                           uint32_t cols, float wscale, void* stream, bool y_bf16) {
   if (!n_tiles) return;
+  const uint32_t rcap = expert_recon_tiles();
+  const uint32_t step = (rcap > 0u && rcap < n_tiles) ? rcap : n_tiles;
   const uint32_t ntiles = (max_nt + 15) / 16;
   // The wire format follows the CONTAINER, not taste: each one needs its own codebook tensor. See
   // expert_wire_format_for_quant.
   const uint32_t fmt = expert_wire_format();
   const bool tr = expert_planes_are_colgroup_major();
+  for (uint32_t t0 = 0; t0 < n_tiles; t0 += step) {
+    const uint32_t chunk_tiles = std::min<uint32_t>(step, n_tiles - t0);
+    const ExpertTile* cur_tiles = tiles + t0;
 #define AFF_EW1(NTV, MTV, FV, TRV)                                                                \
   do {                                                                                             \
   hipLaunchKernelGGL((expert_gemm_wmma_kernel<NTV, MTV, FV, TRV>),                                 \
-                     dim3((rows + kEWaves * MTV * 16 - 1) / (kEWaves * MTV * 16), n_tiles),        \
-                     dim3(kEThreads), 0, (hipStream_t)stream, tiles, x8, xs, cb, wscale, rows,     \
+                     dim3((rows + kEWaves * MTV * 16 - 1) / (kEWaves * MTV * 16), chunk_tiles),    \
+                     dim3(kEThreads), 0, (hipStream_t)stream, cur_tiles, x8, xs, cb, wscale, rows, \
                      cols, y_bf16 ? 1 : 0); AFF_HIP_CHECK(hipGetLastError());                      \
   } while (0)
 // The plane layout and the wire format are INDEPENDENT, and both `tr` branches carry every format
@@ -3059,13 +3097,14 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
   // waves the registers have paid for — there MT=1 doubles the block count and closes the gap. The
   // two are bit-identical by construction, since MT decides which rows a wave owns and not the order
   // of the K reduction.
-  if (ntiles <= 1) AFF_EW(1, 1);
-  else if (ntiles <= 2) AFF_EW(2, 2);
-  else if (ntiles <= 4) AFF_EW(4, 2);
-  else AFF_EW(8, 1);
+    if (ntiles <= 1) AFF_EW(1, 1);
+    else if (ntiles <= 2) AFF_EW(2, 2);
+    else if (ntiles <= 4) AFF_EW(4, 2);
+    else AFF_EW(8, 1);
 #undef AFF_EW
 #undef AFF_EWF
 #undef AFF_EW1
+  }
 }
 
 } // namespace aff
