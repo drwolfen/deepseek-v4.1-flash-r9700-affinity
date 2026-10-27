@@ -71,7 +71,9 @@ Nothing here is the model author's or the engine author's endorsement; this is a
 |---|---|---|
 | Inference engine | [StillDeadcode/affinity](https://codeberg.org/StillDeadcode/affinity) by Yoshi Exeler | MIT. Upstream of everything. |
 | Engine fork (this tree) | `neuromaniacMD/affinity` (our GitHub) | MIT. Adds the rework listed below. Kept as provenance; this repo is the deployable copy. |
-| Optimization ports | [Luce-Org/lucebox](https://github.com/Luce-Org/lucebox) · [lucebox.com](https://www.lucebox.com/) — **Lucebox AI**, Apache-2.0 | Three of the local knobs are **ports from Lucebox's `ds41-gorgon` work**: bounded replay, adaptive verify width (`AdaptiveSpecWidth`) and the protected massive/outlier expert set; the port's quality gate also uses Lucebox's 8,184-token fineweb-edu eval corpus. |
+| Optimization ports (Lucebox) | [Luce-Org/lucebox](https://github.com/Luce-Org/lucebox) · [lucebox.com](https://www.lucebox.com/) — **Lucebox AI**, Apache-2.0 | Three of the v1.0.0 local knobs are **ports from Lucebox's `ds41-gorgon` work**: bounded replay, adaptive verify width (`AdaptiveSpecWidth`) and the protected massive/outlier expert set; the port's quality gate also uses Lucebox's 8,184-token fineweb-edu eval corpus. |
+| Optimization ports (Radiance) | [StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance) (v1.12.0) by Yoshi Exeler | Ports in v1.1.0: Cactus length-faded and capped rejection sampling (`AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R`), fused `hc_post` + DSpark tap recording (`AFF_FUSE_HC_TAP`), and draft output head compression. |
+| Optimization ports (KTransformers) | [05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers) | Ports in v1.1.0: on-GPU group-128 INT4 LM output head (`AFF_DRAFT_HEAD_INT4`), FP8 attention output QDQ (`AFF_O_FP8_QDQ`), and 1017 `namespace::name` tool encoding and parsing. |
 | Base model | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | DeepSeek license. Source of the reference `inference/` and `encoding/` code. |
 | Uncensored weights (`-uc`) | [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8) | FP8 checkpoint that we re-quantised to 2.875 bpw. |
 | Abliterated weights (alt) | [pqhaz/DeepSeek-V4.1-Flash-heretic](https://huggingface.co/pqhaz/DeepSeek-V4.1-Flash-heretic) | Directional ablation of refusal behaviour; lower KL than `-uc`. A `model-heretic.aff` was built but `-uc` is what is served. |
@@ -210,13 +212,12 @@ docker run --name deepseek-affinity \
 
 ## Credits
 
-DeepSeek for the model; Yoshi Exeler / StillDeadcode for affinity; **Lucebox AI
+DeepSeek for the model; Yoshi Exeler / StillDeadcode for affinity and **radiance v1.12.0** (Cactus length-faded/capped rejection sampler, fused `hc_post` tap kernels); **Lucebox AI
 ([Luce-Org/lucebox](https://github.com/Luce-Org/lucebox), Apache-2.0) for the bounded-replay,
-adaptive-width and protected-expert optimizations we ported (and the eval corpus)**; `dealignai` and
+adaptive-width and protected-expert optimizations we ported (and the eval corpus)**; **05yuki ([05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)) for the group-128 INT4 output head, FP8 attention QDQ, and 1017 tool namespace specs**; `dealignai` and
 `pqhaz` for the uncensored builds; the friends whose fixes landed in the fork's `v4-fixes`. **The
 transformation of affinity into this R9700-tweaked engine was done with the help of
-DeepSeek-V4.1-Flash and Gemini 4 Argon.** Engine code remains MIT; see [`LICENSE`](LICENSE) and
+DeepSeek-V4.1-Flash, Gemini 4 Argon, and Gemini 3.8 Flash.** Engine code remains MIT; see [`LICENSE`](LICENSE) and
 [`FORK.md`](FORK.md).
 
-Third-party components and their licences (affinity MIT; Lucebox Apache-2.0 with the exact ported
-sites; stb_image dual MIT/public-domain) are listed in [`THIRD_PARTY.md`](THIRD_PARTY.md).
+Third-party components and their licences (affinity MIT; Lucebox Apache-2.0; Radiance; KTransformers; stb_image dual MIT/public-domain) are listed in [`THIRD_PARTY.md`](THIRD_PARTY.md).

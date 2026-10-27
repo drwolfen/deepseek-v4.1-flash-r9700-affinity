@@ -32,6 +32,21 @@ distributed under the MIT licence in [`LICENSE`](LICENSE) (affinity's). The Apac
 apply to the ported fragments; the required attribution and a copy of the Apache-2.0 licence are
 retained here. No file in this repository is claimed to be relicensed away from Apache-2.0.
 
+## Radiance — Yoshi Exeler
+
+**Radiance engine** — <https://codeberg.org/StillDeadcode/radiance> (v1.12.0).
+Optimizations ported to the fork in v1.1.0:
+- Cactus length-faded and capped rejection sampling (`AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R` in `tools/affinity.cpp`).
+- Fused `batch_hc_expand_reg_kernel` (`AFF_FUSE_HC_TAP` in `src/gpu/batch_kernels.hip` and `src/gpu/dense_gpu.hip`).
+
+## KTransformers (05yuki DeepSeek-1017 fork)
+
+**05yuki** — <https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers>.
+Optimizations and specifications ported in v1.1.0:
+- Group-128 MSE-clipped symmetric INT4 output head quantization (`AFF_DRAFT_HEAD_INT4` in `src/gpu/batch_kernels.hip` and `src/gpu/dense_gpu.hip`).
+- Opt-in FP8 output activation QDQ (`AFF_O_FP8_QDQ` in `src/gpu/batch_kernels.hip`).
+- 1017 tool namespace qualification and completion parser (`src/engine/chat_encode.cpp`, `src/server/server.cpp`).
+
 ## stb_image — MIT / public domain (dual)
 
 Bundled at `src/vision/stb_image.h` (v2.30) for image decode in the vision path.
