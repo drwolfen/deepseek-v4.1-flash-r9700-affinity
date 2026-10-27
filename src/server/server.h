@@ -20,6 +20,7 @@ struct ToolCallIO {
   std::string id;         // OpenAI's call id; only used to order tool results
   std::string name;
   std::string arguments;  // a JSON object, as a string, which is what the schema wants
+  std::string ns;         // optional 1017 tool namespace
 };
 
 struct ChatMessage {

@@ -315,6 +315,8 @@ private:
     // `data` is in WMMA fragment order, not row-major. Only the W8A8 GEMM can read it; every other
     // reader is a wrong answer that still decodes fluently, so they abort instead.
     bool     ps = false;
+    uint8_t* w4_data = nullptr;     // device, group-128 int4 copy for `output` head
+    uint16_t* w4_scales = nullptr;  // device, [nrows][ncols/128] bf16 scales for `output` head
     uint64_t data_bytes = 0, scales_bytes = 0;   // amdnas-fixes weight-verify: sizes for the read-back digest
   };
   struct Entry {
@@ -666,6 +668,9 @@ private:
   bool     batch_hc_read(uint32_t b, float* dst, uint32_t n_embd, uint32_t n_hc);
   bool     batch_hc_tap(uint32_t slot, uint32_t n_taps, uint32_t b_lo, uint32_t n_keep,
                         uint32_t row0, uint32_t rows_cap, uint32_t n_embd, uint32_t n_hc);
+  bool     batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_taps, uint32_t b_lo,
+                             uint32_t n_keep, uint32_t row0, uint32_t rows_cap, uint32_t n_embd,
+                             uint32_t n_hc);
   // The same head, sampled. The vocabulary is Row-split, so a nucleus over one card's band is not a
   // nucleus: the peer's half is gathered first and the draw happens over the whole distribution.
   // Scratch for the sampler's small transfers, sized once at the block width.

@@ -239,10 +239,19 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
   out->response_format = raw_value(body, "response_format");
 
   // tools[] -> the `function` object of each, verbatim. The wrapper is dropped here because that is
-  // what the container's encoder renders (`tools_from_openai_format`).
+  // what the container's encoder renders (`tools_from_openai_format`). If the outer wrapper carries
+  // a 1017 `namespace` field, inject it into `fn` so `chat_encode` qualifies `name` as `ns::name`.
   for (const std::string& t : raw_elements(raw_value(body, "tools"))) {
     std::string fn = raw_value(t, "function");
-    if (fn.empty()) fn = t;                  // already unwrapped, which some clients send
+    const std::string outer_ns = raw_value(t, "namespace");
+    if (fn.empty()) {
+      fn = t;                  // already unwrapped, which some clients send
+    } else if (!outer_ns.empty() && raw_value(fn, "namespace").empty()) {
+      const size_t rbrace = fn.rfind('}');
+      if (rbrace != std::string::npos) {
+        fn = fn.substr(0, rbrace) + ",\"namespace\":" + outer_ns + "}";
+      }
+    }
     out->tools.push_back(fn);
   }
 
@@ -326,8 +335,11 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
           } else {
             const char* w = c;
             m.content = read_json_string(w);
-            if (m.role == "user" && m.content.find("<｜deepseek_image｜>") != std::string::npos) {
-              size_t b64_pos = m.content.find("data:image/");
+            size_t sent_pos = m.role == "user" ? m.content.find("<｜deepseek_image｜>") : std::string::npos;
+            if (sent_pos != std::string::npos) {
+              // Search only after the sentinel: prose that merely quotes the sentinel
+              // (and separately mentions data:image/) must not be decoded as an image.
+              size_t b64_pos = m.content.find("data:image/", sent_pos);
               if (b64_pos != std::string::npos) {
                 size_t end_pos = m.content.find_first_of(" \t\r\n)]}\"", b64_pos);
                 m.image_data = m.content.substr(b64_pos, end_pos == std::string::npos ? std::string::npos : (end_pos - b64_pos));
@@ -341,10 +353,19 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
         for (const std::string& tc : raw_elements(raw_value(sub, "tool_calls"))) {
           ToolCallIO c2;
           if (const char* z = find_top_key(tc, "id")) { const char* w = z; c2.id = read_json_string(w); }
+          if (const char* z = find_top_key(tc, "namespace")) { const char* w = z; c2.ns = read_json_string(w); }
           const std::string fn = raw_value(tc, "function");
           const std::string& src = fn.empty() ? tc : fn;
+          if (c2.ns.empty()) {
+            if (const char* z = find_top_key(src, "namespace")) { const char* w = z; c2.ns = read_json_string(w); }
+          }
           if (const char* z = find_top_key(src, "name")) { const char* w = z; c2.name = read_json_string(w); }
           if (const char* z = find_top_key(src, "arguments")) { const char* w = z; c2.arguments = read_json_string(w); }
+          const size_t sep = c2.name.find("::");
+          if (sep != std::string::npos) {
+            if (c2.ns.empty()) c2.ns = c2.name.substr(0, sep);
+            c2.name = c2.name.substr(sep + 2);
+          }
           if (!c2.name.empty()) m.tool_calls.push_back(std::move(c2));
         }
         if (!m.role.empty()) out->messages.push_back(std::move(m));
@@ -556,7 +577,10 @@ void Server::serve_one(int fd) {
       for (size_t i = 0; i < res.tool_calls.size(); ++i) {
         if (i) j += ",";
         j += "{\"index\":" + std::to_string(i) + ",\"id\":\"" + json_escape(res.tool_calls[i].id) +
-             "\",\"type\":\"function\",\"function\":{\"name\":\"" +
+             "\",\"type\":\"function\"";
+        if (!res.tool_calls[i].ns.empty())
+          j += ",\"namespace\":\"" + json_escape(res.tool_calls[i].ns) + "\"";
+        j += ",\"function\":{\"name\":\"" +
              json_escape(res.tool_calls[i].name) + "\",\"arguments\":\"" +
              json_escape(res.tool_calls[i].arguments) + "\"}}";
       }
@@ -612,7 +636,10 @@ void Server::serve_one(int fd) {
       for (size_t i = 0; i < res.tool_calls.size(); ++i) {
         if (i) j += ",";
         j += "{\"id\":\"" + json_escape(res.tool_calls[i].id) +
-             "\",\"type\":\"function\",\"function\":{\"name\":\"" +
+             "\",\"type\":\"function\"";
+        if (!res.tool_calls[i].ns.empty())
+          j += ",\"namespace\":\"" + json_escape(res.tool_calls[i].ns) + "\"";
+        j += ",\"function\":{\"name\":\"" +
              json_escape(res.tool_calls[i].name) + "\",\"arguments\":\"" +
              json_escape(res.tool_calls[i].arguments) + "\"}}";
       }

@@ -2216,20 +2216,30 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // Every `down` in this sublayer is Col, so every card's block is a partial; block_add put the
       // host tier's whole contribution on rank 0 alone so this sums it in exactly once.
       if (bops_.block_reduce && !bops_.block_reduce(bops_.ctx, E)) return false;
-      if (!bops_.hc_post(bops_.ctx, w.hc_ffn_fn.data != nullptr, E, HC)) return false;
 
-      // ---- the DSpark tap --------------------------------------------------------------------
+      // ---- the DSpark tap (fused into hc_post when AFF_FUSE_HC_TAP != 0) ---------------------
       // `main_hiddens.append(h.mean(dim=2))` in the reference, taken AFTER the layer's second
       // hc_post — the layer's output, not either sublayer's — and concatenated in tap order.
-      //
-      // Straight into the card's own tap plane: the windowing is the kernel's addressing rather than
-      // a per-token memcpy out of a staging buffer, and `b_lo`/`row0` are what select the trailing
-      // window inside this chunk.
-      if (!tap_at.empty() && tap_at[l] >= 0 && base + live > tap_first) {
+      // Fusing the tap write into batch_hc_expand_reg_kernel computes h.mean(dim=2) from the
+      // expanded bf16 values already in registers, saving 3 kernel launches and 3 b_hc reads/step.
+      const bool do_tap = !tap_at.empty() && tap_at[l] >= 0 && base + live > tap_first;
+      static const bool fuse_tap = [] {
+        const char* v = std::getenv("AFF_FUSE_HC_TAP");
+        return !v || !*v || std::strcmp(v, "0") != 0;
+      }();
+      if (do_tap && fuse_tap && w.hc_ffn_fn.data != nullptr && bops_.hc_post_tap) {
         const uint32_t b_lo = base >= tap_first ? 0u : tap_first - base;
-        if (!bops_.hc_tap(bops_.ctx, (uint32_t)tap_at[l], NT, b_lo, live - b_lo,
-                          base + b_lo - tap_first, tap_rows, E, HC))
+        if (!bops_.hc_post_tap(bops_.ctx, true, (uint32_t)tap_at[l], NT, b_lo, live - b_lo,
+                               base + b_lo - tap_first, tap_rows, E, HC))
           return false;
+      } else {
+        if (!bops_.hc_post(bops_.ctx, w.hc_ffn_fn.data != nullptr, E, HC)) return false;
+        if (do_tap) {
+          const uint32_t b_lo = base >= tap_first ? 0u : tap_first - base;
+          if (!bops_.hc_tap(bops_.ctx, (uint32_t)tap_at[l], NT, b_lo, live - b_lo,
+                            base + b_lo - tap_first, tap_rows, E, HC))
+            return false;
+        }
       }
       AFF_PH(hyper);
     }

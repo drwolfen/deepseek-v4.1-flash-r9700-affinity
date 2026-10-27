@@ -204,11 +204,56 @@ std::string response_format_block(const std::string& schema_json) {
          json_compact(schema_json);
 }
 
+std::string apply_tool_namespace(const ToolDef& td) {
+  std::string ns = td.ns;
+  std::string ns_desc = td.ns_desc;
+  auto members = json_members(td.function_json);
+  if (members.empty()) return json_compact(td.function_json);
+  for (const auto& kv : members) {
+    if (kv.first == "namespace") {
+      if (json_is_string(kv.second)) {
+        if (ns.empty()) ns = json_unquote(kv.second);
+      } else {
+        for (const auto& nkv : json_members(kv.second)) {
+          if (nkv.first == "name" && ns.empty()) ns = json_unquote(nkv.second);
+          if (nkv.first == "description" && ns_desc.empty()) ns_desc = json_unquote(nkv.second);
+        }
+      }
+    }
+  }
+  if (ns.empty() && ns_desc.empty()) return json_compact(td.function_json);
+  std::string out = "{";
+  bool first = true;
+  bool had_desc = false;
+  for (const auto& kv : members) {
+    if (kv.first == "namespace") continue;
+    if (!first) out += ", ";
+    first = false;
+    if (kv.first == "name" && !ns.empty() && json_is_string(kv.second)) {
+      std::string bare = json_unquote(kv.second);
+      if (bare.find("::") == std::string::npos) bare = ns + "::" + bare;
+      out += json_quote("name") + ": " + json_quote(bare);
+    } else if (kv.first == "description" && !ns_desc.empty() && json_is_string(kv.second)) {
+      had_desc = true;
+      std::string d = json_unquote(kv.second);
+      out += json_quote("description") + ": " + json_quote(ns_desc + "\n" + d);
+    } else {
+      out += json_quote(kv.first) + ": " + json_compact(kv.second);
+    }
+  }
+  if (!ns_desc.empty() && !had_desc) {
+    if (!first) out += ", ";
+    out += json_quote("description") + ": " + json_quote(ns_desc + "\n");
+  }
+  out += "}";
+  return out;
+}
+
 std::string tools_block(const std::vector<ToolDef>& tools, bool v41) {
   std::string schemas;
   for (size_t i = 0; i < tools.size(); ++i) {
     if (i) schemas += "\n";
-    schemas += json_compact(tools[i].function_json);
+    schemas += apply_tool_namespace(tools[i]);
   }
   const std::string tag_calls = v41 ? " calls" : "tool_calls";
   const std::string tag_inv   = v41 ? " invoke" : "invoke";
@@ -248,7 +293,10 @@ std::string render_tool_calls(const std::vector<ToolCall>& tcs, bool v41 = false
   out += kDsml; out += tag_calls; out += ">\n";
   for (size_t i = 0; i < tcs.size(); ++i) {
     if (i) out += "\n";
-    out += "<"; out += kDsml; out += tag_inv; out += " name=\"" + tcs[i].name + "\">\n";
+    std::string qname = tcs[i].name;
+    if (!tcs[i].ns.empty() && qname.find("::") == std::string::npos)
+      qname = tcs[i].ns + "::" + qname;
+    out += "<"; out += kDsml; out += tag_inv; out += " name=\"" + qname + "\">\n";
     // Arguments that are not a JSON object are wrapped under an "arguments" key, exactly as the
     // reference's except-branch does, rather than dropped.
     auto members = json_members(tcs[i].arguments);
@@ -423,53 +471,163 @@ size_t read_until(size_t i, const std::string& t, const std::vector<std::string>
 
 }  // namespace
 
-// ---- marker-less (bare) DSML repair ---------------------------------------------------------
+// ---- DSML repair (bare tags, truncated V4.1 wrappers, doubled bars, aborted drafts) ----------
 //
-// The model occasionally drops the DSML marker character and emits a bare `<invoke name="X">`
-// block. Every marker below keys on that character, so such a turn matches nothing and is returned
-// as raw content — and a model that does not EOS after the call then rambles for thousands of
-// tokens. Rewrite the bare tags into the marked form, wrapped in a tool_calls block, so the single
-// shape parse_completion already reads applies. Called ONLY when the marker is absent from the
-// whole turn, so a well-formed turn is never touched.
-std::string repair_bare_dsml(const std::string& s) {
+// DeepSeek-V4.1 occasionally glitches when opening or closing a DSML tool-call block:
+//   1. Truncated opening wrapper: `<｜DSML｜>\n<｜DSML｜ invoke…`, `<｜DSML｜\n\n<｜DSML｜ invoke…`,
+//      `<｜DSML｜<｜DSML｜ invoke…`, or bare `<｜DSML｜ invoke…` with the `<｜DSML｜ calls>` wrapper line
+//      dropped entirely.
+//   2. Doubled DSML bar token: `</｜DSML｜｜DSML｜ parameter>`.
+//   3. Marker-less `<invoke name="X">…</invoke>` with the DSML bar dropped completely.
+//   4. Aborted tool-call draft mid-parameter followed by deliberation, a second `</think>`, and a
+//      fresh `<｜DSML｜ calls>` block.
+//
+// Repairs operate only on the post-`</think>` span in Thinking mode so prose quoting `<invoke` or
+// `｜DSML｜` inside `<think>…</think>` is never mutated into a bogus tool call.
+std::string repair_bare_dsml(const std::string& s, ThinkingMode mode) {
   const std::string ds(kDsml);
   std::string t = s;
-  auto rep = [&](const char* from, const std::string& to) {
-    const size_t fl = std::string(from).size();
-    size_t p = 0;
-    while ((p = t.find(from, p)) != std::string::npos) { t.replace(p, fl, to); p += to.size(); }
-  };
-  rep("<invoke name=", "<" + ds + "invoke name=");
-  rep("</invoke>", "</" + ds + "invoke>");
-  rep("<parameter name=", "<" + ds + "parameter name=");
-  rep("</parameter>", "</" + ds + "parameter>");
-  const std::string wrapper = "<" + ds + "tool_calls";
-  if (t.find(wrapper) == std::string::npos) {
-    const std::string io = "<" + ds + "invoke";
-    const std::string ic = "</" + ds + "invoke>";
-    const size_t o = t.find(io);
-    const size_t c = t.rfind(ic);
-    if (o != std::string::npos && c != std::string::npos && c >= o) {
-      t.resize(c + ic.size());                 // drop whatever the model rambled after the close
-      t.insert(o, "\n\n" + wrapper + ">\n");
-      t += "\n</" + ds + "tool_calls>";
+
+  // Case 4: in Thinking mode, if an unclosed tool-call draft after `</think>` was abandoned and the
+  // model emitted another `</think>` followed immediately by a new `<｜DSML｜` block, drop the
+  // abandoned draft between the two `</think>` markers so the final block parses cleanly.
+  if (mode == ThinkingMode::Thinking) {
+    const std::string te_str(kThinkEnd);
+    const size_t te1 = t.find(te_str);
+    if (te1 != std::string::npos) {
+      size_t best_te2 = std::string::npos;
+      size_t scan = te1 + te_str.size();
+      while (scan < t.size()) {
+        const size_t te2 = t.find(te_str, scan);
+        if (te2 == std::string::npos) break;
+        const size_t c1 = t.find("</" + ds + " calls>", te1);
+        const size_t c2 = t.find("</" + ds + "tool_calls>", te1);
+        const bool closed_before = (c1 != std::string::npos && c1 < te2) ||
+                                   (c2 != std::string::npos && c2 < te2);
+        size_t after = te2 + te_str.size();
+        while (after < t.size() &&
+               (t[after] == ' ' || t[after] == '\t' || t[after] == '\n' || t[after] == '\r'))
+          ++after;
+        if (!closed_before && t.compare(after, 1 + ds.size(), "<" + ds) == 0) {
+          best_te2 = te2;
+        }
+        scan = te2 + te_str.size();
+      }
+      if (best_te2 != std::string::npos) {
+        t.erase(te1, best_te2 - te1);
+      }
     }
   }
-  return t;
+
+  size_t body_start = 0;
+  if (mode == ThinkingMode::Thinking) {
+    const size_t te = t.find(kThinkEnd);
+    if (te != std::string::npos) body_start = te + std::string(kThinkEnd).size();
+  }
+
+  std::string body = t.substr(body_start);
+  const std::string eos(kEosStr);
+  const bool had_eos = body.size() >= eos.size() &&
+                       body.compare(body.size() - eos.size(), eos.size(), eos) == 0;
+
+  // Case 2: collapse doubled `｜DSML｜｜DSML｜` tokens in the post-think body.
+  {
+    const std::string dup = ds + ds;
+    size_t p = 0;
+    while ((p = body.find(dup, p)) != std::string::npos) {
+      body.replace(p, dup.size(), ds);
+    }
+  }
+
+  auto rep_body = [&](const std::string& from, const std::string& to) {
+    size_t p = 0;
+    while ((p = body.find(from, p)) != std::string::npos) {
+      body.replace(p, from.size(), to);
+      p += to.size();
+    }
+  };
+
+  // Case 3: marker-less `<invoke name="X">` when no marked DSML tags exist in `body`.
+  const bool has_marked_calls = body.find("<" + ds + "tool_calls") != std::string::npos ||
+                                body.find("<" + ds + " calls") != std::string::npos;
+  const bool has_marked_inv   = body.find("<" + ds + "invoke") != std::string::npos ||
+                                body.find("<" + ds + " invoke") != std::string::npos;
+  if (!has_marked_calls && !has_marked_inv && body.find("<invoke name=") != std::string::npos) {
+    rep_body("<invoke name=", "<" + ds + "invoke name=");
+    rep_body("</invoke>", "</" + ds + "invoke>");
+    rep_body("<parameter name=", "<" + ds + "parameter name=");
+    rep_body("</parameter>", "</" + ds + "parameter>");
+    const std::string wrapper = "<" + ds + "tool_calls";
+    const std::string io = "<" + ds + "invoke";
+    const std::string ic = "</" + ds + "invoke>";
+    const size_t o = body.find(io);
+    const size_t c = body.rfind(ic);
+    if (o != std::string::npos && c != std::string::npos && c >= o) {
+      body.resize(c + ic.size());
+      body.insert(o, "\n\n" + wrapper + ">\n");
+      body += "\n</" + ds + "tool_calls>";
+      if (had_eos) body += eos;
+    }
+    return t.substr(0, body_start) + body;
+  }
+
+  // Case 1: marked `<｜DSML｜ invoke` / `<｜DSML｜invoke` present, but the opening
+  // `<｜DSML｜ calls>` / `<｜DSML｜tool_calls>` wrapper was truncated to `<｜DSML｜>`, `<｜DSML｜\n\n`,
+  // `<｜DSML｜<｜DSML｜ invoke`, `<｜DSML｜calls>`, or omitted completely.
+  if (!has_marked_calls && has_marked_inv) {
+    const size_t p_v41 = body.find("<" + ds + " invoke");
+    const size_t p_v4  = body.find("<" + ds + "invoke");
+    const bool is_v41  = p_v41 != std::string::npos && (p_v4 == std::string::npos || p_v41 <= p_v4);
+    const size_t inv_pos = is_v41 ? p_v41 : p_v4;
+
+    size_t open_pos = inv_pos;
+    const std::string ds_open = "<" + ds;
+    if (inv_pos > 0) {
+      const size_t cand = body.rfind(ds_open, inv_pos - 1);
+      if (cand != std::string::npos) {
+        const size_t mid = cand + ds_open.size();
+        const std::string between = body.substr(mid, inv_pos - mid);
+        if (between.find_first_not_of(" >\n\r\tcalls") == std::string::npos) {
+          open_pos = cand;
+        }
+      }
+    }
+    const std::string fixed_open = "<" + ds + (is_v41 ? " calls>\n" : "tool_calls>\n");
+    body.replace(open_pos, inv_pos - open_pos, fixed_open);
+  }
+
+  // Also normalize truncated closing wrappers (`</｜DSML｜>` or `</｜DSML｜calls>`) if a calls block
+  // is open.
+  if (body.find("<" + ds + " calls") != std::string::npos ||
+      body.find("<" + ds + "tool_calls") != std::string::npos) {
+    const bool is_v41 = body.find("<" + ds + " calls") != std::string::npos;
+    const std::string want_close = "</" + ds + (is_v41 ? " calls>" : "tool_calls>");
+    rep_body("</" + ds + ">", want_close);
+    rep_body("</" + ds + "calls>", want_close);
+    if (body.find("</" + ds + " calls>") == std::string::npos &&
+        body.find("</" + ds + "tool_calls>") == std::string::npos) {
+      const std::string ic_v41 = "</" + ds + " invoke>";
+      const std::string ic_v4  = "</" + ds + "invoke>";
+      const size_t c1 = body.rfind(ic_v41);
+      const size_t c2 = body.rfind(ic_v4);
+      size_t end_inv = std::string::npos;
+      if (c1 != std::string::npos) end_inv = c1 + ic_v41.size();
+      if (c2 != std::string::npos && (end_inv == std::string::npos || c2 + ic_v4.size() > end_inv))
+        end_inv = c2 + ic_v4.size();
+      if (end_inv != std::string::npos) {
+        body.resize(end_inv);
+        body += "\n" + want_close;
+        if (had_eos) body += eos;
+      }
+    }
+  }
+
+  return t.substr(0, body_start) + body;
 }
 
 ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
   ParsedMessage out;
-  // One repaired shape for the whole function: see repair_bare_dsml. Guarded on the MARKED
-  // tool_calls wrapper being absent — NOT on the marker char, which also lives inside kEosStr that
-  // every caller appends, so a marker-char test would never fire.
-  const std::string M = "\xef\xbd\x9c";
-  const bool bare_invoke =
-      text_in.find("<invoke name=") != std::string::npos &&
-      text_in.find("<" + M + "tool_calls") == std::string::npos &&
-      text_in.find("<" + M + " calls") == std::string::npos;
-  const std::string repaired = bare_invoke ? repair_bare_dsml(text_in) : std::string();
-  const std::string text = repaired.empty() ? text_in : repaired;
+  const std::string text = repair_bare_dsml(text_in, mode);
   const std::string dsml = kDsml;
   const std::string tc_open_v4  = std::string("\n\n<") + dsml + "tool_calls";
   const std::string tc_open_v41 = std::string("\n\n<") + dsml + " calls";
@@ -506,37 +664,44 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
   const bool is_tool_open = std::find(open_markers.begin(), open_markers.end(), stop) != open_markers.end();
 
   if (is_tool_open) {
-    const bool is_v41 = (stop == tc_open_v41 || stop == tc_open_v41_raw);
-    const std::string tag_calls = is_v41 ? " calls" : "tool_calls";
-    const std::string tag_inv   = is_v41 ? " invoke" : "invoke";
-    const std::string tag_param = is_v41 ? " parameter" : "parameter";
-
-    const std::string tc_close  = std::string("</") + dsml + tag_calls + ">";
-    const std::string inv_open  = std::string("<") + dsml + tag_inv;
-    const std::string inv_close = std::string("</") + dsml + tag_inv;
-    const std::string par_open  = std::string("<") + dsml + tag_param;
-    const std::string par_close = std::string("/") + dsml + tag_param;
+    const std::string tc_close_v4   = std::string("</") + dsml + "tool_calls>";
+    const std::string tc_close_v41  = std::string("</") + dsml + " calls>";
+    const std::string inv_open_v4   = std::string("<") + dsml + "invoke";
+    const std::string inv_open_v41  = std::string("<") + dsml + " invoke";
+    const std::string inv_close_v4  = std::string("</") + dsml + "invoke";
+    const std::string inv_close_v41 = std::string("</") + dsml + " invoke";
+    const std::string par_open_v4   = std::string("<") + dsml + "parameter";
+    const std::string par_open_v41  = std::string("<") + dsml + " parameter";
+    const std::string par_close_v4  = std::string("/") + dsml + "parameter";
+    const std::string par_close_v41 = std::string("/") + dsml + " parameter";
 
     // Inside the block: alternating `invoke` headers and `parameter` bodies until the close.
+    // Both V4 (no leading space) and V4.1 (leading space) tag spellings are accepted at each step
+    // so a single space-drop inside a V4.1 block does not abort the parse.
     while (i < text.size()) {
-      i = read_until(i, text, {inv_open, tc_close}, &chunk, &stop);
+      i = read_until(i, text, {inv_open_v4, inv_open_v41, tc_close_v4, tc_close_v41}, &chunk, &stop);
       if (chunk != ">\n") return fail("tool call format: expected '>\\n'");
-      if (stop == tc_close) break;
+      if (stop == tc_close_v4 || stop == tc_close_v41) break;
       if (stop.empty()) return fail("unterminated tool_calls block");
 
-      i = read_until(i, text, {par_open, inv_close}, &chunk, &stop);
+      i = read_until(i, text, {par_open_v4, par_open_v41, inv_close_v4, inv_close_v41}, &chunk, &stop);
       // ` name="X">\n`
       const size_t nq = chunk.find("name=\"");
       const size_t ne = nq == std::string::npos ? std::string::npos : chunk.find("\">\n", nq + 6);
       if (nq == std::string::npos || ne == std::string::npos) return fail("tool name format");
       ToolCall tc;
       tc.name = chunk.substr(nq + 6, ne - nq - 6);
+      const size_t sep = tc.name.find("::");
+      if (sep != std::string::npos) {
+        tc.ns = tc.name.substr(0, sep);
+        tc.name = tc.name.substr(sep + 2);
+      }
 
       std::string args = "{";
       std::set<std::string> seen;
       bool first = true;
-      while (stop == par_open) {
-        i = read_until(i, text, {par_close}, &chunk, &stop);
+      while (stop == par_open_v4 || stop == par_open_v41) {
+        i = read_until(i, text, {par_close_v4, par_close_v41}, &chunk, &stop);
         // ` name="k" string="true|false">value<`
         const size_t kq = chunk.find("name=\"");
         const size_t k_end = kq == std::string::npos ? std::string::npos : chunk.find("\" string=\"", kq + 6);
@@ -558,7 +723,7 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
         first = false;
         args += json_quote(key) + ": " + (is_str == "true" ? json_quote(val) : val);
 
-        i = read_until(i, text, {par_open, inv_close}, &chunk, &stop);
+        i = read_until(i, text, {par_open_v4, par_open_v41, inv_close_v4, inv_close_v41}, &chunk, &stop);
         if (chunk != ">\n") return fail("parameter format: expected '>\\n'");
       }
       args += "}";
@@ -571,11 +736,14 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
     return fail("unexpected stop token");
   }
 
-  // A special token loose in the text means the parse mis-framed something.
-  for (const char* sp : {kBos, kEosStr, kThinkStart, kThinkEnd, kDsml})
-    if (out.content.find(sp) != std::string::npos ||
-        out.reasoning_content.find(sp) != std::string::npos)
+  // A special token loose in the text means the parse mis-framed something. When tool_calls have
+  // already been framed after </think>, allow the reasoning block to have quoted `<think>` or
+  // `｜DSML｜` in prose without discarding the valid tool call.
+  for (const char* sp : {kBos, kEosStr, kThinkStart, kThinkEnd, kDsml}) {
+    if (out.content.find(sp) != std::string::npos) return fail("special token in content");
+    if (out.tool_calls.empty() && out.reasoning_content.find(sp) != std::string::npos)
       return fail("special token in content");
+  }
 
   return out;
 }

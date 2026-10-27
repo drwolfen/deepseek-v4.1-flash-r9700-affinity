@@ -45,22 +45,19 @@ RAM.
 
 ---
 
-## Current speed (measured, this machine)
+## Current speed (measured, this machine - v1.1.0 update)
 
-Single stream, 512k-context configuration, DSpark speculative decoding on, thinking on:
+Single stream, 512k-context configuration, DSpark speculative decoding on, thinking on (measured on live Hermes agent sessions at **163.5k–170.7k context**):
 
 | | |
 |---|---|
-| **Decode, long-context reasoning** | **18–19.6 tok/s** (median ≈ 18.9), stable across 40+ hours |
-| Decode, short / high-acceptance bursts | 24–25 tok/s |
-| Draft acceptance | 54–93 % (2.3–4.9 tokens per verified block) |
-| Prefill | ~1000 tok/s at 16k–48k (prefix cache hit 98.7 %, so prefill is rarely exercised) |
+| **Decode, weighted average (163k–171k ctx)** | **21.96 tok/s** (**+28.6%** over v1.0.0 baseline of 17.08 tok/s) |
+| **Decode, peak sustained bursts** | **27.80 tok/s** (e.g. 1,341 tokens in 48.15s at 166.3k context) |
+| **Speculative step latency** | **166.7 ms/block median** (-20.4%), down to **156.8 ms/block** min |
+| **Draft acceptance** | **79.9%** (3.69 tokens/block avg, up to 4.37 tokens/block; tail collapse resolved) |
+| **Prefill** | ~1000 tok/s (persistent prefix cache restores 330+ blocks from disk on restarts) |
 
-Decode is bound by moving the union of selected experts across PCIe: 3274/15360 experts (21.3 %) are
-resident in the two cards, 12086 are read from the 143.5 GiB host pool over the bus. Per decode block
-the engine streams ≈ 2.35 GiB/card, which is ≈ 95 % of the Gen3 ×16 ceiling — the link is saturated.
-That is why the numbers are flat versus context length and why a Gen4 ×16 host would be the single
-biggest speedup (~1.6×, to ~30 tok/s).
+Decode remains PCIe-streaming bound for non-resident experts (3,248 in VRAM / 12,112 streamed over PCIe), but **fused `hc_post` + DSpark taps (`AFF_FUSE_HC_TAP=1`)**, **on-GPU group-128 INT4 LM head (`AFF_DRAFT_HEAD_INT4=1`)**, and **Cactus capped rejection sampling (`AFF_CACTUS_DELTA=0.35`, `AFF_CACTUS_CAP_R=0.5`)** have cut per-block overhead by **-42.8 ms/block** and lifted decode throughput by **+28.6%**.
 
 ---
 
@@ -138,7 +135,10 @@ fineweb-edu eval corpus. Credit and thanks to Lucebox for these; the code commen
 ### Environment knobs used in the served unit
 
 `AFF_ENGRAM_WARM=1` `AFF_SPEC_BACKOFF=2` `AFF_ADAPTIVE_WIDTH=1` `AFF_BOUNDED_REPLAY=1`
+`AFF_FUSE_HC_TAP=1` `AFF_DRAFT_HEAD_INT4=1` `AFF_CACTUS_DELTA=0.35` `AFF_CACTUS_CAP_R=0.5`
 `AFF_RESIDENT_BIAS=0.008` `AFF_NOBUDGET_MAX_TOKENS=16384`.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for full version history, benchmarks, and commit attribution.
 
 ---
 

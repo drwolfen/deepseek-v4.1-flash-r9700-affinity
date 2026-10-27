@@ -1278,6 +1278,65 @@ __global__ void batch_rope_tail_bf16_kernel(uint16_t* __restrict__ x, uint32_t n
   p[i1] = wmma::f32_to_bf16(x0 * sn + x1 * c);
 }
 
+// V4.1-1017: act_quant(o, 32, "ue8m0", scale_dtype, inplace=True) between inverse RoPE and wo_a.
+// One wave32 owns one (block_of_32_dims, token b) in dim-major [dim][nb] bf16 layout.
+__global__ void batch_o_fp8_qdq_bf16_kernel(uint16_t* __restrict__ x, uint32_t n_blocks32,
+                                            uint32_t nb) {
+  const uint32_t wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t total = n_blocks32 * nb;
+  if (wid >= total) return;
+  const uint32_t b = wid % nb, blk = wid / nb;
+  const size_t idx = (size_t)(blk * 32u + lane) * nb + b;
+  const float f = wmma::bf16_to_f32(x[idx]);
+  float amax = fmaxf(fabsf(f), 1e-4f);
+  #pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    amax = fmaxf(amax, __shfl_xor(amax, mask, 32));
+  const uint32_t tbits = __float_as_uint(amax * (1.0f / 448.0f));
+  const int e = (int)((tbits >> 23) & 0xFFu) - 127 + ((tbits & 0x7FFFFFu) != 0u ? 1 : 0);
+  const float s = __uint_as_float((uint32_t)(e + 127) << 23);
+  const float v = fminf(448.0f, fmaxf(-448.0f, f / s));
+  const float a = fabsf(v);
+  if (a == 0.0f) {
+    x[idx] = wmma::f32_to_bf16(v);
+    return;
+  }
+  const int ea = max((int)((__float_as_uint(a) >> 23) & 0xFFu) - 127, -6);
+  const float ulp = __uint_as_float((uint32_t)(ea - 3 + 127) << 23);
+  const float r = (a / ulp + 12582912.0f) - 12582912.0f;
+  const uint32_t qbits = __float_as_uint(r * ulp) | (__float_as_uint(v) & 0x80000000u);
+  const float q = __uint_as_float(qbits) * s;
+  x[idx] = wmma::f32_to_bf16(q);
+}
+
+__global__ void o_fp8_qdq_f32_kernel(float* __restrict__ x, uint32_t n_blocks32) {
+  const uint32_t blk = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const uint32_t lane = threadIdx.x & 31u;
+  if (blk >= n_blocks32) return;
+  const size_t idx = (size_t)blk * 32u + lane;
+  const float f = wmma::bf16_to_f32(wmma::f32_to_bf16(x[idx]));
+  float amax = fmaxf(fabsf(f), 1e-4f);
+  #pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    amax = fmaxf(amax, __shfl_xor(amax, mask, 32));
+  const uint32_t tbits = __float_as_uint(amax * (1.0f / 448.0f));
+  const int e = (int)((tbits >> 23) & 0xFFu) - 127 + ((tbits & 0x7FFFFFu) != 0u ? 1 : 0);
+  const float s = __uint_as_float((uint32_t)(e + 127) << 23);
+  const float v = fminf(448.0f, fmaxf(-448.0f, f / s));
+  const float a = fabsf(v);
+  if (a == 0.0f) {
+    x[idx] = v;
+    return;
+  }
+  const int ea = max((int)((__float_as_uint(a) >> 23) & 0xFFu) - 127, -6);
+  const float ulp = __uint_as_float((uint32_t)(ea - 3 + 127) << 23);
+  const float r = (a / ulp + 12582912.0f) - 12582912.0f;
+  const uint32_t qbits = __float_as_uint(r * ulp) | (__float_as_uint(v) & 0x80000000u);
+  const float q = __uint_as_float(qbits) * s;
+  x[idx] = wmma::bf16_to_f32(wmma::f32_to_bf16(q));
+}
+
 // gate is clamped on ONE side, up on BOTH — see engine/ops.cpp, this asymmetry is from the model.
 __global__ void batch_swiglu_kernel(const float* __restrict__ g, const float* __restrict__ u,
                                     float* __restrict__ out, uint64_t n, float limit) {
@@ -1998,7 +2057,10 @@ __global__ void batch_hc_expand_reg_kernel(uint16_t* __restrict__ out_hc,
                                            const uint16_t* __restrict__ hc,
                                            const float* __restrict__ post,
                                            const float* __restrict__ comb, uint32_t n_embd,
-                                           uint32_t nb, int zb) {
+                                           uint32_t nb, int zb, float* __restrict__ tap,
+                                           uint32_t b_lo, uint32_t n_keep, uint32_t row0,
+                                           uint32_t rows_cap, uint32_t row_stride,
+                                           uint32_t slot_off) {
   const uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t b = (uint32_t)(t % nb), d = (uint32_t)(t / nb);
   if (d >= n_embd) return;
@@ -2008,13 +2070,20 @@ __global__ void batch_hc_expand_reg_kernel(uint16_t* __restrict__ out_hc,
 #pragma unroll
   for (uint32_t src = 0; src < NH; ++src)
     v[src] = wmma::bf16_to_f32(hc[((size_t)src * n_embd + d) * nb + b]);
+  float tap_acc = 0.0f;
 #pragma unroll
   for (uint32_t dst = 0; dst < NH; ++dst) {
     float acc = bv * post[(size_t)dst * nb + b];
 #pragma unroll
     for (uint32_t src = 0; src < NH; ++src)
       acc += comb[(size_t)(dst + src * NH) * nb + b] * v[src];
-    out_hc[((size_t)dst * n_embd + d) * nb + b] = wmma::f32_to_bf16(acc);
+    const uint16_t h16 = wmma::f32_to_bf16(acc);
+    out_hc[((size_t)dst * n_embd + d) * nb + b] = h16;
+    if (tap) tap_acc += wmma::bf16_to_f32(h16);
+  }
+  if (tap && b >= b_lo && b < b_lo + n_keep) {
+    const uint32_t row = row0 + (b - b_lo);
+    if (row < rows_cap) tap[(size_t)row * row_stride + slot_off + d] = tap_acc / (float)NH;
   }
 }
 
@@ -2796,6 +2865,24 @@ void batch_rope_tail_bf16_hip(uint16_t* x, uint32_t n_head, uint32_t head_dim, u
                      r.ext_factor, r.lo, r.hi, sin_sign);
 }
 
+void batch_o_fp8_qdq_bf16_hip(uint16_t* x, uint32_t n_blocks32, uint32_t nb, void* stream) {
+  const uint32_t total_waves = n_blocks32 * nb;
+  if (!total_waves) return;
+  const uint32_t thr = 256;
+  const uint32_t waves_per_blk = thr >> 5;
+  const uint32_t blk = (total_waves + waves_per_blk - 1) / waves_per_blk;
+  AFF_BLAUNCH(batch_o_fp8_qdq_bf16_kernel, dim3(blk), dim3(thr), 0, (hipStream_t)stream, x,
+              n_blocks32, nb);
+}
+
+void o_fp8_qdq_f32_hip(float* x, uint32_t n_blocks32, void* stream) {
+  if (!n_blocks32) return;
+  const uint32_t thr = 256;
+  const uint32_t waves_per_blk = thr >> 5;
+  const uint32_t blk = (n_blocks32 + waves_per_blk - 1) / waves_per_blk;
+  AFF_BLAUNCH(o_fp8_qdq_f32_kernel, dim3(blk), dim3(thr), 0, (hipStream_t)stream, x, n_blocks32);
+}
+
 // dst[dim][nb] <- src[nb][dim], rounding to bf16. The heads path only: attn_out's transpose is the
 // producer of a buffer two GEMMs and a quantiser then read, and all three take bf16 without loss —
 // the WMMA one truncates to bf16 anyway and the quantiser is going to E4M3.
@@ -2940,7 +3027,9 @@ void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float*
 void batch_hc_expand_hip(uint16_t* out_hc, float* block, const uint16_t* hc,
                          const float* post,
                          const float* comb, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
-                         bool zero_block, void* stream) {
+                         bool zero_block, void* stream, float* tap, uint32_t b_lo,
+                         uint32_t n_keep, uint32_t row0, uint32_t rows_cap,
+                         uint32_t row_stride, uint32_t slot_off) {
   const uint64_t total = (uint64_t)n_embd * nb;
   const uint32_t thr = 256;
   // n_hc is a TEMPLATE argument: the runtime-n_hc kernel it replaced re-read hc once per
@@ -2949,7 +3038,8 @@ void batch_hc_expand_hip(uint16_t* out_hc, float* block, const uint16_t* hc,
   const int zb = zero_block ? 1 : 0;
 #define AFF_BXP(NH)                                                                              \
   AFF_BLAUNCH(HIP_KERNEL_NAME(batch_hc_expand_reg_kernel<NH>), g, t3, 0, (hipStream_t)stream,    \
-              out_hc, block, hc, post, comb, n_embd, nb, zb)
+              out_hc, block, hc, post, comb, n_embd, nb, zb, tap, b_lo, n_keep, row0, rows_cap,  \
+              row_stride, slot_off)
   if (n_hc == 1)      { AFF_BXP(1); }
   else if (n_hc == 2) { AFF_BXP(2); }
   else if (n_hc == 8) { AFF_BXP(8); }
@@ -3240,6 +3330,144 @@ void batch_head_combine_hip(const float* own, const float* peers, uint32_t npeer
                             uint32_t n, uint32_t nb, void* stream) {
   AFF_BLAUNCH(batch_head_combine_kernel, dim3(1), dim3(kNarrowTok), 0, (hipStream_t)stream, own,
               peers, npeer, ids, n, nb);
+}
+
+// One wave32 quantises one 128-element bf16 group into 64 bytes of packed int4 nibbles + 1 bf16 scale
+// using a 9-point MSE clip search over alpha in [0.80, 1.00].
+__global__ void quantize_bf16_to_w4_g128_kernel(const uint16_t* __restrict__ src,
+                                                uint8_t* __restrict__ w4,
+                                                uint16_t* __restrict__ scales,
+                                                uint32_t total_groups) {
+  const uint32_t blk = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const uint32_t lane = threadIdx.x & 31u;
+  if (blk >= total_groups) return;
+  const uint16_t* gptr = src + (size_t)blk * 128u + lane * 4u;
+  const float f0 = wmma::bf16_to_f32(gptr[0]);
+  const float f1 = wmma::bf16_to_f32(gptr[1]);
+  const float f2 = wmma::bf16_to_f32(gptr[2]);
+  const float f3 = wmma::bf16_to_f32(gptr[3]);
+  float amax = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
+  #pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    amax = fmaxf(amax, __shfl_xor(amax, mask, 32));
+  float best_s = 0.0f;
+  float best_err = 1e30f;
+  if (amax > 0.0f) {
+    #pragma unroll
+    for (int step = 0; step <= 8; ++step) {
+      const float alpha = 0.80f + 0.025f * (float)step;
+      const float s_cand = wmma::bf16_to_f32(wmma::f32_to_bf16((amax * alpha) * (1.0f / 7.0f)));
+      if (s_cand <= 0.0f) continue;
+      const float inv_s = 1.0f / s_cand;
+      const float q0 = fminf(7.0f, fmaxf(-7.0f, rintf(f0 * inv_s)));
+      const float q1 = fminf(7.0f, fmaxf(-7.0f, rintf(f1 * inv_s)));
+      const float q2 = fminf(7.0f, fmaxf(-7.0f, rintf(f2 * inv_s)));
+      const float q3 = fminf(7.0f, fmaxf(-7.0f, rintf(f3 * inv_s)));
+      const float d0 = f0 - q0 * s_cand, d1 = f1 - q1 * s_cand;
+      const float d2 = f2 - q2 * s_cand, d3 = f3 - q3 * s_cand;
+      float err = (d0 * d0 + d1 * d1) + (d2 * d2 + d3 * d3);
+      #pragma unroll
+      for (int mask = 16; mask > 0; mask >>= 1)
+        err += __shfl_xor(err, mask, 32);
+      if (err < best_err) {
+        best_err = err;
+        best_s = s_cand;
+      }
+    }
+  }
+  if (lane == 0) scales[blk] = wmma::f32_to_bf16(best_s);
+  const float inv_best = best_s > 0.0f ? (1.0f / best_s) : 0.0f;
+  const uint32_t u0 = (uint32_t)((int)fminf(7.0f, fmaxf(-7.0f, rintf(f0 * inv_best))) + 8);
+  const uint32_t u1 = (uint32_t)((int)fminf(7.0f, fmaxf(-7.0f, rintf(f1 * inv_best))) + 8);
+  const uint32_t u2 = (uint32_t)((int)fminf(7.0f, fmaxf(-7.0f, rintf(f2 * inv_best))) + 8);
+  const uint32_t u3 = (uint32_t)((int)fminf(7.0f, fmaxf(-7.0f, rintf(f3 * inv_best))) + 8);
+  ((uint16_t*)w4)[(size_t)blk * 32u + lane] =
+      (uint16_t)(u0 | (u1 << 4) | (u2 << 8) | (u3 << 12));
+}
+
+void quantize_bf16_to_w4_g128_hip(const uint16_t* src, uint8_t* w4, uint16_t* scales,
+                                  uint32_t rows, uint32_t cols, void* stream) {
+  const uint32_t total_groups = rows * (cols / 128u);
+  if (!total_groups) return;
+  const uint32_t thr = 256, waves_per_blk = thr >> 5;
+  const uint32_t blk = (total_groups + waves_per_blk - 1) / waves_per_blk;
+  AFF_BLAUNCH(quantize_bf16_to_w4_g128_kernel, dim3(blk), dim3(thr), 0, (hipStream_t)stream,
+              src, w4, scales, total_groups);
+}
+
+constexpr uint32_t kW4Waves = 8;
+constexpr uint32_t kW4Threads = kW4Waves * kWave;
+
+template <uint32_t T>
+__global__ __launch_bounds__(kW4Threads) void matvec_w4_multix_kernel(
+    const uint8_t* __restrict__ w4, const uint16_t* __restrict__ scales,
+    const float* __restrict__ x, float* __restrict__ out, uint32_t rows, uint32_t cols,
+    uint32_t out_col_stride, int out_token_major) {
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t wave = threadIdx.x >> 5;
+  const uint32_t sc_cols = cols >> 7;
+  const uint32_t w4_cols = cols >> 1;
+  for (uint32_t row = blockIdx.x * kW4Waves + wave; row < rows; row += gridDim.x * kW4Waves) {
+    const uint8_t* wrow = w4 + (size_t)row * w4_cols;
+    const uint16_t* srow = scales + (size_t)row * sc_cols;
+    float acc[T];
+    #pragma unroll
+    for (uint32_t t = 0; t < T; ++t) acc[t] = 0.0f;
+    for (uint32_t c = lane * 8u; c < cols; c += 256u) {
+      const uint32_t p = *(const uint32_t*)(wrow + (c >> 1));
+      const float s = wmma::bf16_to_f32(srow[c >> 7]);
+      const float w0 = (float)(int)((p >>  0) & 0xFu) - 8.0f;
+      const float w1 = (float)(int)((p >>  4) & 0xFu) - 8.0f;
+      const float w2 = (float)(int)((p >>  8) & 0xFu) - 8.0f;
+      const float w3 = (float)(int)((p >> 12) & 0xFu) - 8.0f;
+      const float w4v = (float)(int)((p >> 16) & 0xFu) - 8.0f;
+      const float w5 = (float)(int)((p >> 20) & 0xFu) - 8.0f;
+      const float w6 = (float)(int)((p >> 24) & 0xFu) - 8.0f;
+      const float w7 = (float)(int)((p >> 28) & 0xFu) - 8.0f;
+      #pragma unroll
+      for (uint32_t t = 0; t < T; ++t) {
+        const float* xv = x + (size_t)t * cols + c;
+        const float4 xa = *(const float4*)(xv);
+        const float4 xb = *(const float4*)(xv + 4);
+        const float dot = ((w0 * xa.x + w1 * xa.y) + (w2 * xa.z + w3 * xa.w)) +
+                          ((w4v * xb.x + w5 * xb.y) + (w6 * xb.z + w7 * xb.w));
+        acc[t] = fmaf(dot, s, acc[t]);
+      }
+    }
+    #pragma unroll
+    for (uint32_t t = 0; t < T; ++t) {
+      float v = acc[t];
+      #pragma unroll
+      for (int mask = 16; mask > 0; mask >>= 1) v += __shfl_xor(v, mask, 32);
+      if (lane == 0) {
+        if (out_token_major)
+          out[(size_t)t * rows + row] = v;
+        else
+          out[(size_t)row * out_col_stride + t] = v;
+      }
+    }
+  }
+}
+
+bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float* x_tm,
+                          float* out, uint32_t rows, uint32_t cols, uint32_t nt,
+                          uint32_t out_col_stride, int out_token_major, void* stream) {
+  if (!w4 || !scales || !x_tm || !out || !rows || (cols % 256u) != 0u || !nt || nt > 8u)
+    return false;
+  const uint32_t blocks = std::min<uint32_t>(2048u, (rows + kW4Waves - 1) / kW4Waves);
+#define AFF_W4_MX(T)                                                                               \
+  case T:                                                                                          \
+    AFF_BLAUNCH((matvec_w4_multix_kernel<T>), dim3(blocks), dim3(kW4Threads), 0,                   \
+                (hipStream_t)stream, w4, scales, x_tm, out, rows, cols, out_col_stride,            \
+                out_token_major);                                                                  \
+    break
+  switch (nt) {
+    AFF_W4_MX(1); AFF_W4_MX(2); AFF_W4_MX(3); AFF_W4_MX(4);
+    AFF_W4_MX(5); AFF_W4_MX(6); AFF_W4_MX(7); AFF_W4_MX(8);
+    default: return false;
+  }
+#undef AFF_W4_MX
+  return true;
 }
 
 

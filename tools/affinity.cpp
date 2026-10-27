@@ -210,12 +210,13 @@ static bool load_expert_profile(const std::string& path, std::vector<float>* out
 // bare `</invoke>` — so the turn can be truncated there and generation stopped. The marker char is
 // built from its UTF-8 bytes (U+FF5C) rather than typed, so this file needs no exotic literals.
 static std::size_t tool_block_close_end(const std::string& s, std::size_t at) {
-  const std::string M = "\xef\xbd\x9c";                       // U+FF5C DSML bar
-  const bool wrapped = s.find(std::string("<") + M + "tool_calls", at) != std::string::npos ||
-                       s.find(std::string("<") + M + " calls", at) != std::string::npos;
-  if (wrapped) {
-    for (const std::string& cl : {std::string("</") + M + "tool_calls>",
-                                  std::string("</") + M + " calls>"}) {
+  const std::string ds = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";   // "｜DSML｜" (U+FF5C bars)
+  const bool marked = s.find(std::string("<") + ds, at) != std::string::npos;
+  if (marked) {
+    for (const std::string& cl : {std::string("</") + ds + "tool_calls>",
+                                  std::string("</") + ds + " calls>",
+                                  std::string("</") + ds + "calls>",
+                                  std::string("</") + ds + ">"}) {
       const std::size_t p = s.find(cl, at);
       if (p != std::string::npos) return p + cl.size();
     }
@@ -2011,6 +2012,17 @@ int main(int argc, char** argv) {
     // and online per-width cost EMA tracks step latency (ms) per width q.
     const char* aw_env = std::getenv("AFF_ADAPTIVE_WIDTH");
     const bool adaptive_width_on = (!aw_env || !*aw_env || std::strcmp(aw_env, "0") != 0) && kConfT <= 0.0f;
+    // Cactus rejection sampling with length-fade and acceptance cap (AFF_CACTUS_DELTA, default 0 = off).
+    const char* cactus_d_env = std::getenv("AFF_CACTUS_DELTA");
+    const double kCactusDelta = cactus_d_env ? std::strtod(cactus_d_env, nullptr) : 0.0;
+    const char* cactus_r_env = std::getenv("AFF_CACTUS_CAP_R");
+    const double kCactusCapR = cactus_r_env ? std::strtod(cactus_r_env, nullptr) : 0.5;
+    const char* cactus_fs_env = std::getenv("AFF_CACTUS_FADE_START");
+    const uint32_t kCactusFadeStart =
+        cactus_fs_env ? (uint32_t)std::strtoul(cactus_fs_env, nullptr, 10) : 4096u;
+    const char* cactus_fe_env = std::getenv("AFF_CACTUS_FADE_END");
+    const uint32_t kCactusFadeEnd =
+        cactus_fe_env ? (uint32_t)std::strtoul(cactus_fe_env, nullptr, 10) : 16384u;
     constexpr uint32_t kMaxQ = 8;
     float surv_ema[kMaxQ] = {1.0f, 0.75f, 0.60f, 0.48f, 0.38f, 0.30f, 0.24f, 0.19f};
     float conf_pred_ema[kMaxQ] = {1.0f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f};
@@ -2178,9 +2190,22 @@ int main(int argc, char** argv) {
         while (k < nd && vb.greedy[k] == fed[k + 1]) ++k;
         for (uint32_t j = 0; j < nd; ++j) match[j] = vb.greedy[j] == fed[j + 1];
       } else {
-        while (k < nd && accept_u[k] < (double)vb.draws[k].p_query) ++k;
+        auto accept_prob = [&](uint32_t j) -> double {
+          const double q = (double)vb.draws[j].p_query;
+          if (kCactusDelta <= 0.0 || q <= 0.0 || q >= 1.0) return q;
+          double fade = 1.0;
+          if (kCactusFadeEnd > kCactusFadeStart) {
+            fade = std::clamp((double)((int64_t)kCactusFadeEnd - (int64_t)(generated + j)) /
+                                  (double)(kCactusFadeEnd - kCactusFadeStart),
+                              0.0, 1.0);
+          }
+          const double h_raw = std::min(1.0, q * (1.0 + 2.0 * (kCactusDelta * fade) * (1.0 - q)));
+          if (kCactusCapR > 0.0) return std::max(q, std::min(h_raw, 1.0 - kCactusCapR * (1.0 - q)));
+          return h_raw;
+        };
+        while (k < nd && accept_u[k] < accept_prob(k)) ++k;
         if (k < nd) { rejected = true; reject_tok = vb.draws[k].tok_excl; }
-        for (uint32_t j = 0; j < nd; ++j) match[j] = accept_u[j] < (double)vb.draws[j].p_query;
+        for (uint32_t j = 0; j < nd; ++j) match[j] = accept_u[j] < accept_prob(j);
       }
       if (slot_dbg && nd) {
         std::string gs;
@@ -2651,7 +2676,7 @@ int main(int argc, char** argv) {
         }
         m.reasoning_content = in.reasoning_content;
         m.tool_call_id = in.tool_call_id;
-        for (const ToolCallIO& t : in.tool_calls) m.tool_calls.push_back({t.id, t.name, t.arguments});
+        for (const ToolCallIO& t : in.tool_calls) m.tool_calls.push_back({t.id, t.name, t.arguments, t.ns});
         msgs.push_back(m);
       }
     }
@@ -2774,17 +2799,12 @@ int main(int argc, char** argv) {
     // never lowers it, and the context still bounds the result.
     const uint64_t ctx_room = kMaxKvPositions > ids.size() + 32
                             ? kMaxKvPositions - ids.size() - 32 : 0;
-    // A request that names no `max_tokens` used to fall back to the whole remaining context, so a
-    // client that sends none — the messaging gateway does not — let one reasoning loop hold the
-    // single slot for 37 minutes and 55k tokens with no answer. Bound that default; a client that
-    // does set `max_tokens` is untouched. Override the bound with AFF_NOBUDGET_MAX_TOKENS.
-    uint64_t nobudget_tokens = 16384;
-    if (const char* v = std::getenv("AFF_NOBUDGET_MAX_TOKENS")) {
-      const uint64_t t = std::strtoull(v, nullptr, 10);
-      if (t) nobudget_tokens = t;
+    uint64_t no_budget = ctx_room;
+    if (const char* nb = std::getenv("AFF_NOBUDGET_MAX_TOKENS")) {
+      const uint64_t v = std::strtoull(nb, nullptr, 10);
+      if (v) no_budget = std::min(ctx_room, v);
     }
-    const uint64_t asked = req.has_max_tokens ? (uint64_t)req.max_tokens
-                                              : std::min<uint64_t>(ctx_room, nobudget_tokens);
+    const uint64_t asked = req.has_max_tokens ? (uint64_t)req.max_tokens : no_budget;
     const bool floored = req.has_max_tokens && asked < (uint64_t)max_tokens_floor;
     const uint32_t total_budget = (uint32_t)std::min<uint64_t>(
         ctx_room, std::max<uint64_t>(asked, (uint64_t)max_tokens_floor));
@@ -2997,8 +3017,10 @@ int main(int argc, char** argv) {
     std::vector<std::string> sentinels = req.stop;
     sentinels.push_back(kToolCallsOpen);
     sentinels.push_back(kToolCallsOpenV41);
+    sentinels.push_back(std::string("\n\n<") + "｜DSML｜");
     sentinels.push_back(std::string("<") + "｜DSML｜ calls");
     sentinels.push_back(std::string("<") + "｜DSML｜tool_calls");
+    sentinels.push_back(std::string("<") + "｜DSML｜");
     sentinels.push_back("<invoke");            // marker-less open (see tool_block_close_end)
     // In thinking mode the reasoning streams on its OWN channel. It must not go out as
     // `delta.content` — that puts the model's deliberation, and then a bare </think>, into the
@@ -3077,7 +3099,10 @@ int main(int argc, char** argv) {
         const size_t pos = raw.find(m, streamed);
         if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
       }
-      for (const std::string& m : {std::string("<") + "｜DSML｜ calls", std::string("<") + "｜DSML｜tool_calls"}) {
+      for (const std::string& m : {std::string("\n\n<") + "｜DSML｜",
+                                   std::string("<") + "｜DSML｜ calls",
+                                   std::string("<") + "｜DSML｜tool_calls",
+                                   std::string("<") + "｜DSML｜"}) {
         const size_t pos = raw.find(m, streamed);
         if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
       }
@@ -3191,7 +3216,8 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < recovered.tool_calls.size(); ++i)
           res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(tseq) + "_" + std::to_string(i),
                                                recovered.tool_calls[i].name,
-                                               recovered.tool_calls[i].arguments});
+                                               recovered.tool_calls[i].arguments,
+                                               recovered.tool_calls[i].ns});
         res->finish_reason = "tool_calls";
       } else {
       // The reasoning allowance ran out before the block closed. That text is reasoning, not an
@@ -3221,7 +3247,8 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < pm.tool_calls.size(); ++i)
         res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(tseq) + "_" + std::to_string(i),
                                              pm.tool_calls[i].name,
-                                             pm.tool_calls[i].arguments});
+                                             pm.tool_calls[i].arguments,
+                                             pm.tool_calls[i].ns});
       res->finish_reason = pm.tool_calls.empty() ? "stop" : "tool_calls";
     }
     if (hit_budget && res->finish_reason == "stop") res->finish_reason = "length";

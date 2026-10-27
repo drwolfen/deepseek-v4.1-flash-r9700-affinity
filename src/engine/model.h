@@ -694,6 +694,9 @@ public:
     // caller asked to keep, and `row0` where the first of them lands.
     bool (*hc_tap)(void* ctx, uint32_t slot, uint32_t n_taps, uint32_t b_lo, uint32_t n_keep,
                    uint32_t row0, uint32_t rows_cap, uint32_t n_embd, uint32_t n_hc) = nullptr;
+    bool (*hc_post_tap)(void* ctx, bool has_control, uint32_t slot, uint32_t n_taps, uint32_t b_lo,
+                        uint32_t n_keep, uint32_t row0, uint32_t rows_cap, uint32_t n_embd,
+                        uint32_t n_hc) = nullptr;
     // The vocabulary head for every token of the chunk, with only the argmax coming back. `x` is
     // [n][n_embd] token-major — the collapsed, normed hidden state — and `ids` [n].
     //

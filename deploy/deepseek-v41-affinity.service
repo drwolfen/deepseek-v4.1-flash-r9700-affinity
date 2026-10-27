@@ -1,5 +1,5 @@
 [Unit]
-Description=Affinity Server (DeepSeek-V4.1-Flash Uncensored, 512k ctx, Dual R9700 ROCm 7.14)
+Description=Affinity Server (DeepSeek-V4.1-Flash-1017 Uncensored, 512k ctx, Dual R9700 ROCm 7.14)
 After=network.target
 
 [Service]
@@ -14,27 +14,32 @@ ExecStart=/usr/bin/docker run --name deepseek-affinity \
     -e AFF_SPEC_BACKOFF=2 \
     -e AFF_ADAPTIVE_WIDTH=1 \
     -e AFF_BOUNDED_REPLAY=1 \
+    -e AFF_FUSE_HC_TAP=1 \
+    -e AFF_DRAFT_HEAD_INT4=1 \
+    -e AFF_CACTUS_DELTA=0.35 \
+    -e AFF_CACTUS_CAP_R=0.5 \
     -e AFF_RESIDENT_BIAS=0.008 \
     -e AFF_NOBUDGET_MAX_TOKENS=16384 \
     -p 8000:8000 \
     -v /mnt/fast-storage:/mnt/fast-storage \
     -v /home/ydj/affinity-patched/affinity:/opt/affinity-src/build/affinity:ro \
     affinity:v41-vision \
-    -m /mnt/fast-storage/DeepSeek-V4.1-Flash-UNCENSORED-aff/model-uc.aff \
-    --tokenizer /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json \
+    -m /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.aff \
+    --tokenizer /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json \
     --host 0.0.0.0 --port 8000 \
     --gpu-headroom-mib 1024 \
     --dspark on \
-    --dspark-model /mnt/fast-storage/DeepSeek-V4.1-Flash-UNCENSORED-aff/model-uc.dspark.aff \
-    --engram /mnt/fast-storage/DeepSeek-V4.1-Flash-UNCENSORED-aff/model-uc.engram \
-    --engram-tables /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8 \
-    --prefix-cache-dir /mnt/fast-storage/DeepSeek-V4.1-Flash-UNCENSORED-aff/pcache \
+    --dspark-model /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.dspark.aff \
+    --engram /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.engram \
+    --engram-tables /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8 \
+    --prefix-cache-dir /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/pcache \
     --prefix-cache-gib 64 \
+    --persistent-prefix-cache \
     --kv-size 524288 \
     --kv-commit 262144 \
     --host-pool-mib 200000 --host-pool-reserve-mib 1024 \
     --placement-strategy demand \
-    --placement-save /mnt/fast-storage/DeepSeek-V4.1-Flash-UNCENSORED-aff/placement.affprof \
+    --placement-save /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/placement.affprof \
     --prefill-chunk-size 2816 \
     --default-effort 75 \
     --max-tokens-floor 0
