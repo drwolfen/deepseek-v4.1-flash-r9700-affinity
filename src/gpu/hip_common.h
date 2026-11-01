@@ -161,6 +161,60 @@ inline bool hip_device_info(int i, DeviceInfo* out, std::string* err) {
   return true;
 }
 
+// ---- free VRAM, from the driver's counters ----------------------------------------------------
+//
+// `hipMemGetInfo` reports a LARGER free figure than the amdgpu driver's own sysfs counter on this
+// machine: measured on 2x R9700 / ROCm 7.14, 1026 MiB by HIP against 677 MiB by sysfs, with the
+// expert slab and the codebook already allocated and nothing else running on the cards.
+//
+// That difference is not noise, and it is not small: ~349 MiB, the same order as one full KV
+// commit (0.66 GiB for 262144 positions). The KV grower pays for that commit out of the reserve the
+// slab leaves, so sizing the slab from the optimistic number over-commits by exactly what the
+// reserve exists to cover — a sequence that reaches the top of --kv-size then ends with tens of MiB
+// of real headroom while the engine still believes it has hundreds.
+//
+// So take the SMALLER of the two. sysfs is the driver's view of the whole card, other processes
+// included, which is the right question on a dedicated inference box; HIP is the fallback when the
+// counter cannot be read, and also the floor when it disagrees downwards.
+inline bool read_sysfs_u64(const std::string& path, uint64_t* out) {
+  std::FILE* f = std::fopen(path.c_str(), "re");
+  if (!f) return false;
+  unsigned long long v = 0;
+  const bool ok = std::fscanf(f, "%llu", &v) == 1;
+  std::fclose(f);
+  if (ok && out) *out = (uint64_t)v;
+  return ok;
+}
+
+inline bool hip_free_vram_checked(int dev, uint64_t* free_bytes, uint64_t* total_bytes) {
+  if (!free_bytes || !total_bytes) return false;
+  int prev = 0;
+  const bool have_prev = hipGetDevice(&prev) == hipSuccess;
+  if (hipSetDevice(dev) != hipSuccess) return false;
+  size_t fb = 0, tb = 0;
+  const bool hip_ok = hipMemGetInfo(&fb, &tb) == hipSuccess;
+  char bus[32] = {0};
+  const bool named = hipDeviceGetPCIBusId(bus, (int)sizeof(bus), dev) == hipSuccess && bus[0];
+  if (!hip_ok) {
+    if (have_prev) (void)hipSetDevice(prev);
+    return false;
+  }
+  uint64_t sys_total = 0, sys_used = 0, freeb = fb, totalb = tb;
+  if (named) {
+    const std::string base = std::string("/sys/bus/pci/devices/") + bus;
+    if (read_sysfs_u64(base + "/mem_info_vram_total", &sys_total) &&
+        read_sysfs_u64(base + "/mem_info_vram_used", &sys_used) && sys_used <= sys_total) {
+      const uint64_t sys_free = sys_total - sys_used;
+      if (sys_free < freeb) freeb = sys_free;
+      if (totalb == 0 || sys_total == totalb) totalb = sys_total;
+    }
+  }
+  if (have_prev) (void)hipSetDevice(prev);
+  *free_bytes = freeb;
+  *total_bytes = totalb;
+  return true;
+}
+
 // RAII device buffer. No pooling: allocation happens at load time, not on the decode path.
 template <typename T>
 class DeviceBuffer {

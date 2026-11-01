@@ -411,6 +411,66 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
 
 }  // namespace
 
+__global__ void repeat_penalty_kernel(float* __restrict__ plane, uint32_t vocab,
+                                      uint32_t row_stride, uint32_t col_stride, uint32_t n,
+                                      const uint32_t* __restrict__ ids, uint32_t n_ids,
+                                      float penalty) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_ids) return;
+  const uint32_t id = ids[i];
+  if (id >= vocab) return;
+  float* const row = plane + (size_t)id * row_stride;
+  for (uint32_t c = 0; c < n; ++c) {
+    float& x = row[(size_t)c * col_stride];
+    // The same rule sampler.cpp uses: divide a positive logit, multiply a negative one. Squaring
+    // the penalty on an already-negative token would make it MORE likely, which is the opposite of
+    // what a repetition penalty is for.
+    x = (x > 0.0f) ? x / penalty : x * penalty;
+  }
+}
+
+bool apply_repeat_penalty_hip(float* logits, uint32_t vocab, uint32_t n,
+                              uint32_t row_stride, uint32_t col_stride,
+                              const uint32_t* d_ids, uint32_t n_ids, float penalty, void* stream) {
+  if (!logits || !d_ids || !n_ids || !vocab || !n) return true;   // nothing to do, not a failure
+  if (!(penalty > 0.0f) || penalty == 1.0f) return true;
+  const uint32_t threads = 128;
+  const uint32_t blocks = (n_ids + threads - 1) / threads;
+  hipLaunchKernelGGL(repeat_penalty_kernel, dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                     logits, vocab, row_stride, col_stride, n, d_ids, n_ids, penalty);
+  return hipGetLastError() == hipSuccess;
+}
+
+// DRY, on the same plane and for a different failure: a token-level penalty cannot break a cycle
+// whose tokens are individually ordinary ("Hmm", " —", ".", "\n\n"). What repeats there is the
+// SEQUENCE, so the suppression has to be aimed by the sequence — the ids the host found after the
+// current suffix n-gram last time — and it has to be a constart subtraction rather than a ratio,
+// because a confident loop can sit several logits above its alternatives and a divide of 2 leaves
+// it on top. Subtracting is the only shape that removes a token from the nucleus outright.
+__global__ void dry_penalty_kernel(float* __restrict__ plane, uint32_t vocab, uint32_t row_stride,
+                                   uint32_t col_stride, uint32_t n,
+                                   const uint32_t* __restrict__ ids, uint32_t n_ids,
+                                   float delta) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_ids) return;
+  const uint32_t id = ids[i];
+  if (id >= vocab) return;
+  float* const row = plane + (size_t)id * row_stride;
+  for (uint32_t c = 0; c < n; ++c) row[(size_t)c * col_stride] -= delta;
+}
+
+bool apply_dry_penalty_hip(float* logits, uint32_t vocab, uint32_t n, uint32_t row_stride,
+                           uint32_t col_stride, const uint32_t* d_ids, uint32_t n_ids,
+                           float delta, void* stream) {
+  if (!logits || !d_ids || !n_ids || !vocab || !n) return true;
+  if (!(delta > 0.0f)) return true;
+  const uint32_t threads = 128;
+  const uint32_t blocks = (n_ids + threads - 1) / threads;
+  hipLaunchKernelGGL(dry_penalty_kernel, dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                     logits, vocab, row_stride, col_stride, n, d_ids, n_ids, delta);
+  return hipGetLastError() == hipSuccess;
+}
+
 bool batch_sample_hip(const float* logits, uint32_t vocab, uint32_t n,
                       uint32_t row_stride, uint32_t col_stride,
                       const uint32_t* d_query, const float* d_u, SampleParams p,

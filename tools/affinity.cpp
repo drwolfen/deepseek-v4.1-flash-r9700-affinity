@@ -210,12 +210,13 @@ static bool load_expert_profile(const std::string& path, std::vector<float>* out
 // bare `</invoke>` — so the turn can be truncated there and generation stopped. The marker char is
 // built from its UTF-8 bytes (U+FF5C) rather than typed, so this file needs no exotic literals.
 static std::size_t tool_block_close_end(const std::string& s, std::size_t at) {
-  const std::string M = "\xef\xbd\x9c";                       // U+FF5C DSML bar
-  const bool wrapped = s.find(std::string("<") + M + "tool_calls", at) != std::string::npos ||
-                       s.find(std::string("<") + M + " calls", at) != std::string::npos;
-  if (wrapped) {
-    for (const std::string& cl : {std::string("</") + M + "tool_calls>",
-                                  std::string("</") + M + " calls>"}) {
+  const std::string ds = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";   // "｜DSML｜" (U+FF5C bars)
+  const bool marked = s.find(std::string("<") + ds, at) != std::string::npos;
+  if (marked) {
+    for (const std::string& cl : {std::string("</") + ds + "tool_calls>",
+                                  std::string("</") + ds + " calls>",
+                                  std::string("</") + ds + "calls>",
+                                  std::string("</") + ds + ">"}) {
       const std::size_t p = s.find(cl, at);
       if (p != std::string::npos) return p + cl.size();
     }
@@ -427,6 +428,12 @@ int main(int argc, char** argv) {
     else if (a == "--top-k") { sample_cfg.top_k = (uint32_t)std::strtoul(nxt(), nullptr, 10); sampling_set = true; }
     else if (a == "--top-p") { sample_cfg.top_p = std::strtof(nxt(), nullptr); sampling_set = true; }
     else if (a == "--min-p") { sample_cfg.min_p = std::strtof(nxt(), nullptr); sampling_set = true; }
+    else if (a == "--repeat-penalty") { sample_cfg.repeat_penalty = std::strtof(nxt(), nullptr); sampling_set = true; }
+    else if (a == "--repeat-last-n") { sample_cfg.repeat_last_n = (uint32_t)std::strtoul(nxt(), nullptr, 10); sampling_set = true; }
+    else if (a == "--dry-delta") { sample_cfg.dry_delta = std::strtof(nxt(), nullptr); sampling_set = true; }
+    else if (a == "--dry-ngram") { sample_cfg.dry_ngram = (uint32_t)std::strtoul(nxt(), nullptr, 10); sampling_set = true; }
+    else if (a == "--dry-window") { sample_cfg.dry_window = (uint32_t)std::strtoul(nxt(), nullptr, 10); sampling_set = true; }
+    else if (a == "--dry-min-repeats") { sample_cfg.dry_min_repeats = (uint32_t)std::strtoul(nxt(), nullptr, 10); sampling_set = true; }
     else if (a == "--seed") { sample_cfg.seed = std::strtoull(nxt(), nullptr, 10); sampling_set = true; }
     // ARG_MAX stops `-p "$(cat file)"` at a few hundred KiB — ~30K tokens, well short of what the
     // cache is sized for — so a deep-context prompt has to come from a file.
@@ -1603,13 +1610,35 @@ int main(int argc, char** argv) {
   // --placement-save-secs at most, and the heat plane is only read on this (the dispatch) thread.
   std::chrono::steady_clock::time_point placement_saved_at{};
   auto maybe_save_placement = [&]() {
-    if (placement_save_path.empty() || !placement.engine_running()) return;
+    if (!placement.engine_running()) return;
     const auto now = std::chrono::steady_clock::now();
     if (placement_saved_at.time_since_epoch().count() != 0 &&
         now - placement_saved_at < std::chrono::seconds(placement_save_secs))
       return;
-    std::string serr;
-    if (placement.save_heat_profile(placement_save_path, &serr)) placement_saved_at = now;
+    if (!placement_save_path.empty()) {
+      std::string serr;
+      // The stamp moves on SUCCESS, as it always has: a failing save path must not turn into one
+      // write attempt per decode block.
+      if (placement.save_heat_profile(placement_save_path, &serr)) placement_saved_at = now;
+    } else {
+      placement_saved_at = now;
+    }
+    // ---- the counters, on a timer ---------------------------------------------------------------
+    //
+    // engine_report() prints exactly these at exit, and the dashboard reads them through the bus,
+    // but a serving process has neither: an HTTP run otherwise leaves NOTHING behind to explain its
+    // throughput. Once per save interval is enough to see the exchange rate the strategy is tuned
+    // against — readmits over promotions is the number that says the guards are too loose, and a
+    // starved count that is not zero says the pipeline, not the policy, is the limit.
+    const PlacementEngineStats& es = placement.engine_stats();
+    aff::ui::err("placement: %llu ticks, %llu promotions / %llu demotions, %llu readmits (%.0f%%), "
+                 "%llu refused, starved %llu slab / %llu pool; %.2f GiB h2d, %.2f GiB d2h\n",
+                 (unsigned long long)es.ticks, (unsigned long long)es.promotions,
+                 (unsigned long long)es.demotions, (unsigned long long)es.readmits,
+                 es.promotions ? 100.0 * (double)es.readmits / (double)es.promotions : 0.0,
+                 (unsigned long long)es.refused, (unsigned long long)es.starved_slab,
+                 (unsigned long long)es.starved_pool, (double)es.h2d_bytes / 1073741824.0,
+                 (double)es.d2h_bytes / 1073741824.0);
   };
   auto publish_run = [&](uint64_t generated, uint64_t target, uint64_t prompt_tokens, uint64_t pos,
                          double decode_tok_s, double prefill_tok_s, double ms_block) {
@@ -1984,7 +2013,62 @@ int main(int argc, char** argv) {
       vb.top_p = sc->top_p;
       vb.top_k = sc->top_k;
       vb.min_p = sc->min_p;
+      vb.repeat_penalty = sc->repeat_penalty;
+      // The window is the tail of the sequence as it stands BEFORE this block, which already ends
+      // with the seed token `next` — hist is appended to only after a block is accepted. It
+      // therefore penalises what the model has already said, never a proposal it has not committed
+      // to, which is the same set a host sampler would see (`sampler.cpp` reads `history`).
+      if (sc->repeat_penalty != 1.0f && sc->repeat_last_n) {
+        const size_t take = std::min<size_t>(hist.size(), sc->repeat_last_n);
+        vb.penalty_ids.assign(hist.end() - (std::ptrdiff_t)take, hist.end());
+      } else {
+        vb.penalty_ids.clear();
+      }
+      // DRY is computed per block, below: the suffix n-gram moves with every accepted token.
+      vb.dry_delta = sc->dry_delta;
     }
+    // DRY ids for THIS block: the tokens that continued a repeated key.
+    //
+    // The signal is how often the CURRENT suffix key has already occurred in the recent window.
+    // A cycle in this model is not exactly periodic — "Hmm — hmm / Hmm — run" comes back with
+    // variations ("and then sign", "pause") — so a periodicity test sees nothing, while the key
+    // still recurs dozens of times and the same handful of tokens keep following it.
+    //
+    // The key is deliberately LONG. At four tokens the key `(\n        return self.` matched eight
+    // times in a class of eight generated getters and the continuation `a` was suppressed, which
+    // wrote `self.5`. At eight tokens the key carries the method's own digit, so a systematically
+    // varied passage never matches and only a real loop does.
+    auto dry_ids_for = [&](std::vector<uint32_t>& out) {
+      out.clear();
+      if (!(sc && sc->dry_delta > 0.0f && sc->dry_ngram)) return;
+      const size_t ng = sc->dry_ngram;
+      if (hist.size() <= ng + 1) return;
+      const size_t end = hist.size();
+      const size_t lo = end > (size_t)sc->dry_window + ng ? end - (size_t)sc->dry_window - ng : 0;
+      const uint32_t eos = (uint32_t)tok.eos();
+      const size_t need = std::max<size_t>(2, sc->dry_min_repeats);
+      std::vector<std::pair<uint32_t, uint32_t>> cont;   // (token, times it followed the key)
+      uint32_t occurrences = 0;
+      for (size_t i = lo; i + ng < end; ++i) {
+        bool same = true;
+        for (size_t k = 0; k < ng; ++k)
+          if (hist[i + k] != hist[end - ng + k]) { same = false; break; }
+        if (!same) continue;
+        ++occurrences;
+        const uint32_t nx = hist[i + ng];
+        if (nx == eos) continue;            // never suppress the way out
+        bool found = false;
+        for (auto& c : cont)
+          if (c.first == nx) { ++c.second; found = true; break; }
+        if (!found) cont.push_back({nx, 1u});
+      }
+      if (occurrences >= need)
+        for (const auto& c : cont)
+          if (c.second >= 2) out.push_back(c.first);
+      if (std::getenv("AFF_DRY_DEBUG"))
+        aff::ui::err("dry: hist %zu ng %zu occ %u cont %zu kept %zu delta %.1f\n", hist.size(), ng,
+                     occurrences, cont.size(), out.size(), (double)sc->dry_delta);
+    };
     const bool slot_dbg = std::getenv("AFF_SLOT_DEBUG") != nullptr;
     const bool n_slots_gt1 = dense_gpu.n_slots() > 1;
     uint64_t tap_hash_prev = 0, kv_hash_prev = 0;
@@ -2011,6 +2095,17 @@ int main(int argc, char** argv) {
     // and online per-width cost EMA tracks step latency (ms) per width q.
     const char* aw_env = std::getenv("AFF_ADAPTIVE_WIDTH");
     const bool adaptive_width_on = (!aw_env || !*aw_env || std::strcmp(aw_env, "0") != 0) && kConfT <= 0.0f;
+    // Cactus rejection sampling with length-fade and acceptance cap (AFF_CACTUS_DELTA, default 0 = off).
+    const char* cactus_d_env = std::getenv("AFF_CACTUS_DELTA");
+    const double kCactusDelta = cactus_d_env ? std::strtod(cactus_d_env, nullptr) : 0.0;
+    const char* cactus_r_env = std::getenv("AFF_CACTUS_CAP_R");
+    const double kCactusCapR = cactus_r_env ? std::strtod(cactus_r_env, nullptr) : 0.5;
+    const char* cactus_fs_env = std::getenv("AFF_CACTUS_FADE_START");
+    const uint32_t kCactusFadeStart =
+        cactus_fs_env ? (uint32_t)std::strtoul(cactus_fs_env, nullptr, 10) : 4096u;
+    const char* cactus_fe_env = std::getenv("AFF_CACTUS_FADE_END");
+    const uint32_t kCactusFadeEnd =
+        cactus_fe_env ? (uint32_t)std::strtoul(cactus_fe_env, nullptr, 10) : 16384u;
     constexpr uint32_t kMaxQ = 8;
     float surv_ema[kMaxQ] = {1.0f, 0.75f, 0.60f, 0.48f, 0.38f, 0.30f, 0.24f, 0.19f};
     float conf_pred_ema[kMaxQ] = {1.0f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f};
@@ -2128,6 +2223,7 @@ int main(int argc, char** argv) {
       std::vector<double> accept_u(nd + 1);
       if (sc) {
         vb.query.assign(nd + 1, 0xFFFFFFFFu);
+        dry_ids_for(vb.dry_ids);
         vb.uniforms.assign(2u * (nd + 1), 0.0f);
         for (uint32_t j = 0; j < nd; ++j) vb.query[j] = fed[j + 1];
         for (uint32_t j = 0; j <= nd; ++j) {
@@ -2178,9 +2274,22 @@ int main(int argc, char** argv) {
         while (k < nd && vb.greedy[k] == fed[k + 1]) ++k;
         for (uint32_t j = 0; j < nd; ++j) match[j] = vb.greedy[j] == fed[j + 1];
       } else {
-        while (k < nd && accept_u[k] < (double)vb.draws[k].p_query) ++k;
+        auto accept_prob = [&](uint32_t j) -> double {
+          const double q = (double)vb.draws[j].p_query;
+          if (kCactusDelta <= 0.0 || q <= 0.0 || q >= 1.0) return q;
+          double fade = 1.0;
+          if (kCactusFadeEnd > kCactusFadeStart) {
+            fade = std::clamp((double)((int64_t)kCactusFadeEnd - (int64_t)(generated + j)) /
+                                  (double)(kCactusFadeEnd - kCactusFadeStart),
+                              0.0, 1.0);
+          }
+          const double h_raw = std::min(1.0, q * (1.0 + 2.0 * (kCactusDelta * fade) * (1.0 - q)));
+          if (kCactusCapR > 0.0) return std::max(q, std::min(h_raw, 1.0 - kCactusCapR * (1.0 - q)));
+          return h_raw;
+        };
+        while (k < nd && accept_u[k] < accept_prob(k)) ++k;
         if (k < nd) { rejected = true; reject_tok = vb.draws[k].tok_excl; }
-        for (uint32_t j = 0; j < nd; ++j) match[j] = accept_u[j] < (double)vb.draws[j].p_query;
+        for (uint32_t j = 0; j < nd; ++j) match[j] = accept_u[j] < accept_prob(j);
       }
       if (slot_dbg && nd) {
         std::string gs;
@@ -2651,7 +2760,7 @@ int main(int argc, char** argv) {
         }
         m.reasoning_content = in.reasoning_content;
         m.tool_call_id = in.tool_call_id;
-        for (const ToolCallIO& t : in.tool_calls) m.tool_calls.push_back({t.id, t.name, t.arguments});
+        for (const ToolCallIO& t : in.tool_calls) m.tool_calls.push_back({t.id, t.name, t.arguments, t.ns});
         msgs.push_back(m);
       }
     }
@@ -2774,7 +2883,12 @@ int main(int argc, char** argv) {
     // never lowers it, and the context still bounds the result.
     const uint64_t ctx_room = kMaxKvPositions > ids.size() + 32
                             ? kMaxKvPositions - ids.size() - 32 : 0;
-    const uint64_t asked = req.has_max_tokens ? (uint64_t)req.max_tokens : ctx_room;
+    uint64_t no_budget = ctx_room;
+    if (const char* nb = std::getenv("AFF_NOBUDGET_MAX_TOKENS")) {
+      const uint64_t v = std::strtoull(nb, nullptr, 10);
+      if (v) no_budget = std::min(ctx_room, v);
+    }
+    const uint64_t asked = req.has_max_tokens ? (uint64_t)req.max_tokens : no_budget;
     const bool floored = req.has_max_tokens && asked < (uint64_t)max_tokens_floor;
     const uint32_t total_budget = (uint32_t)std::min<uint64_t>(
         ctx_room, std::max<uint64_t>(asked, (uint64_t)max_tokens_floor));
@@ -2987,8 +3101,10 @@ int main(int argc, char** argv) {
     std::vector<std::string> sentinels = req.stop;
     sentinels.push_back(kToolCallsOpen);
     sentinels.push_back(kToolCallsOpenV41);
+    sentinels.push_back(std::string("\n\n<") + "｜DSML｜");
     sentinels.push_back(std::string("<") + "｜DSML｜ calls");
     sentinels.push_back(std::string("<") + "｜DSML｜tool_calls");
+    sentinels.push_back(std::string("<") + "｜DSML｜");
     sentinels.push_back("<invoke");            // marker-less open (see tool_block_close_end)
     // In thinking mode the reasoning streams on its OWN channel. It must not go out as
     // `delta.content` — that puts the model's deliberation, and then a bare </think>, into the
@@ -3017,6 +3133,18 @@ int main(int argc, char** argv) {
     sc.top_p = req.has_top_p ? req.top_p : 0.95f;
     sc.top_k = req.top_k;
     sc.min_p = req.min_p;
+    // Request value wins; the process default (`--repeat-penalty`) applies when the request leaves
+    // it at the neutral 1.0. A penalty of 0 or less is a client error worth ignoring rather than
+    // dividing by zero: fall back to neutral.
+    sc.repeat_penalty = (req.repeat_penalty > 0.0f && req.repeat_penalty != 1.0f)
+                            ? req.repeat_penalty : sample_cfg.repeat_penalty;
+    sc.repeat_last_n = req.repeat_last_n ? req.repeat_last_n : sample_cfg.repeat_last_n;
+    // A NEGATIVE request value disables DRY for this call; 0 means "engine default".
+    sc.dry_delta = req.dry_delta < 0.0f ? 0.0f
+                 : (req.dry_delta > 0.0f ? req.dry_delta : sample_cfg.dry_delta);
+    sc.dry_ngram = sample_cfg.dry_ngram;
+    sc.dry_window = sample_cfg.dry_window;
+    sc.dry_min_repeats = sample_cfg.dry_min_repeats;
     sc.seed = req.seed ? req.seed : (uint64_t)std::random_device{}();
 
 
@@ -3067,7 +3195,10 @@ int main(int argc, char** argv) {
         const size_t pos = raw.find(m, streamed);
         if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
       }
-      for (const std::string& m : {std::string("<") + "｜DSML｜ calls", std::string("<") + "｜DSML｜tool_calls"}) {
+      for (const std::string& m : {std::string("\n\n<") + "｜DSML｜",
+                                   std::string("<") + "｜DSML｜ calls",
+                                   std::string("<") + "｜DSML｜tool_calls",
+                                   std::string("<") + "｜DSML｜"}) {
         const size_t pos = raw.find(m, streamed);
         if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
       }
@@ -3181,7 +3312,8 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < recovered.tool_calls.size(); ++i)
           res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(tseq) + "_" + std::to_string(i),
                                                recovered.tool_calls[i].name,
-                                               recovered.tool_calls[i].arguments});
+                                               recovered.tool_calls[i].arguments,
+                                               recovered.tool_calls[i].ns});
         res->finish_reason = "tool_calls";
       } else {
       // The reasoning allowance ran out before the block closed. That text is reasoning, not an
@@ -3211,7 +3343,8 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < pm.tool_calls.size(); ++i)
         res->tool_calls.push_back(ToolCallIO{"call_" + std::to_string(tseq) + "_" + std::to_string(i),
                                              pm.tool_calls[i].name,
-                                             pm.tool_calls[i].arguments});
+                                             pm.tool_calls[i].arguments,
+                                             pm.tool_calls[i].ns});
       res->finish_reason = pm.tool_calls.empty() ? "stop" : "tool_calls";
     }
     if (hit_budget && res->finish_reason == "stop") res->finish_reason = "length";

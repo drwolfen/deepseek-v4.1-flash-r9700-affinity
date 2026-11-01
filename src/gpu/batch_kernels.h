@@ -217,6 +217,10 @@ void batch_rope_tail_bf16_hip(uint16_t* x, uint32_t n_head, uint32_t head_dim, u
                               uint32_t pos0, RopeDerived rope, float sin_sign, uint32_t nb,
                               void* stream);
 
+// V4.1-1017: in-place block-32 ue8m0 E4M3 quantise-dequantise on attention output `o` before wo_a.
+void batch_o_fp8_qdq_bf16_hip(uint16_t* x, uint32_t n_blocks32, uint32_t nb, void* stream);
+void o_fp8_qdq_f32_hip(float* x, uint32_t n_blocks32, void* stream);
+
 void batch_swiglu_hip(const float* g, const float* u, float* out, uint32_t n, uint32_t nb,
                       float limit, void* stream);
 
@@ -293,7 +297,9 @@ void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float*
 void batch_hc_expand_hip(uint16_t* out_hc, float* block, const uint16_t* hc,
                          const float* post,
                          const float* comb, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
-                         bool zero_block, void* stream);
+                         bool zero_block, void* stream, float* tap = nullptr, uint32_t b_lo = 0,
+                         uint32_t n_keep = 0, uint32_t row0 = 0, uint32_t rows_cap = 0,
+                         uint32_t row_stride = 0, uint32_t slot_off = 0);
 void batch_hc_add_hip(float* dst, const float* src, uint64_t n, void* stream);
 // The same into the bf16 lanes, for a layer with no hyper-connection control.
 void batch_hc_add_bf16_hip(uint16_t* dst, float* src, uint64_t n, bool zero_src, void* stream);
@@ -410,5 +416,12 @@ void router_topk_hip(const float* logits, const float* bias, const uint8_t* resi
 void router_hash_wt_hip(const float* logits, const uint32_t* sel, const uint32_t* nsel, float* wt,
                         uint32_t nb, uint32_t live, uint32_t k, int norm_topk_prob,
                         float routed_scaling, void* stream);
+
+// Group-128 symmetric int4 (with 9-point MSE clip search) for vocabulary head (`output`).
+void quantize_bf16_to_w4_g128_hip(const uint16_t* src, uint8_t* w4, uint16_t* scales,
+                                  uint32_t rows, uint32_t cols, void* stream);
+bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float* x_tm,
+                          float* out, uint32_t rows, uint32_t cols, uint32_t nt,
+                          uint32_t out_col_stride, int out_token_major, void* stream);
 
 } // namespace aff

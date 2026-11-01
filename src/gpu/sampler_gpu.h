@@ -35,6 +35,8 @@ struct SampleParams {
   float    top_p       = 0.95f;
   uint32_t top_k       = 0;      // 0 disables
   float    min_p       = 0.0f;   // keep p >= min_p * p_max
+  float    repeat_penalty = 1.0f;  // 1.0 disables; negative-free divide/multiply rule
+  uint32_t repeat_last_n  = 0;     // 0 disables the window
 };
 
 struct SpecDraw {
@@ -57,5 +59,30 @@ bool batch_sample_hip(const float* logits, uint32_t vocab, uint32_t n,
                       uint32_t row_stride, uint32_t col_stride,
                       const uint32_t* d_query, const float* d_u, SampleParams p,
                       SpecDraw* d_out, void* stream);
+
+// Repetition penalty, applied to the logit plane BEFORE `batch_sample_hip` reads it.
+//
+// It is a separate launch for one reason: the plane comes back from the head's GEMM, and the
+// sample kernel makes several passes over it (max, softmax, top_k radix, nucleus). Penalising
+// inside any of those passes would mean either a membership scan per vocabulary entry or a
+// second copy of the same rule in each pass. Touching only the historic ids costs one thread per
+// id and leaves every pass below reading one consistent plane.
+//
+// `ids` is a DEVICE array of already-deduplicated token ids in [0, vocab); the caller owns the
+// dedup because a window that repeats a token would otherwise compound the penalty per occurrence.
+// The rule matches sampler.cpp: a positive logit is divided by `penalty`, a negative one
+// multiplied, so no token's score is ever raised. `n` columns (one per position in the block) are
+// penalised, `col_stride` apart.
+bool apply_repeat_penalty_hip(float* logits, uint32_t vocab, uint32_t n,
+                              uint32_t row_stride, uint32_t col_stride,
+                              const uint32_t* d_ids, uint32_t n_ids, float penalty, void* stream);
+
+// DRY: subtract `delta` from the named ids, for tokens the host identified as the ones that
+// continued a repeated n-gram the last time that n-gram appeared. A constant subtraction, not a
+// ratio — see the kernel's comment. `ids` is device-resident and deduplicated, same contract as
+// above, and a `delta` of 0 disables the pass.
+bool apply_dry_penalty_hip(float* logits, uint32_t vocab, uint32_t n,
+                           uint32_t row_stride, uint32_t col_stride,
+                           const uint32_t* d_ids, uint32_t n_ids, float delta, void* stream);
 
 } // namespace aff

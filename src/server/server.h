@@ -20,6 +20,7 @@ struct ToolCallIO {
   std::string id;         // OpenAI's call id; only used to order tool results
   std::string name;
   std::string arguments;  // a JSON object, as a string, which is what the schema wants
+  std::string ns;         // optional 1017 tool namespace
 };
 
 struct ChatMessage {
@@ -44,9 +45,15 @@ struct CompletionRequest {
   float top_p = 1.0f;
   uint32_t top_k = 0;
   float min_p = 0.0f;
-  // No `repetition_penalty`: the served path samples on the device, and the device sampler takes
-  // temperature, top_p, top_k and min_p only. Parsing it here and dropping it would leave a client
-  // believing a knob it sent had an effect.
+  // Repetition penalty, applied on the device before the sample kernel's passes. Same rule as
+  // sampler.cpp (positive logits divide, negative multiply). 1.0 disables; `repeat_last_n` 0
+  // disables the window. `repetition_penalty` is accepted as an alias because that is the name
+  // llama.cpp and most clients send.
+  float repeat_penalty = 1.0f;
+  uint32_t repeat_last_n = 0;
+  // DRY: subtract `dry_delta` from the logits of tokens that continued a repeated suffix n-gram.
+  // 0 leaves the engine default (`--dry-delta`) in charge.
+  float dry_delta = 0.0f;
   bool stream = false;
   // stream_options.include_usage: OpenAI appends one extra chunk carrying usage and no choices.
   bool include_usage = false;

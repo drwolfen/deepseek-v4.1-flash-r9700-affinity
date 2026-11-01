@@ -315,6 +315,8 @@ private:
     // `data` is in WMMA fragment order, not row-major. Only the W8A8 GEMM can read it; every other
     // reader is a wrong answer that still decodes fluently, so they abort instead.
     bool     ps = false;
+    uint8_t* w4_data = nullptr;     // device, group-128 int4 copy for `output` head
+    uint16_t* w4_scales = nullptr;  // device, [nrows][ncols/128] bf16 scales for `output` head
     uint64_t data_bytes = 0, scales_bytes = 0;   // amdnas-fixes weight-verify: sizes for the read-back digest
   };
   struct Entry {
@@ -666,6 +668,9 @@ private:
   bool     batch_hc_read(uint32_t b, float* dst, uint32_t n_embd, uint32_t n_hc);
   bool     batch_hc_tap(uint32_t slot, uint32_t n_taps, uint32_t b_lo, uint32_t n_keep,
                         uint32_t row0, uint32_t rows_cap, uint32_t n_embd, uint32_t n_hc);
+  bool     batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_taps, uint32_t b_lo,
+                             uint32_t n_keep, uint32_t row0, uint32_t rows_cap, uint32_t n_embd,
+                             uint32_t n_hc);
   // The same head, sampled. The vocabulary is Row-split, so a nucleus over one card's band is not a
   // nucleus: the peer's half is gathered first and the draw happens over the whole distribution.
   // Scratch for the sampler's small transfers, sized once at the block width.
@@ -675,10 +680,18 @@ private:
   void*    smp_h_q_ = nullptr;
   void*    smp_h_u_ = nullptr;
   void*    smp_h_out_ = nullptr;
+  // Repetition penalty: the deduplicated window, staged on the host and copied as ids.
+  void*    smp_hist_ = nullptr;
+  uint32_t* smp_h_hist_ = nullptr;
+  // DRY: the host's continuation ids, already deduplicated there.
+  void*    smp_dry_ = nullptr;
+  uint32_t* smp_h_dry_ = nullptr;
   uint32_t smp_cap_ = 0;
   bool     batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
                              const uint32_t* query, const float* u, float temperature, float top_p,
-                             uint32_t top_k, float min_p, Model::PosDraw* out);
+                             uint32_t top_k, float min_p, const uint32_t* penalty_ids,
+                             uint32_t n_penalty_ids, float repeat_penalty, const uint32_t* dry_ids,
+                             uint32_t n_dry_ids, float dry_delta, Model::PosDraw* out);
   bool     batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
                       uint32_t* ids);
   bool     draft_proj(int32_t h, int32_t norm_w, uint64_t rows, uint64_t cols, uint32_t n,

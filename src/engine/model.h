@@ -694,6 +694,9 @@ public:
     // caller asked to keep, and `row0` where the first of them lands.
     bool (*hc_tap)(void* ctx, uint32_t slot, uint32_t n_taps, uint32_t b_lo, uint32_t n_keep,
                    uint32_t row0, uint32_t rows_cap, uint32_t n_embd, uint32_t n_hc) = nullptr;
+    bool (*hc_post_tap)(void* ctx, bool has_control, uint32_t slot, uint32_t n_taps, uint32_t b_lo,
+                        uint32_t n_keep, uint32_t row0, uint32_t rows_cap, uint32_t n_embd,
+                        uint32_t n_hc) = nullptr;
     // The vocabulary head for every token of the chunk, with only the argmax coming back. `x` is
     // [n][n_embd] token-major — the collapsed, normed hidden state — and `ids` [n].
     //
@@ -709,6 +712,8 @@ public:
     bool (*head_sample)(void* ctx, int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n,
                         const float* x, const uint32_t* query, const float* u,
                         float temperature, float top_p, uint32_t top_k, float min_p,
+                        const uint32_t* penalty_ids, uint32_t n_penalty_ids, float repeat_penalty,
+                        const uint32_t* dry_ids, uint32_t n_dry_ids, float dry_delta,
                         PosDraw* out) = nullptr;
     // ---- the DSpark draft --------------------------------------------------------------------
     // The stages are structurally ordinary ratio-0 layers, so everything above runs them unchanged
@@ -910,6 +915,18 @@ public:
     std::vector<uint32_t> query;      // [n] the proposal at each position, 0xFFFFFFFF for none
     std::vector<float>    uniforms;   // [2n] two per position, for the two draws
     std::vector<PosDraw>  draws;      // [n]
+    // Repetition penalty over the sequence's tail, applied to the logit plane before the sample
+    // kernel reads it. `penalty_ids` is oldest-first and deduplicated by the device side, so a
+    // token that recurs in the window is penalised ONCE — the frequency variant is a different
+    // knob and is not this one. 1.0 disables; an empty vector disables.
+    float                 repeat_penalty = 1.0f;
+    std::vector<uint32_t> penalty_ids;
+    // DRY. `dry_ids` are the tokens that followed the current suffix n-gram on previous
+    // occurrences of that n-gram; each gets `dry_delta` SUBTRACTED from its logit. This is what
+    // breaks a sequence loop whose individual tokens are ordinary, which a token-level penalty
+    // cannot reach. Empty vector or a delta of 0 disables.
+    std::vector<uint32_t> dry_ids;
+    float                 dry_delta = 0.0f;
     // The tap itself is not here and never comes back: it is written into a plane in VRAM on both
     // cards, which the draft reads on the card that wrote it. These two say WHERE it landed —
     // `tap_rows` is 0 when no draft is loaded and nothing was tapped.

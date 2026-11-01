@@ -21,12 +21,15 @@ struct ToolDef {
   // so key order and every value's spelling survive — see json_compact in the .cpp for why that is
   // what byte-matching the reference requires.
   std::string function_json;
+  std::string ns;         // optional 1017 tool namespace ("ns" -> rendered as "ns::name")
+  std::string ns_desc;    // optional 1017 namespace description prepended to function.description
 };
 
 struct ToolCall {
   std::string id;         // OpenAI's call id. Only used to order tool results; may be empty.
   std::string name;
   std::string arguments;  // a JSON object, as a string, exactly as the OpenAI schema wants
+  std::string ns;         // optional 1017 tool namespace
 };
 
 struct ChatMsg {

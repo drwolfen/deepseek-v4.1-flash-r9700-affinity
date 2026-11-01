@@ -916,7 +916,10 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   for (size_t i = 0; i < devs_.size(); ++i) {
     AFF_HIP_CHECK(hipSetDevice(devs_[i]));
     size_t freeb = 0, totalb = 0;
-    AFF_HIP_CHECK(hipMemGetInfo(&freeb, &totalb));
+    // Driver counter, not hipMemGetInfo alone: see hip_free_vram_checked. HIP over-reports free
+    // VRAM by ~350 MiB a card here, which is the same order as the KV growth this reserve pays for.
+    if (!hip_free_vram_checked(devs_[i], (uint64_t*)&freeb, (uint64_t*)&totalb))
+      AFF_HIP_CHECK(hipMemGetInfo(&freeb, &totalb));
     const uint64_t want = (uint64_t)(budget_gib * 1073741824.0);
     // What the slab must not take. Two things: the engine's own allocations after this point,
     // which are small, and allocator slack — free VRAM that hipMemGetInfo reports but that cannot
@@ -935,10 +938,15 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     const uint64_t avail = freeb > keep + engine_after ? freeb - keep - engine_after : 0;
     const uint64_t cap = std::min<uint64_t>(want, avail);
     per_gpu[i] = cap / slot_stride;
-    aff::ui::err("placement sizing: card %zu free %.0f MiB, reserve %.0f MiB + engine-after %.0f MiB (shadow %u slots, "
-                 "codebook %.1f MiB) -> %llu slots\n", i, (double)freeb / 1048576.0, (double)keep / 1048576.0,
-                 (double)engine_after / 1048576.0, shadow_slots_, (double)cb_.v.size() * 4 / 1048576.0,
-                 (unsigned long long)per_gpu[i]);
+    // Both figures, because the difference is the whole point of hip_free_vram_checked: a slab
+    // sized from the HIP number alone leaves the reserve short by exactly what KV growth spends.
+    size_t hip_freeb = 0, hip_totalb = 0;
+    (void)hipMemGetInfo(&hip_freeb, &hip_totalb);
+    aff::ui::err("placement sizing: card %zu free %.0f MiB (HIP %.0f MiB), reserve %.0f MiB + "
+                 "engine-after %.0f MiB (shadow %u slots, codebook %.1f MiB) -> %llu slots\n",
+                 i, (double)freeb / 1048576.0, (double)hip_freeb / 1048576.0,
+                 (double)keep / 1048576.0, (double)engine_after / 1048576.0, shadow_slots_,
+                 (double)cb_.v.size() * 4 / 1048576.0, (unsigned long long)per_gpu[i]);
     // A shard slot is claimed on EVERY card at once, so the resident count is the smallest card's,
     // not the sum. With one card it is the same statement.
     if (tp_parts_ > 1) total_slots = i ? std::min(total_slots, per_gpu[i]) : per_gpu[i];
