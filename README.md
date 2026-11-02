@@ -18,7 +18,12 @@ patches*).
 **Model files (1017 revision):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
 **Model files (legacy 0925):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
 
-**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v1.1.0`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v1.1.0)
+**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v4.3.1`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v4.3.1)
+
+**v4.3.0** merges `main`'s v1.1.0 Radiance/KTransformers ports into the 4.2.0 GPU line. **v4.3.1**
+is the docs/deploy sync for that release: README, run script and service unit now match the served
+container. The merge builds clean on `gfx1201` and passes the bundled tests; the measured decode
+figures below remain the v1.1.0 numbers.
 
 ---
 
@@ -50,7 +55,7 @@ RAM.
 
 ## Current speed (measured, this machine - v1.1.0 update)
 
-Single stream, 512k-context configuration, DSpark speculative decoding on, thinking on (measured on live Hermes agent sessions at **163.5k–170.7k context**):
+Single stream, 512k-context configuration, DSpark speculative decoding on, thinking on (measured on live Hermes agent sessions at **163.5k–170.7k context**). The 4.2.0/4.3.0 line changes VRAM accounting, placement churn, sampler bounds and kernel scheduling; it did not move decode throughput on this box, so these remain the reference numbers.
 
 | | |
 |---|---|
@@ -93,13 +98,15 @@ licensed (`LICENSE`, `FORK.md`, `UPSTREAM-README.md` kept unchanged).
 > claim — the vision port, the KV sizing, the tool-call recovery, the imatrix calibration, the
 > `AFF_NOBUDGET` patch.
 
-Branches: this repository's history is the fork's `v41-tool-fix` line (mirroring upstream `a48b72e`
-plus the V4.1 port) with ten further commits of **unpublished local work** that produced the served
-binary, plus one commit capturing the on-GPU imatrix/placement working tree and one patch commit.
+Branches: `v41-tools-fix` is the fork's V4.1 line (mirroring upstream `a48b72e` plus the V4.1 port)
+with the local work below; `main` carries the v1.0/v1.1 ports. **`v4.3.0`** (branch
+`merge/v41-tools-fix-v4.3.0`) merges the two. All of the local work is published in this
+repository's history, including the on-GPU imatrix/placement working tree and the `AFF_NOBUDGET`
+patch commit.
 
 ### ⭐ Local work — the part that is ours
 
-These are the changes that are not in the fork's published branches. This is where the speed and the
+These are the local changes, published in this repository's history. This is where the speed and the
 agentic-robustness come from.
 
 | diff | change | measured effect |
@@ -118,6 +125,33 @@ agentic-robustness come from.
 | [`2779348`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2779348) · [`patches/AFF_NOBUDGET_MAX_TOKENS.patch`](patches/AFF_NOBUDGET_MAX_TOKENS.patch) | bound the default when a request sends **no** `max_tokens` (was: the whole remaining context) | a gateway reasoning loop can no longer hold the single slot for 37 min / 55k tokens; explicit `max_tokens` untouched |
 
 Every commit message carries the same measurement detail as the table, with the exact before/after.
+
+### v4.2.0 / v4.3.0 — accounting, placement, sampling
+
+- **Driver-counter VRAM sizing** (`hip_free_vram_checked`, `src/gpu/hip_common.h`). Slab sizing uses
+  `min(hipMemGetInfo, sysfs mem_info_vram_total/used)`; HIP remains the fallback and the floor. On
+  this box the optimistic HIP figure under-counted the reserve by ~350 MiB/card. A 479,603-token
+  request left 66 MiB free on GPU0 before the change and 920 MiB after it.
+- **Placement telemetry** (`maybe_save_placement`, `tools/affinity.cpp`). Serving runs log
+  promotions, demotions, readmits, refusals, starvation and H2D/D2H churn once per
+  `--placement-save-secs` instead of only on CLI exit.
+- **Placement guards 1.6 / 3.0** (`--placement-hysteresis`, `--placement-min-gain`). At equal tick
+  counts: promotions 9,533 → 4,422, readmits 71% → 53%, H2D churn 113 → 52 GiB, starved slab/pool
+  88/105 → 28/44. Throughput unchanged inside noise.
+- **Sampler bounds**: `--repeat-penalty`, `--repeat-last-n`, sequence-level DRY
+  (`--dry-delta/-ngram/-window/-min-repeats`) and the Cactus acceptance governor
+  (`AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R`).
+- **Kernel and scheduling work**: EXL3 prefetch ring (`AFF_PREFETCH_RING`), MoE reconstruction
+  tiling (`AFF_MOE_RECON_TILES`), fused V4.1 narrow HC + FP8 scale prefetch, frozen prefill plc and
+  a bonus slab; block-32 Walsh–Hadamard rotation is opt-in (`AFF_HADAMARD_ROT`).
+- **`AFF_EQUAL_UBATCH`** splits prefill into fewer equal chunks. Default **off** — measured negative
+  here — but the segment-limit refactor underneath it is always active and makes bounded-replay and
+  vision boundaries correct by construction.
+
+**v4.3.0** carries `main`'s v1.1.0 ports into this line: protected-expert residency, FP8 grouped
+RoPE, fused `hc_post` + DSpark taps, stage rings and the deployment docs. The merge resolved 13
+conflict hunks across `model.cpp`, `dense_gpu.{h,hip}` and `static_placement.hip`; the build is
+clean and `ctest` passes 7/7.
 
 **Ported from [Lucebox](https://github.com/Luce-Org/lucebox)** (Apache-2.0, by **Lucebox AI** / `Luce-Org`,
 in `2a4478f` and its neighbours): the V4.1 decoder SWA bounded replay (`AFF_BOUNDED_REPLAY`, from
@@ -141,7 +175,7 @@ fineweb-edu eval corpus. Credit and thanks to Lucebox for these; the code commen
 
 `AFF_ENGRAM_WARM=1` `AFF_SPEC_BACKOFF=2` `AFF_ADAPTIVE_WIDTH=1` `AFF_BOUNDED_REPLAY=1`
 `AFF_FUSE_HC_TAP=1` `AFF_DRAFT_HEAD_INT4=1` `AFF_CACTUS_DELTA=0.35` `AFF_CACTUS_CAP_R=0.5`
-`AFF_RESIDENT_BIAS=0.008` `AFF_NOBUDGET_MAX_TOKENS=16384`.
+`AFF_RESIDENT_BIAS=0.008` `AFF_MOE_RECON_TILES=32` `AFF_NOBUDGET_MAX_TOKENS=16384`.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for full version history, benchmarks, and commit attribution.
 
@@ -175,7 +209,7 @@ The quantisation recipe is in [`model/QUANT.md`](model/QUANT.md); checks that mu
 
 **Prebuilt package:** [release `v1.0.0`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v1.0.0)
 carries `affinity-r9700-1.0.0.tar.gz` — the patched engine binary for `gfx1201` plus `deploy/`,
-`model/` and `patches/`.
+`model/` and `patches/`. `v4.3.0` is source-only; build it with the command below.
 
 Build the engine image (needs Docker; the host needs no ROCm):
 
@@ -190,13 +224,17 @@ unit, and [`deploy/run.sh`](deploy/run.sh)):
 docker run --name deepseek-affinity \
   --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
   -e AFF_ENGRAM_WARM=1 -e AFF_SPEC_BACKOFF=2 -e AFF_ADAPTIVE_WIDTH=1 \
-  -e AFF_BOUNDED_REPLAY=1 -e AFF_RESIDENT_BIAS=0.008 -e AFF_NOBUDGET_MAX_TOKENS=16384 \
+  -e AFF_BOUNDED_REPLAY=1 -e AFF_FUSE_HC_TAP=1 -e AFF_DRAFT_HEAD_INT4=1 \
+  -e AFF_CACTUS_DELTA=0.35 -e AFF_CACTUS_CAP_R=0.5 \
+  -e AFF_RESIDENT_BIAS=0.008 -e AFF_MOE_RECON_TILES=32 \
+  -e AFF_NOBUDGET_MAX_TOKENS=16384 \
   -v /models:/models affinity:v41-vision \
     -m /models/model-uc.aff --tokenizer /models/tokenizer.json \
     --dspark on --dspark-model /models/model-uc.dspark.aff \
     --engram /models/model-uc.engram --engram-tables /models \
-    --kv-size 524288 --kv-commit 262144 \
-    --host-pool-mib 200000 --placement-strategy demand \
+    --kv-size 327680 --kv-commit 262144 \
+    --gpu-headroom-mib 384 --host-pool-mib 200000 --placement-strategy demand \
+    --placement-hysteresis 1.6 --placement-min-gain 3.0 \
     --placement-save /models/placement.affprof \
     --prefill-chunk-size 2816 --default-effort 75 --max-tokens-floor 0
 ```

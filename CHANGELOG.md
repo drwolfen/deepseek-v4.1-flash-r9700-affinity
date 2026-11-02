@@ -6,6 +6,14 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [4.3.1] — 2026-11-03 — "docs match the release"
+
+No engine changes. README now points at the v4.3.0/v4.3.1 releases and documents the 4.2.0/4.3.0
+work; `deploy/run.sh` and `deploy/deepseek-v41-affinity.service` now match the served container
+(`--kv-size 327680`, `--gpu-headroom-mib 384`, placement guards 1.6/3.0,
+`AFF_MOE_RECON_TILES=32`, `AFF_PREFETCH_RING=0`, persistent prefix cache). Build and test results
+are unchanged from 4.3.0.
+
 ## [4.3.0] — 2026-11-02 — "carry the upstream ports"
 
 Merges `main` (v1.1.0 Radiance/KTransformers ports) into the 4.2.0 GPU line. The two branches

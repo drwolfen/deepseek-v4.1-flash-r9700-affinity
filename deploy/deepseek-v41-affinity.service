@@ -19,6 +19,8 @@ ExecStart=/usr/bin/docker run --name deepseek-affinity \
     -e AFF_CACTUS_DELTA=0.35 \
     -e AFF_CACTUS_CAP_R=0.5 \
     -e AFF_RESIDENT_BIAS=0.008 \
+    -e AFF_MOE_RECON_TILES=32 \
+    -e AFF_PREFETCH_RING=0 \
     -e AFF_NOBUDGET_MAX_TOKENS=16384 \
     -p 8000:8000 \
     -v /mnt/fast-storage:/mnt/fast-storage \
@@ -27,7 +29,7 @@ ExecStart=/usr/bin/docker run --name deepseek-affinity \
     -m /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.aff \
     --tokenizer /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json \
     --host 0.0.0.0 --port 8000 \
-    --gpu-headroom-mib 1024 \
+    --gpu-headroom-mib 384 \
     --dspark on \
     --dspark-model /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.dspark.aff \
     --engram /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.engram \
@@ -35,10 +37,11 @@ ExecStart=/usr/bin/docker run --name deepseek-affinity \
     --prefix-cache-dir /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/pcache \
     --prefix-cache-gib 64 \
     --persistent-prefix-cache \
-    --kv-size 524288 \
+    --kv-size 327680 \
     --kv-commit 262144 \
     --host-pool-mib 200000 --host-pool-reserve-mib 1024 \
     --placement-strategy demand \
+    --placement-hysteresis 1.6 --placement-min-gain 3.0 \
     --placement-save /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/placement.affprof \
     --prefill-chunk-size 2816 \
     --default-effort 75 \
