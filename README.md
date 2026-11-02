@@ -18,12 +18,12 @@ patches*).
 **Model files (1017 revision):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
 **Model files (legacy 0925):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
 
-**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v4.3.1`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v4.3.1)
+**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v4.3.2`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v4.3.2)
 
 **v4.3.0** merges `main`'s v1.1.0 Radiance/KTransformers ports into the 4.2.0 GPU line. **v4.3.1**
 is the docs/deploy sync for that release: README, run script and service unit now match the served
-container. The merge builds clean on `gfx1201` and passes the bundled tests; the measured decode
-figures below remain the v1.1.0 numbers.
+container. **v4.3.2** adds the v4.3 Arm 1 A/B results to the README. The merge builds clean on
+`gfx1201` and passes the bundled tests.
 
 ---
 
@@ -53,9 +53,43 @@ RAM.
 
 ---
 
-## Current speed (measured, this machine - v1.1.0 update)
+## Current speed (measured, this machine)
 
-Single stream, 512k-context configuration, DSpark speculative decoding on, thinking on (measured on live Hermes agent sessions at **163.5k–170.7k context**). The 4.2.0/4.3.0 line changes VRAM accounting, placement churn, sampler bounds and kernel scheduling; it did not move decode throughput on this box, so these remain the reference numbers.
+Two harnesses are reported: the v1.1.0 live Hermes sessions at 163k–171k context, and the v4.3
+Arm 1 A/B against the v4.2.0 baseline on 2026-11-02. They are not directly comparable — different
+context lengths, prompts and measurement methods.
+
+### v4.3 Arm 1 — deployed 2026-11-02 (BF16 target head)
+
+A/B on this box: `aff_bench.py` (5 runs), greedy code decode, prefill suite, batch-8, and a live
+74.8k-context Hermes workload. Raw JSON is under `/mnt/fast-storage/benchmarks/ab/`.
+
+| metric | v4.2.0 baseline | **v4.3 Arm 1** | delta |
+|---|---:|---:|---:|
+| `aff_bench` decode median | 16.33 tok/s | **19.27 tok/s** | **+18.0%** |
+| `aff_bench` decode peak | 17.87 tok/s | **20.74 tok/s** | +16.1% |
+| Greedy code decode (`temp=0`, 160 tok) | 12.07 tok/s | **14.48 tok/s** | **+20.0%** |
+| Greedy TTFT (26 tok) | 1.725 s | **1.314 s** | **-23.8%** |
+| Prefill 2048 (3,073 tok) | 558.4 tok/s | **680.1 tok/s** | **+21.8%** |
+| Prefill 8192 (12,206 tok) | 954.3 tok/s | **1,014.5 tok/s** | +6.3% |
+| Prefill 32768 (49,012 tok)\* | 1,281.2 tok/s | 1,180.3 tok/s | -7.9% |
+| Batch-8 aggregate | 10.9 tok/s | **21.4 tok/s** (24.8 peak) | **+96.3%** |
+| Live Hermes, 74.8k ctx | — | **21.0 tok/s** (5,410 tok) | 63.2% acceptance |
+| Resident experts / card | 3,157 | **3,279** | **+122** |
+| GPU1 bonus shards | 0 | **+88** (534.9 MiB) | 3,367 total |
+| Post-slab free VRAM | [930, 1479] MiB | [385, 382] MiB | -1,642 MiB idle |
+| Min free VRAM under load | [930, 1478] MiB | [292, 304] MiB | 0 OOM / 0 spill |
+
+\* A background `ffmpeg av1_vaapi` 4K HDR transcode on GPU0 ran during the 49k prefill point; the
+drop is memory-controller contention, not the patch.
+
+**Arm 2 (`AFF_LMHEAD_INT4=1`) was rejected.** Quantising the shared target verification head to INT4
+cut stochastic DSpark acceptance from 66.4% to 53.5% and decode median to 16.11 tok/s. The draft head
+stays INT4 (`AFF_DRAFT_HEAD_INT4=1`); the target head stays BF16.
+
+### v1.1.0 live Hermes sessions (163k–171k context)
+
+Single stream, 512k-context configuration, DSpark speculative decoding on, thinking on:
 
 | | |
 |---|---|
@@ -65,7 +99,7 @@ Single stream, 512k-context configuration, DSpark speculative decoding on, think
 | **Draft acceptance** | **79.9%** (3.69 tokens/block avg, up to 4.37 tokens/block; tail collapse resolved) |
 | **Prefill** | ~1000 tok/s (persistent prefix cache restores 330+ blocks from disk on restarts) |
 
-Decode remains PCIe-streaming bound for non-resident experts (3,248 in VRAM / 12,112 streamed over PCIe), but **fused `hc_post` + DSpark taps (`AFF_FUSE_HC_TAP=1`)**, **on-GPU group-128 INT4 LM head (`AFF_DRAFT_HEAD_INT4=1`)**, and **Cactus capped rejection sampling (`AFF_CACTUS_DELTA=0.35`, `AFF_CACTUS_CAP_R=0.5`)** have cut per-block overhead by **-42.8 ms/block** and lifted decode throughput by **+28.6%**.
+Decode remains PCIe-streaming bound for non-resident experts (3,279 symmetric resident experts/card, plus 88 bonus shards on GPU1 in the v4.3 unit; the rest stream over PCIe), but **fused `hc_post` + DSpark taps (`AFF_FUSE_HC_TAP=1`)**, **on-GPU group-128 INT4 draft head (`AFF_DRAFT_HEAD_INT4=1`)**, and **Cactus capped rejection sampling (`AFF_CACTUS_DELTA=0.35`, `AFF_CACTUS_CAP_R=0.5`)** cut per-block overhead by **-42.8 ms/block** and lifted decode throughput by **+28.6%** on the v1.1.0 live workload.
 
 ---
 
@@ -141,9 +175,28 @@ Every commit message carries the same measurement detail as the table, with the 
 - **Sampler bounds**: `--repeat-penalty`, `--repeat-last-n`, sequence-level DRY
   (`--dry-delta/-ngram/-window/-min-repeats`) and the Cactus acceptance governor
   (`AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R`).
-- **Kernel and scheduling work**: EXL3 prefetch ring (`AFF_PREFETCH_RING`), MoE reconstruction
-  tiling (`AFF_MOE_RECON_TILES`), fused V4.1 narrow HC + FP8 scale prefetch, frozen prefill plc and
-  a bonus slab; block-32 Walsh–Hadamard rotation is opt-in (`AFF_HADAMARD_ROT`).
+- **Kernel and scheduling work**:
+  - **Decode-gated MoE reconstruction tile cap**: `AFF_MOE_RECON_TILES=32` applies only when
+    `ntiles > 1` (`max_nt > 16`), removing ~480 empty GPU launches per verify step while keeping
+    `rcap=32` for prefill.
+  - **Radiance LDS scale prefetch** in `gemm_fp8_body` (Radiance `14e91c4`): stages FP8 weight and
+    activation scales one K-tile ahead in LDS, removing VMEM scoreboard stalls.
+  - **Fused V4.1 narrow hyper-connection** (`AFF_V41_HC_FUSED=1`, default): collapses `hc_pre`
+    from 3 kernels to 2 and halves `hc` HBM reads; also removes a dead `hcn_sq_kernel` launch.
+  - **Zero-copy `b_pre` / `b_pre_prev` swap**: removes 352 D2D `hipMemcpyAsync` launches per verify
+    step and fixes the missing `else` braces plus destructor cleanup.
+  - **Prefill placement freeze** (`AFF_PREFILL_FREEZE_PLC=1`, default): calls `engine_retire`
+    instead of `engine_tick` when `nb_tok > 16`, so long prefills stop evicting decode-hot experts.
+    This is the +96.3% post-prefill batch-8 result.
+  - **VRAM reclamation + asymmetric bonus slab** (`AFF_BONUS_SLAB=1`, `--gpu-headroom-mib 384`,
+    `AFF_PREFETCH_RING=0`): +122 symmetric resident experts/card and +88 hottest non-resident shards
+    on GPU1 (534.9 MiB), with 385/382 MiB free after slab allocation and 292/304 MiB under load.
+  - **EXL3 prefetch ring** (`AFF_PREFETCH_RING`, disabled in the served unit because the experts it
+    would stage are already 100% resident), block-32 Walsh–Hadamard rotation
+    (`AFF_HADAMARD_ROT`, opt-in).
+  - **`AFF_LMHEAD_INT4` completeness fix** across `reg`, `mv`, `mv_multi`, `batch_head_sample`,
+    `batch_head` and `draft_head`. Kept **disabled** in production: INT4 on the shared target head
+    cut DSpark acceptance from 66.4% to 53.5%; the draft head remains INT4.
 - **`AFF_EQUAL_UBATCH`** splits prefill into fewer equal chunks. Default **off** — measured negative
   here — but the segment-limit refactor underneath it is always active and makes bounded-replay and
   vision boundaries correct by construction.

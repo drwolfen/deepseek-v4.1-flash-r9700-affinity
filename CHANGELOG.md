@@ -6,6 +6,16 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [4.3.2] — 2026-11-03 — "benchmarks in the README"
+
+No engine changes. README gains the v4.3 Arm 1 A/B against the v4.2.0 baseline: decode median
+19.27 vs 16.33 tok/s (+18.0%), greedy decode 14.48 vs 12.07 (+20.0%), prefill 2048 680.1 vs
+558.4 tok/s (+21.8%), batch-8 21.4 vs 10.9 tok/s (+96.3%), live 74.8k Hermes 21.0 tok/s, plus the
+VRAM reclamation numbers (3,279 symmetric experts/card, +88 GPU1 bonus shards). Documents the
+decode-gated MoE recon tile cap, Radiance LDS scale prefetch, `AFF_V41_HC_FUSED`,
+`AFF_PREFILL_FREEZE_PLC`, `AFF_BONUS_SLAB` and the rejected `AFF_LMHEAD_INT4` arm (acceptance
+66.4% → 53.5%).
+
 ## [4.3.1] — 2026-11-03 — "docs match the release"
 
 No engine changes. README now points at the v4.3.0/v4.3.1 releases and documents the 4.2.0/4.3.0
