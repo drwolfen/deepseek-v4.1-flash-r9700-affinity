@@ -2863,6 +2863,19 @@ int main(int argc, char** argv) {
       }
     }
 
+    // A prompt that cannot fit is refused HERE, as a 400, and not by the KV grower. The grower's
+    // answer to an over-long prompt is `ui::fatal`, which takes the serving process down: a client
+    // that outgrew --kv-size then looks like a dead server instead of a request that asked for too
+    // much. 32 is the slack ctx_room already keeps, so this is exactly the point where the budget
+    // below would reach zero.
+    if (ids.size() + 32 >= kMaxKvPositions) {
+      res->error = "context_length_exceeded: the prompt is " + std::to_string(ids.size()) +
+                   " tokens and this engine serves at most " +
+                   std::to_string(kMaxKvPositions > 32 ? kMaxKvPositions - 32 : 0) +
+                   " (--kv-size " + std::to_string(kMaxKvPositions) + ")";
+      return;
+    }
+
     // ---- what max_tokens bounds ------------------------------------------------------------------
     //
     // EVERY generated token counts, reasoning included. That is what the OpenAI schema says for a
