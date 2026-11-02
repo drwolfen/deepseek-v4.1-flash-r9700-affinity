@@ -515,9 +515,14 @@ __device__ __forceinline__ void gemm_fp8_body(
   // — this card's line size, not 128. At FK = 64 a thread reads a quarter of a line and the other
   // three quarters are only paid for if the line survives in L0 for three more K tiles.
   constexpr uint32_t kNG = FK / 64;                      // 32-byte granule pairs a thread
+  constexpr uint32_t kFolds = (FK + 127u) / 128u;        // 128-col scale blocks touched per K tile
+  static_assert(kFolds <= MW * kWave, "kFolds exceeds block threads");
+  static_assert(kFolds * FN <= MW * kWave, "kFolds*FN exceeds block threads");
   __shared__ uint8_t s_b[FN * FK];
   // Only instantiated for PS == false; an empty array is not legal, so it is one byte otherwise.
   __shared__ uint8_t s_a[PS ? 1 : FM * FK];
+  __shared__ uint32_t s_ws[kFolds];
+  __shared__ float s_sx[kFolds * FN];
 
   const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
   const uint32_t n0 = blockIdx.y * FN;
@@ -539,10 +544,9 @@ __device__ __forceinline__ void gemm_fp8_body(
   const uint32_t ktiles = cols >> 4;
   const uint32_t rt0 = (w_row_off + m0 + wm) >> 4;       // this wave's first row tile
   const uint32_t srow = (w_row_off + m0) >> 7;
-  // The tokens this lane owns, one per N tile — a lane owns column `frag_c` of each of its NT
-  // accumulators, and those are 16 columns apart. Folding the scale with only the first one is
-  // wrong for the others, which reads as a ~2.0 relative error rather than as noise.
-  const uint32_t tok0 = n0 + wn + wmma::frag_c(lane);
+  const uint32_t fc = wmma::frag_c(lane);
+  const uint32_t sf = tid / FN, stn = tid % FN;
+  const uint32_t sx_tok = n0 + stn;
 
   // Row-major A staging assignment, identical to B's: 128 rows x 64 B, 32 B a thread.
   const uint32_t am = tid >> 1;
@@ -554,15 +558,25 @@ __device__ __forceinline__ void gemm_fp8_body(
   const uint8_t* asrc = Wp + (size_t)(w_row_off + m0 + am) * cols + sk;
   const bool b_row = sn < FN && (Full || (n0 + sn) < nb);
   const bool a_row = !PS && (Full || (m0 + am) < rows);
-  // One K tile ahead, in registers. The load for tile c0+kFK is issued before the WMMA for tile c0
-  // and consumed after it, so the memory latency sits under the arithmetic instead of in front of a
-  // barrier. Nothing about what is computed changes -- same operands, same order, bit-identical.
+  // One K tile ahead, in registers. Stage Sw and Sx alongside B/A so the scale fold inside the ks
+  // loop reads LDS instead of stalling on in-order VMEM behind the next tile's pb/apf prefetches.
   Stage8Reg pb[kNG], pa[kNG];
 #pragma unroll
   for (uint32_t g = 0; g < kNG; ++g) {
     const uint32_t o = kbeg + g * 64;
     pb[g] = stage8_load(bsrc + o, b_row && (Full || o + sk + 32 <= cols));
     pa[g] = stage8_load(asrc + o, a_row && (Full || o + sk + 32 <= cols));
+  }
+  uint32_t pws = 0u;
+  float psx = 0.0f;
+  if (tid < kFolds) {
+    const uint32_t kb0 = (kbeg >> 7) + tid;
+    if (Full || kb0 < sc_cols) pws = Sw[(size_t)srow * sc_cols + kb0];
+  }
+  if (tid < kFolds * FN) {
+    const uint32_t kb0 = (kbeg >> 7) + sf;
+    if ((Full || sx_tok < nb) && (Full || kb0 < sc_cols))
+      psx = Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb0];
   }
 
   for (uint32_t c0 = kbeg; c0 < kend; c0 += FK) {
@@ -572,6 +586,8 @@ __device__ __forceinline__ void gemm_fp8_body(
       if (sn < FN) stage8_store<FK>(s_b, sn, sk + g * 64, pb[g]);
       if (!PS) stage8_store<FK>(s_a, am, sk + g * 64, pa[g]);
     }
+    if (tid < kFolds) s_ws[tid] = pws;
+    if (tid < kFolds * FN) s_sx[tid] = psx;
     __syncthreads();
     const uint32_t c1 = c0 + FK;
     if (c1 < kend) {
@@ -581,6 +597,16 @@ __device__ __forceinline__ void gemm_fp8_body(
         const bool live = Full || (o + sk + 32 <= cols);
         if (sn < FN) pb[g] = stage8_load(bsrc + o, b_row && live);
         if (!PS) pa[g] = stage8_load(asrc + o, a_row && live);
+      }
+      if (tid < kFolds) {
+        const uint32_t kb1 = (c1 >> 7) + tid;
+        pws = (Full || kb1 < sc_cols) ? Sw[(size_t)srow * sc_cols + kb1] : 0u;
+      }
+      if (tid < kFolds * FN) {
+        const uint32_t kb1 = (c1 >> 7) + sf;
+        psx = ((Full || sx_tok < nb) && (Full || kb1 < sc_cols))
+                  ? Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb1]
+                  : 0.0f;
       }
     }
 
@@ -610,19 +636,14 @@ __device__ __forceinline__ void gemm_fp8_body(
 #pragma unroll
         for (uint32_t j = 0; j < NT; ++j) raw[i][j] = wmma::mma_fp8(af[i], bf[j], raw[i][j]);
 
-    // End of a 128-column scale block: fold both scales in and reset. INSIDE the ks loop, because
-    // at FK = 256 one staged tile spans two scale blocks and folding once would apply the second
-    // block's scale to the first block's products. `c0` is uniform and `ks` is a constant after
-    // unrolling, so the test is uniform and mostly compile-time.
+    // End of a 128-column scale block: fold both scales in from LDS and reset.
     if ((c0 + ks + wmma::kK) % 128u == 0 || c0 + ks + wmma::kK >= kend) {
-      const uint32_t kb = (c0 + ks) >> 7;
-      const uint32_t e = Sw[(size_t)srow * sc_cols + kb];
+      const uint32_t fold = ks >> 7;
+      const uint32_t e = s_ws[fold];
       const float ws = __uint_as_float(e ? (e << 23) : 0u);
 #pragma unroll
       for (uint32_t j = 0; j < NT; ++j) {
-        const uint32_t tok = tok0 + j * 16;
-        const float s = ws * ((Full || tok < nb) ? Sx[(size_t)tok * sx_ld + (x_off >> 7) + kb]
-                                                 : 0.0f);
+        const float s = ws * s_sx[fold * FN + wn + j * 16 + fc];
 #pragma unroll
         for (uint32_t i = 0; i < kFMTiles; ++i)
 #pragma unroll
@@ -2054,6 +2075,130 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_kernel(const float* __re
   }
 }
 
+// V4.1 narrow hyper-connection collapse + dual sum-of-squares in a single pass over `hc`.
+// On V4.1 `pre_in` comes from the previous sublayer, so `cur` = sum_h hc * pre_in does not depend
+// on sum(hc^2). Reading `hc` once computes `cur`, `part_cur` (sum cur^2), and `part_hc` (sum hc^2)
+// together, cutting HBM traffic on `hc` in half and saving a kernel launch per sublayer per GPU.
+template <uint32_t NB, uint32_t NH>
+__global__ __launch_bounds__(kHcnThreads) void hcn_v41_collapse_sq_kernel(
+    const uint16_t* __restrict__ hc, const float* __restrict__ pre_in, float* __restrict__ cur,
+    float* __restrict__ part_hc, float* __restrict__ part_cur, uint32_t n_embd, uint32_t n_part) {
+  __shared__ float s[NB * kHcnThreads];
+  __shared__ float s_pre[NB * NH];
+  const uint32_t tid = threadIdx.x;
+  if (tid < NB) {
+#pragma unroll
+    for (uint32_t h = 0; h < NH; ++h) s_pre[h * NB + tid] = pre_in[(size_t)h * NB + tid];
+  }
+  __syncthreads();
+  float g[NH][NB];
+#pragma unroll
+  for (uint32_t h = 0; h < NH; ++h)
+#pragma unroll
+    for (uint32_t b = 0; b < NB; ++b) g[h][b] = s_pre[h * NB + b];
+  float acc_cur[NB] = {}, acc_hc[NB] = {};
+  for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
+    float o[NB] = {};
+#pragma unroll
+    for (uint32_t h = 0; h < NH; ++h) {
+      float v[NB];
+      hcn_row<NB>(hc + ((size_t)h * n_embd + d) * NB, v);
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b) {
+        o[b] += v[b] * g[h][b];
+        acc_hc[b] += v[b] * v[b];
+      }
+    }
+#pragma unroll
+    for (uint32_t b = 0; b < NB; ++b) {
+      cur[(size_t)d * NB + b] = o[b];
+      acc_cur[b] += o[b] * o[b];
+    }
+  }
+  hcn_block_sum<NB>(s, acc_cur, tid);
+  if (tid < NB) part_cur[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
+  __syncthreads();
+  hcn_block_sum<NB>(s, acc_hc, tid);
+  if (tid < NB) part_hc[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
+}
+
+// V4.1 narrow RMSNorm + FP8 quantisation + single-block Sinkhorn gate writeback (`blockIdx.x == 0`).
+// Blocks 1..N-1 never run the 20-iter Sinkhorn chain, and in block 0 only warp 0 runs it after q8.
+template <uint32_t NB, uint32_t NH>
+__global__ __launch_bounds__(kHcnThreads) void hcn_norm_v41_kernel(
+    const float* __restrict__ cur, const float* __restrict__ part_cur,
+    const float* __restrict__ part_hc, const float* __restrict__ mix,
+    const float* __restrict__ scale, const float* __restrict__ base,
+    float* __restrict__ pre_out, float* __restrict__ post_out, float* __restrict__ comb_out,
+    const float* __restrict__ nw, float* __restrict__ norm, uint8_t* __restrict__ q8,
+    float* __restrict__ qs, uint32_t n_embd, uint64_t hc_dim, uint32_t n_part, uint32_t iters,
+    float hc_eps, float rms_eps) {
+  __shared__ float s_inv[NB];
+  __shared__ float s_max[2][NB];
+  const uint32_t tid = threadIdx.x;
+  if (tid < NB) {
+    float tot = 0.0f;
+    for (uint32_t c = 0; c < n_part; ++c) tot += part_cur[(size_t)c * NB + tid];
+    s_inv[tid] = rsqrtf(tot / (float)n_embd + rms_eps);
+  }
+  if (tid < 2 * NB) s_max[tid / NB][tid % NB] = 0.0f;
+  __syncthreads();
+  float inv[NB];
+#pragma unroll
+  for (uint32_t b = 0; b < NB; ++b) inv[b] = s_inv[b];
+
+  const uint32_t d = blockIdx.x * kHcnThreads + tid;
+  float v[NB];
+  if (d < n_embd) {
+    const float w = nw ? nw[d] : 1.0f;
+#pragma unroll
+    for (uint32_t b = 0; b < NB; ++b) {
+      v[b] = cur[(size_t)d * NB + b] * inv[b] * w;
+      norm[(size_t)d * NB + b] = v[b];
+    }
+  }
+  if (q8) {
+    const uint32_t win = tid >> 7;
+    if (d < n_embd)
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b)
+        atomicMax((unsigned int*)&s_max[win][b], __float_as_uint(fabsf(v[b])));
+    __syncthreads();
+    const uint32_t nkb = n_embd >> 7;
+    const uint32_t kb = blockIdx.x * 2 + win;
+    float sc[NB];
+#pragma unroll
+    for (uint32_t b = 0; b < NB; ++b) {
+      const float m = s_max[win][b];
+      sc[b] = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+    }
+    if ((tid & 127u) < NB) qs[(size_t)(tid & 127u) * nkb + kb] = sc[tid & 127u];
+    if (d < n_embd) {
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b) {
+        const float t = fminf(fmaxf(v[b] * (1.0f / sc[b]), -448.0f), 448.0f);
+        int pk = 0;
+        pk = __builtin_amdgcn_cvt_pk_fp8_f32(t, 0.0f, pk, false);
+        q8[(size_t)b * n_embd + d] = (uint8_t)((uint32_t)pk & 0xffu);
+      }
+    }
+  }
+  if (blockIdx.x == 0 && tid < NB) {
+    float tot_hc = 0.0f;
+    for (uint32_t c = 0; c < n_part; ++c) tot_hc += part_hc[(size_t)c * NB + tid];
+    float pre[NH], post[NH], comb[NH * NH];
+    hc_gates_lane_nh<NH>(mix, NB, tid, rsqrtf(tot_hc / (float)hc_dim + rms_eps), scale, base, pre,
+                         post, comb, iters, hc_eps);
+#pragma unroll
+    for (uint32_t h = 0; h < NH; ++h) {
+      pre_out[(size_t)h * NB + tid] = pre[h];
+      post_out[(size_t)h * NB + tid] = post[h];
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < NH * NH; ++i) comb_out[(size_t)i * NB + tid] = comb[i];
+  }
+}
+
 // The same kernel with `hc` read once instead of once per destination. At n_hc=4 the loop above
 // loads the same four values sixteen times; the trip count is a runtime argument so neither loop
 // unrolls and nothing gets hoisted. Same terms, same order, same `acc = bv * post[...]` seed, so it
@@ -3019,6 +3164,29 @@ void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float
   // TWO partial planes. The expand kernel reads the first (every block re-derives the gates from
   // it) and writes the second, and one plane would let block 0's write race block 5's read.
   float* const part2 = part + (size_t)kHcnChunks * NB;
+  static const bool v41_hc_fused = [] {
+    const char* s = std::getenv("AFF_V41_HC_FUSED");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  if (has_control && pre_in && v41_hc_fused) {
+    const uint32_t nblk = (n_embd + kHcnThreads - 1) / kHcnThreads;
+    const uint32_t n_part = std::min<uint32_t>(kHcnChunks, nblk);
+#define AFF_HCN_V41(NH)                                                                           \
+  do {                                                                                            \
+    AFF_BLAUNCH((hcn_v41_collapse_sq_kernel<NB, NH>), dim3(n_part), t, 0, st, hc, pre_in, cur,    \
+                part, part2, n_embd, n_part);                                                     \
+    AFF_BLAUNCH((hcn_norm_v41_kernel<NB, NH>), dim3(nblk), t, 0, st, cur, part2, part, mix,       \
+                scale, base, pre, post, comb, nw, norm, q8, qs, n_embd, (uint64_t)n_embd * NH,    \
+                n_part, iters, hc_eps, rms_eps);                                                  \
+  } while (0)
+    if (n_hc == 1)      { AFF_HCN_V41(1); }
+    else if (n_hc == 2) { AFF_HCN_V41(2); }
+    else if (n_hc == 4) { AFF_HCN_V41(4); }
+    else if (n_hc == 8) { AFF_HCN_V41(8); }
+    else { aff::ui::fatal("batch_hc_fused_narrow: n_hc=%u\n", n_hc); std::abort(); }
+#undef AFF_HCN_V41
+    return;
+  }
   if (has_control) {
     AFF_BLAUNCH((hcn_sq_kernel<NB>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc);
 #define AFF_HCN_X(NH)                                                                             \
@@ -3054,7 +3222,8 @@ void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float*
   const hipStream_t st = (hipStream_t)stream;
   const dim3 g(kHcnChunks), t(kHcnThreads);
   float* const part2 = part + (size_t)kHcnChunks * NB;   // two planes, for the reason above
-  AFF_BLAUNCH((hcn_sq_kernel<NB>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc);
+  if (!pre_in)
+    AFF_BLAUNCH((hcn_sq_kernel<NB>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc);
 #define AFF_HCH_X(NH)                                                                             \
   AFF_BLAUNCH((hcn_head_gate_kernel<NB, NH>), g, t, 0, st, hc, part, mix, scale, base, cur, part2, \
               n_embd, (uint64_t)n_embd * n_hc, hc_eps, rms_eps, pre_in)

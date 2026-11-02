@@ -63,6 +63,7 @@ struct StaticPlacement::Impl {
   // One big slab per card rather than 7000 small allocations: the expert stride is uniform, so a
   // slot index is arithmetic, and hipMalloc is slow enough that per-expert calls dominate load.
   std::vector<uint8_t*> slab;
+  std::vector<uint8_t*> bonus_slab;  // optional asymmetric extra resident shards per card
   std::vector<float*>   d_cb;        // codebook, per card
   std::vector<hipStream_t> stream;
   // ---- the hybrid stream ------------------------------------------------------------------------
@@ -181,6 +182,7 @@ StaticPlacement::~StaticPlacement() {
   for (size_t i = 0; i < impl_->slab.size(); ++i) {
     (void)hipSetDevice(devs_[i]);
     (void)hipFree(impl_->slab[i]);
+    if (i < impl_->bonus_slab.size() && impl_->bonus_slab[i]) (void)hipFree(impl_->bonus_slab[i]);
     (void)hipFree(impl_->d_cb[i]);
     (void)hipStreamDestroy(impl_->stream[i]);
   }
@@ -329,6 +331,9 @@ void StaticPlacement::publish_base(size_t idx, PlcPatch* sink) {
     uint64_t a = 0;
     if (device_of_[idx] >= 0 && (tp_parts_ > 1 || device_of_[idx] == (int)dv))
       a = (uint64_t)(uintptr_t)(impl_->slab[dv] + offset_of_[idx]) | kPlcResident;
+    else if (dv < impl_->bonus_slab.size() && impl_->bonus_slab[dv] &&
+             dv * n + idx < bonus_off_.size() && bonus_off_[dv * n + idx] != UINT64_MAX)
+      a = (uint64_t)(uintptr_t)(impl_->bonus_slab[dv] + bonus_off_[dv * n + idx]) | kPlcResident;
     else if (const uint8_t* p = pool_shard_dev(layer, e, dv))
       a = (uint64_t)(uintptr_t)p;
     if (sink) {
@@ -895,7 +900,8 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   pref_cap_ = 0;
   if (const char* pr = std::getenv("AFF_PREFETCH_RING"); pr && *pr) {
     const int want_pref = std::atoi(pr);
-    if (want_pref > 0 && tp_parts_ > 1) {
+    if (want_pref > 0 && tp_parts_ > 1 && route_tag_ != 'S' &&
+        (uint64_t)n_layer * n_expert > 512u) {
       pref_cap_ = std::min<uint32_t>((uint32_t)want_pref, 64u);
       for (size_t i = 0; i < devs_.size() && i < 8; ++i) {
         AFF_HIP_CHECK(hipSetDevice(devs_[i]));
@@ -952,6 +958,7 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     if (tp_parts_ > 1) total_slots = i ? std::min(total_slots, per_gpu[i]) : per_gpu[i];
     else                total_slots += per_gpu[i];
   }
+  const std::vector<uint64_t> raw_per_gpu = per_gpu;
   if (tp_parts_ > 1) {
     for (size_t i = 0; i < devs_.size(); ++i) per_gpu[i] = total_slots;
     // The part count BY NUMBER, not "TP=2": it is the rank count now, and a banner that names the
@@ -1020,8 +1027,16 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   }
 
   I.slab.resize(devs_.size());
+  I.bonus_slab.assign(devs_.size(), nullptr);
+  bonus_off_.assign(devs_.size() * order.size(), UINT64_MAX);
   I.d_cb.resize(devs_.size());
   I.stream.resize(devs_.size());
+
+  static const bool bonus_slab_on = [] {
+    const char* s = std::getenv("AFF_BONUS_SLAB");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  std::vector<uint64_t> bonus_slots(devs_.size(), 0);
 
   for (size_t i = 0; i < devs_.size(); ++i) {
     AFF_HIP_CHECK(hipSetDevice(devs_[i]));
@@ -1040,6 +1055,19 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     cb_bytes_ = cb_bytes;
     AFF_HIP_CHECK(hipMemcpy(I.d_cb[i], cb_src, cb_bytes, hipMemcpyHostToDevice));
     AFF_HIP_CHECK(hipStreamCreate(&I.stream[i]));
+    if (bonus_slab_on && tp_parts_ > 1 && raw_per_gpu[i] > total_slots &&
+        n_resident < order.size()) {
+      const uint64_t bslots =
+          std::min<uint64_t>(raw_per_gpu[i] - total_slots, order.size() - n_resident);
+      if (hipMalloc(&I.bonus_slab[i], bslots * slot_stride + 4096) == hipSuccess) {
+        bonus_slots[i] = bslots;
+        aff::ui::err("bonus slab: card %zu holds %llu asymmetric extra expert shards (%.1f MiB)\n",
+                     i, (unsigned long long)bslots, (double)bslots * slot_stride / 1048576.0);
+      } else {
+        (void)hipGetLastError();
+        I.bonus_slab[i] = nullptr;
+      }
+    }
   }
   {
     // The slabs exist, so a resident expert's address is now computable. Pooled ones are still 0
@@ -1091,7 +1119,13 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     }
     }
 
-    std::atomic<size_t> cursor{0};
+    std::vector<std::pair<uint32_t, std::pair<size_t, uint64_t>>> bjobs;  // idx -> (dev, bslot)
+    for (size_t d = 0; d < devs_.size(); ++d) {
+      for (uint64_t b = 0; b < bonus_slots[d]; ++b)
+        bjobs.push_back({order[n_resident + b], {d, b}});
+    }
+
+    std::atomic<size_t> cursor{0}, bcursor{0};
     const size_t tp2_check = 0;
     std::atomic<size_t> tp2_bad{0}, tp2_seen{0};
     // The load loop used to (void)-cast every HIP return. That is the exact shape of the failure
@@ -1201,6 +1235,30 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
             offset_of_[idx] = slot * I.stride;
           }
         }
+        for (;;) {
+          const size_t bj = bcursor.fetch_add(1);
+          if (bj >= bjobs.size()) break;
+          const uint32_t idx = bjobs[bj].first;
+          const size_t d = bjobs[bj].second.first;
+          const uint64_t bslot = bjobs[bj].second.second;
+          const uint32_t layer = idx / n_expert, e = idx % n_expert;
+          const uint64_t off = aff->expert_file_offset(layer, e);
+          uint64_t got = 0;
+          while (got < I.stride) {
+            const ssize_t r = ::pread(aff->fd(), (uint8_t*)pin[0] + got, I.stride - got,
+                                      (off_t)(off + got));
+            if (r <= 0) break;
+            got += (uint64_t)r;
+          }
+          if (tr) aff::expert_transpose_planes_host((uint8_t*)pin[0], aff->layer(layer), scratch);
+          aff::expert_shard_host((const uint8_t*)pin[0], aff->layer(layer), shard_, tp_parts_,
+                                 (uint32_t)d, (uint8_t*)pin_sh[d]);
+          note(hipSetDevice(devs_[d]), "hipSetDevice(bonus)", d, bslot);
+          note(hipMemcpyAsync(I.bonus_slab[d] + bslot * shard_.stride, pin_sh[d], shard_.stride,
+                              hipMemcpyHostToDevice, st[d]), "hipMemcpyAsync(bonus)", d, bslot);
+          note(hipStreamSynchronize(st[d]), "hipStreamSynchronize(bonus)", d, bslot);
+          bonus_off_[d * order.size() + idx] = bslot * shard_.stride;
+        }
         for (size_t d = 0; d < devs_.size(); ++d) {
           (void)hipSetDevice(devs_[d]);
           (void)hipHostFree(pin[d]);
@@ -1245,14 +1303,14 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   // kernel hold a second copy of the pool's bytes during the exact window the pool is being
   // populated — gigabytes of peak RAM the pool then could not have.
 
-  {
+  for (size_t d = 0; d < devs_.size(); ++d) {
     size_t fb = 0, tb = 0;
-    (void)hipSetDevice(devs_[0]);
+    (void)hipSetDevice(devs_[d]);
     (void)hipMemGetInfo(&fb, &tb);
-    // Printed on every run on purpose. Three separate bugs have been "the engine ran out of VRAM
-    // somewhere after placement", and each time the first question was this number.
-    aff::ui::err("placement headroom: %.0f MiB free on card 0 after the slabs\n",
-                 fb / 1048576.0);
+    uint64_t sfb = 0, stb = 0;
+    const bool ok_sys = hip_free_vram_checked(devs_[d], &sfb, &stb);
+    aff::ui::err("placement headroom: card %zu %.0f MiB free (HIP %.0f MiB) after the slabs\n",
+                 d, (ok_sys ? (double)sfb : (double)fb) / 1048576.0, fb / 1048576.0);
   }
   stats_.vram_used_gib = (double)(total_slots * I.stride) / 1073741824.0;
   stats_.load_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1762,7 +1820,12 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         // One card writes the ring. Both select the same experts — a resident expert has a shard on
         // every card at the same slab offset, and a missing one has both shards in the same pool
         // slot — so a ring per card would carry every dispatch twice, identically.
-        A.act = (dv == 0) ? act_dev_ : nullptr;
+        static const bool prefill_freeze_plc = [] {
+          const char* s = std::getenv("AFF_PREFILL_FREEZE_PLC");
+          return !s || !*s || std::strcmp(s, "0") != 0;
+        }();
+        const bool freeze_plc = prefill_freeze_plc && nb_tok > 16u;
+        A.act = (!freeze_plc && dv == 0) ? act_dev_ : nullptr;
         A.shard = shard_;
         A.bg = (uint16_t*)bg_[dv]; A.bu = (uint16_t*)bu_[dv]; A.bydn = (uint16_t*)bydn_[dv];
         A.tile_cap = cap;
@@ -2055,7 +2118,14 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
   // could still be reading a slab slot or a pool slot the mover wants to write. The staging ring
   // needs exactly that guarantee, for the same reason.
   ssd_stage_arm(streams);
-  if (engine_on_) engine_tick(layer, sel, total, streams, plan_on);
+  if (engine_on_) {
+    static const bool prefill_freeze_plc = [] {
+      const char* s = std::getenv("AFF_PREFILL_FREEZE_PLC");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
+    if (prefill_freeze_plc && nb_tok > 16u) engine_retire(streams);
+    else                                    engine_tick(layer, sel, total, streams, plan_on);
+  }
 
   // ---- what the card says about the plan, read BEHIND the issue frontier -------------------------
   //

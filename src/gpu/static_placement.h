@@ -502,6 +502,7 @@ private:
   double headroom_mib_ = 0.0;                 // 0 = the derived fraction; see set_driver_headroom_mib
   uint64_t resident_now_ = 0, resident_target_ = 0;
   std::vector<uint32_t> resident_at_load_;    // per layer, for the before/after histogram
+  std::vector<uint64_t> bonus_off_;           // [card][layer*n_expert + e], UINT64_MAX if absent
   // Bit 1: this engine has promoted it before. Bit 2: it has demoted it before. Two bits over 11008
   // experts, so the thrash question costs 11 KiB and no time on the dispatch path.
   std::vector<uint8_t> ever_moved_;

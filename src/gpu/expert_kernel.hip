@@ -3096,9 +3096,12 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
                           const uint8_t* x8, const float* xs, const float* cb, uint32_t rows,
                           uint32_t cols, float wscale, void* stream, bool y_bf16) {
   if (!n_tiles) return;
-  const uint32_t rcap = expert_recon_tiles();
-  const uint32_t step = (rcap > 0u && rcap < n_tiles) ? rcap : n_tiles;
   const uint32_t ntiles = (max_nt + 15) / 16;
+  const uint32_t rcap = expert_recon_tiles();
+  // Gate tile-chunking on ntiles > 1 (wide prefill buckets). At decode (max_nt <= 16, ntiles == 1),
+  // moe_plan pads n_tiles to cap (e.g. 36) with nt == 0 dummy tiles, so splitting at rcap == 32
+  // issues a second launch per plane just to early-return on 4 empty tiles (+480 launches/step).
+  const uint32_t step = (ntiles > 1u && rcap > 0u && rcap < n_tiles) ? rcap : n_tiles;
   // The wire format follows the CONTAINER, not taste: each one needs its own codebook tensor. See
   // expert_wire_format_for_quant.
   const uint32_t fmt = expert_wire_format();
