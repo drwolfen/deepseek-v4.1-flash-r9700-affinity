@@ -6,6 +6,27 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [4.3.0] — 2026-11-02 — "carry the upstream ports"
+
+Merges `main` (v1.1.0 Radiance/KTransformers ports) into the 4.2.0 GPU line. The two branches
+diverged on 2026-10-12. Thirteen conflict hunks across five files were resolved in favour of this
+line's implementations where both sides solved the same problem:
+
+- **Prefill chunking** keeps `AFF_EQUAL_UBATCH`, bounded replay and the `limit`-based vision cuts;
+  upstream's simpler `chunk` loop is not used.
+- **LM-head INT4** keeps `launch_w4_head` over the shared `matvec_w4_multix_hip`; upstream's
+  `AFF_LMHEAD_INT4` / `AFF_DRAFT_HEAD_INT4` switches remain honoured. The duplicate upstream
+  declaration in `dense_gpu.hip` was removed.
+- **Sampler history** keeps the device `smp_hist_` / `smp_dry_` buffers used by this line's
+  repetition-penalty and DRY paths.
+- **Prefetch ring teardown** frees `d_pref_slab_` / `d_pref_src_` per device.
+- **CHANGELOG** keeps this file, which already contained the v1.1.0 and v1.0.0 sections.
+
+Upstream changes that did not conflict (protected-expert residency, FP8 grouped RoPE, fused HC,
+stage rings, deployment docs, licences) are carried over unchanged.
+
+Build: `cmake --build` clean with ROCm 7.x / `gfx1201`; `ctest` 7/7 passed.
+
 ## [4.2.0] — 2026-11-01 — "measure the reserve"
 
 The theme of this release is that the engine's *accounting* of VRAM was wrong in one direction and

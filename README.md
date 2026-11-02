@@ -1,326 +1,226 @@
-# Affinity
+# deepseek-v4.1-flash-r9700-affinity
 
-> ## This is a fork
->
-> **Affinity is the work of Yoshi Exeler: [StillDeadcode/affinity](https://codeberg.org/StillDeadcode/affinity)
-> on Codeberg, MIT licensed.** The engine, its design and everything below this box are the original project's,
-> and this README is upstream's, unchanged. Please star, cite and report engine issues upstream.
->
-> This fork adds, on top of upstream `a48b72e`:
-> - **`v4-fixes`** (default branch): robustness fixes for DeepSeek-V4-Flash and V4-Flash-0731, including the
->   "fluent garbage after the first long prompt" bug. The fixes are offered upstream as Codeberg issue #6 and PRs #7–#11.
-> - **`v41`**: DeepSeek-V4.1-Flash support (indexer, engram, chat encoding), correct against the reference model.
-> - A Docker build on AMD's TheRock ROCm 7.14 (`docker/Dockerfile`) and measured results on two Radeon AI PRO R9700s.
->
-> Details, commits and numbers: **[FORK.md](FORK.md)**.
->
-> ### Prebuilt quantised model
->
-> **[neuromaniacmd/DeepSeek-V4-Flash-0731-affinity-2.875bpw](https://huggingface.co/neuromaniacmd/DeepSeek-V4-Flash-0731-affinity-2.875bpw)** on Hugging Face is a ready-made affinity
-> container for [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731). It was made with
-> upstream's own `aff-quantize` exactly as in *3. Quantise* below: routed experts at 2.875 bpw with affinity's codebook
-> quant, weighted by the teamblobfish V4-Flash imatrix; dense weights in the checkpoint's FP8; plus 0731's bundled DSpark
-> draft. That saves the 149 GB checkpoint download and ~2.5 h of quantising. The main container is split into three
-> parts for the Hub's 50 GB file limit (reassemble with `cat`, checksums included). It loads only in affinity, not in
-> llama.cpp or vLLM. Measured on two R9700s: ~1.3K tok/s prefill, 35–50 tok/s decode, 262K context.
+A working setup for serving **DeepSeek-V4.1-Flash** (the uncensored / abliterated build) on **two AMD
+Radeon AI PRO R9700s**, using a fork of the [affinity](https://codeberg.org/StillDeadcode/affinity)
+inference engine, plus a locally quantised 2.875-bpw container of the model.
 
-An inference engine for DeepSeek-V4-Flash on **one or two** RDNA4 GPUs. Single C++/HIP codebase, no
-framework.
+This repository is the *setup*: the engine source (fork + our patches), the deployment unit, the
+quantisation recipe, and the measurements, all captured on one machine. It exists so the exact
+combination that produced the numbers below can be rebuilt.
 
-The model is 284 B parameters and does not fit in VRAM. At 2.875 bpw its routed experts are ~93 GiB
-against the ~64 GiB two 32 GiB cards give you, or half that on one, so on every token some of the
-experts a layer needs are in host RAM. An expert on a card reads at ~630 GB/s; one in host RAM
-crosses PCIe at about a tenth of that. Decode speed is therefore mostly one question: how often is
-the expert this token wants already resident? The engine is built around moving experts to keep that
-number high.
+The affinity engine was transformed into this **R9700-tweaked version with the help of
+DeepSeek-V4.1-Flash and Gemini 4 Argon** (used to port, patch and tune the engine — see *Rework and
+patches*).
 
-## Requirements
+> **Tested on exactly two R9700s.** Every number here was measured on a two-card box. The engine
+> upstream supports one card, but that configuration was not benchmarked for this setup.
+
+**Model files (1017 revision):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
+**Model files (legacy 0925):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
+
+**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v1.1.0`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v1.1.0)
+
+---
+
+## Hardware (the machine the numbers come from)
 
 | | |
 |---|---|
-| GPU | **One or two AMD RDNA4 `gfx1201` cards.** Radeon AI PRO R9700 (32 GiB) is the reference card; two of them is the design point |
-| Runtime | ROCm 7.x with `hipcc`. Two cards additionally need peer access between them |
-| RAM | 64 GB. The non-resident experts live here; more is better, and on one card it is what makes the model runnable at all |
-| Disk | ~101 GiB container, ~7 GiB draft, plus the source checkpoint |
-| Build | CMake 3.24+, C++20 |
+| GPU | **2 × AMD Radeon AI PRO R9700**, `gfx1201` (RDNA4), 32 GiB each |
+| CPU | Intel Xeon Platinum 8160 (Skylake-SP), 2 sockets × 24 cores / 48 threads = 96 threads |
+| RAM | 754 GiB DDR4 (2 NUMA nodes) |
+| PCIe | GPUs link at **Gen5 ×16**, but the switch **uplink runs Gen3 ×16 (8.0 GT/s)** — the host Xeon is a PCIe-3.0 CPU. See *Performance notes*. |
+| Host OS | **Ubuntu 24.04.5 LTS** (Noble Numbat), kernel 7.0.0, ROCm 7.2.4 |
+| Engine build | AMD TheRock ROCm 7.14 image (no host ROCm needed) |
 
-The kernels assume RDNA4 wave32 and its WMMA fragment layout; the configure refuses anything that is
-not `gfx12xx`.
+### Minimum RAM
 
-### Card count
+The routed experts do not fit in 64 GiB of VRAM. At 2.875 bpw the routed experts are ~93 GiB and the
+whole container is **191.32 GiB**; the two cards hold ~41 GiB of expert slab, so the rest lives in host
+RAM.
 
-**Two cards** is the design point and what every number in this README was measured on. Both cards
-are tensor-parallel ranks: every GPU op except the routed experts is split across them, each holds
-half of every resident expert, and the two exchange through a peer-push all-reduce.
+- **~160 GiB RAM** is the practical floor for this configuration (512k context, DSpark, engram): the
+  host expert pool alone is **143.5 GiB** plus the OS and page cache.
+- Below that, experts spill to the SSD tier and decode collapses (the engine's own note: a 32 GiB card
+  with 64 GB RAM runs ~8 tok/s instead of ~19+ because most experts end up on disk).
+- At 512k context the KV cache is committed at 262144 backed positions (0.66 GiB VRAM); the compressed
+  indexer/prefix cache is on disk.
 
-**One card** is supported and runs the whole model with no collective at all. It is worth having if
-you have the RAM, since the experts that do not fit spill to the host pool and then to the container
-on disk. It works, and it is slow: on a 32 GiB card with 64 GB of RAM, roughly 8 tok/s against 110
-on two cards, because most of the experts end up on disk. More RAM is the fix; the pool is what
-keeps them off the SSD tier.
+---
 
-Every `gfx1201` card the runtime reports becomes a rank, so on a machine with exactly one or two
-there is nothing to configure. `--gpus N` caps the count and `HIP_VISIBLE_DEVICES` chooses which.
+## Current speed (measured, this machine - v1.1.0 update)
 
-**Three or more cards is refused at startup.** Nothing in the engine is written for two in
-particular. The rank count is a runtime value throughout, and the pieces that were most likely to
-break are tested past two: the N-way expert split byte-for-byte and arithmetically at four ways, the
-all-reduce bit-identical across ranks at 3, 4 and 8, attention at every per-card head count. The
-engine as a whole still emits degenerate text there, and the cause is not yet known. Refusing beats
-shipping a configuration whose output is fluent and wrong. On a bigger box, run it with `--gpus 2`.
+Single stream, 512k-context configuration, DSpark speculative decoding on, thinking on (measured on live Hermes agent sessions at **163.5k–170.7k context**):
 
-A CPU-only configure builds the quantiser but not `affinity`.
+| | |
+|---|---|
+| **Decode, weighted average (163k–171k ctx)** | **21.96 tok/s** (**+28.6%** over v1.0.0 baseline of 17.08 tok/s) |
+| **Decode, peak sustained bursts** | **27.80 tok/s** (e.g. 1,341 tokens in 48.15s at 166.3k context) |
+| **Speculative step latency** | **166.7 ms/block median** (-20.4%), down to **156.8 ms/block** min |
+| **Draft acceptance** | **79.9%** (3.69 tokens/block avg, up to 4.37 tokens/block; tail collapse resolved) |
+| **Prefill** | ~1000 tok/s (persistent prefix cache restores 330+ blocks from disk on restarts) |
 
-## 1. Build
+Decode remains PCIe-streaming bound for non-resident experts (3,248 in VRAM / 12,112 streamed over PCIe), but **fused `hc_post` + DSpark taps (`AFF_FUSE_HC_TAP=1`)**, **on-GPU group-128 INT4 LM head (`AFF_DRAFT_HEAD_INT4=1`)**, and **Cactus capped rejection sampling (`AFF_CACTUS_DELTA=0.35`, `AFF_CACTUS_CAP_R=0.5`)** have cut per-block overhead by **-42.8 ms/block** and lifted decode throughput by **+28.6%**.
 
-```sh
-git clone https://codeberg.org/StillDeadcode/affinity.git && cd affinity
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
+---
 
-Builds `affinity`, `aff-quantize`, `aff-info` and `aff-gpucheck`.
+## What comes from where
 
-| Option | Default | |
+Nothing here is the model author's or the engine author's endorsement; this is a personal fork.
+
+| component | origin | license / note |
 |---|---|---|
-| `-DAFF_HIP=ON\|OFF\|AUTO` | `AUTO` | GPU kernels; `AUTO` enables them if `hipcc` is found |
-| `-DAFF_GPU_ARCH=` | `gfx1201` | Target architecture |
-| `-DAFF_NATIVE=ON\|OFF` | `ON` | `-march=native` |
+| Inference engine | [StillDeadcode/affinity](https://codeberg.org/StillDeadcode/affinity) by Yoshi Exeler | MIT. Upstream of everything. |
+| Engine fork (this tree) | `neuromaniacMD/affinity` (our GitHub) | MIT. Adds the rework listed below. Kept as provenance; this repo is the deployable copy. |
+| Optimization ports (Lucebox) | [Luce-Org/lucebox](https://github.com/Luce-Org/lucebox) · [lucebox.com](https://www.lucebox.com/) — **Lucebox AI**, Apache-2.0 | Three of the v1.0.0 local knobs are **ports from Lucebox's `ds41-gorgon` work**: bounded replay, adaptive verify width (`AdaptiveSpecWidth`) and the protected massive/outlier expert set; the port's quality gate also uses Lucebox's 8,184-token fineweb-edu eval corpus. |
+| Optimization ports (Radiance) | [StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance) (v1.12.0) by Yoshi Exeler | Ports in v1.1.0: Cactus length-faded and capped rejection sampling (`AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R`), fused `hc_post` + DSpark tap recording (`AFF_FUSE_HC_TAP`), and draft output head compression. |
+| Optimization ports (KTransformers) | [05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers) | Ports in v1.1.0: on-GPU group-128 INT4 LM output head (`AFF_DRAFT_HEAD_INT4`), FP8 attention output QDQ (`AFF_O_FP8_QDQ`), and 1017 `namespace::name` tool encoding and parsing. |
+| Base model | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | DeepSeek license. Source of the reference `inference/` and `encoding/` code. |
+| Uncensored weights (`-uc`) | [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8) | FP8 checkpoint that we re-quantised to 2.875 bpw. |
+| Abliterated weights (alt) | [pqhaz/DeepSeek-V4.1-Flash-heretic](https://huggingface.co/pqhaz/DeepSeek-V4.1-Flash-heretic) | Directional ablation of refusal behaviour; lower KL than `-uc`. A `model-heretic.aff` was built but `-uc` is what is served. |
+| GGUF / imatrix | [Adolphsson/DeepSeek-V4.1-Flash-UNCENSORED-GGUF](https://huggingface.co/Adolphsson/DeepSeek-V4.1-Flash-UNCENSORED-GGUF) | Import-matrix source for the 2.875-bpw encode. |
+| Quantiser | affinity's own `aff-quantize` | Routed experts only, 2.875 bpw codebook quant, imatrix-weighted. |
 
-## 2. Get the checkpoint
+The engine itself, its design, the kernels and the base README are upstream's work and remain MIT
+licensed (`LICENSE`, `FORK.md`, `UPSTREAM-README.md` kept unchanged).
+
+---
+
+## Rework and patches (with measured effect)
+
+> **Every commit below is traceable.** Click the short SHA to open the full diff on GitHub. All of the
+> local work lives in this repository's history, so you can read the actual code change behind each
+> claim — the vision port, the KV sizing, the tool-call recovery, the imatrix calibration, the
+> `AFF_NOBUDGET` patch.
+
+Branches: this repository's history is the fork's `v41-tool-fix` line (mirroring upstream `a48b72e`
+plus the V4.1 port) with ten further commits of **unpublished local work** that produced the served
+binary, plus one commit capturing the on-GPU imatrix/placement working tree and one patch commit.
+
+### ⭐ Local work — the part that is ours
+
+These are the changes that are not in the fork's published branches. This is where the speed and the
+agentic-robustness come from.
+
+| diff | change | measured effect |
+|---|---|---|
+| [`91e78ba`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/91e78ba) | **DeepSeek ViT on the CPU**, wired into prefill and the chat endpoint. Three reference discrepancies fixed (2D-RoPE half rotation, channel-major aligner, aspect-preserving pad) | embedding cosine vs reference 0.31 → 0.85; end-to-end image grounding works |
+| [`cbb3f07`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cbb3f07) | ViT **weight-stationary GEMM + AVX-512 attention** | 546×546: 13.2 s → 3.25 s; 1024×1024: minutes → 38 s |
+| [`e1a2025`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e1a2025) | ViT **query-blocked attention**; opt-in engram page-cache warm (`AFF_ENGRAM_WARM`) | 74×74: 38.4 s → 23.3 s, numerically identical |
+| [`cac0510`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cac0510) | size the compressed KV cache **per kv source, not per layer** | KV 1016 → 100 MiB/card; resident experts 2206 → 2357 |
+| [`997489c`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/997489c) | **tile the indexer byte mask** over the prefill chunk | prefill arena 2068 → 1426 MiB/card; resident experts 2357 → 2462 |
+| [`78244dc`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/78244dc) | **persist the learned placement heat plane** across restarts (`--placement-save`) | residency survives restarts (no re-learn from zero) |
+| [`a4c9f85`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/a4c9f85) | recover **marker-less ("bare") DSML tool calls** and stop at the block close | a poisoned 117k-token replay dropped 4360 → 195 completion tokens; stops the agent runaway/confabulation |
+| [`bc42be2`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/bc42be2) | DSpark **confidence head** + opt-in gating (`AFF_SPEC_CONF_T`) | wash on 2 cards — kept as a calibration instrument |
+| [`27ec8fa`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/27ec8fa) | opt-in DSpark backoff after a zero-accept streak (`AFF_SPEC_BACKOFF=N`) | wash on 2 cards (verify dominates, not the draft) — kept as a knob |
+| [`1ae7c09`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/1ae7c09) | **SSE keep-alive** while a tool call is withheld | long tool calls no longer trip client body-idle timeouts (300 s) |
+| [`2a4478f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2a4478f) | working tree captured: **on-GPU imatrix calibration** (`--calibrate-tokens/-chunk-size/-max-chunks`, `--imatrix-in/out`, `imatrix_accum_*` kernels), **bounded replay** (`AFF_BOUNDED_REPLAY`), **soft resident bias** (`AFF_RESIDENT_BIAS`), pinned sampler staging, async peer-copy overlap, `AFF_BLOCK_AT` hooks | the engine can emit its own imatrix from the model's own activations; host↔device copies overlap |
+| [`2779348`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2779348) · [`patches/AFF_NOBUDGET_MAX_TOKENS.patch`](patches/AFF_NOBUDGET_MAX_TOKENS.patch) | bound the default when a request sends **no** `max_tokens` (was: the whole remaining context) | a gateway reasoning loop can no longer hold the single slot for 37 min / 55k tokens; explicit `max_tokens` untouched |
+
+Every commit message carries the same measurement detail as the table, with the exact before/after.
+
+**Ported from [Lucebox](https://github.com/Luce-Org/lucebox)** (Apache-2.0, by **Lucebox AI** / `Luce-Org`,
+in `2a4478f` and its neighbours): the V4.1 decoder SWA bounded replay (`AFF_BOUNDED_REPLAY`, from
+Lucebox's `ds41-gorgon` profile — see `src/engine/model.cpp`), the cost-aware adaptive verify width
+(`AFF_ADAPTIVE_WIDTH`, from Lucebox's `AdaptiveSpecWidth` — `tools/affinity.cpp`), and the protected
+massive/outlier expert set (from Lucebox's `share/deepseek41/massive_experts.json` —
+`src/gpu/static_placement.hip`). The port's quality gate also reuses Lucebox's 8,184-token
+fineweb-edu eval corpus. Credit and thanks to Lucebox for these; the code comments mark each site.
+(`ds41-gorgon` is Lucebox's launch profile — DeepSeek-V4.1 on an R9700 beside a 192 GB Ryzen AI Max+.)
+
+### V4.1 / multimodal port (fork `v41` branch, also in this history)
+
+| diff | change | improvement |
+|---|---|---|
+| [`e6070f5`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e6070f5) | V4.1 reasoning-effort prefix + `陪同下` token, byte-identical to the reference `encoding.py` | correct V4.1 chat encoding |
+| [`e03a05b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e03a05b), [`774aa6a`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/774aa6a), [`4165fce`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/4165fce), [`4bc938b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/4bc938b) | engram gate/stride, engram bf16 weights, V4.1 has no per-head RMS on q | four bugs that produced fluent-but-wrong text; fixes make the port correct |
+| [`d91ae9d`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/d91ae9d) | engram n-gram layers 1 and 14 (91.6 GiB tables), indexer, compressor | V4.1 architecture support |
+| [`2dbb093`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2dbb093) | stop retrying a KV growth the card cannot hold | removes the 64k decode cliff |
+
+### Environment knobs used in the served unit
+
+`AFF_ENGRAM_WARM=1` `AFF_SPEC_BACKOFF=2` `AFF_ADAPTIVE_WIDTH=1` `AFF_BOUNDED_REPLAY=1`
+`AFF_FUSE_HC_TAP=1` `AFF_DRAFT_HEAD_INT4=1` `AFF_CACTUS_DELTA=0.35` `AFF_CACTUS_CAP_R=0.5`
+`AFF_RESIDENT_BIAS=0.008` `AFF_NOBUDGET_MAX_TOKENS=16384`.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for full version history, benchmarks, and commit attribution.
+
+---
+
+## Model files
+
+Built from the uncensored FP8 checkpoints with affinity's own `aff-quantize`. The weights are hosted on
+the Hugging Face Hub:
+
+- **1017 revision (Current, recommended):** [**`Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw`**](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
+- **Legacy 0925 release:** [**`Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw`**](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
+
+### 1017 Container Files
+
+| file (HF repo) | size | role |
+|---|---|---|
+| [`model-uc-1017.aff.part-00 … part-04`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/tree/main) | **191.32 GiB** total | the 1017 container (routed experts 2.875 bpw codebook quant, dense FP8, embedding/head bf16). Split into 5 parts. |
+| [`model-uc-1017.dspark.aff`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/model-uc-1017.dspark.aff) | 5.22 GiB | DSpark speculative-decoding draft head |
+| [`model-uc-1017.engram`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/model-uc-1017.engram) | 506 KiB | engram n-gram sidecar |
+| [`uc-1017-cb.raw`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/uc-1017-cb.raw) | 32 KiB | the 2×1024-entry codebook the experts were encoded against |
+
+Reassemble the main container with `cat model-uc-1017.aff.part-* > model-uc-1017.aff`; verify with `sha256sum -c SHA256SUMS.parts`.
+
+The quantisation recipe is in [`model/QUANT.md`](model/QUANT.md); checks that must pass: `aff-info`,
+`aff-cfgcheck`, `aff-fp8check`, `aff-exphash` (15360 distinct experts), `aff-gpucheck --dq`.
+
+---
+
+## Build and run
+
+**Prebuilt package:** [release `v1.0.0`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v1.0.0)
+carries `affinity-r9700-1.0.0.tar.gz` — the patched engine binary for `gfx1201` plus `deploy/`,
+`model/` and `patches/`.
+
+Build the engine image (needs Docker; the host needs no ROCm):
 
 ```sh
-pip install -U "huggingface_hub[cli]"
-hf download deepseek-ai/DeepSeek-V4-Flash --local-dir ./DeepSeek-V4-Flash
+docker build -f docker/Dockerfile -t affinity:v41-vision .
 ```
 
-You need the whole directory: `config.json`, the safetensors shards and `tokenizer.json`. The
-speculative-decode draft is in the same checkpoint (the `mtp.*` tensors), not a separate download.
-
-Then an importance matrix. This is not ours. It is a llama.cpp GGUF imatrix published alongside a
-community GGUF of the same checkpoint:
+Serve (see [`deploy/deepseek-v41-affinity.service`](deploy/deepseek-v41-affinity.service) for the full
+unit, and [`deploy/run.sh`](deploy/run.sh)):
 
 ```sh
-hf download teamblobfish/DeepSeek-V4-Flash-GGUF imatrix/imatrix-v4-flash.dat --local-dir .
+docker run --name deepseek-affinity \
+  --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
+  -e AFF_ENGRAM_WARM=1 -e AFF_SPEC_BACKOFF=2 -e AFF_ADAPTIVE_WIDTH=1 \
+  -e AFF_BOUNDED_REPLAY=1 -e AFF_RESIDENT_BIAS=0.008 -e AFF_NOBUDGET_MAX_TOKENS=16384 \
+  -v /models:/models affinity:v41-vision \
+    -m /models/model-uc.aff --tokenizer /models/tokenizer.json \
+    --dspark on --dspark-model /models/model-uc.dspark.aff \
+    --engram /models/model-uc.engram --engram-tables /models \
+    --kv-size 524288 --kv-commit 262144 \
+    --host-pool-mib 200000 --placement-strategy demand \
+    --placement-save /models/placement.affprof \
+    --prefill-chunk-size 2816 --default-effort 75 --max-tokens-floor 0
 ```
 
-470 MB, calibrated on wikitext (2000 × 512-token chunks). Any llama.cpp imatrix for this model works
-as long as it carries **per-expert** `in_sum2` and `counts`. For MoE tensors llama.cpp writes one row
-per expert, and both jobs below need that per-expert form rather than a tensor-wide average.
+---
 
-It does two jobs, and it is honest to say both are modest.
+## Performance notes
 
-**It weights the quantiser's error.** `in_sum2/counts` is `E[x_j²]` per input column per expert, which
-turns the rounding objective from plain L2 into a weighted one, so precision goes to the columns the
-model actually drives hard. Worth about 2% lower error under the activation distribution the imatrix
-itself measures. This is the job that justifies the download.
+- Decode is **PCIe-bandwidth bound**, not context bound: step time is flat from 32k to 300k
+  (`corr(prompt, s/block) = 0.06`), and tracks drafted tokens (`corr = 0.72`).
+- The GPUs negotiate Gen5, but the switch uplink is Gen3 because the Xeon 8160 is a PCIe-3.0 part.
+  Moving the cards to a PCIe-4.0 host (`x16` uplink) should roughly halve the expert-streaming term →
+  ~1.6× decode, ≈ 30 tok/s. **Keep the uplink at ×16**: Gen4 ×8 equals Gen3 ×16 and would gain nothing.
+- AVX-512 VNNI on the host would not help this build: the MoE matmuls run on the GPU (experts streamed
+  over PCIe), the host does routing, sampling and engram lookups only.
 
-**Its activation counts become the container's expert-popularity profile**, which the placement
-engine ranks against to choose which experts start resident. Against no profile at all that is worth
-1.2 points of hit rate. Imatrix popularity is not decode popularity, the calibration corpus is not
-your workload, and the heat engine re-ranks from real routing within a few dispatches regardless. It
-is a warm start, not a policy, and `--expert-profile` overrides it with one fitted from real traces.
+## Credits
 
-Both are optional. Quantising without `--imatrix` gives you an unweighted container and no profile;
-it works. `--imatrix` is ignored under `--dspark`, which is keyed by target layer.
+DeepSeek for the model; Yoshi Exeler / StillDeadcode for affinity and **radiance v1.12.0** (Cactus length-faded/capped rejection sampler, fused `hc_post` tap kernels); **Lucebox AI
+([Luce-Org/lucebox](https://github.com/Luce-Org/lucebox), Apache-2.0) for the bounded-replay,
+adaptive-width and protected-expert optimizations we ported (and the eval corpus)**; **05yuki ([05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)) for the group-128 INT4 output head, FP8 attention QDQ, and 1017 tool namespace specs**; `dealignai` and
+`pqhaz` for the uncensored builds; the friends whose fixes landed in the fork's `v4-fixes`. **The
+transformation of affinity into this R9700-tweaked engine was done with the help of
+DeepSeek-V4.1-Flash, Gemini 4 Argon, and Gemini 3.8 Flash.** Engine code remains MIT; see [`LICENSE`](LICENSE) and
+[`FORK.md`](FORK.md).
 
-## 3. Quantise
-
-```sh
-./build/aff-quantize --src ./DeepSeek-V4-Flash --out model.aff \
-                     --imatrix imatrix/imatrix-v4-flash.dat --threads 12
-```
-
-Produces 101.1 GiB: 92.9 GiB of routed experts, ~6.2 GiB of dense weights kept in the checkpoint's
-own FP8, 2.0 GiB of embedding and head. Around three hours at twelve threads. The output is a pure
-function of the checkpoint and the imatrix, so the same inputs give a byte-identical file at any
-`--threads`. It exits non-zero if any expert fails to write, because a partial container loads
-cleanly and decodes garbage.
-
-Then the draft, which must share the main container's codebook:
-
-```sh
-./build/aff-quantize --src ./DeepSeek-V4-Flash --out model.dspark.aff \
-                     --dspark --codebook model.aff
-```
-
-~7.0 GiB. Skipping it is fine: run with `--dspark off`, which gives the draft's VRAM to the experts.
-
-| `aff-quantize` | |
-|---|---|
-| `--src DIR` | Checkpoint directory |
-| `--out FILE` | Container to write |
-| `--imatrix FILE` | Importance weights, llama.cpp format |
-| `--layers N` | First N layers only. Exercises the pipeline; the output is not the model |
-| `--threads N` | Default one per core. Does not affect the output |
-| `--dspark` | Quantise the `mtp.*` draft stages instead |
-| `--codebook FILE` | Take the codebook from this container. Required with `--dspark` |
-
-## 4. Run
-
-```sh
-./build/aff-info model.aff                    # check the container first
-
-./build/affinity -m model.aff --tokenizer ./DeepSeek-V4-Flash/tokenizer.json \
-                 -p 'The capital of France is' -n 32
-
-./build/affinity -m model.aff --tokenizer ./DeepSeek-V4-Flash/tokenizer.json --port 8080
-```
-
-The server does `/v1/chat/completions` (streaming and not), `/v1/completions` and `/v1/models`, with
-tool calls in and out. `--dspark-model` defaults to `<model>.dspark.aff`, so step 3's draft is picked
-up automatically.
-
-If output looks wrong, `aff-gpucheck -m model.aff` runs the GPU expert path against the CPU
-reference on the real container.
-
-On a terminal both modes draw a live view: per-card utilisation and VRAM, throughput, draft
-acceptance, and the expert plane coloured by tier. Piped or redirected it prints ordinary lines
-instead, unchanged. `--ui plain` forces lines on a terminal; `--ui dash` fails rather than downgrade.
-
-## Configuration
-
-`--help` prints all of this. Defaults in brackets.
-
-**Model and memory**
-
-| | |
-|---|---|
-| `-m, --model FILE` | The `.aff` container. Required |
-| `--tokenizer FILE` | `tokenizer.json` |
-| `--gpus N` | [0 = every supported card] Tensor-parallel ranks, 1 or 2. `HIP_VISIBLE_DEVICES` chooses which cards; this takes a prefix of them |
-| `--dspark on\|off` | [on] Speculative decode. Off does not load the draft and gives its VRAM to the experts; the text differs between the two |
-| `--dspark-model FILE` | [`<model>.dspark.aff`] |
-| `--dspark-placement vram\|ram` | [vram] `ram` pools the draft's slab. A trade, not a saving: the draft rereads its experts several times a block |
-| `--gpu-mib M` | Cap on VRAM per card for the expert slabs. Default exceeds any card, so free VRAM binds |
-| `--host-pool-mib M` | RAM for the non-VRAM experts [from MemAvailable]. Pin it for anything you compare |
-| `--gpu-headroom-mib M` | [0 = derive] VRAM the slab leaves alone. Too small and the slab's own allocation fails |
-| `--host-pool-reserve-mib M` | [1536] RAM left free when auto-sizing. What does not fit the pool falls to SSD, and a layer with even one expert on SSD reverts to the slower host dispatch |
-| `--kv-size N` | [1048576] KV positions. Address space, not VRAM; lowering it does not buy residency |
-| `--kv-commit N` | [65536] Positions actually backed at load. The rest costs nothing until reached, and the difference goes to the expert slab |
-| `--kv-margin N` | [16384] How far ahead the grower keeps the cache backed |
-
-**Prefix cache.** Keeps served attention state on SSD so an agent session does not re-prefill its
-whole transcript every turn.
-
-| | |
-|---|---|
-| `--prefix-cache-dir D` | Off unless given. `D` needs `O_DIRECT` |
-| `--prefix-cache-gib N` | [from free space, max 64] |
-| `--prefix-cache-block N` | [512] Tokens a block. Must divide by the largest compress ratio |
-| `--persistent-prefix-cache` | Keep the store across restarts. **It holds conversation content on disk unencrypted** |
-| `--prefix-cache-verify` | Hash the attention state once the prompt is in. A check, not a serving mode |
-
-**Serving**
-
-| | |
-|---|---|
-| `--host ADDR` | [127.0.0.1] |
-| `--port N` | [8080] |
-| `--max-tokens-floor N` | [256000] Raise a request's `max_tokens` to at least this. Reasoning and answer share one budget, so a small hardcoded value truncates reasoning and returns no answer. 0 honours the caller |
-
-**Generation**
-
-| | |
-|---|---|
-| `-p, --prompt TEXT` | Generate once to stdout instead of serving |
-| `--prompt-file F` | Needed past ~30K tokens, where `-p "$(cat F)"` hits `ARG_MAX` |
-| `-n, --n-predict N` | [32] |
-| `--ignore-eos` | Keep going past EOS |
-| `--no-echo` | Do not echo the prompt |
-| `--ui auto\|dash\|plain` | [auto] |
-| `--temp F` | [0, greedy] Greedy degenerates and changes which experts route; use `--seed` and real settings |
-| `--top-k N` | [0 = off] |
-| `--top-p F` | [1.0] |
-| `--min-p F` | [0] |
-| `--seed N` | Reproducible only under `--placement-strategy static`: the mover changes residency, and residency sets the summation order |
-
-**Performance**
-
-| | |
-|---|---|
-| `--prefill-chunk-size N` | [1408] Tokens a prefill chunk, rounded to 128. Bigger amortises the experts further but leaves fewer resident |
-| `--placement-strategy S` | [heat] `heat`, `demand` (promotes what the dispatch just streamed) or `static` (nothing moves) |
-| `--placement-moves N` | [8] Swaps started a layer dispatch |
-| `--placement-decay F` | [0.98] Heat decay a dispatch |
-| `--placement-hysteresis F` | [1.25] Promote only at this heat ratio |
-| `--placement-min-gain F` | [1.5] …and this many activations. Link traffic is U-shaped in it; raising it moves more bytes, not fewer |
-| `--placement-lead N` | [2] Hold the host within N layer dispatches of the cards. 0 is unbounded, which starves the mover of slots to move into. Decode only |
-| `--placement-shadow N` | [32] Spare slab slots for in-flight promotions |
-| `--keepalive-us U` | [0 = off] Per-card heartbeat |
-
-**Diagnostics.** Several of these deliberately produce output that is not the model's.
-
-| | |
-|---|---|
-| `--prefill-reps N` | Re-run the prefill N times in one process, median and spread. Placement converges across reps, so one prefill is a cold number |
-| `--prefill-alt FILE` | Rotate a second prompt through `--prefill-reps` |
-| `--route-trace FILE` | Record every layer dispatch. Format at the top of `src/engine/route_trace.h`. Forces the host dispatch, so its tok/s is not the shipping rate |
-| `--expert-profile FILE` | Use this popularity profile instead of the container's |
-| `--dump-logits K` / `--tokens a,b,c` / `--logits-out F` | Top-K logits for explicit token ids |
-| `--dump-tokens` | Print the token ids for `-p` and exit |
-| `--force-tokens a,b,c` | Decode these ids instead of the sampler's. Needed to compare two builds at all |
-| `--no-routed-experts` | Zero the routed experts to isolate the dense path |
-| `--index-topk K` | Override the indexer's top-k |
-| `--max-layers N` | Stop after N layers |
-
-**Environment**
-
-| | |
-|---|---|
-| `AFF_PROFILE=1` | Per-phase breakdown. **Not a passive observer.** It restores a readback and the drain behind it, which changes the mover's slot supply. Do not compare a profiled run against an unprofiled one |
-| `AFF_BLOCK=1` | The host blocking table alone, without that readback |
-| `AFF_FORCE_RESIDENT=1` | Restrict routing to resident experts. Measures the all-resident ceiling; the output is wrong on purpose |
-| `AFF_TRACE=dense[,events][,deep][,sync][,evsync]` | Per-entry-point device timing |
-| `AFF_MOVER_DUP=K` / `AFF_MOVER_DUP_DIR=both\|h2d\|d2h` | Re-issue each mover copy K times. Same decisions and same text, K times the link bytes. Prices a move without changing what the engine does |
-| `AFF_XRANK_INJECT=N` | Perturb one rank's cross-rank digest, so the check comparing the cards can be shown to fire |
-
-## How it works
-
-Every routed expert is in one of three places: a flat per-card **VRAM slab**, a pinned **host pool**,
-or left in the container's mmap on **SSD**. A missing expert is not copied into VRAM and then
-multiplied. The GEMM reads it straight out of host memory over PCIe while it runs, so the transfer
-is inside the kernel rather than in front of it. The SSD tier is a cliff; size `--host-pool-mib` to
-avoid it.
-
-A placement engine moves experts between slab and pool while decoding. It keeps a heat per expert
-(LFU with decay, credited per distinct expert per dispatch and weighted by how many of the block's
-tokens chose it) and swaps the hottest pooled expert for the coldest resident one when the gain
-clears the two guards. The ranking is global rather than per layer: a slab slot is layer-agnostic,
-so capacity moves to the layers that need it.
-
-Two things about that are not obvious. A swap moves two shards and a miss moves one, and the two
-PCIe directions share one budget, so a promotion has to repay about 1.4 future hits, which is why
-total link traffic is U-shaped in `--placement-min-gain`. And what usually limits the mover is not
-the policy but slot supply: a freed slot returns to the free list only when its quarantine event
-signals, and that event is on the compute stream, so an unbounded host lead leaves the mover with
-nowhere to move into. That is what `--placement-lead` exists for.
-
-The rest: every GPU op except the routed experts is tensor-parallel across every card, with a
-one-shot peer-push all-reduce. Dense weights keep the checkpoint's own FP8 rather than being
-dequantised, because VRAM is the scarce resource. Attention is MLA over a compressed latent KV at
-8.5 KB a token, which is why a 1M-position cache costs ~4.3 GiB a card instead of tens of gigabytes,
-and above ~2048 positions an indexer picks which positions each query attends to. Speculative decode
-runs the checkpoint's own MTP stages as a draft, verified in one batched pass with acceptance
-checked on the device.
-
-## Limitations
-
-- DeepSeek-V4-Flash only. The geometry is compiled in; there is no architecture abstraction.
-- One or two cards; more is refused at startup. See Requirements.
-- Batch 1 to 4, latency-first. No continuous batching and no paged scheduler: batching an MoE that
-  reads weights from host RAM makes the tokens in a batch pay for the union of their experts.
-- Throughput depends heavily on the prompt, because which experts a token routes to decides how much
-  host memory the step reads. Two prompts differ by more than most code changes do, so compare
-  builds with `--force-tokens` and quote milliseconds a block rather than tok/s.
-- An expert that fits neither VRAM nor the host pool falls to an SSD tier with no dispatch path, and
-  routing to one aborts. Pin `--host-pool-mib` rather than trusting the auto-size.
-
-## Acknowledgements
-
-The all-reduce is adapted from `vllm-radiance`'s `radiance_ar_ext`, and the FP8 weight preshuffle
-follows its `shuffle_weight` layout.
-
-## License
-
-MIT. See [`LICENSE`](LICENSE).
+Third-party components and their licences (affinity MIT; Lucebox Apache-2.0; Radiance; KTransformers; stb_image dual MIT/public-domain) are listed in [`THIRD_PARTY.md`](THIRD_PARTY.md).
