@@ -1628,16 +1628,29 @@ int main(int argc, char** argv) {
     // engine_report() prints exactly these at exit, and the dashboard reads them through the bus,
     // but a serving process has neither: an HTTP run otherwise leaves NOTHING behind to explain its
     // throughput. Once per save interval is enough to see the exchange rate the strategy is tuned
-    // against — readmits over promotions is the number that says the guards are too loose, and a
-    // starved count that is not zero says the pipeline, not the policy, is the limit.
+    // against — and a starved count that is not zero says the pipeline, not the policy, is the
+    // limit.
+    //
+    // The re-promotion RATE is not a pass/fail number, and printing it as one made a healthy
+    // 24-hour run read as 99% thrash. `readmits` counts a promotion of an expert that was demoted
+    // at least once, so with D distinct experts ever promoted out of P promotions the ratio is
+    // bounded below by 1 - D/P and approaches that bound as the run lengthens. On this box P
+    // reached 2.1M against D = 10.7k, i.e. 99.5% was arithmetic, not policy. What the guards
+    // actually control is moves per unit of work: promotions and H2D per 1000 ticks. Print those.
     const PlacementEngineStats& es = placement.engine_stats();
-    aff::ui::err("placement: %llu ticks, %llu promotions / %llu demotions, %llu readmits (%.0f%%), "
-                 "%llu refused, starved %llu slab / %llu pool; %.2f GiB h2d, %.2f GiB d2h\n",
+    const double per1k = es.ticks ? 1000.0 / (double)es.ticks : 0.0;
+    aff::ui::err("placement: %llu ticks, %llu promotions / %llu demotions (%.0f per 1000 ticks), "
+                 "%llu re-promotions (%.0f%%, saturates at 1 - distinct/promotions), "
+                 "%llu distinct, %llu refused, starved %llu slab / %llu pool; "
+                 "%.2f GiB h2d (%.2f GiB per 1000 ticks), %.2f GiB d2h\n",
                  (unsigned long long)es.ticks, (unsigned long long)es.promotions,
-                 (unsigned long long)es.demotions, (unsigned long long)es.readmits,
+                 (unsigned long long)es.demotions, (double)es.promotions * per1k,
+                 (unsigned long long)es.readmits,
                  es.promotions ? 100.0 * (double)es.readmits / (double)es.promotions : 0.0,
+                 (unsigned long long)es.distinct_promoted,
                  (unsigned long long)es.refused, (unsigned long long)es.starved_slab,
                  (unsigned long long)es.starved_pool, (double)es.h2d_bytes / 1073741824.0,
+                 (double)es.h2d_bytes / 1073741824.0 * per1k,
                  (double)es.d2h_bytes / 1073741824.0);
   };
   auto publish_run = [&](uint64_t generated, uint64_t target, uint64_t prompt_tokens, uint64_t pos,

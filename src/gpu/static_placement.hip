@@ -2689,11 +2689,14 @@ void StaticPlacement::engine_report() const {
                (unsigned long long)estats_.dry, (unsigned long long)estats_.no_slot,
                (unsigned long long)estats_.no_supply,
                (unsigned long long)estats_.rounds_total, (unsigned long long)estats_.ticks);
-  // The one line that says whether the traffic above was worth paying. A readmit is an expert this
-  // engine demoted and then fetched back: both directions of the bus spent to return to where it
-  // started, on the link the hybrid tier needs. High here means the guards are too loose.
-  aff::ui::err("  %llu distinct experts promoted, %llu readmits (%.0f%% of promotions were "
-              "of something it had already demoted)\n",
+  // Whether the traffic above was worth paying. A re-promotion is an expert this engine demoted
+  // and then fetched back: both directions of the bus spent to return to where it started, on the
+  // link the hybrid tier needs. Read the COUNT against the distinct count, not the percentage: with
+  // D distinct experts ever promoted out of P promotions, the ratio cannot fall below 1 - D/P, so
+  // any long run approaches that bound no matter how tight the guards are. The guards move the
+  // count, and moves per tick (the period line), not this fraction.
+  aff::ui::err("  %llu distinct experts promoted, %llu re-promotions (%.0f%% of promotions; the "
+              "floor is 1 - distinct/promotions, so this saturates as the run lengthens)\n",
               (unsigned long long)estats_.distinct_promoted, (unsigned long long)estats_.readmits,
               estats_.promotions ? 100.0 * (double)estats_.readmits / (double)estats_.promotions
                                  : 0.0);
