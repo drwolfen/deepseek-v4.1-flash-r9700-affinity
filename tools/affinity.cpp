@@ -3341,7 +3341,7 @@ int main(int argc, char** argv) {
                                                recovered.tool_calls[i].arguments,
                                                recovered.tool_calls[i].ns});
         res->finish_reason = "tool_calls";
-      } else {
+      } else if (hit_budget) {
       // The reasoning allowance ran out before the block closed. That text is reasoning, not an
       // answer, and returning it as `content` hands the caller the model's deliberation as if it had
       // replied. Said on stderr too, because an empty content with finish_reason "length" is easy
@@ -3355,6 +3355,15 @@ int main(int argc, char** argv) {
                    floored              ? "--max-tokens-floor"
                    : req.has_max_tokens ? "max_tokens"
                                         : "the context left after the prompt");
+      } else {
+      // Premature EOS (or stop string) inside <think> well below the token budget. Returning
+      // finish_reason "length" here misleads agent harnesses into thinking-budget-exhaustion abort
+      // paths instead of empty-turn / thinking-prefill continuation nudges.
+      res->reasoning_content = raw;
+      res->finish_reason = "stop";
+      aff::ui::err("server: the reasoning block ended early at %u/%u tokens before </think>; "
+                   "returning finish_reason \"stop\" with reasoning_content only.\n",
+                   made, total_budget);
       }
     } else if (!pm.ok) {
       // A generation the parser cannot frame is still the model's output, and the client gets it
