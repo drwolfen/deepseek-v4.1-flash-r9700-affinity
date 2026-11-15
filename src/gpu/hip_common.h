@@ -77,7 +77,10 @@ inline uint32_t device_cus(int dev) {
 // Total HIP devices, INCLUDING the iGPU. Rarely what you want — see gfx12_devices().
 inline int hip_device_count() {
   int n = 0;
-  if (hipGetDeviceCount(&n) != hipSuccess) return 0;
+  if (hipGetDeviceCount(&n) != hipSuccess) {
+    (void)hipGetLastError();
+    return 0;
+  }
   return n;
 }
 

@@ -1035,16 +1035,9 @@ int main(int argc, char** argv) {
                    (unsigned long long)kMaxKvPositions,
                    (unsigned long long)kMaxKvPositions * kSlots);
     }
-    // The prefix cache holds single-sequence design (a shared writer thread, stage pool and index)
-    // and poisons draft acceptance for one slot under two interleaved sequences — a concurrency bug
-    // isolated but not yet fixed (repro: SLOTS-STAGE3 findings). Correct behaviour beats a fast
-    // wrong one, so multi-slot serving runs WITHOUT it. Single-slot is unaffected and keeps it.
-    if (kSlots > 1 && !pcache.dir.empty()) {
-      aff::ui::err("prefix cache: disabled under --slots %u (single-sequence design; multi-slot "
-                   "poisons draft acceptance — see SLOTS-STAGE3). Single-slot keeps it.\n", kSlots);
-      pcache.dir.clear();
-      pcache_verify = false;
-    }
+    // The prefix cache is slot-safe: every entry point — lookup+restore, the promote publish, the
+    // main prefill, and the end-of-turn publish — runs under engine_mu with set_slot() current, so
+    // one slot is inside cache code at a time and always reads/writes its own KV rows (PR #4).
     if (dense_gpu.attn_init(c.n_layer + n_stage, c.n_head, c.head_dim, c.rope_dim, c.sliding,
                             comp_rows.data(), KvDtype::FP8R, kMaxKvPositions, kKvCommitPositions,
                             &kerr))
@@ -1563,6 +1556,16 @@ int main(int argc, char** argv) {
   // The placement engine last: it needs both tiers final. Fatal on failure rather than falling back
   // to static — asking for --placement heat and silently getting static reads as "runtime placement
   // is not worth it", which is the same failure mode the dspark loader refuses.
+  // Auto-fallback: when total VRAM fits all experts and host pool is disabled,
+  // heat/demand placement has nothing to move/pool; fall back to static instead of aborting (Issue #12).
+  if (pcfg.strategy != PlacementEngineConfig::Strategy::Static &&
+      placement.stats().resident_experts >= placement.stats().total_experts &&
+      !host_pool.enabled()) {
+    aff::ui::out("placement engine: all %llu experts resident in VRAM and host pool is disabled; "
+                 "falling back to static placement\n",
+                 (unsigned long long)placement.stats().resident_experts);
+    pcfg.strategy = PlacementEngineConfig::Strategy::Static;
+  }
   {
     std::string eerr;
     if (!placement.placement_engine_init(&host_pool, pcfg, &eerr)) {
@@ -3079,6 +3082,8 @@ int main(int argc, char** argv) {
     }
 #ifdef AFF_WITH_HIP
     if (pcache_verify && n_pre) {
+      std::unique_lock<std::mutex> step(engine_mu);
+      dense_gpu.set_slot(slot);
       // Every live row, in the region order the store uses. The append-only parts are hashed only
       // as far as the position reaches, because rows past it are whatever the last conversation
       // left and are never read; the rings are hashed whole, because all of them are live.
@@ -3348,6 +3353,8 @@ int main(int argc, char** argv) {
     // already does after a rejected tail, and it is safe for the same reason: the rows above `upto`
     // are overwritten by the next tokens before anything reads them.
     if (prefix_cache.ready() && !hist.empty()) {
+      std::unique_lock<std::mutex> step(engine_mu);
+      dense_gpu.set_slot(slot);
       // A raw one-token request is also used to prime an input prefix. Speculative
       // verification can have consumed its generated token; do not let that discarded
       // output become a cache hit in the following request. Keep normal turns unchanged.

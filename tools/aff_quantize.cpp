@@ -915,9 +915,29 @@ int main(int argc, char** argv) {
         const TensorDecl& t = td[i];
         const uint64_t n = t.rows * t.cols;
         const StTensor* src_t = shard.empty() ? nullptr : st.find(srcs[i].name);
-        const StTensor* sc_t  = (src_t && src_t->dtype == StDType::F8_E4M3)
-                                ? st.find(srcs[i].name.substr(0, srcs[i].name.rfind(".weight")) + ".scale")
-                                : nullptr;
+        const StTensor* sc_t  = nullptr;
+        std::unique_ptr<SafeTensorsFile> sc_file_holder;
+        if (src_t && src_t->dtype == StDType::F8_E4M3) {
+          const size_t wpos = srcs[i].name.rfind(".weight");
+          const std::string base_name = (wpos != std::string::npos) ? srcs[i].name.substr(0, wpos) : srcs[i].name;
+          std::string sc_name = base_name + ".scale";
+          sc_t = st.find(sc_name);
+          if (!sc_t) {
+            sc_name = base_name + ".weight_scale_inv";
+            sc_t = st.find(sc_name);
+          }
+          if (!sc_t) {
+            auto it = wmap.find(base_name + ".scale");
+            if (it == wmap.end()) it = wmap.find(base_name + ".weight_scale_inv");
+            if (it != wmap.end() && it->second != shard) {
+              sc_file_holder = std::make_unique<SafeTensorsFile>();
+              std::string sc_err;
+              if (sc_file_holder->open(src + "/" + it->second, &sc_err)) {
+                sc_t = sc_file_holder->find(it->first);
+              }
+            }
+          }
+        }
         (void)sc_t;
         // FP8 passthrough: copy the checkpoint's own bytes and scales, no conversion at all.
         // Dequantising these to bf16 doubles the largest traffic source in the engine for no

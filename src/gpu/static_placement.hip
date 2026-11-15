@@ -2190,9 +2190,18 @@ bool StaticPlacement::placement_engine_init(HostExpertPool* pool,
     return fail("the placement engine needs either the TP=2 expert shard split or a single card: "
                 "a slab slot is only layer- and card-agnostic when every card holds a piece of "
                 "every resident expert");
-  if (!pool || !pool->enabled() || !pool_registered_)
+  if (!pool || !pool->enabled() || !pool_registered_) {
+    if (stats_.resident_experts >= stats_.total_experts) {
+      aff::ui::out("placement engine: all %llu experts resident in VRAM and host pool is disabled; "
+                   "falling back to static placement\n",
+                   (unsigned long long)stats_.resident_experts);
+      ecfg_.strategy = PlacementEngineConfig::Strategy::Static;
+      engine_on_ = false;
+      return true;
+    }
     return fail("the placement engine needs the registered host pool — a demoted expert's bytes "
                 "have nowhere else to go");
+  }
   if (!shadow_slots_)
     return fail("no shadow slab slots reserved; call reserve_shadow_slots() before init()");
   // Read directly rather than through Model::force_resident_routing(), to keep this file off
