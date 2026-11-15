@@ -17,6 +17,7 @@
 #include "server/server.h"
 #include "engine/chat_encode.h"
 #include "engine/prefix_cache.h"
+#include "engine/cactus.h"
 #include "vision/vit.h"
 
 #include "ui/dashboard.h"
@@ -2115,17 +2116,8 @@ int main(int argc, char** argv) {
     // and online per-width cost EMA tracks step latency (ms) per width q.
     const char* aw_env = std::getenv("AFF_ADAPTIVE_WIDTH");
     const bool adaptive_width_on = (!aw_env || !*aw_env || std::strcmp(aw_env, "0") != 0) && kConfT <= 0.0f;
-    // Cactus rejection sampling with length-fade and acceptance cap (AFF_CACTUS_DELTA, default 0 = off).
-    const char* cactus_d_env = std::getenv("AFF_CACTUS_DELTA");
-    const double kCactusDelta = cactus_d_env ? std::strtod(cactus_d_env, nullptr) : 0.0;
-    const char* cactus_r_env = std::getenv("AFF_CACTUS_CAP_R");
-    const double kCactusCapR = cactus_r_env ? std::strtod(cactus_r_env, nullptr) : 0.5;
-    const char* cactus_fs_env = std::getenv("AFF_CACTUS_FADE_START");
-    const uint32_t kCactusFadeStart =
-        cactus_fs_env ? (uint32_t)std::strtoul(cactus_fs_env, nullptr, 10) : 4096u;
-    const char* cactus_fe_env = std::getenv("AFF_CACTUS_FADE_END");
-    const uint32_t kCactusFadeEnd =
-        cactus_fe_env ? (uint32_t)std::strtoul(cactus_fe_env, nullptr, 10) : 16384u;
+    // Cactus rejection sampling with escape mixture, length-fade and acceptance cap (AFF_CACTUS_DELTA, default 0 = off; AFF_CACTUS_ESCAPE, default 0.25).
+    const aff::CactusParams cactus_params = aff::CactusParams::from_env();
     constexpr uint32_t kMaxQ = 8;
     float surv_ema[kMaxQ] = {1.0f, 0.75f, 0.60f, 0.48f, 0.38f, 0.30f, 0.24f, 0.19f};
     float conf_pred_ema[kMaxQ] = {1.0f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f};
@@ -2296,16 +2288,7 @@ int main(int argc, char** argv) {
       } else {
         auto accept_prob = [&](uint32_t j) -> double {
           const double q = (double)vb.draws[j].p_query;
-          if (kCactusDelta <= 0.0 || q <= 0.0 || q >= 1.0) return q;
-          double fade = 1.0;
-          if (kCactusFadeEnd > kCactusFadeStart) {
-            fade = std::clamp((double)((int64_t)kCactusFadeEnd - (int64_t)(generated + j)) /
-                                  (double)(kCactusFadeEnd - kCactusFadeStart),
-                              0.0, 1.0);
-          }
-          const double h_raw = std::min(1.0, q * (1.0 + 2.0 * (kCactusDelta * fade) * (1.0 - q)));
-          if (kCactusCapR > 0.0) return std::max(q, std::min(h_raw, 1.0 - kCactusCapR * (1.0 - q)));
-          return h_raw;
+          return aff::cactus_accept_prob(q, 1.0, generated + j, cactus_params);
         };
         while (k < nd && accept_u[k] < accept_prob(k)) ++k;
         if (k < nd) { rejected = true; reject_tok = vb.draws[k].tok_excl; }
@@ -2332,7 +2315,8 @@ int main(int argc, char** argv) {
         const uint32_t q_off = std::min<uint32_t>(nd + 1, kMaxQ - 1);
         last_clean_accept = (k == nd);
         // Update step cost EMA after warmup (ignore first 2 cold steps per width, clamp outliers).
-        if (++cost_samples[q_off] > 2 && step_ms > 1.0) {
+        // Under greedy decoding (temp=0 / !sc), avoid wall-clock timing jitter altering verify width decisions (PR #967).
+        if (sc && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
           const float clamped_ms = std::min((float)step_ms, cost_ema[q_off] * 1.25f);
           cost_ema[q_off] = 0.85f * cost_ema[q_off] + 0.15f * clamped_ms;
         }
