@@ -1288,6 +1288,7 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
                    (unsigned long long)std::min<size_t>(tp2_check, tp2_seen.load()),
                    (unsigned long long)tp2_bad.load());
     stats_.resident_experts = jobs.size();
+    bonus_shards_ = bjobs.size();
     // Every resident expert now has a slab address. set_host_pool calls this again once the pooled
     // ones do too; running it twice costs 11008 stores and removes an ordering dependency between
     // the two, which is the better trade.

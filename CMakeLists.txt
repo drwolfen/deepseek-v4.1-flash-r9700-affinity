@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(affinity-engine VERSION 4.3.3 LANGUAGES CXX)
+project(affinity-engine VERSION 4.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,7 +20,7 @@ option(AFF_NATIVE "Build for the host CPU (-march=native)" ON)
 # and rebuilt. What actually catches a stale binary is `__DATE__ __TIME__` in src/build_stamp.h,
 # which is the compile time of that binary's own translation unit, and the mtime check in
 # bench/measure.sh. Do not treat this string as evidence that a binary is current.
-execute_process(COMMAND git describe --always --dirty
+execute_process(COMMAND git -c safe.directory=* describe --always --dirty
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                 OUTPUT_VARIABLE AFF_GIT_ID OUTPUT_STRIP_TRAILING_WHITESPACE
                 ERROR_QUIET)
@@ -38,15 +38,19 @@ if(AFF_VER_FILE)
     set(AFF_VERSION_STR "v${AFF_VER_FILE}")
   endif()
 else()
-  set(AFF_VERSION_STR "v4.3.3")
+  set(AFF_VERSION_STR "v4.4.0")
 endif()
 
-execute_process(COMMAND git rev-parse --short HEAD
-                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                OUTPUT_VARIABLE AFF_GIT_SHA_STR OUTPUT_STRIP_TRAILING_WHITESPACE
-                ERROR_QUIET)
-if(NOT AFF_GIT_SHA_STR)
-  set(AFF_GIT_SHA_STR "unknown")
+if(DEFINED AFF_GIT_SHA AND NOT "${AFF_GIT_SHA}" STREQUAL "")
+  set(AFF_GIT_SHA_STR "${AFF_GIT_SHA}")
+else()
+  execute_process(COMMAND git -c safe.directory=* rev-parse --short HEAD
+                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                  OUTPUT_VARIABLE AFF_GIT_SHA_STR OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET)
+  if(NOT AFF_GIT_SHA_STR)
+    set(AFF_GIT_SHA_STR "unknown")
+  endif()
 endif()
 
 string(TIMESTAMP AFF_BUILD_STAMP_STR "%Y-%m-%dT%H:%M:%SZ" UTC)

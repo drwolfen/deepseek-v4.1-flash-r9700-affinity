@@ -2719,7 +2719,7 @@ int main(int argc, char** argv) {
   srv_ctx.build_stamp = AFF_BUILD_STAMP;
 #ifdef AFF_WITH_HIP
   srv_ctx.get_resident_experts = [&placement]() -> int64_t {
-    return (int64_t)placement.stats().resident_experts;
+    return (int64_t)(placement.stats().resident_experts + placement.bonus_shards());
   };
   srv_ctx.get_free_vram_mib = [&placement]() -> std::vector<uint64_t> {
     std::vector<uint64_t> out;

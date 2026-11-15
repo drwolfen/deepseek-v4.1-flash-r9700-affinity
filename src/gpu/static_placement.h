@@ -223,6 +223,7 @@ public:
   }
 
   const PlacementStats& stats() const { return stats_; }
+  uint64_t bonus_shards() const { return bonus_shards_; }
 
   // ---- the placement engine ---------------------------------------------------------------------
   //
@@ -503,6 +504,7 @@ private:
   uint64_t resident_now_ = 0, resident_target_ = 0;
   std::vector<uint32_t> resident_at_load_;    // per layer, for the before/after histogram
   std::vector<uint64_t> bonus_off_;           // [card][layer*n_expert + e], UINT64_MAX if absent
+  uint64_t bonus_shards_ = 0;                 // count of asymmetric bonus slab shards across cards
   // Bit 1: this engine has promoted it before. Bit 2: it has demoted it before. Two bits over 11008
   // experts, so the thrash question costs 11 KiB and no time on the dispatch path.
   std::vector<uint8_t> ever_moved_;
