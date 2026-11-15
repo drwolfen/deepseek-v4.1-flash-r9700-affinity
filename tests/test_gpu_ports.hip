@@ -1,6 +1,9 @@
 #include "gpu/batch_kernels.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cmath>
 #include <cstdint>
