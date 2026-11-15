@@ -54,6 +54,8 @@ struct CompletionRequest {
   // DRY: subtract `dry_delta` from the logits of tokens that continued a repeated suffix n-gram.
   // 0 leaves the engine default (`--dry-delta`) in charge.
   float dry_delta = 0.0f;
+  bool raw_prompt = false;
+  bool ignore_eos = false;
   bool stream = false;
   // stream_options.include_usage: OpenAI appends one extra chunk carrying usage and no choices.
   bool include_usage = false;
@@ -80,6 +82,7 @@ struct GenResult {
   // it on every reply. Counted in tokens, so reasoning counts toward completion as it does upstream.
   uint32_t prompt_tokens = 0;
   uint32_t completion_tokens = 0;
+  uint32_t cached_tokens = 0;
   // Set when the request cannot be served as asked. The server answers 400 rather than an empty
   // completion, so the caller sees a refusal instead of a model that had nothing to say.
   std::string error;
@@ -90,6 +93,27 @@ struct GenResult {
 // which is which and lets the client decide, exactly as `reasoning_content` does on the completed
 // message.
 enum class Delta { Content, Reasoning };
+
+#ifndef AFF_VERSION
+#define AFF_VERSION "v4.3.3"
+#endif
+
+#ifndef AFF_GIT_SHA
+#define AFF_GIT_SHA "unknown"
+#endif
+
+#ifndef AFF_BUILD_STAMP
+#define AFF_BUILD_STAMP ""
+#endif
+
+struct ServerContext {
+  std::string status = "ok";
+  std::string version = AFF_VERSION;
+  std::string git_sha = AFF_GIT_SHA;
+  std::string build_stamp = AFF_BUILD_STAMP;
+  std::function<int64_t()> get_resident_experts;
+  std::function<std::vector<uint64_t>()> get_free_vram_mib;
+};
 
 // Emits one piece of output. Returning false asks generation to stop (client disconnected).
 using TokenSink = std::function<bool(const std::string& piece, Delta chan, bool done)>;
@@ -112,6 +136,8 @@ public:
   // time. Must match the engine's --slots, because it is an index into the engine's per-sequence
   // state and not just a count.
   void set_slots(uint32_t n) { n_slots_ = n ? n : 1; }
+  void set_context(ServerContext ctx) { ctx_ = std::move(ctx); }
+  const ServerContext& context() const { return ctx_; }
   uint16_t port() const { return port_; }
 
 private:
@@ -119,6 +145,7 @@ private:
   int listen_fd_ = -1;
   uint16_t port_ = 0;
   std::string model_name_ = "DeepSeek-V4-Flash";
+  ServerContext ctx_;
   // ---- admission ------------------------------------------------------------------------------
   //
   // The generator closes over one engine. Its KV cache is now per SLOT, so two requests in

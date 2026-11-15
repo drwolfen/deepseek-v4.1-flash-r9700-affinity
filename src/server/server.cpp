@@ -130,7 +130,8 @@ static std::string usage_json(const GenResult& g) {
   const uint64_t t = (uint64_t)g.prompt_tokens + g.completion_tokens;
   return "\"usage\":{\"prompt_tokens\":" + std::to_string(g.prompt_tokens) +
          ",\"completion_tokens\":" + std::to_string(g.completion_tokens) +
-         ",\"total_tokens\":" + std::to_string(t) + "}";
+         ",\"total_tokens\":" + std::to_string(t) +
+         ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(g.cached_tokens) + "}}";
 }
 
 // The raw text of the value at `key`, braces and all. The parser above reads scalars; tools and
@@ -183,6 +184,8 @@ static std::vector<std::string> raw_elements(const std::string& arr) {
 }
 
 bool parse_completion_request(const std::string& body, bool chat, CompletionRequest* out) {
+  out->raw_prompt = !chat;
+  if (const char* p = find_top_key(body, "ignore_eos")) out->ignore_eos = std::strncmp(skip_ws(p), "true", 4) == 0;
   if (const char* p = find_top_key(body, "model")) { const char* q = p; out->model = read_json_string(q); }
   // `max_completion_tokens` is the current OpenAI spelling and `max_tokens` the deprecated one;
   // clients send either, and reading only one silently ignores the caller's limit.
@@ -452,6 +455,7 @@ void Server::serve_one(int fd) {
   const bool is_chat = head.find("/v1/chat/completions") != std::string::npos;
   const bool is_comp = head.find("/v1/completions") != std::string::npos;
   const bool is_models = head.find("/v1/models") != std::string::npos;
+  const bool is_health = head.find("/health") != std::string::npos;
 
   // A browser sends OPTIONS before any cross-origin POST and will not send the request itself
   // unless the preflight is answered. Without this every web client fails before it starts.
@@ -473,6 +477,34 @@ void Server::serve_one(int fd) {
     send_all(fd, h, (size_t)n);
     send_all(fd, payload.data(), payload.size());
   };
+
+  if (is_health) {
+    std::string vram_json = "[";
+    if (ctx_.get_free_vram_mib) {
+      const std::vector<uint64_t> vrams = ctx_.get_free_vram_mib();
+      for (size_t i = 0; i < vrams.size(); ++i) {
+        if (i > 0) vram_json += ",";
+        vram_json += std::to_string(vrams[i]);
+      }
+    }
+    vram_json += "]";
+
+    const int64_t resident = ctx_.get_resident_experts ? ctx_.get_resident_experts() : 0;
+    const std::string ver = ctx_.version.empty() ? AFF_VERSION : ctx_.version;
+    const std::string sha = ctx_.git_sha.empty() ? AFF_GIT_SHA : ctx_.git_sha;
+    const std::string stamp = ctx_.build_stamp.empty() ? AFF_BUILD_STAMP : ctx_.build_stamp;
+    const std::string st = ctx_.status.empty() ? "ok" : ctx_.status;
+
+    const std::string j = "{\"status\":\"" + st + "\""
+                          ",\"version\":\"" + ver + "\""
+                          ",\"git_sha\":\"" + sha + "\""
+                          ",\"build_stamp\":\"" + stamp + "\""
+                          ",\"resident_experts\":" + std::to_string(resident) +
+                          ",\"free_vram_mib\":" + vram_json + "}";
+    reply("application/json", j);
+    ::close(fd);
+    return;
+  }
 
   if (is_models) {
     const std::string j = "{\"object\":\"list\",\"data\":[{\"id\":\"" + model_name_ +

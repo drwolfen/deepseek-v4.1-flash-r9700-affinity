@@ -20,6 +20,10 @@
 
 #pragma once
 
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_PLATFORM_NVIDIA__)
+#define __HIP_PLATFORM_AMD__ 1
+#endif
+
 #include <hip/hip_runtime.h>
 
 #include "ui/log.h"

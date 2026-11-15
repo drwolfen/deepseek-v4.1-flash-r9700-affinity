@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(affinity-engine VERSION 4.3.2 LANGUAGES CXX)
+project(affinity-engine VERSION 4.3.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +28,34 @@ if(NOT AFF_GIT_ID)
   set(AFF_GIT_ID "nogit")
 endif()
 add_compile_definitions(AFF_BUILD_ID="${AFF_GIT_ID}")
+
+file(STRINGS "${CMAKE_SOURCE_DIR}/VERSION" AFF_VER_FILE LIMIT_COUNT 1)
+if(AFF_VER_FILE)
+  string(STRIP "${AFF_VER_FILE}" AFF_VER_FILE)
+  if(AFF_VER_FILE MATCHES "^v")
+    set(AFF_VERSION_STR "${AFF_VER_FILE}")
+  else()
+    set(AFF_VERSION_STR "v${AFF_VER_FILE}")
+  endif()
+else()
+  set(AFF_VERSION_STR "v4.3.3")
+endif()
+
+execute_process(COMMAND git rev-parse --short HEAD
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                OUTPUT_VARIABLE AFF_GIT_SHA_STR OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+if(NOT AFF_GIT_SHA_STR)
+  set(AFF_GIT_SHA_STR "unknown")
+endif()
+
+string(TIMESTAMP AFF_BUILD_STAMP_STR "%Y-%m-%dT%H:%M:%SZ" UTC)
+
+add_compile_definitions(
+  AFF_VERSION="${AFF_VERSION_STR}"
+  AFF_GIT_SHA="${AFF_GIT_SHA_STR}"
+  AFF_BUILD_STAMP="${AFF_BUILD_STAMP_STR}"
+)
 
 # HIP is optional so the LIBRARY and the tests still build CPU-only on a machine without ROCm. The
 # `affinity` binary is not in that set — see the note on its target. Enabled when hipcc is present.
@@ -229,7 +257,7 @@ if(AFF_HIP)
   target_link_options(aff_gpu PUBLIC "${AFF_HIP_LIBDIR}")
   target_compile_options(aff_gpu PRIVATE -ffp-contract=off)
 
-  target_compile_definitions(aff_gpu PUBLIC AFF_WITH_HIP)
+  target_compile_definitions(aff_gpu PUBLIC AFF_WITH_HIP __HIP_PLATFORM_AMD__)
 
   # Compiled as HIP because it uses DeviceBuffer; it is a tool, not a unit test, because it needs a
   # real container to point at.
@@ -260,6 +288,7 @@ if(AFF_HIP)
     aff_hip_test(test_moe_recon_tiles moe_recon_tiles)
     aff_hip_test(test_moe_plan moe_plan)
     aff_hip_test(test_prefetch_ring prefetch_ring)
+    aff_hip_test(test_gpu_ports gpu_ports)
     aff_hip_test(test_wmma wmma)
   endif()
 
@@ -308,7 +337,7 @@ if(AFF_HIP)
   foreach(t aff-verify affinity)
     if(TARGET ${t})
       target_link_libraries(${t} PRIVATE aff_gpu)
-      target_compile_definitions(${t} PRIVATE AFF_WITH_HIP)
+      target_compile_definitions(${t} PRIVATE AFF_WITH_HIP __HIP_PLATFORM_AMD__)
     endif()
   endforeach()
 endif()

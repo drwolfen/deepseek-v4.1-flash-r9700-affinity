@@ -8,6 +8,7 @@
 #include "engine/sampler.h"
 #include "engine/tokenizer.h"
 #ifdef AFF_WITH_HIP
+#include "gpu/hip_common.h"
 #include "gpu/digest.h"
 #include "gpu/static_placement.h"
 #include "gpu/dense_gpu.h"
@@ -348,6 +349,7 @@ int main(int argc, char** argv) {
   std::string force_list;
   bool no_routed = false;
   bool ignore_eos = false;
+  bool raw_completions = false;
   // One-shot sampling. Greedy by default because it is reproducible, but temperature 0 degenerates
   // and changes which experts route, so a throughput or acceptance figure should be taken at real
   // sampler settings with a fixed seed instead.
@@ -455,6 +457,7 @@ int main(int argc, char** argv) {
     else if (a == "--force-tokens") force_list = nxt();
     else if (a == "--no-routed-experts") no_routed = true;
     else if (a == "--ignore-eos") ignore_eos = true;
+    else if (a == "--raw-completions") raw_completions = true;
     else if (a == "--gpu-mib") gpu_budget_mib = std::strtod(nxt(), nullptr);
     else if (a == "--host-pool-mib") host_pool_mib = std::strtod(nxt(), nullptr);
     else if (a == "--dspark") {
@@ -542,6 +545,7 @@ int main(int argc, char** argv) {
         "Model and memory\n"
         "  -m, --model FILE            .aff model container (required)\n"
         "      --tokenizer FILE        tokenizer.json\n"
+        "      --raw-completions       raw text /v1/completions with ignore_eos and cache usage\n"
         "      --dspark on|off         speculative decode via the DSpark draft (default on). Off\n"
         "                              runs the same block verify one token wide and does not load\n"
         "                              the draft, handing its VRAM back to the routed experts. The\n"
@@ -2707,6 +2711,46 @@ int main(int argc, char** argv) {
   // server exists to be driven by agents), and a random seed per request so two identical requests
   // are two samples rather than one answer twice.
   srv.set_slots(kSlots);
+
+  ServerContext srv_ctx;
+  srv_ctx.status = "ok";
+  srv_ctx.version = AFF_VERSION;
+  srv_ctx.git_sha = AFF_GIT_SHA;
+  srv_ctx.build_stamp = AFF_BUILD_STAMP;
+#ifdef AFF_WITH_HIP
+  srv_ctx.get_resident_experts = [&placement]() -> int64_t {
+    return (int64_t)placement.stats().resident_experts;
+  };
+  srv_ctx.get_free_vram_mib = [&placement]() -> std::vector<uint64_t> {
+    std::vector<uint64_t> out;
+    const std::vector<int>& devs = !placement.devices().empty() ? placement.devices() : gfx12_devices();
+    for (int d : devs) {
+      uint64_t fb = 0, tb = 0;
+      if (hip_free_vram_checked(d, &fb, &tb)) {
+        out.push_back(fb / 1048576);
+      } else {
+        size_t h_fb = 0, h_tb = 0;
+        int prev = 0;
+        const bool have_prev = hipGetDevice(&prev) == hipSuccess;
+        if (hipSetDevice(d) == hipSuccess) {
+          if (hipMemGetInfo(&h_fb, &h_tb) == hipSuccess) {
+            out.push_back((uint64_t)(h_fb / 1048576));
+          } else {
+            out.push_back(0);
+          }
+          if (have_prev) (void)hipSetDevice(prev);
+        } else {
+          out.push_back(0);
+        }
+      }
+    }
+    return out;
+  };
+#else
+  srv_ctx.get_resident_experts = []() -> int64_t { return 0; };
+  srv_ctx.get_free_vram_mib = []() -> std::vector<uint64_t> { return {}; };
+#endif
+  srv.set_context(std::move(srv_ctx));
   // amdnas-fixes weight-verify (AFF_WEIGHT_VERIFY=1): hash the read-only device state before each chat request and
   // compare it with the first result. A WEIGHT-MISMATCH names what changed; a clean line is the positive evidence.
   std::vector<std::pair<std::string, uint64_t>> wv_base;
@@ -2851,7 +2895,8 @@ int main(int argc, char** argv) {
       return;
     }
 
-    const std::string prompt = encode_messages(msgs, eo);
+    const bool raw_mode = raw_completions && req.raw_prompt;
+    const std::string prompt = raw_mode ? req.prompt : encode_messages(msgs, eo);
     // add_bos false: the encoder put the BOS in the string, and a second one is a different prompt.
     std::vector<uint32_t> ids = tok.vocab_size() ? tok.encode(prompt, false)
                                                  : std::vector<uint32_t>{1};
@@ -2971,6 +3016,7 @@ int main(int argc, char** argv) {
                      rerr.c_str(), n_pre);
       }
     }
+    res->cached_tokens = from;  // Actual successful restore, before any recomputation/promotion.
     // ---- the promotion boundary --------------------------------------------------------------
     //
     // `lookup` returns two different numbers and both of them matter. `from` is where a
@@ -3137,7 +3183,7 @@ int main(int argc, char** argv) {
     // client's transcript as if it were the reply — but dropping it is just as wrong, because a
     // client that renders reasoning has nothing to render. So it goes out as `reasoning_content`
     // until the block closes, and as content after.
-    bool open_think = eo.thinking_mode == ThinkingMode::Thinking;
+    bool open_think = !raw_mode && eo.thinking_mode == ThinkingMode::Thinking;
     size_t think_streamed = 0;
     // A token boundary is not a character boundary: an emoji arrives as two tokens, and cutting
     // between them puts half a character in a JSON string, which is not valid UTF-8 and not valid
@@ -3181,9 +3227,30 @@ int main(int argc, char** argv) {
     const Model::PhaseProfile p_before = model.profile();
     const auto t_dec0 = std::chrono::steady_clock::now();
     const uint32_t made = spec_decode(slot, st, blk, ids.empty() ? 1u : ids.back(), hist, total_budget,
-                                      /*ignore_eos_=*/false, [&](uint32_t id) {
-      if ((int32_t)id == tok.eos()) return false;
+                                      /*ignore_eos_=*/raw_mode && req.ignore_eos, [&](uint32_t id) {
+      if ((int32_t)id == tok.eos() && !(raw_mode && req.ignore_eos)) return false;
       raw += tok.vocab_size() ? tok.decode_one(id) : std::string();
+      if (raw_mode) {
+        size_t safe = raw.size();
+        bool stopped = false;
+        for (const auto& stop : req.stop) {
+          if (stop.empty()) continue;
+          const size_t at = raw.find(stop, streamed);
+          if (at != std::string::npos && at < safe) { safe = at; stopped = true; }
+        }
+        if (!stopped) {
+          for (const auto& stop : req.stop)
+            for (size_t n = std::min(stop.empty() ? size_t(0) : stop.size()-1, safe-streamed); n; --n)
+              if (raw.compare(safe-n,n,stop,0,n)==0) { safe-=n; break; }
+          safe = utf8_end(raw,safe);
+        }
+        if (safe > streamed) {
+          const auto piece=raw.substr(streamed,safe-streamed);streamed=safe;
+          if (!sink(piece,Delta::Content,false)) return false;
+        }
+        if (stopped) raw.resize(safe);
+        return !stopped;
+      }
       if (open_think) {
         const size_t te = raw.find(think_end);
         // Everything up to the closing marker is reasoning. Hold back any tail that could still
@@ -3281,7 +3348,11 @@ int main(int argc, char** argv) {
     // already does after a rejected tail, and it is safe for the same reason: the rows above `upto`
     // are overwritten by the next tokens before anything reads them.
     if (prefix_cache.ready() && !hist.empty()) {
-      const uint32_t upto = (uint32_t)std::min<size_t>(st.pos, hist.size());
+      // A raw one-token request is also used to prime an input prefix. Speculative
+      // verification can have consumed its generated token; do not let that discarded
+      // output become a cache hit in the following request. Keep normal turns unchanged.
+      const size_t cache_end = raw_mode && total_budget == 1 ? ids.size() : hist.size();
+      const uint32_t upto = (uint32_t)std::min<size_t>(st.pos, cache_end);
       if (st.pos > upto) model.rollback(&st, upto);
       std::string perr;
       if (upto && !prefix_cache.publish(hist.data(), upto, &perr))
@@ -3315,6 +3386,13 @@ int main(int argc, char** argv) {
       if (think_streamed < raw.size()) sink(raw.substr(think_streamed), Delta::Reasoning, false);
     } else if (!saw_marker && streamed < raw.size()) {
       sink(raw.substr(streamed), Delta::Content, false);
+    }
+
+    if (raw_mode) {
+      res->content = raw;
+      res->finish_reason = hit_budget ? "length" : "stop";
+      sink("", Delta::Content, true);
+      return;
     }
 
     const ThinkingMode tm = eo.thinking_mode;
