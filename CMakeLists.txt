@@ -44,7 +44,7 @@ else()
       set(AFF_VERSION_STR "v${AFF_VER_FILE}")
     endif()
   else()
-    set(AFF_VERSION_STR "v5.1.0-rc1")
+    set(AFF_VERSION_STR "v5.1.0")
   endif()
 endif()
 

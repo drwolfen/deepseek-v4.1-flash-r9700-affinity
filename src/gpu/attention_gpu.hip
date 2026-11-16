@@ -448,8 +448,8 @@ static inline bool draft_skip_masked_enabled() {
 
 static inline bool attn_lookahead_enabled() {
   const char* v = std::getenv("AFF_ATTN_LOOKAHEAD");
-  if (v && (*v == '0' || std::strcmp(v, "false") == 0)) return false;
-  return true; // default 1 for A/B candidate testing
+  if (v && (*v == '1' || std::strcmp(v, "true") == 0)) return true;
+  return false;
 }
 
 template <int DT, bool DRAFT_SKIP = false, bool LOOKAHEAD = false>

@@ -95,7 +95,7 @@ struct GenResult {
 enum class Delta { Content, Reasoning };
 
 #ifndef AFF_VERSION
-#define AFF_VERSION "v4.3.3"
+#define AFF_VERSION "v5.1.0"
 #endif
 
 #ifndef AFF_GIT_SHA
