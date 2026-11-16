@@ -334,6 +334,69 @@ int main() {
       (void)hipFree(p);
   }
 
+  // 6. Test AFF_ATTN_LOOKAHEAD RDNA4 decode K/V prefetch & Wave32 DPP reductions (#980, #992)
+  {
+    const uint32_t width = 64, n_rot = 0, n_head = 4;
+    const std::vector<uint32_t> kv_lens = {64, 2049, 8192};
+
+    std::vector<float> h_q((size_t)n_head * width);
+    for (size_t i = 0; i < h_q.size(); ++i)
+      h_q[i] = std::sin((float)i * 0.033f) * 0.25f;
+
+    float* d_q = nullptr;
+    float* d_out_ref = nullptr;
+    float* d_out_lookahead = nullptr;
+    assert(hipMalloc(&d_q, h_q.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_out_ref, h_q.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_out_lookahead, h_q.size() * sizeof(float)) == hipSuccess);
+    assert(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+
+    for (uint32_t kv_len : kv_lens) {
+      const uint32_t ring = kv_len + 16;
+      std::vector<float> h_raw((size_t)ring * width);
+      for (size_t i = 0; i < h_raw.size(); ++i)
+        h_raw[i] = std::cos((float)i * 0.017f) * 0.2f;
+
+      float* d_raw = nullptr;
+      assert(hipMalloc(&d_raw, h_raw.size() * sizeof(float)) == hipSuccess);
+      assert(hipMemcpy(d_raw, h_raw.data(), h_raw.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+
+      const float scale = 1.0f / std::sqrt((float)width);
+
+      // Run with AFF_ATTN_LOOKAHEAD=0 (untouched baseline path)
+      setenv("AFF_ATTN_LOOKAHEAD", "0", 1);
+      aff::mqa_attend_hip(aff::KvDtype::F32, d_q, d_raw, nullptr, nullptr, nullptr,
+                          d_out_ref, n_head, 0, kv_len, ring, 0, width, n_rot, scale, nullptr);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      // Run with AFF_ATTN_LOOKAHEAD=1 (lookahead + Wave32 DPP reductions)
+      setenv("AFF_ATTN_LOOKAHEAD", "1", 1);
+      aff::mqa_attend_hip(aff::KvDtype::F32, d_q, d_raw, nullptr, nullptr, nullptr,
+                          d_out_lookahead, n_head, 0, kv_len, ring, 0, width, n_rot, scale, nullptr);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      std::vector<float> h_ref(h_q.size()), h_lookahead(h_q.size());
+      assert(hipMemcpy(h_ref.data(), d_out_ref, h_q.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_lookahead.data(), d_out_lookahead, h_q.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+
+      float max_diff = 0.0f;
+      for (size_t i = 0; i < h_q.size(); ++i) {
+        assert(!std::isnan(h_ref[i]));
+        assert(!std::isinf(h_ref[i]));
+        assert(!std::isnan(h_lookahead[i]));
+        assert(!std::isinf(h_lookahead[i]));
+        const float diff = std::fabs(h_lookahead[i] - h_ref[i]);
+        if (diff > max_diff) max_diff = diff;
+      }
+      assert(max_diff < 1e-4f);
+
+      (void)hipFree(d_raw);
+    }
+
+    for (void* p : {(void*)d_q, (void*)d_out_ref, (void*)d_out_lookahead})
+      (void)hipFree(p);
+  }
+
   std::printf("PASS: test_gpu_ports on gfx1201\n");
   return 0;
 }
