@@ -38,6 +38,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace aff {
 
@@ -216,7 +217,7 @@ __device__ __forceinline__ float bf16_to_f32_att(uint16_t h) {
 // QB: the query buffer is bf16 rather than f32. The batched prefill path feeds it from the arena,
 // where the heads buffer is bf16 and the flash kernel beside it reads the same thing; the
 // single-token path still passes f32.
-template <int DT, bool QB = false>
+template <int DT, bool QB = false, bool DRAFT_SKIP = false>
 __device__ __forceinline__ void attend_body(
     const void* __restrict__ qbase, const void* __restrict__ raw, const void* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const float* __restrict__ sinks, bool has_sink,
@@ -288,6 +289,13 @@ __device__ __forceinline__ void attend_body(
     float acc[kHeadsPerBlk];
     for (uint32_t h = 0; h < nh; ++h) acc[h] = 0.0f;
     for (uint32_t j = 0; j < n_keys; ++j) {
+      if constexpr (DRAFT_SKIP) {
+        bool all_zero = true;
+        for (uint32_t h = 0; h < nh; ++h) {
+          if (s_score[(size_t)h * n_keys + j] != 0.0f) { all_zero = false; break; }
+        }
+        if (all_zero) continue;
+      }
       uint32_t rs = raw0 + j; if (rs >= ring) rs -= ring;
       const KvRow<DT> k = (j < n_raw) ? KvRow<DT>(raw, rs, stride, width, nope)
                                       : KvRow<DT>(comp, j - n_raw, stride, width, nope);
@@ -319,7 +327,7 @@ __global__ __launch_bounds__(kAttnThreads) void mqa_attend_kernel(
 // the compressor emits a row every `ratio` positions, so tokens inside one sub-batch legitimately
 // see different numbers of compressed rows; taking the batch's max here would let an early token
 // attend to a row derived from a later one.
-template <int DT, bool QB>
+template <int DT, bool QB, bool DRAFT_SKIP = false>
 __global__ __launch_bounds__(kAttnThreads) void mqa_attend_batch_kernel(
     const void* __restrict__ q, const void* __restrict__ raw, const void* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const uint32_t* __restrict__ n_comp_v,
@@ -340,9 +348,9 @@ __global__ __launch_bounds__(kAttnThreads) void mqa_attend_batch_kernel(
   const size_t tok = (size_t)(b0 + t) * n_head * width + (size_t)h0 * width;
   const void* qp = QB ? (const void*)((const uint16_t*)q + tok)
                       : (const void*)((const float*)q + tok);
-  attend_body<DT, QB>(qp, raw, comp, allowed ? allowed + (size_t)t * max_comp : nullptr,
-                      sinks ? sinks + h0 : nullptr, sinks != nullptr, out + tok, s_score, raw0,
-                      n_raw, ring, n_comp, width, nope, stride, scale, min(nhb, n_head - h0));
+  attend_body<DT, QB, DRAFT_SKIP>(qp, raw, comp, allowed ? allowed + (size_t)t * max_comp : nullptr,
+                                 sinks ? sinks + h0 : nullptr, sinks != nullptr, out + tok, s_score, raw0,
+                                 n_raw, ring, n_comp, width, nope, stride, scale, min(nhb, n_head - h0));
 }
 
 
@@ -681,10 +689,22 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
   hipStream_t st = (hipStream_t)stream;
   const uint32_t sd = (uint32_t)kv_row_bytes(dt, width, n_rot);
   const uint32_t nope = width - n_rot;
-#define AFF_ATTB(DTV, QBV)                                                                     \
-  hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV>), g, b, lds, st, q, raw, comp, allowed,   \
-                     n_comp_v, sinks, out, b0, pos0, sliding, ring, max_comp, n_head, width,      \
-                     nope, sd, scale, nhb, flat_n, flat_raw0, raw_floor)
+  static const bool draft_mask_skip = []() -> bool {
+    const char* v = std::getenv("AFF_DRAFT_RING_MASK_SKIP");
+    return v && *v && std::strcmp(v, "0") != 0;
+  }();
+#define AFF_ATTB(DTV, QBV)                                                                         \
+  do {                                                                                             \
+    if (draft_mask_skip) {                                                                         \
+      hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, true>), g, b, lds, st, q, raw, comp,   \
+                         allowed, n_comp_v, sinks, out, b0, pos0, sliding, ring, max_comp,         \
+                         n_head, width, nope, sd, scale, nhb, flat_n, flat_raw0, raw_floor);      \
+    } else {                                                                                       \
+      hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, false>), g, b, lds, st, q, raw, comp,  \
+                         allowed, n_comp_v, sinks, out, b0, pos0, sliding, ring, max_comp,         \
+                         n_head, width, nope, sd, scale, nhb, flat_n, flat_raw0, raw_floor);      \
+    }                                                                                              \
+  } while (0)
 #define AFF_ATTQ(DTV) do { if (q_bf16) AFF_ATTB(DTV, true); else AFF_ATTB(DTV, false); } while (0)
   switch (dt) {
     case KvDtype::F32:   AFF_ATTQ(0); break;

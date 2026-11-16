@@ -994,6 +994,12 @@ public:
   // the calibration print).
   void set_dspark_confidence_enabled(bool on) { dspark_conf_on_ = on; }
 
+  // Deterministic KL / Perplexity Evaluation Harness.
+  // Performs teacher-forced evaluation over tokenized corpus `ids` of length `n`,
+  // saving per-position target logprob + top-K logits into binary format at `out_bin`.
+  bool forward_kl_eval(const uint32_t* ids, uint32_t n, const std::string& out_bin,
+                       uint32_t top_k = 64) const;
+
   // Unwinds the KV cache to `keep` positions, after a speculative block whose tail was rejected.
   //
   // Cheaper than it looks, and the reason is a property of both caches rather than an optimisation:

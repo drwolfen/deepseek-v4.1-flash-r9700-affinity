@@ -43,6 +43,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace aff {
 namespace {
@@ -653,7 +655,16 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
   // grid and nothing else.
   const uint32_t raw_avail0 = (pos0 >= raw_floor) ? (pos0 - raw_floor + 1u) : 0u;
   const uint32_t nraw0 = (raw_avail0 < sliding) ? raw_avail0 : sliding;
-  const uint32_t nkeys = nraw0 + (n_comp_v ? n_comp_hint : n_comp1);
+  static const bool kv_split_live = []() -> bool {
+    const char* v = std::getenv("AFF_KV_SPLIT_LIVE");
+    return v && *v && std::strcmp(v, "0") != 0;
+  }();
+  uint32_t comp_hint_used = (n_comp_v ? n_comp_hint : n_comp1);
+  if (kv_split_live && n_comp_v && n_comp_hint > 0) {
+    const uint32_t max_live_comp = (pos0 + n) / 4u;
+    if (max_live_comp < comp_hint_used) comp_hint_used = max_live_comp;
+  }
+  const uint32_t nkeys = nraw0 + comp_hint_used;
   const uint32_t nsp = flash_split_slices(n, ntiles, nkeys, split);
   float* po = nsp > 1u ? split->o : nullptr;
   float* pm = nsp > 1u ? split->ml : nullptr;

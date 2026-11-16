@@ -35,6 +35,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace aff {
 
@@ -76,7 +77,8 @@ __device__ __forceinline__ float4 f4add(float4 a, float4 b) {
 // NPEER is a template argument, not a runtime one, so that at two ranks — the configuration this
 // engine is tuned on — the push and the reduce collapse to exactly the single-peer straight line
 // they were before the generalisation, with no loop and no indirection through the peer table.
-template <int NPEER>
+// NRANK_SYNC ports N-rank flag sync from StillDeadcode/libr4d PR #2 (9e0728e).
+template <int NPEER, bool NRANK_SYNC = false>
 __global__ void tp_ar_kernel(const float4* __restrict__ in,
                              TpPush<NPEER> push, const float4* my_scratch,
                              float4* __restrict__ out,
@@ -126,14 +128,29 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
   asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
 
-  if (tid == 0) {
+  if constexpr (NRANK_SYNC && NPEER > 1) {
+    if (tid == 0) {
 #pragma unroll
-    for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
-    unsigned long long z = 0;
-#pragma unroll
-    for (int j = 0; j < NPEER; ++j) {
-      while (load_sys_acq(&my_flags[j * kTpMaxBlocks + b]) < s) {
+      for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
+    }
+    if (tid < NPEER) {
+      const unsigned int* f = &my_flags[tid * kTpMaxBlocks + b];
+      unsigned long long z = 0;
+      while ((int)(load_sys_acq(f) - s) < 0) {
+        __builtin_amdgcn_s_sleep(2);
         if (++z > kTpSpinMax) { note_timeout(timeout, s); break; }
+      }
+    }
+  } else {
+    if (tid == 0) {
+#pragma unroll
+      for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
+      unsigned long long z = 0;
+#pragma unroll
+      for (int j = 0; j < NPEER; ++j) {
+        while (load_sys_acq(&my_flags[j * kTpMaxBlocks + b]) < s) {
+          if (++z > kTpSpinMax) { note_timeout(timeout, s); break; }
+        }
       }
     }
   }
@@ -203,7 +220,7 @@ struct TpPush8 {
   unsigned int*  flags[NPEER];
 };
 
-template <int NPEER>
+template <int NPEER, bool NRANK_SYNC = false>
 __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
                                  TpPush8<NPEER> push, const unsigned char* my_base,
                                  float* __restrict__ out,
@@ -274,14 +291,29 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
 
   asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
-  if (tid == 0) {
-    #pragma unroll
-    for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
-    unsigned long long z = 0;
-    #pragma unroll
-    for (int j = 0; j < NPEER; ++j) {
-      while (load_sys_acq(&my_flags[j * kTpMaxBlocks + b]) < s) {
+  if constexpr (NRANK_SYNC && NPEER > 1) {
+    if (tid == 0) {
+      #pragma unroll
+      for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
+    }
+    if (tid < NPEER) {
+      const unsigned int* f = &my_flags[tid * kTpMaxBlocks + b];
+      unsigned long long z = 0;
+      while ((int)(load_sys_acq(f) - s) < 0) {
+        __builtin_amdgcn_s_sleep(2);
         if (++z > kTpSpinMax) { note_timeout(timeout, s); break; }
+      }
+    }
+  } else {
+    if (tid == 0) {
+      #pragma unroll
+      for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
+      unsigned long long z = 0;
+      #pragma unroll
+      for (int j = 0; j < NPEER; ++j) {
+        while (load_sys_acq(&my_flags[j * kTpMaxBlocks + b]) < s) {
+          if (++z > kTpSpinMax) { note_timeout(timeout, s); break; }
+        }
       }
     }
   }
@@ -575,12 +607,18 @@ void tp_free(TpContext* ctx) {
 
 namespace {
 
+static inline bool tp_nrank_sync_enabled() {
+  const char* v = std::getenv("AFF_TP_NRANK_SYNC");
+  return v && *v && std::strcmp(v, "0") != 0;
+}
+
 // One launch per rank, with that rank's peer table filled in. NPEER is a template argument so the
 // two-rank path keeps the straight-line kernel it had; the switch below is the only place the live
 // rank count meets it.
 template <int NPEER>
 void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4, int nb, int nt,
                      int slot4, int peer4) {
+  const bool tp_nrank_sync = tp_nrank_sync_enabled();
   for (size_t r = 0; r < ctx.ranks; ++r) {
     TpPush<NPEER> push{};
     for (size_t q = 0, j = 0; q < ctx.ranks; ++q) {
@@ -591,10 +629,17 @@ void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4
       ++j;
     }
     set_device(ctx.dev[r]);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_kernel<NPEER>), dim3(nb), dim3(nt), 0,
-                       (hipStream_t)ctx.stream[r], (const float4*)in[r], push,
-                       (const float4*)ctx.scratch[r], (float4*)out[r], ctx.flags[r], ctx.seq[r],
-                       ctx.timeout_dev, n4, slot4, peer4, (int)r);
+    if (tp_nrank_sync && NPEER > 1) {
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_kernel<NPEER, true>), dim3(nb), dim3(nt), 0,
+                         (hipStream_t)ctx.stream[r], (const float4*)in[r], push,
+                         (const float4*)ctx.scratch[r], (float4*)out[r], ctx.flags[r], ctx.seq[r],
+                         ctx.timeout_dev, n4, slot4, peer4, (int)r);
+    } else {
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_kernel<NPEER, false>), dim3(nb), dim3(nt), 0,
+                         (hipStream_t)ctx.stream[r], (const float4*)in[r], push,
+                         (const float4*)ctx.scratch[r], (float4*)out[r], ctx.flags[r], ctx.seq[r],
+                         ctx.timeout_dev, n4, slot4, peer4, (int)r);
+    }
     AFF_HIP_CHECK(hipGetLastError());
   }
 }
@@ -602,6 +647,7 @@ void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4
 template <int NPEER>
 void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, int nb,
                    int slot_bytes, int peer_bytes, int scale_off) {
+  const bool tp_nrank_sync = tp_nrank_sync_enabled();
   for (size_t r = 0; r < ctx.ranks; ++r) {
     TpPush8<NPEER> push{};
     for (size_t q = 0, j = 0; q < ctx.ranks; ++q) {
@@ -612,10 +658,17 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
       ++j;
     }
     set_device(ctx.dev[r]);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER>), dim3(nb), dim3(256), 0,
-                       (hipStream_t)ctx.stream[r], in[r], push,
-                       (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
-                       ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+    if (tp_nrank_sync && NPEER > 1) {
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, true>), dim3(nb), dim3(256), 0,
+                         (hipStream_t)ctx.stream[r], in[r], push,
+                         (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                         ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+    } else {
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, false>), dim3(nb), dim3(256), 0,
+                         (hipStream_t)ctx.stream[r], in[r], push,
+                         (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                         ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+    }
     AFF_HIP_CHECK(hipGetLastError());
   }
 }

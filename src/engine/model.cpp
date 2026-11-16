@@ -2612,4 +2612,102 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
   return true;
 }
 
+bool Model::forward_kl_eval(const uint32_t* ids, uint32_t n, const std::string& out_bin,
+                            uint32_t top_k) const {
+  if (!ids || n < 2) return false;
+  std::FILE* f = std::fopen(out_bin.c_str(), "wb");
+  if (!f) {
+    ui::err("kl-eval: cannot open output binary %s\n", out_bin.c_str());
+    return false;
+  }
+
+  const char magic[4] = {'K', 'L', 'E', 'V'};
+  const uint32_t version = 1;
+  const uint32_t num_positions = n - 1;
+  const uint32_t k = (top_k > 0 && top_k <= 256) ? top_k : 64;
+  const uint32_t vocab_size = cfg_.vocab;
+  float placeholder_mean_nll = 0.0f;
+  float reserved[2] = {0.0f, 0.0f};
+
+  std::fwrite(magic, 1, 4, f);
+  std::fwrite(&version, sizeof(uint32_t), 1, f);
+  std::fwrite(&num_positions, sizeof(uint32_t), 1, f);
+  std::fwrite(&k, sizeof(uint32_t), 1, f);
+  std::fwrite(&vocab_size, sizeof(uint32_t), 1, f);
+  std::fwrite(&placeholder_mean_nll, sizeof(float), 1, f);
+  std::fwrite(reserved, sizeof(float), 2, f);
+
+  SeqState st;
+  init_state(&st, n + 64);
+
+  std::vector<float> logits(cfg_.vocab);
+  std::vector<uint32_t> order(cfg_.vocab);
+  for (uint32_t i = 0; i < cfg_.vocab; ++i) order[i] = i;
+
+  double total_nll = 0.0;
+  uint32_t evaluated = 0;
+
+  for (uint32_t pos = 0; pos < n - 1; ++pos) {
+    const uint32_t tok_in = ids[pos];
+    const uint32_t target_tok = ids[pos + 1];
+
+    forward_token(tok_in, &st, nullptr, nullptr, &logits, true);
+
+    float max_logit = -1e30f;
+    for (float v : logits) {
+      if (v > max_logit) max_logit = v;
+    }
+    double sum_exp = 0.0;
+    for (float v : logits) {
+      sum_exp += std::exp((double)(v - max_logit));
+    }
+    const float lse = max_logit + (float)std::log(sum_exp);
+
+    const float target_logit = (target_tok < cfg_.vocab) ? logits[target_tok] : -1e30f;
+    const float target_nll = lse - target_logit;
+
+    total_nll += target_nll;
+    evaluated++;
+
+    std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                      [&](uint32_t a, uint32_t b) { return logits[a] > logits[b]; });
+
+    std::vector<uint32_t> topk_ids(k);
+    std::vector<float> topk_logits(k);
+    for (uint32_t j = 0; j < k; ++j) {
+      topk_ids[j] = order[j];
+      topk_logits[j] = logits[order[j]];
+    }
+
+    std::fwrite(&pos, sizeof(uint32_t), 1, f);
+    std::fwrite(&target_tok, sizeof(uint32_t), 1, f);
+    std::fwrite(&target_nll, sizeof(float), 1, f);
+    std::fwrite(&lse, sizeof(float), 1, f);
+    std::fwrite(topk_ids.data(), sizeof(uint32_t), k, f);
+    std::fwrite(topk_logits.data(), sizeof(float), k, f);
+
+    if ((pos + 1) % 1000 == 0 || pos + 2 == n) {
+      aff::ui::err("kl-eval: %u/%u tokens (current nll: %.4f, mean nll: %.4f)\n",
+                   pos + 1, n - 1, target_nll, (float)(total_nll / evaluated));
+    }
+  }
+
+  const float mean_nll = evaluated > 0 ? (float)(total_nll / evaluated) : 0.0f;
+  const double ppl = std::exp((double)mean_nll);
+
+  std::fseek(f, 0, SEEK_SET);
+  std::fwrite(magic, 1, 4, f);
+  std::fwrite(&version, sizeof(uint32_t), 1, f);
+  std::fwrite(&evaluated, sizeof(uint32_t), 1, f);
+  std::fwrite(&k, sizeof(uint32_t), 1, f);
+  std::fwrite(&vocab_size, sizeof(uint32_t), 1, f);
+  std::fwrite(&mean_nll, sizeof(float), 1, f);
+  std::fwrite(reserved, sizeof(float), 2, f);
+  std::fclose(f);
+
+  aff::ui::out("kl-eval: evaluated %u tokens, mean_nll = %.6f, ppl = %.4f (saved to %s)\n",
+               evaluated, mean_nll, ppl, out_bin.c_str());
+  return true;
+}
+
 }  // namespace aff

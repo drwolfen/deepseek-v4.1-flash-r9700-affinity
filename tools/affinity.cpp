@@ -361,6 +361,9 @@ int main(int argc, char** argv) {
   // that picks it, and every recorded fingerprint here was taken on the former.
   bool sampling_set = false;
   std::string logits_out;
+  bool kl_eval_mode = false;
+  std::string kl_corpus_path;
+  std::string kl_out_bin;
   // Oracle knobs, for tools/ref_forward.py: at the shipped index_topk the lightning indexer needs
   // ~2048 positions and all 43 layers before it engages. See Model::set_index_topk.
   uint32_t index_topk = 0, max_layers = 0, cand_topk_blocks = 0;
@@ -492,6 +495,12 @@ int main(int argc, char** argv) {
     else if (a == "--persistent-prefix-cache") pcache.persistent = true;
     else if (a == "--prefix-cache-verify") pcache_verify = true;
     else if (a == "--logits-out") logits_out = nxt();
+    else if (a == "--kl-eval") {
+      kl_corpus_path = nxt();
+      kl_out_bin = nxt();
+      kl_eval_mode = true;
+      one_shot = true;
+    }
     else if (a == "--engram") engram_file = nxt();
     else if (a == "--engram-tables") engram_dir = nxt();
     else if (a == "--index-topk") index_topk = (uint32_t)std::strtoul(nxt(), nullptr, 10);
@@ -1811,6 +1820,37 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (kl_eval_mode) {
+    if (kl_corpus_path.empty() || kl_out_bin.empty()) {
+      aff::ui::err("fatal: --kl-eval requires <corpus_txt> and <out_bin>\n");
+      return 1;
+    }
+    std::FILE* cf = std::fopen(kl_corpus_path.c_str(), "rb");
+    if (!cf) {
+      aff::ui::err("fatal: cannot open corpus file %s\n", kl_corpus_path.c_str());
+      return 1;
+    }
+    std::string text;
+    char chunk[65536];
+    size_t nr;
+    while ((nr = std::fread(chunk, 1, sizeof(chunk), cf)) > 0) text.append(chunk, nr);
+    std::fclose(cf);
+
+    std::vector<uint32_t> ids = tok.encode(text);
+    aff::ui::out("kl-eval: tokenized %zu tokens from %s\n", ids.size(), kl_corpus_path.c_str());
+    if (ids.size() < 8184) {
+      aff::ui::err("fatal: corpus produced %zu tokens, need >= 8184\n", ids.size());
+      return 1;
+    }
+    const uint32_t eval_len = 8184;
+    kv_reserve_for(eval_len + 64);
+    if (!model.forward_kl_eval(ids.data(), eval_len, kl_out_bin, 64)) {
+      aff::ui::err("fatal: forward_kl_eval failed\n");
+      return 1;
+    }
+    return 0;
+  }
+
 #ifdef AFF_WITH_HIP
   if (!calibrate_tokens_path.empty()) {
     std::FILE* cf = std::fopen(calibrate_tokens_path.c_str(), "rb");
@@ -2126,6 +2166,17 @@ int main(int argc, char** argv) {
     // narrower verify touches proportionally fewer non-resident PCIe experts per layer.
     float cost_ema[kMaxQ] = {0.0f, 48.0f, 68.0f, 82.0f, 95.0f, 108.0f, 120.0f, 132.0f};
     uint32_t cost_samples[kMaxQ] = {};
+    const char* probe_env = std::getenv("AFF_SPEC_PROBE_NEIGHBOR");
+    const bool probe_neighbor_on = probe_env && *probe_env && std::strcmp(probe_env, "0") != 0;
+    bool probe_in_flight = false;
+    uint32_t probe_phase = 0; // 0..3 anchor, 4..7 neighbor
+    uint32_t probe_anchor_q = 0;
+    uint32_t probe_target_q = 0;
+    uint32_t steps_since_probe = 0;
+    std::vector<float> probe_samples_anchor;
+    std::vector<float> probe_samples_target;
+    float cost_row_exact_ema[kMaxQ] = {};
+    uint32_t cost_row_exact_samples[kMaxQ] = {};
     bool last_clean_accept = false;
     uint32_t zero_run = 0;
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
@@ -2211,7 +2262,30 @@ int main(int argc, char** argv) {
           // After a clean all-accepted block, explore one wider width if within 3% utility.
           if (last_clean_accept && best_q < max_q && util[best_q + 1] >= best_u * 0.97f)
             best_q += 1;
-          nd = best_q - 1;
+          if (probe_neighbor_on) {
+            if (!probe_in_flight) {
+              steps_since_probe++;
+              if (steps_since_probe >= 32) {
+                const uint32_t nbr = (best_q < max_q) ? best_q + 1 : best_q - 1;
+                if (nbr >= 2) {
+                  probe_in_flight = true;
+                  probe_phase = 0;
+                  probe_anchor_q = best_q;
+                  probe_target_q = nbr;
+                  probe_samples_anchor.clear();
+                  probe_samples_target.clear();
+                }
+              }
+            }
+            if (probe_in_flight) {
+              const uint32_t run_q = (probe_phase < 4) ? probe_anchor_q : probe_target_q;
+              nd = run_q - 1;
+            } else {
+              nd = best_q - 1;
+            }
+          } else {
+            nd = best_q - 1;
+          }
         }
         if (conf_dbg) {
           std::string cs;
@@ -2319,6 +2393,39 @@ int main(int argc, char** argv) {
         if (sc && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
           const float clamped_ms = std::min((float)step_ms, cost_ema[q_off] * 1.25f);
           cost_ema[q_off] = 0.85f * cost_ema[q_off] + 0.15f * clamped_ms;
+        }
+        if (probe_neighbor_on && step_ms > 1.0) {
+          // Exact row count tracking (PR #429 / PR #452)
+          if (++cost_row_exact_samples[q_off] > 2) {
+            if (cost_row_exact_ema[q_off] <= 0.0f) {
+              cost_row_exact_ema[q_off] = (float)step_ms;
+            } else {
+              const float cl = std::min((float)step_ms, cost_row_exact_ema[q_off] * 1.30f);
+              cost_row_exact_ema[q_off] = 0.85f * cost_row_exact_ema[q_off] + 0.15f * cl;
+            }
+          }
+          if (probe_in_flight) {
+            if (probe_phase < 4) {
+              probe_samples_anchor.push_back((float)step_ms);
+            } else {
+              probe_samples_target.push_back((float)step_ms);
+            }
+            probe_phase++;
+            if (probe_phase >= 8) {
+              if (probe_samples_anchor.size() >= 4 && probe_samples_target.size() >= 4) {
+                std::sort(probe_samples_anchor.begin(), probe_samples_anchor.end());
+                std::sort(probe_samples_target.begin(), probe_samples_target.end());
+                const float med_anchor = 0.5f * (probe_samples_anchor[1] + probe_samples_anchor[2]);
+                const float med_target = 0.5f * (probe_samples_target[1] + probe_samples_target[2]);
+                if (med_anchor > 0.0f && med_target > 0.0f) {
+                  const float ratio = med_target / med_anchor;
+                  cost_ema[probe_target_q] = 0.70f * cost_ema[probe_target_q] + 0.30f * (cost_ema[probe_anchor_q] * ratio);
+                }
+              }
+              probe_in_flight = false;
+              steps_since_probe = 0;
+            }
+          }
         }
         // Update prefix survival EMAs and per-depth confidence calibration.
         const std::vector<float>& conf = model.dspark_confidence();

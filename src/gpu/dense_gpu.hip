@@ -4952,6 +4952,15 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
     // attends every compressed row (a short prompt whose indexer never ran), which is unchanged.
     const bool use_dense = !gather && (dev_mask || (allowed && n_comp_max));
     if (!b_allow_dense_ && use_dense) return false;
+    static const bool kv_split_live = [] {
+      const char* v = std::getenv("AFF_KV_SPLIT_LIVE");
+      return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    uint32_t comp_split_hint = gather ? a_idx_topk_[slot_] : n_comp_max;
+    if (kv_split_live && gather) {
+      const uint32_t max_live_comp = (pos0 + n) / 4u;
+      if (max_live_comp < comp_split_hint) comp_split_hint = max_live_comp;
+    }
     if (flash)
       mqa_attend_flash_hip(D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][kvl(layer)],
                            gather ? nullptr
@@ -4960,7 +4969,7 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
                            gather ? D.b_admn + b0 : D.b_ncomp, /*n_comp1=*/0u, D.a_sink[layer],
                            D.b_htm, b0, n, b_nb_, pos0,
                            a_sliding_, a_ring_, a_maxcomp_, a_hpr_, scale, D.stream,
-                           /*q_bf16=*/true, &D.fsplit, gather ? a_idx_topk_[slot_] : n_comp_max,
+                           /*q_bf16=*/true, &D.fsplit, comp_split_hint,
                            gather ? D.b_adm + (size_t)b0 * kAdmCap : nullptr, kAdmCap, raw_floor);
     else
       mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][kvl(layer)],
@@ -5923,6 +5932,10 @@ bool DenseGpu::batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n
   // to the same pairs, `markov_key`'s float map is order-preserving on finite logits, and `max` is
   // associative, so the fold is independent of how many cards there are and of their order.
   {
+    static const bool verify_gpu_argmax = [] {
+      const char* v = std::getenv("AFF_VERIFY_GPU_ARGMAX");
+      return v && *v && std::strcmp(v, "0") != 0;
+    }();
     size_t nband = 0;
     for (size_t d = 0; d < R; ++d) nband += band[d] ? 1 : 0;
     if (!nband) return false;                             // no card owns any of the vocabulary
