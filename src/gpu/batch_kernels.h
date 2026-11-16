@@ -431,6 +431,7 @@ void embed_tokens_gather_hip(const uint16_t* embed_table, const uint32_t* token_
 // Hyper-Connection kernel refresh (Radiance c896a87, 222cbe7, b0a58b5).
 bool hc_fused_v2_enabled();
 bool hc_chained_enabled();
+uint32_t hc_chained_min_rows();
 
 void batch_hc_read_fused_v2_hip(const uint16_t* h, const float* w, const void* downv,
                                 long dld, const unsigned short* injw, unsigned short* dout,
@@ -442,6 +443,7 @@ void batch_hc_read_fused_v2_hip(const uint16_t* h, const float* w, const void* d
 void batch_hc_chained_decode_hip(const uint16_t* h, const float* w, const void* downv,
                                  long dld, const void* upv, long uld, unsigned short* dout,
                                  float* out_norm, long rows, long n, int hc, long lr,
-                                 void* stream, uint32_t* sync_counters = nullptr);
+                                 void* stream, uint32_t* sync_counters = nullptr,
+                                 bool force_chained = false);
 
 } // namespace aff

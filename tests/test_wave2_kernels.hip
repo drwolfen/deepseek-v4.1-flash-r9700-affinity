@@ -114,88 +114,100 @@ int main() {
   // 3. Hyper-Connection refresh: fused v2 and chained decode vs CPU reference
   {
     assert(hipSetDevice(0) == hipSuccess);
-    const long rows = 4, n = 2560;
+    const long test_rows[] = {1, 4, 8, 16};
+    const long n = 2560;
     const int hc = 4;
-    const long total_h = rows * hc * n;
-    std::vector<uint16_t> h_in(total_h);
-    std::vector<float> w_in(n);
-    for (long i = 0; i < total_h; ++i) h_in[i] = f32_to_bf16_cpu(std::sin((float)i * 0.003f) * 1.5f);
-    for (long i = 0; i < n; ++i) w_in[i] = 1.0f + 0.1f * std::cos((float)i * 0.01f);
 
-    std::vector<float> ref_norm(rows * n);
-    for (long r = 0; r < rows; ++r) {
-      for (long i = 0; i < n; ++i) {
-        float sum = 0.0f;
-        for (int c = 0; c < hc; ++c) {
-          sum += bf16_to_f32_cpu(h_in[r * hc * n + c * n + i]);
+    for (long rows : test_rows) {
+      const long total_h = rows * hc * n;
+      std::vector<uint16_t> h_in(total_h);
+      std::vector<float> w_in(n);
+      for (long i = 0; i < total_h; ++i) h_in[i] = f32_to_bf16_cpu(std::sin((float)i * 0.003f) * 1.5f);
+      for (long i = 0; i < n; ++i) w_in[i] = 1.0f + 0.1f * std::cos((float)i * 0.01f);
+
+      std::vector<float> ref_norm(rows * n);
+      for (long r = 0; r < rows; ++r) {
+        for (long i = 0; i < n; ++i) {
+          float sum = 0.0f;
+          for (int c = 0; c < hc; ++c) {
+            sum += bf16_to_f32_cpu(h_in[r * hc * n + c * n + i]);
+          }
+          sum *= (1.0f / (float)hc);
+          sum *= w_in[i];
+          ref_norm[r * n + i] = sum;
         }
-        sum *= (1.0f / (float)hc);
-        sum *= w_in[i];
-        ref_norm[r * n + i] = sum;
       }
+
+      uint16_t* d_h = nullptr;
+      float* d_w = nullptr;
+      float* d_out_norm_v2 = nullptr;
+      float* d_out_norm_ch = nullptr;
+      unsigned short* d_out_v2 = nullptr;
+      unsigned short* d_out_ch = nullptr;
+      uint32_t* d_sync = nullptr;
+
+      assert(hipMalloc(&d_h, total_h * sizeof(uint16_t)) == hipSuccess);
+      assert(hipMalloc(&d_w, n * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_out_norm_v2, rows * n * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_out_norm_ch, rows * n * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_out_v2, rows * n * sizeof(unsigned short)) == hipSuccess);
+      assert(hipMalloc(&d_out_ch, rows * n * sizeof(unsigned short)) == hipSuccess);
+      assert(hipMalloc(&d_sync, 16 * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMemset(d_sync, 0, 16 * sizeof(uint32_t)) == hipSuccess);
+
+      assert(hipMemcpy(d_h, h_in.data(), total_h * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_w, w_in.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+
+      batch_hc_read_fused_v2_hip(d_h, d_w, nullptr, 0, nullptr, d_out_v2, nullptr, nullptr, nullptr, 0,
+                                 nullptr, d_out_norm_v2, rows, n, hc, 0, hc * n, 0.0f, nullptr, d_sync);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      assert(hipMemset(d_sync, 0, 16 * sizeof(uint32_t)) == hipSuccess);
+      batch_hc_chained_decode_hip(d_h, d_w, nullptr, 0, nullptr, 0, d_out_ch, d_out_norm_ch,
+                                  rows, n, hc, 0, nullptr, d_sync, /*force_chained=*/true);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      std::vector<float> got_v2(rows * n), got_ch(rows * n);
+      assert(hipMemcpy(got_v2.data(), d_out_norm_v2, rows * n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(got_ch.data(), d_out_norm_ch, rows * n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+
+      auto check_sim = [&](const std::vector<float>& got, const char* name) {
+        double dot_ab = 0.0, norm_a = 0.0, norm_b = 0.0;
+        float max_abs_err = 0.0f;
+        for (size_t i = 0; i < got.size(); ++i) {
+          double a = ref_norm[i], b = got[i];
+          dot_ab += a * b;
+          norm_a += a * a;
+          norm_b += b * b;
+          float diff = std::fabs(got[i] - ref_norm[i]);
+          if (diff > max_abs_err) max_abs_err = diff;
+        }
+        double cos_sim = dot_ab / (std::sqrt(norm_a) * std::sqrt(norm_b));
+        std::printf("HC %s (rows=%ld): cos_sim=%f, max_abs_err=%e\n", name, rows, cos_sim, max_abs_err);
+        assert(cos_sim > 0.99999);
+        assert(max_abs_err < 1e-4f);
+      };
+
+      check_sim(got_v2, "Fused V2");
+      check_sim(got_ch, "Chained");
+
+      // Verify dispatched path as well
+      assert(hipMemset(d_sync, 0, 16 * sizeof(uint32_t)) == hipSuccess);
+      batch_hc_chained_decode_hip(d_h, d_w, nullptr, 0, nullptr, 0, d_out_ch, d_out_norm_ch,
+                                  rows, n, hc, 0, nullptr, d_sync, /*force_chained=*/false);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      assert(hipMemcpy(got_ch.data(), d_out_norm_ch, rows * n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+      check_sim(got_ch, "Dispatched");
+
+      (void)hipFree(d_h);
+      (void)hipFree(d_w);
+      (void)hipFree(d_out_norm_v2);
+      (void)hipFree(d_out_norm_ch);
+      (void)hipFree(d_out_v2);
+      (void)hipFree(d_out_ch);
+      (void)hipFree(d_sync);
     }
-
-    uint16_t* d_h = nullptr;
-    float* d_w = nullptr;
-    float* d_out_norm_v2 = nullptr;
-    float* d_out_norm_ch = nullptr;
-    unsigned short* d_out_v2 = nullptr;
-    unsigned short* d_out_ch = nullptr;
-    uint32_t* d_sync = nullptr;
-
-    assert(hipMalloc(&d_h, total_h * sizeof(uint16_t)) == hipSuccess);
-    assert(hipMalloc(&d_w, n * sizeof(float)) == hipSuccess);
-    assert(hipMalloc(&d_out_norm_v2, rows * n * sizeof(float)) == hipSuccess);
-    assert(hipMalloc(&d_out_norm_ch, rows * n * sizeof(float)) == hipSuccess);
-    assert(hipMalloc(&d_out_v2, rows * n * sizeof(unsigned short)) == hipSuccess);
-    assert(hipMalloc(&d_out_ch, rows * n * sizeof(unsigned short)) == hipSuccess);
-    assert(hipMalloc(&d_sync, 16 * sizeof(uint32_t)) == hipSuccess);
-    assert(hipMemset(d_sync, 0, 16 * sizeof(uint32_t)) == hipSuccess);
-
-    assert(hipMemcpy(d_h, h_in.data(), total_h * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
-    assert(hipMemcpy(d_w, w_in.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
-
-    batch_hc_read_fused_v2_hip(d_h, d_w, nullptr, 0, nullptr, d_out_v2, nullptr, nullptr, nullptr, 0,
-                               nullptr, d_out_norm_v2, rows, n, hc, 0, hc * n, 0.0f, nullptr, d_sync);
-    assert(hipDeviceSynchronize() == hipSuccess);
-
-    assert(hipMemset(d_sync, 0, 16 * sizeof(uint32_t)) == hipSuccess);
-    batch_hc_chained_decode_hip(d_h, d_w, nullptr, 0, nullptr, 0, d_out_ch, d_out_norm_ch,
-                                rows, n, hc, 0, nullptr, d_sync);
-    assert(hipDeviceSynchronize() == hipSuccess);
-
-    std::vector<float> got_v2(rows * n), got_ch(rows * n);
-    assert(hipMemcpy(got_v2.data(), d_out_norm_v2, rows * n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
-    assert(hipMemcpy(got_ch.data(), d_out_norm_ch, rows * n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
-
-    auto check_sim = [&](const std::vector<float>& got, const char* name) {
-      double dot_ab = 0.0, norm_a = 0.0, norm_b = 0.0;
-      float max_abs_err = 0.0f;
-      for (size_t i = 0; i < got.size(); ++i) {
-        double a = ref_norm[i], b = got[i];
-        dot_ab += a * b;
-        norm_a += a * a;
-        norm_b += b * b;
-        float diff = std::fabs(got[i] - ref_norm[i]);
-        if (diff > max_abs_err) max_abs_err = diff;
-      }
-      double cos_sim = dot_ab / (std::sqrt(norm_a) * std::sqrt(norm_b));
-      std::printf("HC %s: cos_sim=%f, max_abs_err=%e\n", name, cos_sim, max_abs_err);
-      assert(cos_sim > 0.99999);
-      assert(max_abs_err < 1e-4f);
-    };
-
-    check_sim(got_v2, "Fused V2");
-    check_sim(got_ch, "Chained");
-
-    (void)hipFree(d_h);
-    (void)hipFree(d_w);
-    (void)hipFree(d_out_norm_v2);
-    (void)hipFree(d_out_norm_ch);
-    (void)hipFree(d_out_v2);
-    (void)hipFree(d_out_ch);
-    (void)hipFree(d_sync);
-    std::printf("PASS: Hyper-Connection fused V2 & chained decode kernels\n");
+    std::printf("PASS: Hyper-Connection fused V2 & chained decode kernels across n_rows={1, 4, 8, 16}\n");
   }
 
   // 4. Summed MoE Down GEMM across n_tokens = {1, 4, 16, 24, 64}

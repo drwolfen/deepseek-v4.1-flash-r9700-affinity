@@ -3713,7 +3713,7 @@ void embed_tokens_gather_hip(const uint16_t* embed_table, const uint32_t* token_
 bool hc_fused_v2_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("AFF_HC_FUSED_V2");
-    return s && *s && std::strcmp(s, "0") != 0;
+    return !s || (*s && std::strcmp(s, "0") != 0);
   }();
   return on;
 }
@@ -3721,9 +3721,17 @@ bool hc_fused_v2_enabled() {
 bool hc_chained_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("AFF_HC_CHAINED");
-    return s && *s && std::strcmp(s, "0") != 0;
+    return !s || (*s && std::strcmp(s, "0") != 0);
   }();
   return on;
+}
+
+uint32_t hc_chained_min_rows() {
+  static const uint32_t min_rows = [] {
+    const char* s = std::getenv("AFF_HC_CHAINED_MIN_ROWS");
+    return (s && *s) ? (uint32_t)std::strtoul(s, nullptr, 10) : 8u;
+  }();
+  return min_rows;
 }
 
 // Barrier ordering LDS only, leaving global loads in flight across workgroup (Radiance 222cbe7)
@@ -3890,8 +3898,14 @@ __global__ __launch_bounds__(256) void hc_chained_decode_kernel(
 void batch_hc_chained_decode_hip(const uint16_t* h, const float* w, const void* downv,
                                  long dld, const void* upv, long uld, unsigned short* dout,
                                  float* out_norm, long rows, long n, int hc, long lr,
-                                 void* stream, uint32_t* sync_counters) {
+                                 void* stream, uint32_t* sync_counters, bool force_chained) {
   if (!h || !rows || !n || hc <= 0) return;
+  if (!force_chained && hc_fused_v2_enabled() && hc_chained_enabled() && (uint32_t)rows < hc_chained_min_rows()) {
+    batch_hc_read_fused_v2_hip(h, w, downv, dld, nullptr, dout, nullptr, nullptr, upv, uld,
+                               nullptr, out_norm, rows, n, hc, lr, (size_t)hc * n, 0.0f,
+                               stream, sync_counters);
+    return;
+  }
   const uint32_t grid = (n + 255u) / 256u;
   if (rows <= 8) {
     // Form G (1..8 rows)
