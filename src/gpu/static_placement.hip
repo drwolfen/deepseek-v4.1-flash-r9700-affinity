@@ -2071,6 +2071,24 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
                              (const float*)bqs_[dv], I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true);
       } }
       if (split) {
+        // AFF_MOE_SINGLE_JOIN (#983, #984):
+        // In device planning mode, resident tiles (groups 0..3) and pooled tiles (groups 4..7)
+        // feed into a single unified expert_swiglu_quant_hip kernel launch on stream st over all
+        // `taken` slots across bg_[dv], bu_[dv], ba8_[dv], and bas_[dv].
+        // Stream st MUST wait for stream hyb's gate/up GEMMs via ev_gu before reading bg_/bu_,
+        // and stream hyb MUST wait for stream st's SwiGLU via ev_sw before reading ba8_/bas_.
+        // Bypassing ev_gu/ev_sw would produce Read-After-Write hazards across intermediate scratch
+        // buffers. Therefore, ev_gu and ev_sw barriers are strictly preserved even if AFF_MOE_SINGLE_JOIN=1.
+        static const bool single_join_warned = [] {
+          const char* s = std::getenv("AFF_MOE_SINGLE_JOIN");
+          if (s && *s && std::strcmp(s, "0") != 0) {
+            aff::ui::err("note: AFF_MOE_SINGLE_JOIN=1 requested: ev_gu/ev_sw stream barriers preserved "
+                         "to prevent intermediate buffer RAW races across unified SwiGLU launch.\n");
+          }
+          return true;
+        }();
+        (void)single_join_warned;
+
         AFF_HIP_CHECK(hipEventRecord(I.ev_gu[dv][es], hyb));
         AFF_HIP_CHECK(hipStreamWaitEvent(st, I.ev_gu[dv][es], 0));
       }

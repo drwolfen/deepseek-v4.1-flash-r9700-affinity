@@ -1,5 +1,6 @@
 #include "gpu/attention_gpu.h"
 #include "gpu/batch_kernels.h"
+#include "gpu/moe_plan.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cstdlib>
@@ -394,6 +395,141 @@ int main() {
     }
 
     for (void* p : {(void*)d_q, (void*)d_out_ref, (void*)d_out_lookahead})
+      (void)hipFree(p);
+  }
+
+  // 7. Test MoE multi-row shared-expert deduplication and stream join invariants (#983, #984)
+  {
+    const uint32_t nb_tok = 16;
+    const uint32_t k = 4;
+    const uint32_t n_expert = 64;
+    const uint32_t taken = nb_tok * k;
+    const uint32_t cap = aff::moe_plan_tile_cap(nb_tok, k, n_expert);
+    const uint32_t pref_cap = 16;
+
+    std::vector<uint32_t> h_sel(taken);
+    std::vector<float> h_wt(taken, 0.25f);
+    std::vector<uint64_t> h_plc(n_expert, 0ull);
+
+    // Expert 0 is resident (bit 0 = 1)
+    h_plc[0] = 0x10000000ull | 1ull;
+    // Experts 1, 2, 3, 4 are pooled (bit 0 = 0, non-null address)
+    for (uint32_t e = 1; e <= 4; ++e) {
+      h_plc[e] = 0x20000000ull + (uint64_t)e * 0x100000ull;
+    }
+
+    // All 16 tokens select the exact same 4 experts: expert 0 (resident), experts 1, 2, 3 (pooled)
+    for (uint32_t t = 0; t < nb_tok; ++t) {
+      h_sel[t * k + 0] = 0; // resident
+      h_sel[t * k + 1] = 1; // pooled
+      h_sel[t * k + 2] = 2; // pooled
+      h_sel[t * k + 3] = 3; // pooled
+    }
+
+    uint32_t* d_sel = nullptr;
+    float* d_wt = nullptr;
+    uint64_t* d_plc = nullptr;
+    uint32_t* d_tok = nullptr;
+    float* d_wt_out = nullptr;
+    uint32_t* d_ord = nullptr;
+    uint32_t* d_run = nullptr;
+    uint32_t* d_slot_col = nullptr;
+    aff::ExpertTile* d_tiles = nullptr;
+    uint32_t* d_counts = nullptr;
+    aff::MoePlanStatus* d_status = nullptr;
+    uint16_t* d_bg = nullptr;
+    uint16_t* d_bu = nullptr;
+    uint16_t* d_bydn = nullptr;
+    uint8_t* d_pref_slab = nullptr;
+    const uint8_t** d_pref_src = nullptr;
+
+    assert(hipMalloc(&d_sel, h_sel.size() * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_wt, h_wt.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_plc, h_plc.size() * sizeof(uint64_t)) == hipSuccess);
+    assert(hipMalloc(&d_tok, 2 * taken * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_wt_out, taken * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_ord, taken * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_run, (nb_tok + 1) * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_slot_col, taken * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_tiles, 3 * 8 * cap * sizeof(aff::ExpertTile)) == hipSuccess);
+    assert(hipMalloc(&d_counts, 8 * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_status, sizeof(aff::MoePlanStatus)) == hipSuccess);
+    assert(hipMalloc(&d_bg, taken * sizeof(uint16_t)) == hipSuccess);
+    assert(hipMalloc(&d_bu, taken * sizeof(uint16_t)) == hipSuccess);
+    assert(hipMalloc(&d_bydn, taken * sizeof(uint16_t)) == hipSuccess);
+    assert(hipMalloc(&d_pref_slab, pref_cap * 1024) == hipSuccess);
+    assert(hipMalloc(&d_pref_src, pref_cap * sizeof(uint8_t*)) == hipSuccess);
+
+    assert(hipMemcpy(d_sel, h_sel.data(), h_sel.size() * sizeof(uint32_t), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_wt, h_wt.data(), h_wt.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_plc, h_plc.data(), h_plc.size() * sizeof(uint64_t), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemset(d_status, 0, sizeof(aff::MoePlanStatus)) == hipSuccess);
+    assert(hipMemset(d_pref_src, 0, pref_cap * sizeof(uint8_t*)) == hipSuccess);
+
+    aff::MoePlanArgs A;
+    A.sel = d_sel;
+    A.wt = d_wt;
+    A.plc = d_plc;
+    A.layer = 0;
+    A.nb_tok = nb_tok;
+    A.k = k;
+    A.n_expert = n_expert;
+    A.tok = d_tok;
+    A.wt_out = d_wt_out;
+    A.ord = d_ord;
+    A.run = d_run;
+    A.slot_col = d_slot_col;
+    A.tiles = d_tiles;
+    A.counts = d_counts;
+    A.status = d_status;
+    A.act = nullptr;
+    A.shard.stride = 1024;
+    A.bg = d_bg;
+    A.bu = d_bu;
+    A.bydn = d_bydn;
+    A.tile_cap = cap;
+    A.pref_slab = d_pref_slab;
+    A.pref_src = d_pref_src;
+    A.pref_cap = pref_cap;
+
+    bool plan_ok = aff::moe_plan_hip(A, nullptr);
+    assert(plan_ok);
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    aff::MoePlanStatus h_status{};
+    assert(hipMemcpy(&h_status, d_status, sizeof(aff::MoePlanStatus), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(h_status.bad == 0);
+    assert(h_status.over == 0);
+    assert(h_status.taken == taken);
+    assert(h_status.n_res == 1);   // Only expert 0 is resident
+    assert(h_status.n_uniq == 4);  // 1 resident + 3 unique pooled experts
+
+    std::vector<const uint8_t*> h_pref_src(pref_cap, nullptr);
+    assert(hipMemcpy(h_pref_src.data(), d_pref_src, pref_cap * sizeof(uint8_t*), hipMemcpyDeviceToHost) == hipSuccess);
+
+    // Verify #984 invariant: exactly 1 unique read entry per pooled expert in pref_src
+    const uint32_t pooled_count = h_status.n_uniq - h_status.n_res;
+    assert(pooled_count == 3);
+    for (uint32_t i = 0; i < pooled_count; ++i) {
+      assert(h_pref_src[i] != nullptr);
+      const uint64_t expected_addr = 0x20000000ull + (uint64_t)(i + 1) * 0x100000ull;
+      assert((uint64_t)(uintptr_t)h_pref_src[i] == expected_addr);
+    }
+    // Verify remaining pref_src slots were not overwritten
+    for (uint32_t i = pooled_count; i < pref_cap; ++i) {
+      assert(h_pref_src[i] == nullptr);
+    }
+
+    // Verify AFF_MOE_SINGLE_JOIN runtime toggle safety
+    setenv("AFF_MOE_SINGLE_JOIN", "1", 1);
+    const char* env_val = std::getenv("AFF_MOE_SINGLE_JOIN");
+    assert(env_val && std::strcmp(env_val, "1") == 0);
+    setenv("AFF_MOE_SINGLE_JOIN", "0", 1);
+
+    for (void* p : {(void*)d_sel, (void*)d_wt, (void*)d_plc, (void*)d_tok, (void*)d_wt_out,
+                    (void*)d_ord, (void*)d_run, (void*)d_slot_col, (void*)d_tiles,
+                    (void*)d_counts, (void*)d_status, (void*)d_bg, (void*)d_bu,
+                    (void*)d_bydn, (void*)d_pref_slab, (void*)d_pref_src})
       (void)hipFree(p);
   }
 
