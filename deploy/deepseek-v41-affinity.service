@@ -1,5 +1,5 @@
 [Unit]
-Description=Affinity Server (DeepSeek-V4.1-Flash-1017 Uncensored, 512k ctx, Dual R9700 ROCm 7.14)
+Description=Affinity Server (DeepSeek-V4.1-Flash-1017 Uncensored, 512k ctx, Dual R9700 ROCm 10.1 v5.0.0)
 After=network.target
 
 [Service]
@@ -8,6 +8,7 @@ TimeoutStartSec=300
 ExecStartPre=-/usr/bin/docker stop deepseek-affinity
 ExecStartPre=-/usr/bin/docker rm deepseek-affinity
 ExecStart=/usr/bin/docker run --name deepseek-affinity \
+    --security-opt label=disable \
     --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
     --cpuset-cpus=0-23,48-71 \
     -e AFF_ENGRAM_WARM=1 \
@@ -18,17 +19,23 @@ ExecStart=/usr/bin/docker run --name deepseek-affinity \
     -e AFF_DRAFT_HEAD_INT4=1 \
     -e AFF_CACTUS_DELTA=0.35 \
     -e AFF_CACTUS_CAP_R=0.5 \
+    -e AFF_CACTUS_ESCAPE=0.25 \
     -e AFF_RESIDENT_BIAS=0.008 \
     -e AFF_MOE_RECON_TILES=32 \
     -e AFF_PREFETCH_RING=0 \
     -e AFF_NOBUDGET_MAX_TOKENS=16384 \
+    -e AFF_HC_FUSED_V2=1 \
+    -e AFF_HC_CHAINED=1 \
+    -e AFF_HC_CHAINED_MIN_ROWS=1 \
+    -e AFF_SPARSE_INDEXER=1 \
+    -e AFF_INDEXER_SCORE_BUDGET_MB=36 \
     -p 8000:8000 \
     -v /mnt/fast-storage:/mnt/fast-storage \
-    -v /home/ydj/affinity-patched/affinity:/opt/affinity-src/build/affinity:ro \
-    affinity:v41-vision \
+    deepseek-affinity:v5.0.0 \
     -m /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.aff \
     --tokenizer /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json \
     --host 0.0.0.0 --port 8000 \
+    --raw-completions \
     --gpu-headroom-mib 384 \
     --dspark on \
     --dspark-model /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.dspark.aff \
@@ -45,6 +52,9 @@ ExecStart=/usr/bin/docker run --name deepseek-affinity \
     --placement-save /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/placement.affprof \
     --prefill-chunk-size 2816 \
     --default-effort 75 \
+    --repeat-penalty 1.1 \
+    --repeat-last-n 96 \
+    --dry-delta 40 \
     --max-tokens-floor 0
 ExecStop=/usr/bin/docker stop deepseek-affinity
 Restart=always

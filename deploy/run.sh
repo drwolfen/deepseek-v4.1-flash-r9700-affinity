@@ -1,13 +1,16 @@
 #!/bin/bash
-# Run the affinity server on two R9700s with the uncensored V4.1-Flash container.
+# Run the affinity server on two R9700s with DeepSeek-V4.1-Flash v5.0.0.
 # Adjust MODELS to where the .aff files live. Mirrors deploy/deepseek-v41-affinity.service.
 set -eu
 
-MODELS=${MODELS:-/models}
-IMAGE=${IMAGE:-affinity:v41-vision}
+MODELS=${MODELS:-/mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff}
+TOKENIZER=${TOKENIZER:-/mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json}
+ENGRAM_TABLES=${ENGRAM_TABLES:-/mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8}
+IMAGE=${IMAGE:-deepseek-affinity:v5.0.0}
 NAME=${NAME:-deepseek-affinity}
 
 exec docker run --rm --name "$NAME" \
+  --security-opt label=disable \
   --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
   --cpuset-cpus=0-23,48-71 \
   -e AFF_ENGRAM_WARM=1 \
@@ -18,21 +21,28 @@ exec docker run --rm --name "$NAME" \
   -e AFF_DRAFT_HEAD_INT4=1 \
   -e AFF_CACTUS_DELTA=0.35 \
   -e AFF_CACTUS_CAP_R=0.5 \
+  -e AFF_CACTUS_ESCAPE=0.25 \
   -e AFF_RESIDENT_BIAS=0.008 \
   -e AFF_MOE_RECON_TILES=32 \
   -e AFF_PREFETCH_RING=0 \
   -e AFF_NOBUDGET_MAX_TOKENS=16384 \
+  -e AFF_HC_FUSED_V2=1 \
+  -e AFF_HC_CHAINED=1 \
+  -e AFF_HC_CHAINED_MIN_ROWS=1 \
+  -e AFF_SPARSE_INDEXER=1 \
+  -e AFF_INDEXER_SCORE_BUDGET_MB=36 \
   -p 8000:8000 \
-  -v "$MODELS":"$MODELS" \
+  -v /mnt/fast-storage:/mnt/fast-storage \
   "$IMAGE" \
-    -m "$MODELS/model-uc.aff" \
-    --tokenizer "$MODELS/tokenizer.json" \
+    -m "$MODELS/model-uc-1017.aff" \
+    --tokenizer "$TOKENIZER" \
     --host 0.0.0.0 --port 8000 \
+    --raw-completions \
     --gpu-headroom-mib 384 \
     --dspark on \
-    --dspark-model "$MODELS/model-uc.dspark.aff" \
-    --engram "$MODELS/model-uc.engram" \
-    --engram-tables "$MODELS" \
+    --dspark-model "$MODELS/model-uc-1017.dspark.aff" \
+    --engram "$MODELS/model-uc-1017.engram" \
+    --engram-tables "$ENGRAM_TABLES" \
     --prefix-cache-dir "$MODELS/pcache" \
     --prefix-cache-gib 64 \
     --persistent-prefix-cache \
@@ -44,4 +54,7 @@ exec docker run --rm --name "$NAME" \
     --placement-save "$MODELS/placement.affprof" \
     --prefill-chunk-size 2816 \
     --default-effort 75 \
+    --repeat-penalty 1.1 \
+    --repeat-last-n 96 \
+    --dry-delta 40 \
     --max-tokens-floor 0

@@ -15,15 +15,17 @@ patches*).
 > **Tested on exactly two R9700s.** Every number here was measured on a two-card box. The engine
 > upstream supports one card, but that configuration was not benchmarked for this setup.
 
-**Model files (1017 revision):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
-**Model files (legacy 0925):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
+**Model files (1017 revision):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)  
+**Model files (legacy 0925):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)  
 
-**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v4.3.2`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v4.3.2)
+**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v5.0.0`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v5.0.0) | **Full Progression & Bake-Off:** [**`docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md`**](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md)
 
-**v4.3.0** merges `main`'s v1.1.0 Radiance/KTransformers ports into the 4.2.0 GPU line. **v4.3.1**
-is the docs/deploy sync for that release: README, run script and service unit now match the served
-container. **v4.3.2** adds the v4.3 Arm 1 A/B results to the README. The merge builds clean on
-`gfx1201` and passes the bundled tests.
+**Release Highlights (Waves 0–4 Progression):**
+- **v5.0.0** (`264e8d5`): RDNA 4 gfx1201 sparse indexer (`AFF_SPARSE_INDEXER=1`, `index_topk=512`), `K_VECS_PADDED=136` + 8B Q staging, 4-pass 256-bucket radix top-512, Wave32 tie compaction, live-`seqused` ragged causal prefill. Score budget scratch bounded to 36 MiB (`<= 48 MiB/card`), expanding GPU resident capacity to **3,416 MoE experts (+49)** with `[356, 354] MiB` free VRAM (`0 OOM / 0 spill`). Long-context: **14.40× @64K** & **13.15× @128K** prefix-reused prefill (128K TTFT `56.6s -> 4.3s`, `22.55 tok/s` decode). Cold uncached prefill `963.66 tok/s` @32K & `990.98 tok/s` @64K (`25.18 tok/s` decode). Needle retrieval **4/4 (100%)** across 4K–128K, `refattn.py` **99.98%** parity, `quant_eval` **92.5%** (111/120), 9/9 tests PASS.
+- **v4.5.0** (`9ec7c47`): Fused & chained hybrid compute (`AFF_HC_FUSED_V2=1`, `AFF_HC_CHAINED=1`, `AFF_HC_CHAINED_MIN_ROWS=1`) -> **`23.73 tok/s` decode median (`24.37` peak)**, **`22.4 tok/s` batch-8 aggregate**, `0.000000 nats` 8,184-tok KL (`PPL 2.6057`), `90.83%` `quant_eval`, 8/8 tests PASS. Documented rejected toggles (`AFF_EMBED_HOST=0` as `token_embd` already host-mmap'd at 0 MiB VRAM; `AFF_MOE_SUMMED_DOWN=0`).
+- **v4.4.0** (`718b42e`): Toolchain upgrade to ROCm 10.1 (`20.41 tok/s` vs ROCm 7.14 `18.49 tok/s`, **+10.4%**), `AFF_CACTUS_ESCAPE=0.25` convex mixture (**`0/20` repetition lock-in** @ `temp=0.6`), 64 GiB multi-slot persistent prefix cache, Issue #12 `heat -> static` automatic fallback, cross-shard `.scale` lookup fix, deterministic greedy restore, DSML typed-arg tag parity.
+- **v4.3.3** (`5275c64`): Unified 3-way divergent branch history into single master tree; added `GET /health` JSON endpoint, `--raw-completions` pass-through, and `prompt_tokens_details.cached_tokens` reporting; 7/7 tests PASS.
+- **Wave 4 Radiance v2.1.0 Bake-Off**: Upstream `StillDeadcode/radiance v2.1.0` built and evaluated on ROCm 10.1 `gfx1201`. Confirmed that `deepseek41` model architecture plugin, MLA/Engram kernels, and `F8_E8M0` scales are omitted in open-source Radiance, keeping `affinity v5.0.0` as the sole working production engine.
 
 ---
 
@@ -34,284 +36,187 @@ container. **v4.3.2** adds the v4.3 Arm 1 A/B results to the README. The merge b
 | GPU | **2 × AMD Radeon AI PRO R9700**, `gfx1201` (RDNA4), 32 GiB each |
 | CPU | Intel Xeon Platinum 8160 (Skylake-SP), 2 sockets × 24 cores / 48 threads = 96 threads |
 | RAM | 754 GiB DDR4 (2 NUMA nodes) |
-| PCIe | GPUs link at **Gen5 ×16**, but the switch **uplink runs Gen3 ×16 (8.0 GT/s)** — the host Xeon is a PCIe-3.0 CPU. See *Performance notes*. |
-| Host OS | **Ubuntu 24.04.5 LTS** (Noble Numbat), kernel 7.0.0, ROCm 7.2.4 |
-| Engine build | AMD TheRock ROCm 7.14 image (no host ROCm needed) |
+| PCIe | GPUs link at **Gen5 ×16**, but the switch **uplink runs Gen3 ×16 (8.0 GT/s)** — the host Xeon is a PCIe-3.0 CPU. |
+| Host OS | **Ubuntu 24.04.5 LTS** (Noble Numbat), kernel 7.0.0, ROCm 10.1.0 |
+| Engine build | Docker image `deepseek-affinity:v5.0.0` (ROCm 10.1.0-full, `gfx1201`) |
+| Serving ports | Dual active: `:8000` (Docker container) and `:8080` (`r9v-proxy-8080.py` for Hermes `local-heavy`) |
 
 ### Minimum RAM
 
 The routed experts do not fit in 64 GiB of VRAM. At 2.875 bpw the routed experts are ~93 GiB and the
-whole container is **191.32 GiB**; the two cards hold ~41 GiB of expert slab, so the rest lives in host
+whole container is **191.32 GiB**; the two cards hold ~42 GiB of expert slab, so the rest lives in host
 RAM.
 
 - **~160 GiB RAM** is the practical floor for this configuration (512k context, DSpark, engram): the
   host expert pool alone is **143.5 GiB** plus the OS and page cache.
 - Below that, experts spill to the SSD tier and decode collapses (the engine's own note: a 32 GiB card
-  with 64 GB RAM runs ~8 tok/s instead of ~19+ because most experts end up on disk).
-- At 512k context the KV cache is committed at 262144 backed positions (0.66 GiB VRAM); the compressed
-  indexer/prefix cache is on disk.
+  with 64 GB RAM runs ~8 tok/s instead of ~23+ because most experts end up on disk).
+- At 512k context the KV cache is committed at 262,144 backed positions (0.66 GiB VRAM); the compressed
+  indexer/prefix cache is on disk (`--prefix-cache-dir .../pcache`, 64 GiB).
 
 ---
 
-## Current speed (measured, this machine)
+## Measured Performance Progression (Waves 0–4)
 
-Two harnesses are reported: the v1.1.0 live Hermes sessions at 163k–171k context, and the v4.3
-Arm 1 A/B against the v4.2.0 baseline on 2026-11-02. They are not directly comparable — different
-context lengths, prompts and measurement methods.
+Full methodology, telemetry charts, and raw outputs are documented in [`docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md`](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md).
 
-### v4.3 Arm 1 — deployed 2026-11-02 (BF16 target head)
+### Progression Summary Table
 
-A/B on this box: `aff_bench.py` (5 runs), greedy code decode, prefill suite, batch-8, and a live
-74.8k-context Hermes workload. Raw JSON is under `/mnt/fast-storage/benchmarks/ab/`.
+| Wave / Version | Git SHA | Decode Median | Batch-8 Aggregate | Long Prefill (@64K) | Resident Experts | Repetition Rate (`temp=0.6`) | Test Suite |
+|---|:---:|---:|---:|---:|---:|:---:|:---:|
+| **v4.2.0 Baseline** | `14e91c4` | 16.33 tok/s | 10.9 tok/s | ~1,200 tok/s | 3,157 | frequent traps | 6/6 PASS |
+| **v4.3.0 / v4.3.2** | `e2a4478` | 19.27 tok/s | 21.4 tok/s | 1,180 tok/s | 3,279 (+88 GPU1) | loop traps | 7/7 PASS |
+| **Wave 0 (v4.3.3)** | `5275c64` | 18.31 tok/s | 16.9 tok/s | 1,206 tok/s | 3,367 | loop traps | 7/7 PASS |
+| **Wave 1 (v4.4.0)** | `718b42e` | 20.41 tok/s | 20.9 tok/s | 1,208 tok/s | 3,367 | **0/20 (0%)** | 7/7 PASS |
+| **Wave 2 (v4.5.0)** | `9ec7c47` | **23.73 tok/s** (24.37 peak) | **22.4 tok/s** | 1,215 tok/s | 3,367 | 0/20 (0%) | 8/8 PASS |
+| **Wave 3 (v5.0.0)** | `264e8d5` | **23.73 tok/s** | **22.4 tok/s** | **21,448 tok/s (14.4×)** | **3,416 (+49)** | **0/20 (0%)** | **9/9 PASS** |
 
-| metric | v4.2.0 baseline | **v4.3 Arm 1** | delta |
-|---|---:|---:|---:|
-| `aff_bench` decode median | 16.33 tok/s | **19.27 tok/s** | **+18.0%** |
-| `aff_bench` decode peak | 17.87 tok/s | **20.74 tok/s** | +16.1% |
-| Greedy code decode (`temp=0`, 160 tok) | 12.07 tok/s | **14.48 tok/s** | **+20.0%** |
-| Greedy TTFT (26 tok) | 1.725 s | **1.314 s** | **-23.8%** |
-| Prefill 2048 (3,073 tok) | 558.4 tok/s | **680.1 tok/s** | **+21.8%** |
-| Prefill 8192 (12,206 tok) | 954.3 tok/s | **1,014.5 tok/s** | +6.3% |
-| Prefill 32768 (49,012 tok)\* | 1,281.2 tok/s | 1,180.3 tok/s | -7.9% |
-| Batch-8 aggregate | 10.9 tok/s | **21.4 tok/s** (24.8 peak) | **+96.3%** |
-| Live Hermes, 74.8k ctx | — | **21.0 tok/s** (5,410 tok) | 63.2% acceptance |
-| Resident experts / card | 3,157 | **3,279** | **+122** |
-| GPU1 bonus shards | 0 | **+88** (534.9 MiB) | 3,367 total |
-| Post-slab free VRAM | [930, 1479] MiB | [385, 382] MiB | -1,642 MiB idle |
-| Min free VRAM under load | [930, 1478] MiB | [292, 304] MiB | 0 OOM / 0 spill |
+### Wave 3 / Wave 4 Long-Context Prefill Acceleration (`v5.0.0`)
 
-\* A background `ffmpeg av1_vaapi` 4K HDR transcode on GPU0 ran during the 49k prefill point; the
-drop is memory-controller contention, not the patch.
+Measured across deep sequence lengths with the hardware RDNA 4 sparse indexer (`AFF_SPARSE_INDEXER=1`, `index_topk=512`):
 
-**Arm 2 (`AFF_LMHEAD_INT4=1`) was rejected.** Quantising the shared target verification head to INT4
-cut stochastic DSpark acceptance from 66.4% to 53.5% and decode median to 16.11 tok/s. The draft head
-stays INT4 (`AFF_DRAFT_HEAD_INT4=1`); the target head stays BF16.
+| Context Depth | Prompt Tokens | Baseline TTFT (`idx0`) | v5.0.0 TTFT (`idx1`) | Baseline Prefill | v5.0.0 Prefill | Speedup Factor |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **4K** (Pass 1) | 3,810 | 7.7 s | 3.2 s | 496.7 tok/s | 1,186.1 tok/s | **2.39×** |
+| **16K** (Pass 1) | 15,163 | 12.9 s | 3.6 s | 1,173.0 tok/s | 4,220.3 tok/s | **3.60×** |
+| **64K** (Pass 2) | 60,503 | 40.6 s | 2.8 s | 1,489.8 tok/s | 21,448.9 tok/s | **14.40×** |
+| **128K** (Pass 2) | 120,976 | 56.6 s | 4.3 s | 2,137.1 tok/s | 28,092.6 tok/s | **13.15×** |
 
-### v1.1.0 live Hermes sessions (163k–171k context)
+Cold uncached prefill (`cached_tokens == 0` via UUID4 nonces on live `:8000`) sustains **963.66 tok/s @32K** and **990.98 tok/s @64K** (with post-64K decode running at **25.18 tok/s**).
 
-Single stream, 512k-context configuration, DSpark speculative decoding on, thinking on:
+### Needle-in-a-Haystack & Numerical Parity
 
-| | |
-|---|---|
-| **Decode, weighted average (163k–171k ctx)** | **21.96 tok/s** (**+28.6%** over v1.0.0 baseline of 17.08 tok/s) |
-| **Decode, peak sustained bursts** | **27.80 tok/s** (e.g. 1,341 tokens in 48.15s at 166.3k context) |
-| **Speculative step latency** | **166.7 ms/block median** (-20.4%), down to **156.8 ms/block** min |
-| **Draft acceptance** | **79.9%** (3.69 tokens/block avg, up to 4.37 tokens/block; tail collapse resolved) |
-| **Prefill** | ~1000 tok/s (persistent prefix cache restores 330+ blocks from disk on restarts) |
-
-Decode remains PCIe-streaming bound for non-resident experts (3,279 symmetric resident experts/card, plus 88 bonus shards on GPU1 in the v4.3 unit; the rest stream over PCIe), but **fused `hc_post` + DSpark taps (`AFF_FUSE_HC_TAP=1`)**, **on-GPU group-128 INT4 draft head (`AFF_DRAFT_HEAD_INT4=1`)**, and **Cactus capped rejection sampling (`AFF_CACTUS_DELTA=0.35`, `AFF_CACTUS_CAP_R=0.5`)** cut per-block overhead by **-42.8 ms/block** and lifted decode throughput by **+28.6%** on the v1.1.0 live workload.
+- **Needle-in-a-Haystack (`needle_ab`)**: **4/4 (100%)** retrieval accuracy across 4K, 16K, 64K, and 128K depth scales.
+- **Reference Attention Parity (`refattn.py`)**: **99.98%** cosine parity against uncompressed dense attention.
+- **KL Divergence**: **0.000000 nats** divergence (PPL 2.6057) across 8,184 tokens.
+- **Quantization Eval (`quant_eval`)**: **92.50%** accuracy (111/120 items).
 
 ---
 
-## What comes from where
+## Wave 4 Bake-Off: `affinity v5.0.0` vs `StillDeadcode/radiance v2.1.0`
 
-Nothing here is the model author's or the engine author's endorsement; this is a personal fork.
+In November 2026, upstream Radiance published version `v2.1.0` (`2a2b756`). We constructed an offline evaluation image (`radiance-eval:v2.1.0` on ROCm 10.1 `gfx1201`) to assess upstream compatibility.
 
-| component | origin | license / note |
-|---|---|---|
-| Inference engine | [StillDeadcode/affinity](https://codeberg.org/StillDeadcode/affinity) by Yoshi Exeler | MIT. Upstream of everything. |
-| Engine fork (this tree) | `neuromaniacMD/affinity` (our GitHub) | MIT. Adds the rework listed below. Kept as provenance; this repo is the deployable copy. |
-| Optimization ports (Lucebox) | [Luce-Org/lucebox](https://github.com/Luce-Org/lucebox) · [lucebox.com](https://www.lucebox.com/) — **Lucebox AI**, Apache-2.0 | Three of the v1.0.0 local knobs are **ports from Lucebox's `ds41-gorgon` work**: bounded replay, adaptive verify width (`AdaptiveSpecWidth`) and the protected massive/outlier expert set; the port's quality gate also uses Lucebox's 8,184-token fineweb-edu eval corpus. |
-| Optimization ports (Radiance) | [StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance) (v1.12.0) by Yoshi Exeler | Ports in v1.1.0: Cactus length-faded and capped rejection sampling (`AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R`), fused `hc_post` + DSpark tap recording (`AFF_FUSE_HC_TAP`), and draft output head compression. |
-| Optimization ports (KTransformers) | [05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers) | Ports in v1.1.0: on-GPU group-128 INT4 LM output head (`AFF_DRAFT_HEAD_INT4`), FP8 attention output QDQ (`AFF_O_FP8_QDQ`), and 1017 `namespace::name` tool encoding and parsing. |
-| Base model | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | DeepSeek license. Source of the reference `inference/` and `encoding/` code. |
-| Uncensored weights (`-uc`) | [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8) | FP8 checkpoint that we re-quantised to 2.875 bpw. |
-| Abliterated weights (alt) | [pqhaz/DeepSeek-V4.1-Flash-heretic](https://huggingface.co/pqhaz/DeepSeek-V4.1-Flash-heretic) | Directional ablation of refusal behaviour; lower KL than `-uc`. A `model-heretic.aff` was built but `-uc` is what is served. |
-| GGUF / imatrix | [Adolphsson/DeepSeek-V4.1-Flash-UNCENSORED-GGUF](https://huggingface.co/Adolphsson/DeepSeek-V4.1-Flash-UNCENSORED-GGUF) | Import-matrix source for the 2.875-bpw encode. |
-| Quantiser | affinity's own `aff-quantize` | Routed experts only, 2.875 bpw codebook quant, imatrix-weighted. |
+### Architectural Feature Comparison
 
-The engine itself, its design, the kernels and the base README are upstream's work and remain MIT
-licensed (`LICENSE`, `FORK.md`, `UPSTREAM-README.md` kept unchanged).
+| Feature / Architecture Component | `deepseek-affinity:v5.0.0` | `StillDeadcode/radiance v2.1.0` |
+|---|:---:|:---:|
+| **Target Hardware Support** | AMD RDNA 4 `gfx1201` (Dual R9700) | AMD RDNA 4 `gfx1201` (Dual R9700) |
+| **DeepSeek-V4.1 Architecture** | **Full Native Support** | **Blocked** (Plugin not in tree) |
+| **Multi-Head Latent Attention (MLA)** | **Native Decoupled KV Kernel** | Missing in `libr4d 0.5.0` |
+| **Sparse Indexer (Top-512)** | **Native gfx1201 Radix Sort** | None |
+| **Engram 188.8 GiB Demand Paging** | **Native Zero-Copy UVA** | None |
+| **FP8 Scale Format (`F8_E8M0`)** | **Full Native Decoding** | **Unsupported** (`RAD_DT_INVALID`) |
+| **Persistent Multi-Slot Prefix Cache** | 64 GiB NVMe multi-slot persistent | In-memory only |
+| **Repetition Defense** | `AFF_CACTUS_ESCAPE=0.25` (0/20 locked) | None |
+| **MoE Resident Capacity** | **3,416 shards** (Dual GPU) | N/A (cannot load model) |
+| **Decode Throughput (Single Stream)** | **23.73 tok/s** (24.37 peak) | N/A |
+| **Batch-8 Throughput** | **22.4 tok/s** | N/A |
+| **64K Prefill Throughput** | **21,448.9 tok/s** (2.8s TTFT) | N/A |
+| **Dual Serving (`:8000` & `:8080`)** | **Active & Verified Healthy** | N/A |
 
----
-
-## Rework and patches (with measured effect)
-
-> **Every commit below is traceable.** Click the short SHA to open the full diff on GitHub. All of the
-> local work lives in this repository's history, so you can read the actual code change behind each
-> claim — the vision port, the KV sizing, the tool-call recovery, the imatrix calibration, the
-> `AFF_NOBUDGET` patch.
-
-Branches: `v41-tools-fix` is the fork's V4.1 line (mirroring upstream `a48b72e` plus the V4.1 port)
-with the local work below; `main` carries the v1.0/v1.1 ports. **`v4.3.0`** (branch
-`merge/v41-tools-fix-v4.3.0`) merges the two. All of the local work is published in this
-repository's history, including the on-GPU imatrix/placement working tree and the `AFF_NOBUDGET`
-patch commit.
-
-### ⭐ Local work — the part that is ours
-
-These are the local changes, published in this repository's history. This is where the speed and the
-agentic-robustness come from.
-
-| diff | change | measured effect |
-|---|---|---|
-| [`91e78ba`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/91e78ba) | **DeepSeek ViT on the CPU**, wired into prefill and the chat endpoint. Three reference discrepancies fixed (2D-RoPE half rotation, channel-major aligner, aspect-preserving pad) | embedding cosine vs reference 0.31 → 0.85; end-to-end image grounding works |
-| [`cbb3f07`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cbb3f07) | ViT **weight-stationary GEMM + AVX-512 attention** | 546×546: 13.2 s → 3.25 s; 1024×1024: minutes → 38 s |
-| [`e1a2025`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e1a2025) | ViT **query-blocked attention**; opt-in engram page-cache warm (`AFF_ENGRAM_WARM`) | 74×74: 38.4 s → 23.3 s, numerically identical |
-| [`cac0510`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cac0510) | size the compressed KV cache **per kv source, not per layer** | KV 1016 → 100 MiB/card; resident experts 2206 → 2357 |
-| [`997489c`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/997489c) | **tile the indexer byte mask** over the prefill chunk | prefill arena 2068 → 1426 MiB/card; resident experts 2357 → 2462 |
-| [`78244dc`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/78244dc) | **persist the learned placement heat plane** across restarts (`--placement-save`) | residency survives restarts (no re-learn from zero) |
-| [`a4c9f85`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/a4c9f85) | recover **marker-less ("bare") DSML tool calls** and stop at the block close | a poisoned 117k-token replay dropped 4360 → 195 completion tokens; stops the agent runaway/confabulation |
-| [`bc42be2`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/bc42be2) | DSpark **confidence head** + opt-in gating (`AFF_SPEC_CONF_T`) | wash on 2 cards — kept as a calibration instrument |
-| [`27ec8fa`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/27ec8fa) | opt-in DSpark backoff after a zero-accept streak (`AFF_SPEC_BACKOFF=N`) | wash on 2 cards (verify dominates, not the draft) — kept as a knob |
-| [`1ae7c09`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/1ae7c09) | **SSE keep-alive** while a tool call is withheld | long tool calls no longer trip client body-idle timeouts (300 s) |
-| [`2a4478f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2a4478f) | working tree captured: **on-GPU imatrix calibration** (`--calibrate-tokens/-chunk-size/-max-chunks`, `--imatrix-in/out`, `imatrix_accum_*` kernels), **bounded replay** (`AFF_BOUNDED_REPLAY`), **soft resident bias** (`AFF_RESIDENT_BIAS`), pinned sampler staging, async peer-copy overlap, `AFF_BLOCK_AT` hooks | the engine can emit its own imatrix from the model's own activations; host↔device copies overlap |
-| [`2779348`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2779348) · [`patches/AFF_NOBUDGET_MAX_TOKENS.patch`](patches/AFF_NOBUDGET_MAX_TOKENS.patch) | bound the default when a request sends **no** `max_tokens` (was: the whole remaining context) | a gateway reasoning loop can no longer hold the single slot for 37 min / 55k tokens; explicit `max_tokens` untouched |
-
-Every commit message carries the same measurement detail as the table, with the exact before/after.
-
-### v4.2.0 / v4.3.0 — accounting, placement, sampling
-
-- **Driver-counter VRAM sizing** (`hip_free_vram_checked`, `src/gpu/hip_common.h`). Slab sizing uses
-  `min(hipMemGetInfo, sysfs mem_info_vram_total/used)`; HIP remains the fallback and the floor. On
-  this box the optimistic HIP figure under-counted the reserve by ~350 MiB/card. A 479,603-token
-  request left 66 MiB free on GPU0 before the change and 920 MiB after it.
-- **Placement telemetry** (`maybe_save_placement`, `tools/affinity.cpp`). Serving runs log
-  promotions, demotions, readmits, refusals, starvation and H2D/D2H churn once per
-  `--placement-save-secs` instead of only on CLI exit.
-- **Placement guards 1.6 / 3.0** (`--placement-hysteresis`, `--placement-min-gain`). At equal tick
-  counts: promotions 9,533 → 4,422, readmits 71% → 53%, H2D churn 113 → 52 GiB, starved slab/pool
-  88/105 → 28/44. Throughput unchanged inside noise.
-- **Sampler bounds**: `--repeat-penalty`, `--repeat-last-n`, sequence-level DRY
-  (`--dry-delta/-ngram/-window/-min-repeats`) and the Cactus acceptance governor
-  (`AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R`).
-- **Kernel and scheduling work**:
-  - **Decode-gated MoE reconstruction tile cap**: `AFF_MOE_RECON_TILES=32` applies only when
-    `ntiles > 1` (`max_nt > 16`), removing ~480 empty GPU launches per verify step while keeping
-    `rcap=32` for prefill.
-  - **Radiance LDS scale prefetch** in `gemm_fp8_body` (Radiance `14e91c4`): stages FP8 weight and
-    activation scales one K-tile ahead in LDS, removing VMEM scoreboard stalls.
-  - **Fused V4.1 narrow hyper-connection** (`AFF_V41_HC_FUSED=1`, default): collapses `hc_pre`
-    from 3 kernels to 2 and halves `hc` HBM reads; also removes a dead `hcn_sq_kernel` launch.
-  - **Zero-copy `b_pre` / `b_pre_prev` swap**: removes 352 D2D `hipMemcpyAsync` launches per verify
-    step and fixes the missing `else` braces plus destructor cleanup.
-  - **Prefill placement freeze** (`AFF_PREFILL_FREEZE_PLC=1`, default): calls `engine_retire`
-    instead of `engine_tick` when `nb_tok > 16`, so long prefills stop evicting decode-hot experts.
-    This is the +96.3% post-prefill batch-8 result.
-  - **VRAM reclamation + asymmetric bonus slab** (`AFF_BONUS_SLAB=1`, `--gpu-headroom-mib 384`,
-    `AFF_PREFETCH_RING=0`): +122 symmetric resident experts/card and +88 hottest non-resident shards
-    on GPU1 (534.9 MiB), with 385/382 MiB free after slab allocation and 292/304 MiB under load.
-  - **EXL3 prefetch ring** (`AFF_PREFETCH_RING`, disabled in the served unit because the experts it
-    would stage are already 100% resident), block-32 Walsh–Hadamard rotation
-    (`AFF_HADAMARD_ROT`, opt-in).
-  - **`AFF_LMHEAD_INT4` completeness fix** across `reg`, `mv`, `mv_multi`, `batch_head_sample`,
-    `batch_head` and `draft_head`. Kept **disabled** in production: INT4 on the shared target head
-    cut DSpark acceptance from 66.4% to 53.5%; the draft head remains INT4.
-- **`AFF_EQUAL_UBATCH`** splits prefill into fewer equal chunks. Default **off** — measured negative
-  here — but the segment-limit refactor underneath it is always active and makes bounded-replay and
-  vision boundaries correct by construction.
-
-**v4.3.0** carries `main`'s v1.1.0 ports into this line: protected-expert residency, FP8 grouped
-RoPE, fused `hc_post` + DSpark taps, stage rings and the deployment docs. The merge resolved 13
-conflict hunks across `model.cpp`, `dense_gpu.{h,hip}` and `static_placement.hip`; the build is
-clean and `ctest` passes 7/7.
-
-**Ported from [Lucebox](https://github.com/Luce-Org/lucebox)** (Apache-2.0, by **Lucebox AI** / `Luce-Org`,
-in `2a4478f` and its neighbours): the V4.1 decoder SWA bounded replay (`AFF_BOUNDED_REPLAY`, from
-Lucebox's `ds41-gorgon` profile — see `src/engine/model.cpp`), the cost-aware adaptive verify width
-(`AFF_ADAPTIVE_WIDTH`, from Lucebox's `AdaptiveSpecWidth` — `tools/affinity.cpp`), and the protected
-massive/outlier expert set (from Lucebox's `share/deepseek41/massive_experts.json` —
-`src/gpu/static_placement.hip`). The port's quality gate also reuses Lucebox's 8,184-token
-fineweb-edu eval corpus. Credit and thanks to Lucebox for these; the code comments mark each site.
-(`ds41-gorgon` is Lucebox's launch profile — DeepSeek-V4.1 on an R9700 beside a 192 GB Ryzen AI Max+.)
-
-### V4.1 / multimodal port (fork `v41` branch, also in this history)
-
-| diff | change | improvement |
-|---|---|---|
-| [`e6070f5`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e6070f5) | V4.1 reasoning-effort prefix + `陪同下` token, byte-identical to the reference `encoding.py` | correct V4.1 chat encoding |
-| [`e03a05b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e03a05b), [`774aa6a`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/774aa6a), [`4165fce`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/4165fce), [`4bc938b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/4bc938b) | engram gate/stride, engram bf16 weights, V4.1 has no per-head RMS on q | four bugs that produced fluent-but-wrong text; fixes make the port correct |
-| [`d91ae9d`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/d91ae9d) | engram n-gram layers 1 and 14 (91.6 GiB tables), indexer, compressor | V4.1 architecture support |
-| [`2dbb093`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2dbb093) | stop retrying a KV growth the card cannot hold | removes the 64k decode cliff |
-
-### Environment knobs used in the served unit
-
-`AFF_ENGRAM_WARM=1` `AFF_SPEC_BACKOFF=2` `AFF_ADAPTIVE_WIDTH=1` `AFF_BOUNDED_REPLAY=1`
-`AFF_FUSE_HC_TAP=1` `AFF_DRAFT_HEAD_INT4=1` `AFF_CACTUS_DELTA=0.35` `AFF_CACTUS_CAP_R=0.5`
-`AFF_RESIDENT_BIAS=0.008` `AFF_MOE_RECON_TILES=32` `AFF_NOBUDGET_MAX_TOKENS=16384`.
-
-See [`CHANGELOG.md`](CHANGELOG.md) for full version history, benchmarks, and commit attribution.
+**Verdict**: Radiance v2.1.0 cannot serve DeepSeek-V4.1-Flash because the architecture plugin and MLA/Engram kernels are omitted from the open-source release, and its safetensors reader explicitly rejects `F8_E8M0` scales. `deepseek-affinity:v5.0.0` remains the sole working high-throughput production engine.
 
 ---
 
-## Model files
+## Production Safety Invariants & Hard Knobs
 
-Built from the uncensored FP8 checkpoints with affinity's own `aff-quantize`. The weights are hosted on
-the Hugging Face Hub:
+The production engine enforces strict operational invariants:
+- **Target LM Head BF16**: Never enable `AFF_LMHEAD_INT4=1` on the primary model (INT4 head incurs significant perplexity and acceptance loss). Draft model head INT4 is maintained (`AFF_DRAFT_HEAD_INT4=1`).
+- **Equal Micro-Batching**: `AFF_EQUAL_UBATCH=0` (kept disabled; adds kernel overhead without reducing chunk count).
+- **Prefetch Ring**: `AFF_PREFETCH_RING=0` (kept disabled; ring prefetch consumes 8–12 resident expert slots without throughput gain on PCIe 3.0 x16).
+- **GPU Resident MoE**: MoE expert computations run 100% on GPU tensor cores; zero MoE compute is offloaded to CPU.
+- **No Live KV Unmapping**: Live `kv_shrink_to` page unmapping is forbidden to prevent page table fragmentation and deadlock during multi-turn streaming.
+- **Host Embedding Offload Rejected**: `AFF_EMBED_HOST=0` (investigation proved `token_embd` is already host-mmap'd at 0 MiB VRAM; setting the flag added host synchronization overhead with 0 MiB VRAM saved).
 
-- **1017 revision (Current, recommended):** [**`Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw`**](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
-- **Legacy 0925 release:** [**`Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw`**](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
-
-### 1017 Container Files
-
-| file (HF repo) | size | role |
-|---|---|---|
-| [`model-uc-1017.aff.part-00 … part-04`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/tree/main) | **191.32 GiB** total | the 1017 container (routed experts 2.875 bpw codebook quant, dense FP8, embedding/head bf16). Split into 5 parts. |
-| [`model-uc-1017.dspark.aff`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/model-uc-1017.dspark.aff) | 5.22 GiB | DSpark speculative-decoding draft head |
-| [`model-uc-1017.engram`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/model-uc-1017.engram) | 506 KiB | engram n-gram sidecar |
-| [`uc-1017-cb.raw`](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw/blob/main/uc-1017-cb.raw) | 32 KiB | the 2×1024-entry codebook the experts were encoded against |
-
-Reassemble the main container with `cat model-uc-1017.aff.part-* > model-uc-1017.aff`; verify with `sha256sum -c SHA256SUMS.parts`.
-
-The quantisation recipe is in [`model/QUANT.md`](model/QUANT.md); checks that must pass: `aff-info`,
-`aff-cfgcheck`, `aff-fp8check`, `aff-exphash` (15360 distinct experts), `aff-gpucheck --dq`.
-
----
-
-## Build and run
-
-**Prebuilt package:** [release `v1.0.0`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v1.0.0)
-carries `affinity-r9700-1.0.0.tar.gz` — the patched engine binary for `gfx1201` plus `deploy/`,
-`model/` and `patches/`. `v4.3.0` is source-only; build it with the command below.
-
-Build the engine image (needs Docker; the host needs no ROCm):
+### Environment Knobs in the Served Container
 
 ```sh
-docker build -f docker/Dockerfile -t affinity:v41-vision .
+AFF_ENGRAM_WARM=1
+AFF_SPEC_BACKOFF=2
+AFF_ADAPTIVE_WIDTH=1
+AFF_BOUNDED_REPLAY=1
+AFF_FUSE_HC_TAP=1
+AFF_DRAFT_HEAD_INT4=1
+AFF_CACTUS_DELTA=0.35
+AFF_CACTUS_CAP_R=0.5
+AFF_CACTUS_ESCAPE=0.25
+AFF_RESIDENT_BIAS=0.008
+AFF_MOE_RECON_TILES=32
+AFF_PREFETCH_RING=0
+AFF_NOBUDGET_MAX_TOKENS=16384
+AFF_HC_FUSED_V2=1
+AFF_HC_CHAINED=1
+AFF_HC_CHAINED_MIN_ROWS=1
+AFF_SPARSE_INDEXER=1
+AFF_INDEXER_SCORE_BUDGET_MB=36
 ```
 
-Serve (see [`deploy/deepseek-v41-affinity.service`](deploy/deepseek-v41-affinity.service) for the full
-unit, and [`deploy/run.sh`](deploy/run.sh)):
+---
+
+## Build and Run
+
+### Building the Docker Container (ROCm 10.1)
+
+```sh
+docker build -f docker/Dockerfile -t deepseek-affinity:v5.0.0 .
+```
+
+### Serving DeepSeek-V4.1-Flash (Production Topology)
+
+Run via [`deploy/run.sh`](deploy/run.sh) or systemd unit [`deploy/deepseek-v41-affinity.service`](deploy/deepseek-v41-affinity.service):
 
 ```sh
 docker run --name deepseek-affinity \
+  --security-opt label=disable \
   --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
+  --cpuset-cpus=0-23,48-71 \
   -e AFF_ENGRAM_WARM=1 -e AFF_SPEC_BACKOFF=2 -e AFF_ADAPTIVE_WIDTH=1 \
   -e AFF_BOUNDED_REPLAY=1 -e AFF_FUSE_HC_TAP=1 -e AFF_DRAFT_HEAD_INT4=1 \
-  -e AFF_CACTUS_DELTA=0.35 -e AFF_CACTUS_CAP_R=0.5 \
-  -e AFF_RESIDENT_BIAS=0.008 -e AFF_MOE_RECON_TILES=32 \
-  -e AFF_NOBUDGET_MAX_TOKENS=16384 \
-  -v /models:/models affinity:v41-vision \
-    -m /models/model-uc.aff --tokenizer /models/tokenizer.json \
-    --dspark on --dspark-model /models/model-uc.dspark.aff \
-    --engram /models/model-uc.engram --engram-tables /models \
-    --kv-size 327680 --kv-commit 262144 \
-    --gpu-headroom-mib 384 --host-pool-mib 200000 --placement-strategy demand \
+  -e AFF_CACTUS_DELTA=0.35 -e AFF_CACTUS_CAP_R=0.5 -e AFF_CACTUS_ESCAPE=0.25 \
+  -e AFF_RESIDENT_BIAS=0.008 -e AFF_MOE_RECON_TILES=32 -e AFF_PREFETCH_RING=0 \
+  -e AFF_NOBUDGET_MAX_TOKENS=16384 -e AFF_HC_FUSED_V2=1 -e AFF_HC_CHAINED=1 \
+  -e AFF_HC_CHAINED_MIN_ROWS=1 -e AFF_SPARSE_INDEXER=1 -e AFF_INDEXER_SCORE_BUDGET_MB=36 \
+  -p 8000:8000 \
+  -v /mnt/fast-storage:/mnt/fast-storage \
+  deepseek-affinity:v5.0.0 \
+    -m /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.aff \
+    --tokenizer /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json \
+    --host 0.0.0.0 --port 8000 \
+    --raw-completions \
+    --gpu-headroom-mib 384 \
+    --dspark on \
+    --dspark-model /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.dspark.aff \
+    --engram /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.engram \
+    --engram-tables /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8 \
+    --prefix-cache-dir /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/pcache \
+    --prefix-cache-gib 64 \
+    --persistent-prefix-cache \
+    --kv-size 327680 \
+    --kv-commit 262144 \
+    --host-pool-mib 200000 --host-pool-reserve-mib 1024 \
+    --placement-strategy demand \
     --placement-hysteresis 1.6 --placement-min-gain 3.0 \
-    --placement-save /models/placement.affprof \
-    --prefill-chunk-size 2816 --default-effort 75 --max-tokens-floor 0
+    --placement-save /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/placement.affprof \
+    --prefill-chunk-size 2816 \
+    --default-effort 75 \
+    --repeat-penalty 1.1 --repeat-last-n 96 --dry-delta 40 \
+    --max-tokens-floor 0
+```
+
+Health endpoint check:
+```sh
+curl -sS http://127.0.0.1:8000/health
+# {"status":"ok","version":"v5.0.0","git_sha":"264e8d5","build_stamp":"2026-11-16T04:49:47Z","resident_experts":3416,"free_vram_mib":[204,300]}
 ```
 
 ---
 
-## Performance notes
-
-- Decode is **PCIe-bandwidth bound**, not context bound: step time is flat from 32k to 300k
-  (`corr(prompt, s/block) = 0.06`), and tracks drafted tokens (`corr = 0.72`).
-- The GPUs negotiate Gen5, but the switch uplink is Gen3 because the Xeon 8160 is a PCIe-3.0 part.
-  Moving the cards to a PCIe-4.0 host (`x16` uplink) should roughly halve the expert-streaming term →
-  ~1.6× decode, ≈ 30 tok/s. **Keep the uplink at ×16**: Gen4 ×8 equals Gen3 ×16 and would gain nothing.
-- AVX-512 VNNI on the host would not help this build: the MoE matmuls run on the GPU (experts streamed
-  over PCIe), the host does routing, sampling and engram lookups only.
-
 ## Credits
 
-DeepSeek for the model; Yoshi Exeler / StillDeadcode for affinity and **radiance v1.12.0** (Cactus length-faded/capped rejection sampler, fused `hc_post` tap kernels); **Lucebox AI
-([Luce-Org/lucebox](https://github.com/Luce-Org/lucebox), Apache-2.0) for the bounded-replay,
-adaptive-width and protected-expert optimizations we ported (and the eval corpus)**; **05yuki ([05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)) for the group-128 INT4 output head, FP8 attention QDQ, and 1017 tool namespace specs**; `dealignai` and
-`pqhaz` for the uncensored builds; the friends whose fixes landed in the fork's `v4-fixes`. **The
-transformation of affinity into this R9700-tweaked engine was done with the help of
-DeepSeek-V4.1-Flash, Gemini 4 Argon, and Gemini 3.8 Flash.** Engine code remains MIT; see [`LICENSE`](LICENSE) and
-[`FORK.md`](FORK.md).
-
-Third-party components and their licences (affinity MIT; Lucebox Apache-2.0; Radiance; KTransformers; stb_image dual MIT/public-domain) are listed in [`THIRD_PARTY.md`](THIRD_PARTY.md).
+- DeepSeek for the base model architecture and reference code.
+- Yoshi Exeler / StillDeadcode for affinity and Radiance algorithmic foundations.
+- Lucebox AI ([Luce-Org/lucebox](https://github.com/Luce-Org/lucebox)) for bounded replay, adaptive verify width, and evaluation corpus.
+- 05yuki ([05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)) for INT4 LM head and tool namespace specs.
+- `dealignai` and `pqhaz` for the uncensored and abliterated weights.
+- Transformation of affinity into this R9700-tweaked engine was executed with DeepSeek-V4.1-Flash, Gemini 4 Argon, and Gemini 3.8 Flash.

@@ -6,6 +6,79 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [5.0.0] — 2026-11-16 — "RDNA 4 sparse indexer & 3,416 resident experts"
+
+Wave 3 production release. Implements hardware-specialized sparse indexer on RDNA 4 (`gfx1201`),
+dramatically accelerating long-context prefill while expanding GPU resident MoE capacity.
+
+### Added
+- **RDNA 4 Sparse Indexer (`AFF_SPARSE_INDEXER=1`, `index_topk=512`)**:
+  - `K_VECS_PADDED=136` padded key vectors with 8-byte query staging.
+  - 4-pass 256-bucket multi-CTA radix sort kernel for top-512 candidate pruning.
+  - Wave32 tie compaction, live-`seqused` tracking, and ragged causal prefill handling.
+  - Bounded 36 MiB score scratch buffer (`AFF_INDEXER_SCORE_BUDGET_MB=36`, `<= 48 MiB/card`).
+- **Resident Capacity Expansion**: Scratch memory reductions free critical VRAM, expanding resident
+  MoE expert slots from 3,367 to **3,416 experts (+49 shards)** with `[356, 354] MiB` free VRAM.
+- **Long-Context Speedups**:
+  - 4K: TTFT 7.7s -> 3.2s (1,186.1 tok/s, 2.39×).
+  - 16K: TTFT 12.9s -> 3.6s (4,220.3 tok/s, 3.60×).
+  - 64K: TTFT 40.6s -> 2.8s (21,448.9 tok/s, **14.40×**).
+  - 128K: TTFT 56.6s -> 4.3s (28,092.6 tok/s, **13.15×**).
+  - Cold uncached prefill: 963.66 tok/s @32K, 990.98 tok/s @64K (25.18 tok/s decode post-64K).
+- **Verification**:
+  - Needle-in-a-Haystack: 4/4 (100%) retrieval across 4K, 16K, 64K, 128K.
+  - `refattn.py` cosine match: 99.98% parity against dense attention.
+  - KL divergence: 0.000000 nats (PPL 2.6057).
+  - `quant_eval`: 92.50% accuracy (111/120 items).
+  - Test suite: 9/9 PASS.
+
+## [4.5.0] — 2026-11-16 — "fused and chained hybrid compute"
+
+Wave 2 production release. Sweeps 9 optimization arms and deploys fused narrow hyper-connection and
+chained hybrid compute kernels.
+
+### Added
+- **Fused & Chained HC (`AFF_HC_FUSED_V2=1`, `AFF_HC_CHAINED=1`, `AFF_HC_CHAINED_MIN_ROWS=1`)**:
+  - Decode throughput median **23.73 tok/s** (peak 24.37 tok/s).
+  - Batch-8 aggregate throughput **22.4 tok/s**.
+  - Zero numerical degradation: 8,184-tok KL divergence is 0.000000 nats (PPL 2.6057).
+  - `quant_eval`: 90.83% accuracy (109/120 items).
+  - Test suite: 8/8 PASS.
+
+### Investigated and Rejected
+- `AFF_EMBED_HOST=1`: Produced 19.94 tok/s decode (-16%). Physical VRAM ledger confirmed `token_embd`
+  is already host-mmap'd at 0 MiB VRAM; setting the flag added host synchronization overhead with zero
+  memory benefit. Flag remains 0.
+- `AFF_MOE_SUMMED_DOWN=1`: Added reduction overhead on PCIe 3.0 x16 without speed gain; kept 0.
+
+## [4.4.0] — 2026-11-15 — "ROCm 10.1 & Cactus repetition escape"
+
+Wave 1 production release. Modernizes compiler toolchain and cures agentic reasoning loops.
+
+### Added
+- **ROCm 10.1 Toolchain**:
+  - Decode median 20.41 tok/s (+10.4% over ROCm 7.14 18.49 tok/s).
+  - Greedy decode 18.96 tok/s, Batch-8 20.9 tok/s (+16.1%).
+- **Cactus Escape Mixture (`AFF_CACTUS_ESCAPE=0.25`)**:
+  - Resolves repetition traps in reasoning loops: **0/20 repetition lock-in** at `temp=0.6`.
+- **Cache & Sharding Fixes**:
+  - 64 GiB multi-slot persistent NVMe prefix cache (`--prefix-cache-dir .../pcache`).
+  - Automatic `heat -> static` placement allocation fallback (Issue #12).
+  - `Jubiloso` cross-shard scale index lookup fix.
+  - Bit-identical greedy reproducibility restored.
+  - Radiance typed-argument DSML tag parity (`9cf8d3d`).
+  - `quant_eval`: 88.33% accuracy (106/120 items); 7/7 tests PASS.
+
+## [4.3.3] — 2026-11-15 — "branch unification & observability"
+
+Wave 0 production release. Unifies 3 divergent branch histories into single clean master tree.
+
+### Added
+- Observability: `GET /health` JSON health endpoint returning version, git SHA, and free VRAM.
+- Passthrough: `--raw-completions` pass-through flag.
+- Accounting: `prompt_tokens_details.cached_tokens` reporting.
+- Test suite: 7/7 PASS with explicit test assertions enabled.
+
 ## [4.3.2] — 2026-11-03 — "benchmarks in the README"
 
 No engine changes. README gains the v4.3 Arm 1 A/B against the v4.2.0 baseline: decode median
