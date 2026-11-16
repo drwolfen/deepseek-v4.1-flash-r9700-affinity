@@ -295,6 +295,7 @@ if(AFF_HIP)
     aff_hip_test(test_gpu_ports gpu_ports)
     aff_hip_test(test_wmma wmma)
     aff_hip_test(test_wave2_kernels wave2_kernels)
+    aff_hip_test(test_v41_indexer test_v41_indexer)
   endif()
 
   # ---- benches ----------------------------------------------------------------------------------

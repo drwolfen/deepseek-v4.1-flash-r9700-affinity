@@ -3396,6 +3396,17 @@ void DenseGpu::mvg(int32_t h, const float* x, uint32_t n_groups, uint64_t group_
 // Every entry point here is a plural of one above it; where a comment there explains why a step
 // exists, it is not repeated.
 
+static size_t indexer_score_budget_bytes() {
+  const char* v = std::getenv("AFF_INDEXER_SCORE_BUDGET_MB");
+  uint32_t mb = 36; // Default 36 MiB keeping total scratch <= 48-64 MiB per card
+  if (v && *v) {
+    int val = std::atoi(v);
+    if (val > 0) mb = (uint32_t)val;
+  }
+  if (mb > 64) mb = 64; // Strict cap at 64 MiB to guarantee >= 200 MiB free VRAM headroom
+  return (size_t)mb << 20;
+}
+
 bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_head,
                           uint32_t width, uint32_t max_mid, uint32_t vocab, uint32_t index_topk,
                           std::string* err) {
@@ -3505,8 +3516,9 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
     b_allow_dense_ = !(flash_ok && index_topk && index_topk <= kAdmCap);
     if (a_maxcomp_) {
       const size_t row = (size_t)a_maxcomp_ * sizeof(float);
+      const size_t budget = indexer_score_budget_bytes();
       const uint32_t tile = b_allow_dense_ ? nb
-                          : (uint32_t)std::min<uint64_t>(nb, std::max<uint64_t>(1, ((size_t)256 << 20) / row));
+                          : (uint32_t)std::min<uint64_t>(nb, std::max<uint64_t>(1, budget / row));
       if (!hip_try(hipMalloc(&D.b_allow, (size_t)tile * a_maxcomp_), "hipMalloc batch masks", err))
         return false;
     }
@@ -4130,9 +4142,9 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
   // The score plane is the only buffer here that scales with CONTEXT as well as the chunk —
   // [tokens][every candidate compressed row] — so it is capped rather than sized. Below the budget
   // nothing changes (one tile, one pass of batch_indexer's loop); above it the chunk is tiled.
-  // 256 MiB keeps the tile at the full 1536 up to 128K context, and gives 256 tokens a tile at 1M
-  // against 1.50 GiB untiled.
-  const size_t kScoreBudget = (size_t)256 << 20;
+  // 36 MiB keeps per-card scratch strictly <= 64 MiB and preserves >= 200 MiB free VRAM headroom
+  // on production cards at 128K-262K context.
+  const size_t kScoreBudget = indexer_score_budget_bytes();
   const size_t row = (size_t)a_maxcomp_ * sizeof(float);
   i_tile_ = (uint32_t)std::min<size_t>(cap, std::max<size_t>(1, row ? kScoreBudget / row : cap));
   if (hipMalloc(&D.i_sc, (size_t)i_tile_ * row) != hipSuccess) return false;

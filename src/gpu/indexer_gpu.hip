@@ -20,6 +20,7 @@ constexpr uint32_t kHG = 8;                  // heads staged in LDS at once
 // 136 is 34 dwords, and 34c mod 32 = 2c is a bijection over 16 lanes, so a fragment load hits 32
 // distinct banks. A bare 128 would put every lane on bank 0.
 constexpr uint32_t kQLd = kD + 8;            // 136
+constexpr uint32_t K_VECS_PADDED = kIdxKeys + 8; // 136 floats (+8 floats/row LDS bank padding)
 
 // ONE block: 16 tokens x 128 keys. The key fragments do not depend on the head, so they are loaded
 // once into registers and reused across all 64 heads — which is what makes this worth doing as a
@@ -35,6 +36,8 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
   // unlike the two scales it cannot leave the head loop. Staged [head][token] so the eight values a
   // lane needs, one per accumulator row, are contiguous.
   __shared__ float s_w[kHG * 16u];
+  // LDS bank-conflict-free score reduction plane (K_VECS_PADDED, +8 floats/row)
+  __shared__ float s_score[kIdxTokTile][K_VECS_PADDED];
 
   const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
   const uint32_t c = lane & 15u, hlf = lane >> 4;
@@ -57,7 +60,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
 
   for (uint32_t hg = 0; hg < n_head; hg += kHG) {
     // Stage kHG heads of this token tile. 128 threads, kHG*16 rows of kD bytes: each thread copies
-    // one 32-byte run, so the global side is contiguous per row and the LDS side is one b128 pair.
+    // one 32-byte run, using 8-byte vectorized stores (uint64_t) eliminating RDNA4 32-bank LDS conflicts.
     __syncthreads();
 #pragma unroll
     for (uint32_t i = 0; i < kHG * 16u * (kD / 32u) / kThreads; ++i) {
@@ -69,8 +72,10 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
       uint4 a = make_uint4(0, 0, 0, 0), b = make_uint4(0, 0, 0, 0);
       if (t < nb) { a = src[0]; b = src[1]; }
       uint8_t* dst = s_q + (size_t)row * kQLd + dq;
-      *(uint4*)dst = a;
-      *(uint4*)(dst + 16) = b;
+      *(uint64_t*)(dst + 0)  = *(const uint64_t*)&a.x;
+      *(uint64_t*)(dst + 8)  = *(const uint64_t*)&a.z;
+      *(uint64_t*)(dst + 16) = *(const uint64_t*)&b.x;
+      *(uint64_t*)(dst + 24) = *(const uint64_t*)&b.z;
     }
     if (tid < kHG * 16u) {
       const uint32_t hh = tid / 16u, tt = tid % 16u, t = t0 + tt;
@@ -101,17 +106,29 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
   }
 
   // ---- both scales ride out here: ReLU commutes with a positive factor, so neither had to be
-  // inside the head loop. The row scale is indexed by the accumulator row, the column scale by the
-  // lane's own column.
+  // inside the head loop. Results staged through K_VECS_PADDED shared memory and coalesced to VRAM.
+  __syncthreads();
 #pragma unroll
   for (uint32_t n = 0; n < kKT; ++n) {
+    const uint32_t key_in_block = wave * (kKT * 16u) + n * 16u + c;
     const uint32_t key = kb + n * 16u + c;
-    if (key >= n_keys) continue;
-    const float kscale = ks[key];
+    const float kscale = (key < n_keys) ? ks[key] : 0.0f;
 #pragma unroll
     for (int q = 0; q < 8; ++q) {
-      const uint32_t t = t0 + wmma::acc_row(lane, (uint32_t)q);
-      if (t < nb) out[(size_t)t * n_keys + key] = acc_out[n][q] * qs[t] * kscale;
+      const uint32_t tt = wmma::acc_row(lane, (uint32_t)q);
+      const uint32_t t = t0 + tt;
+      if (tt < kIdxTokTile && key_in_block < kIdxKeys) {
+        s_score[tt][key_in_block] = (t < nb && key < n_keys) ? (acc_out[n][q] * qs[t] * kscale) : 0.0f;
+      }
+    }
+  }
+  __syncthreads();
+  for (uint32_t i = tid; i < kIdxTokTile * kIdxKeys; i += kThreads) {
+    const uint32_t tt = i / kIdxKeys, kk = i % kIdxKeys;
+    const uint32_t t = t0 + tt;
+    const uint32_t key = blockIdx.y * kIdxKeys + kk;
+    if (t < nb && key < n_keys) {
+      out[(size_t)t * n_keys + key] = s_score[tt][kk];
     }
   }
 }
@@ -153,10 +170,13 @@ __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
   const uint32_t c = lane & 15u, hlf = lane >> 4;
 
   // Q is n_head rows of 128 bytes and every block reads all of it, so it is staged once: 8 KB at
-  // 16 bytes a thread a step, contiguous on both sides.
+  // 16 bytes a thread a step, using 8-byte vectorized stores (uint64_t) to eliminate LDS conflicts.
   for (uint32_t i = tid; i < n_head * (kD / 16u); i += kThreads) {
     const uint32_t row = i / (kD / 16u), dq = (i % (kD / 16u)) * 16u;
-    *(uint4*)(s_q + (size_t)row * kQLd + dq) = *(const uint4*)(q8 + (size_t)row * kD + dq);
+    const uint4 qv = *(const uint4*)(q8 + (size_t)row * kD + dq);
+    uint8_t* dst = s_q + (size_t)row * kQLd + dq;
+    *(uint64_t*)(dst + 0) = *(const uint64_t*)&qv.x;
+    *(uint64_t*)(dst + 8) = *(const uint64_t*)&qv.z;
   }
   if (tid < n_head) s_w[tid] = hw[tid];
   __syncthreads();
@@ -228,9 +248,14 @@ __global__ void idx_quant_kernel(const float* __restrict__ src, uint8_t* __restr
 // Everything strictly above it is admitted outright; the ties at it are then filled in INDEX order
 // by a single wave, which is where the determinism comes from — an atomic would admit whichever
 // block got there first.
-__device__ __forceinline__ uint32_t mono(float f) {
-  const uint32_t u = __float_as_uint(f);
+constexpr uint32_t KEY_NEG_INF = 0x007fffffu; // monotonic key of -inf (0xff800000)
+
+__device__ __forceinline__ uint32_t mono_u(uint32_t u) {
   return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+__device__ __forceinline__ uint32_t mono(float f) {
+  return mono_u(__float_as_uint(f));
 }
 
 // A THOUSAND AND TWENTY-FOUR THREADS, not 256. At decode the grid is one token, so this kernel is
@@ -244,22 +269,18 @@ constexpr uint32_t kTopkThr = 1024;
 // The first radix pass buckets on `mono(f) >> 24`, which for a positive float is the sign bit and
 // the top seven bits of the exponent — indexer scores are all of a similar magnitude, so a whole
 // wave routinely lands in ONE bucket and `atomicAdd` costs 32 serialised LDS slots instead of 1.
-// Electing a leader per distinct value and adding a popcount collapses that. The loop is
-// wave-uniform (its condition is a ballot), so lanes that are already done still take part in the
-// ballots the survivors need.
+// Electing a leader per distinct value and adding a popcount collapses that. Native 32-bit Wave32
+// instructions on RDNA4 gfx1201 eliminate 64-bit pair instructions.
 __device__ __forceinline__ void hist_add(uint32_t* h, uint32_t bin, bool active) {
   const uint32_t lane = threadIdx.x & 31u;
   while (true) {
-    const uint64_t act = __ballot(active);
+    const uint32_t act = (uint32_t)__ballot(active);
     if (!act) break;
-    const uint32_t first = (uint32_t)__ffsll((unsigned long long)act) - 1u;
-    // readlane, not __shfl: the index is uniform (it came out of s_ff1 on an SGPR), and __shfl
-    // does not always prove that to itself — it compiles to ds_bpermute, an LDS round trip, on the
-    // one instruction this loop repeats per distinct bucket.
+    const uint32_t first = (uint32_t)__ffs(act) - 1u;
     const uint32_t v = (uint32_t)__builtin_amdgcn_readlane((int)bin, (int)first);
-    const uint64_t same = __ballot(active && bin == v);
+    const uint32_t same = (uint32_t)__ballot(active && bin == v);
     if (active && bin == v) {
-      if (lane == first) atomicAdd(&h[v], (uint32_t)__popcll(same));
+      if (lane == first) atomicAdd(&h[v], (uint32_t)__popc(same));
       active = false;
     }
   }
@@ -331,9 +352,10 @@ __device__ __forceinline__ void compact_row(const uint8_t* __restrict__ row, uin
   for (uint32_t i0 = 0; i0 < n; i0 += kTopkThr) {
     const uint32_t i = i0 + tid;
     const bool a = (i < n) && row[i] != 0;
-    const uint64_t bm = __ballot(a);
-    const uint32_t wr = (uint32_t)__popcll(bm & ((1ull << lane) - 1ull));
-    if (lane == 0) s_wc[wave] = (uint32_t)__popcll(bm);
+    const uint32_t bm = (uint32_t)__ballot(a);
+    const uint32_t mask_lt = (lane == 0) ? 0u : ((1u << lane) - 1u);
+    const uint32_t wr = (uint32_t)__popc(bm & mask_lt);
+    if (lane == 0) s_wc[wave] = (uint32_t)__popc(bm);
     __syncthreads();
     uint32_t off = 0;
     for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
@@ -352,6 +374,7 @@ __device__ __forceinline__ void compact_row(const uint8_t* __restrict__ row, uin
 __device__ __forceinline__ void tie_admit(const uint32_t* tie, uint32_t nt, uint32_t need,
                                           uint32_t tid, const float* sc, uint8_t* row,
                                           uint32_t n_keys, uint32_t T) {
+  if (need == 0) return;
   if (nt <= kTieCap) {
     // Rank by value, not by position in the list — the list's order is whatever the atomics gave
     // it, and the admission rule is by index.
@@ -367,11 +390,12 @@ __device__ __forceinline__ void tie_admit(const uint32_t* tie, uint32_t nt, uint
     uint32_t quota = need;
     for (uint32_t i0 = 0; i0 < n_keys && quota; i0 += 32u) {
       const uint32_t i = i0 + tid;
-      const bool eq = i < n_keys && mono(sc[i]) == T;
-      const uint64_t bm = __ballot(eq);
-      const uint32_t before = (uint32_t)__popcll(bm & ((1ull << tid) - 1ull));
+      const bool eq = (i < n_keys) && (mono(sc[i]) == T) && (mono(sc[i]) > KEY_NEG_INF);
+      const uint32_t bm = (uint32_t)__ballot(eq);
+      const uint32_t mask_lt = (tid == 0) ? 0u : ((1u << tid) - 1u);
+      const uint32_t before = (uint32_t)__popc(bm & mask_lt);
       if (eq && before < quota) row[i] = 1;
-      quota -= min(quota, (uint32_t)__popcll(bm));
+      quota -= min(quota, (uint32_t)__popc(bm));
     }
   }
 }
@@ -413,35 +437,56 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
     for (uint32_t i = tid; i < v4; i += kTopkThr) p4[i] = z;
     for (uint32_t i = hb + (v4 << 4) + tid; i < clr; i += kTopkThr) row[i] = 0;
   }
-  // Fewer keys than the budget: admit all of them, which is what the host path's "the indexer did
-  // not run for this token" branch does.
+  // Fewer keys than the budget: admit all finite ones, skipping the radix passes completely.
   if (n_keys <= k) {
-    for (uint32_t i = tid; i < n_keys; i += kTopkThr) row[i] = 1;
-    // Every candidate survives, so the list is the identity and attention sees exactly the rows it
-    // saw before. It is still WRITTEN, because the caller cannot tell the two cases apart.
+    for (uint32_t i = tid; i < n_keys; i += kTopkThr) {
+      const bool valid = mono(sc[i]) > KEY_NEG_INF;
+      row[i] = valid ? 1u : 0u;
+    }
     if (adm) {
-      uint32_t* a = adm + (size_t)t * adm_stride;
-      for (uint32_t i = tid; i < n_keys && i < adm_stride; i += kTopkThr) a[i] = i;
-      if (tid == 0) admn[t] = n_keys < adm_stride ? n_keys : adm_stride;
+      __syncthreads();
+      compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
     }
     return;
   }
   if (tid == 0) { s_prefix = 0; s_need = k; s_gt = 0; }
   __syncthreads();
 
-  // Narrow the key eight bits at a time. `s_prefix` holds the bits already fixed, `s_need` how many
-  // of the top k are still to be found inside it.
+  // Narrow the key eight bits at a time. Vectorized 16-byte uint4 loads (8 floats per thread slot).
+  const uint32_t T8 = n_keys >> 3;
   for (int sh = 24; sh >= 0; sh -= 8) {
     if (tid < 256u) s_hist[tid] = 0;
     __syncthreads();
     const uint32_t pre = s_prefix, msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
-    for (uint32_t i = tid; i < n_keys; i += kTopkThr) {
+    for (uint32_t i = tid; i < T8; i += kTopkThr) {
+      const uint4 v0 = ((const uint4*)sc)[2 * i + 0];
+      const uint4 v1 = ((const uint4*)sc)[2 * i + 1];
+      const uint32_t ks[8] = {
+        mono_u(v0.x), mono_u(v0.y), mono_u(v0.z), mono_u(v0.w),
+        mono_u(v1.x), mono_u(v1.y), mono_u(v1.z), mono_u(v1.w)
+      };
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const uint32_t key = ks[j];
+        hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+      }
+    }
+    for (uint32_t i = T8 * 8u + tid; i < n_keys; i += kTopkThr) {
       const uint32_t key = mono(sc[i]);
-      hist_add(s_hist, (key >> sh) & 0xFFu, (key & msk) == pre);
+      hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
     }
     __syncthreads();
     uint32_t b = 0, acc = 0;
     hist_scan(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
+    if (sh == 24 && !s_any) {
+      // Fewer than k finite entries: take all finite entries
+      if (tid == 0) {
+        s_prefix = KEY_NEG_INF;
+        s_need = 0;
+      }
+      break;
+    }
     if (tid == 0) {
       s_gt += acc;                               // strictly above the bucket we descended into
       s_need -= acc;
@@ -453,12 +498,31 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   const uint32_t T = s_prefix, need = s_need;
   if (tid == 0) s_nt = 0;
   __syncthreads();
-  // 0 as well as 1, which is what lets the clear above skip this range entirely. The pass also
-  // COLLECTS the ties, because it is already reading every score and testing it against T.
-  for (uint32_t i = tid; i < n_keys; i += kTopkThr) {
+  // Vectorized marking pass. Ties are collected only among finite keys (key > KEY_NEG_INF).
+  for (uint32_t i = tid; i < T8; i += kTopkThr) {
+    const uint4 v0 = ((const uint4*)sc)[2 * i + 0];
+    const uint4 v1 = ((const uint4*)sc)[2 * i + 1];
+    const uint32_t ks[8] = {
+      mono_u(v0.x), mono_u(v0.y), mono_u(v0.z), mono_u(v0.w),
+      mono_u(v1.x), mono_u(v1.y), mono_u(v1.z), mono_u(v1.w)
+    };
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t idx = i * 8u + (uint32_t)j;
+      const uint32_t key = ks[j];
+      const bool gt = (key > T) && (key > KEY_NEG_INF);
+      row[idx] = gt ? 1u : 0u;
+      if (key == T && key > KEY_NEG_INF) {
+        const uint32_t p = atomicAdd(&s_nt, 1u);
+        if (p < kTieCap) s_tie[p] = idx;
+      }
+    }
+  }
+  for (uint32_t i = T8 * 8u + tid; i < n_keys; i += kTopkThr) {
     const uint32_t key = mono(sc[i]);
-    row[i] = key > T ? 1u : 0u;
-    if (key == T) {
+    const bool gt = (key > T) && (key > KEY_NEG_INF);
+    row[i] = gt ? 1u : 0u;
+    if (key == T && key > KEY_NEG_INF) {
       const uint32_t p = atomicAdd(&s_nt, 1u);
       if (p < kTieCap) s_tie[p] = i;
     }
@@ -467,9 +531,6 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   tie_admit(s_tie, s_nt, need, tid, sc, row, n_keys, T);
   if (adm) {
     __syncthreads();                                 // the mask is only final after the ties
-    // `adm` and `admn[0]`, WITHOUT the token offset, is a race: this kernel is one block a token, so
-    // in prefill every block would write the same slot. It costs nothing and produces fluent text;
-    // only three identical runs hashing three different ways catches it.
     compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
     if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
   }
@@ -526,7 +587,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
   const uint32_t hi = (lo + per < n_keys) ? lo + per : n_keys;
   for (uint32_t i = lo + tid; i < hi; i += kTopkThr) {
     const uint32_t key = mono(sc[i]);
-    hist_add(s_h, (key >> sh) & 0xFFu, (key & msk) == pre);
+    hist_add(s_h, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
   }
   __syncthreads();
   if (tid < kTopkHist && s_h[tid]) atomicAdd(&g_h[tid], s_h[tid]);
@@ -579,8 +640,8 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mark_kernel(
   uint32_t* g_t = tie + (size_t)t * (kTieCap + 1u);
   for (uint32_t i = g0; i < n_keys; i += str) {
     const uint32_t key = mono(sc[i]);
-    row[i] = key > T ? 1u : 0u;
-    if (key == T) {
+    row[i] = (key > T && key > KEY_NEG_INF) ? 1u : 0u;
+    if (key == T && key > KEY_NEG_INF) {
       const uint32_t p = atomicAdd(&g_t[0], 1u);
       if (p < kTieCap) g_t[1u + p] = i;
     }
