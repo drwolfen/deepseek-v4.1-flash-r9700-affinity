@@ -1,13 +1,13 @@
 #!/bin/bash
-# Run the affinity server on two R9700s with DeepSeek-V4.1-Flash v5.0.0.
+# Run the affinity server on two R9700s with DeepSeek-V4.1-Flash v5.1.0.
 # Adjust MODELS to where the .aff files live. Mirrors deploy/deepseek-v41-affinity.service.
 set -eu
 
-MODELS=${MODELS:-/models/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff}
-TOKENIZER=${TOKENIZER:-/models/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json}
-ENGRAM_TABLES=${ENGRAM_TABLES:-/models/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8}
+MODELS=${MODELS:-/models/DeepSeek-V4.1-Flash-1017-MoonMath-aff}
+TOKENIZER=${TOKENIZER:-/models/LLM-Models/DeepSeek-V4.1-Flash-1017-MoonMath-FP8/tokenizer.json}
+ENGRAM_TABLES=${ENGRAM_TABLES:-/models/LLM-Models/DeepSeek-V4.1-Flash-1017-MoonMath-FP8}
 STORAGE_DIR=${STORAGE_DIR:-/models}
-IMAGE=${IMAGE:-deepseek-affinity:v5.0.0}
+IMAGE=${IMAGE:-deepseek-affinity:v5.1.0}
 NAME=${NAME:-deepseek-affinity}
 
 exec docker run --rm --name "$NAME" \
@@ -32,17 +32,20 @@ exec docker run --rm --name "$NAME" \
   -e AFF_HC_CHAINED_MIN_ROWS=1 \
   -e AFF_SPARSE_INDEXER=1 \
   -e AFF_INDEXER_SCORE_BUDGET_MB=36 \
+  -e AFF_DRAFT_SKIP_MASKED=1 \
+  -e AFF_ATTN_LOOKAHEAD=0 \
+  -e AFF_PCACHE_DELTA=1 \
   -p 8000:8000 \
   -v "$STORAGE_DIR":/models \
   "$IMAGE" \
-    -m "$MODELS/model-uc-1017.aff" \
+    -m "$MODELS/model-moonmath-1017.aff" \
     --tokenizer "$TOKENIZER" \
     --host 0.0.0.0 --port 8000 \
     --raw-completions \
     --gpu-headroom-mib 384 \
     --dspark on \
-    --dspark-model "$MODELS/model-uc-1017.dspark.aff" \
-    --engram "$MODELS/model-uc-1017.engram" \
+    --dspark-model "$MODELS/model-moonmath-1017.dspark.aff" \
+    --engram "$MODELS/model-moonmath-1017.engram" \
     --engram-tables "$ENGRAM_TABLES" \
     --prefix-cache-dir "$MODELS/pcache" \
     --prefix-cache-gib 64 \
