@@ -9,8 +9,8 @@ quantisation recipe, and the measurements, all captured on one machine. It exist
 combination that produced the numbers below can be rebuilt.
 
 The affinity engine was transformed into this **R9700-tweaked version with the help of
-DeepSeek-V4.1-Flash and Gemini 4 Argon** (used to port, patch and tune the engine — see *Rework and
-patches*).
+DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, and Gemini 3.8 Flash**
+(used to port, patch and tune the engine — see *Rework and patches*).
 
 > **Tested on exactly two R9700s.** Every number here was measured on a two-card box. The engine
 > upstream supports one card, but that configuration was not benchmarked for this setup.
@@ -113,9 +113,58 @@ In November 2026, upstream Radiance published version `v2.1.0` (`2a2b756`). We c
 | **Decode Throughput (Single Stream)** | **23.73 tok/s** (24.37 peak) | N/A |
 | **Batch-8 Throughput** | **22.4 tok/s** | N/A |
 | **64K Prefill Throughput** | **21,448.9 tok/s** (2.8s TTFT) | N/A |
-| **Dual Serving (`:8000` & `:8080`)** | **Active & Verified Healthy** | N/A |
 
 **Verdict**: Radiance v2.1.0 cannot serve DeepSeek-V4.1-Flash because the architecture plugin and MLA/Engram kernels are omitted from the open-source release, and its safetensors reader explicitly rejects `F8_E8M0` scales. `deepseek-affinity:v5.0.0` remains the sole working high-throughput production engine.
+
+---
+
+## Rework and patches (with measured effect)
+
+> **Every commit below is traceable.** Click the short SHA to open the full diff on GitHub. All of the
+> local work lives in this repository's history, so you can read the actual code change behind each
+> claim — the vision port, the KV sizing, the tool-call recovery, the imatrix calibration, the
+> `AFF_NOBUDGET` patch, the hyper-connection kernels, and the RDNA4 `gfx1201` sparse attention indexer.
+
+All historical lines (`v1.0.0`, `v1.1.0`, `v41-tools-fix`, `merge/v41-tools-fix-v4.3.0`, and Waves 0–4 through `v5.0.0`) are unified in `main`.
+
+### ⭐ Local work & engine updates (`v1.0.0` → `v5.0.0`)
+
+These are the local changes and backports published in this repository's history, ordered chronologically from initial bring-up through `v5.0.0`:
+
+| diff | change | measured effect |
+|---|---|---|
+| [`91e78ba`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/91e78ba) | **DeepSeek ViT on the CPU**, wired into prefill and the chat endpoint. Three reference discrepancies fixed (2D-RoPE half rotation, channel-major aligner, aspect-preserving pad) | embedding cosine vs reference 0.31 → 0.85; end-to-end image grounding works |
+| [`cbb3f07`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cbb3f07) | ViT **weight-stationary GEMM + AVX-512 attention** | 546×546: 13.2 s → 3.25 s; 1024×1024: minutes → 38 s |
+| [`e1a2025`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e1a2025) | ViT **query-blocked attention**; opt-in engram page-cache warm (`AFF_ENGRAM_WARM`) | 74×74: 38.4 s → 23.3 s, numerically identical |
+| [`cac0510`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cac0510) | size the compressed KV cache **per kv source, not per layer** | KV 1016 → 100 MiB/card; resident experts 2206 → 2357 |
+| [`997489c`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/997489c) | **tile the indexer byte mask** over the prefill chunk | prefill arena 2068 → 1426 MiB/card; resident experts 2357 → 2462 |
+| [`78244dc`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/78244dc) | **persist the learned placement heat plane** across restarts (`--placement-save`) | residency survives restarts (no re-learn from zero) |
+| [`a4c9f85`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/a4c9f85) | recover **marker-less ("bare") DSML tool calls** and stop at the block close | a poisoned 117k-token replay dropped 4360 → 195 completion tokens; stops agent runaway/confabulation |
+| [`bc42be2`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/bc42be2) | DSpark **confidence head** + opt-in gating (`AFF_SPEC_CONF_T`) | wash on 2 cards — kept as a calibration instrument |
+| [`27ec8fa`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/27ec8fa) | opt-in DSpark backoff after a zero-accept streak (`AFF_SPEC_BACKOFF=N`) | wash on 2 cards (verify dominates, not the draft) — kept as a knob |
+| [`1ae7c09`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/1ae7c09) | **SSE keep-alive** while a tool call is withheld | long tool calls no longer trip client body-idle timeouts (300 s) |
+| [`2a4478f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2a4478f) | **on-GPU imatrix calibration** (`--calibrate-tokens/-chunk-size/-max-chunks`, `--imatrix-in/out`, `imatrix_accum_*` kernels), **bounded replay** (`AFF_BOUNDED_REPLAY`), **soft resident bias** (`AFF_RESIDENT_BIAS`), pinned sampler staging, async peer-copy overlap, `AFF_BLOCK_AT` hooks | engine emits its own imatrix from the model's activations; host↔device copies overlap |
+| [`2779348`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2779348) · [`patches/AFF_NOBUDGET_MAX_TOKENS.patch`](patches/AFF_NOBUDGET_MAX_TOKENS.patch) | bound the default when a request sends **no** `max_tokens` (was: the whole remaining context) | runaway reasoning request can no longer hold a slot for 37 min / 55k tokens; explicit `max_tokens` untouched |
+| [`154eb2b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/154eb2b) | **`v1.1.0` Radiance & KTransformers ports**: fused `hc_post` + DSpark tap (`AFF_FUSE_HC_TAP`), on-GPU group-128 INT4 draft head (`AFF_DRAFT_HEAD_INT4`), FP8 attention output QDQ (`AFF_O_FP8_QDQ`), Cactus capped rejection (`AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R`), 1017 `namespace::name` tool parsing | decode 17.08 → 21.96 tok/s (+28.6%) @163k–171k ctx; step latency -42.8 ms/block |
+| [`23ec996`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/23ec996), [`6c77094`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/6c77094), [`308638e`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/308638e) | coalesced TR `MT=1` sub-tile loads + decode-gated **`AFF_MOE_RECON_TILES=32`** L2 slicing; opt-in EXL3 block-32 Walsh–Hadamard rotation (`AFF_HADAMARD_ROT`) and device-planned prefetch ring (`AFF_PREFETCH_RING`) | removes ~480 empty GPU launches per verify step while keeping `rcap=32` on prefill |
+| [`7fd7a71`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/7fd7a71), [`9e5db70`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/9e5db70), [`1f0d668`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/1f0d668) | **`v4.2.0` VRAM accounting & placement guards**: sysfs-checked `hip_free_vram_checked`, periodic `--placement-save-secs` telemetry (moves/1000 ticks), hysteresis/min-gain `1.6 / 3.0`, HTTP 400 guard on over-long prompts | 479k-token free VRAM 66 → 920 MiB; H2D churn 113 → 52 GiB (-54%); promotions 9,533 → 4,422 |
+| [`026a9b0`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/026a9b0), [`3a06ea1`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/3a06ea1) | **`v4.3.0` GPU line + `v1.1.0` merge**: fused V4.1 narrow `hc_pre` (`AFF_V41_HC_FUSED=1`), LDS FP8 scale prefetch, zero-copy `b_pre` swap, prefill placement freeze (`AFF_PREFILL_FREEZE_PLC=1`), asymmetric GPU1 bonus slab (`AFF_BONUS_SLAB=1`) | decode median 16.33 → 19.27 tok/s (+18.0%); batch-8 10.9 → 21.4 tok/s (+96.3%); resident experts 3,157 → 3,367 |
+| [`21ba484`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/21ba484), [`fa1588b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/fa1588b), [`5275c64`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/5275c64) | **Wave 0 (`v4.3.3`)**: return `finish_reason: "stop"` on premature EOS inside `<think>`; add `GET /health` JSON endpoint, `--raw-completions`, and `cached_tokens` reporting; active release asserts in `test_gpu_ports`; unify 3-way branch divergence | single linearised `main`; clean `<think>` EOS termination; 7/7 tests PASS |
+| [`17682d7`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/17682d7), [`3551e14`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/3551e14), [`34610b4`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/34610b4), [`718b42e`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/718b42e) | **Wave 1 (`v4.4.0`) + ROCm 10.1**: thread-safe multi-slot persistent prefix cache, `heat → static` placement auto-fallback, cross-shard `.scale` quantizer lookup, **Cactus convex escape mixture** (`AFF_CACTUS_ESCAPE=0.25`), V4.1 DSML typed-argument tag parity, bonus-slab `resident_experts` accounting | decode median 18.31 → 20.41 tok/s (+10.4% w/ ROCm 10.1); `temp=0.6` reasoning loop lock-in **0/20 (0%)** |
+| [`f849997`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/f849997), [`bf2ae04`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/bf2ae04), [`cbf07da`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/cbf07da), [`14f149d`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/14f149d), [`9ec7c47`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/9ec7c47) | **Wave 2 (`v4.5.0`)**: fused `hc_read` + pipelined tiled up-mix (`AFF_HC_FUSED_V2=1`), chained multi-row hyper-connection (`AFF_HC_CHAINED=1`, `AFF_HC_CHAINED_MIN_ROWS=1`), scheduler/drafter/KV/TP ports, 8,184-token KL harness (`forward_prefill`); gated off net-negative `AFF_EMBED_HOST` & `AFF_MOE_SUMMED_DOWN` | decode median **20.41 → 23.73 tok/s** (24.37 peak, **+23.1% vs v4.3.2**); batch-8 **22.4 tok/s**; KL **0.000000 nats** (PPL 2.6057); 8/8 tests PASS |
+| [`570e787`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/570e787), [`a02f669`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/a02f669), [`264e8d5`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/264e8d5) | **Wave 3 (`v5.0.0`)**: native RDNA4 `gfx1201` sparse attention indexer (`AFF_SPARSE_INDEXER=1`, `index_topk=512`), `K_VECS_PADDED=136` + 8B Q staging, multi-CTA 4-pass 256-bucket radix top-512, Wave32 tie compaction, live-`seqused` ragged causal prefill, short-seq skip + chunk metadata reuse, 36 MiB score scratch budget | **14.40× @64K** (21,448.9 tok/s, TTFT 40.6 s → 2.8 s) & **13.15× @128K** (28,092.6 tok/s, TTFT 56.6 s → 4.3 s); resident experts **3,367 → 3,416 (+49)**; needle **4/4**, `refattn` **99.98%**, `quant_eval` **92.5%**, 9/9 tests PASS |
+| [`a041faf`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/a041faf) | **Wave 4 bake-off**: offline ROCm 10.1 `gfx1201` build & evaluation of `StillDeadcode/radiance v2.1.0` against `deepseek-affinity:v5.0.0` | verified open-source Radiance omits `deepseek41` plugin, MLA/Engram kernels, and `F8_E8M0` scales; `v5.0.0` retained in production |
+
+### V4.1 / multimodal port (fork `v41` branch, also in this history)
+
+| diff | change | improvement |
+|---|---|---|
+| [`e6070f5`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e6070f5) | V4.1 reasoning-effort prefix + `陪同下` token, byte-identical to the reference `encoding.py` | correct V4.1 chat encoding |
+| [`e03a05b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e03a05b), [`774aa6a`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/774aa6a), [`4165fce`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/4165fce), [`4bc938b`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/4bc938b) | engram gate/stride, engram bf16 weights, V4.1 has no per-head RMS on q | four bugs that produced fluent-but-wrong text; fixes make the port correct |
+| [`d91ae9d`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/d91ae9d) | engram n-gram layers 1 and 14 (91.6 GiB tables), indexer, compressor | V4.1 architecture support |
+| [`2dbb093`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2dbb093) | stop retrying a KV growth the card cannot hold | removes the 64k decode cliff |
+
+See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md`](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md) for full version history, benchmarks, and third-party attributions ([`THIRD_PARTY.md`](THIRD_PARTY.md)).
 
 ---
 
