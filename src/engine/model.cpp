@@ -1050,7 +1050,8 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     // identity-preserving form: on V4 it IS `ratio == 4`.
     static const bool sparse_indexer_on = [] {
       const char* v = std::getenv("AFF_SPARSE_INDEXER");
-      return v && *v && std::strcmp(v, "0") != 0;
+      if (!v || !*v) return true;
+      return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
     }();
     const bool skip_short_seq = sparse_indexer_on && indexer_short_seq_skip(pos, cfg_.index_topk);
     const bool idx_may_run = !skip_short_seq && cfg_.is_index_source(l) && w.idx_wq_b &&
@@ -1835,7 +1836,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // names anything at all on V4.1. Guarded on w.ratio because the divisor below is the layer's.
       static const bool sparse_indexer_on = [] {
         const char* v = std::getenv("AFF_SPARSE_INDEXER");
-        return v && *v && std::strcmp(v, "0") != 0;
+        if (!v || !*v) return true;
+        return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
       }();
       const bool skip_short_seq = sparse_indexer_on && indexer_short_seq_skip(pos0 + live, cfg_.index_topk);
       const bool idx_may_run = !skip_short_seq && w.ratio && cfg_.is_index_source(l) && w.idx_wq_b &&
