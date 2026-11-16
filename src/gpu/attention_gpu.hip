@@ -306,7 +306,14 @@ __device__ __forceinline__ void attend_body(
   }
 }
 
-template <int DT>
+static inline bool draft_skip_masked_enabled() {
+  const char* v = std::getenv("AFF_DRAFT_SKIP_MASKED");
+  if (!v || !*v) v = std::getenv("AFF_DRAFT_RING_MASK_SKIP");
+  if (v && (*v == '0' || std::strcmp(v, "false") == 0)) return false;
+  return true; // default 1 for A/B candidate testing
+}
+
+template <int DT, bool DRAFT_SKIP = false>
 __global__ __launch_bounds__(kAttnThreads) void mqa_attend_kernel(
     const float* __restrict__ q, const void* __restrict__ raw, const void* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const float* __restrict__ sinks,
@@ -314,10 +321,10 @@ __global__ __launch_bounds__(kAttnThreads) void mqa_attend_kernel(
     uint32_t width, uint32_t nope, uint32_t stride, float scale, uint32_t n_head, uint32_t nhb) {
   extern __shared__ float s_score[];              // nhb * n_keys, then nhb
   const uint32_t h0 = blockIdx.x * nhb;
-  attend_body<DT>((const void*)(q + (size_t)h0 * width), raw, comp, allowed,
-                  sinks ? sinks + h0 : nullptr,
-                  sinks != nullptr, out + (size_t)h0 * width, s_score, raw0, n_raw, ring, n_comp,
-                  width, nope, stride, scale, min(nhb, n_head - h0));
+  attend_body<DT, false, DRAFT_SKIP>((const void*)(q + (size_t)h0 * width), raw, comp, allowed,
+                                     sinks ? sinks + h0 : nullptr,
+                                     sinks != nullptr, out + (size_t)h0 * width, s_score, raw0, n_raw, ring, n_comp,
+                                     width, nope, stride, scale, min(nhb, n_head - h0));
 }
 
 // grid(n_head, n). blockIdx.y names the token; everything else is the same attention.
@@ -651,20 +658,24 @@ void mqa_attend_hip(KvDtype dt, const float* q, const void* raw, const void* com
   hipStream_t st = (hipStream_t)stream;
   const uint32_t sd = (uint32_t)kv_row_bytes(dt, width, n_rot);
   const uint32_t nope = width - n_rot;
+  const bool draft_mask_skip = draft_skip_masked_enabled();
+#define AFF_ATT_S(DTV)                                                                             \
+  do {                                                                                             \
+    if (draft_mask_skip) {                                                                         \
+      hipLaunchKernelGGL((mqa_attend_kernel<DTV, true>), g, b, lds, st, q, raw, comp, allowed,    \
+                         sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale, n_head, nhb);\
+    } else {                                                                                       \
+      hipLaunchKernelGGL((mqa_attend_kernel<DTV, false>), g, b, lds, st, q, raw, comp, allowed,   \
+                         sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale, n_head, nhb);\
+    }                                                                                              \
+  } while (0)
   switch (dt) {
-    case KvDtype::F32:
-      hipLaunchKernelGGL((mqa_attend_kernel<0>), g, b, lds, st, q, raw, comp, allowed, sinks, out,
-                         raw0, n_raw, ring, n_comp, width, nope, sd, scale, n_head, nhb); break;
-    case KvDtype::FP8:
-      hipLaunchKernelGGL((mqa_attend_kernel<2>), g, b, lds, st, q, raw, comp, allowed, sinks, out,
-                         raw0, n_raw, ring, n_comp, width, nope, sd, scale, n_head, nhb); break;
-    case KvDtype::MIXED:
-      hipLaunchKernelGGL((mqa_attend_kernel<3>), g, b, lds, st, q, raw, comp, allowed, sinks, out,
-                         raw0, n_raw, ring, n_comp, width, nope, sd, scale, n_head, nhb); break;
-    case KvDtype::FP8R:
-      hipLaunchKernelGGL((mqa_attend_kernel<4>), g, b, lds, st, q, raw, comp, allowed, sinks, out,
-                         raw0, n_raw, ring, n_comp, width, nope, sd, scale, n_head, nhb); break;
+    case KvDtype::F32:   AFF_ATT_S(0); break;
+    case KvDtype::FP8:   AFF_ATT_S(2); break;
+    case KvDtype::MIXED: AFF_ATT_S(3); break;
+    case KvDtype::FP8R:  AFF_ATT_S(4); break;
   }
+#undef AFF_ATT_S
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -688,10 +699,7 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
   hipStream_t st = (hipStream_t)stream;
   const uint32_t sd = (uint32_t)kv_row_bytes(dt, width, n_rot);
   const uint32_t nope = width - n_rot;
-  static const bool draft_mask_skip = []() -> bool {
-    const char* v = std::getenv("AFF_DRAFT_RING_MASK_SKIP");
-    return v && *v && std::strcmp(v, "0") != 0;
-  }();
+  const bool draft_mask_skip = draft_skip_masked_enabled();
   // Hardware gridDim.y max is 65535 on RDNA. Chunking n into slices <= 65535 guards against
   // hardware overflow for long prefill (>65535 rows up to 262144 context).
   constexpr uint32_t kMaxGridY = 65535;

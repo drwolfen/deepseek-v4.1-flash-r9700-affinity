@@ -1,6 +1,8 @@
+#include "gpu/attention_gpu.h"
 #include "gpu/batch_kernels.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <cstdlib>
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -240,6 +242,95 @@ int main() {
     }
 
     for (void* p : {(void*)d_table, (void*)d_ids, (void*)d_out})
+      (void)hipFree(p);
+  }
+
+  // 5. Test AFF_DRAFT_SKIP_MASKED DSpark ring-attention masked tile skip (#958)
+  {
+    const uint32_t width = 64, n_rot = 0, n_head = 4;
+    const uint32_t ring = 64, n_raw = 16, n_comp = 32;
+    const uint32_t n_keys = n_raw + n_comp;
+    const uint32_t n_tokens = 4;
+
+    std::vector<float> h_q((size_t)n_tokens * n_head * width);
+    for (size_t i = 0; i < h_q.size(); ++i)
+      h_q[i] = std::sin((float)i * 0.05f) * 0.2f;
+
+    std::vector<float> h_raw((size_t)ring * width);
+    for (size_t i = 0; i < h_raw.size(); ++i)
+      h_raw[i] = std::cos((float)i * 0.07f) * 0.2f;
+
+    std::vector<float> h_comp((size_t)n_comp * width);
+    for (size_t i = 0; i < h_comp.size(); ++i)
+      h_comp[i] = std::sin((float)i * 0.09f) * 0.2f;
+
+    // Mask for compressed keys per token (n_tokens x n_comp)
+    std::vector<uint8_t> h_allowed((size_t)n_tokens * n_comp, 0);
+    // Token 0: partially unmasked (keys 0..7 active)
+    for (uint32_t j = 0; j < 8; ++j) h_allowed[j] = 1;
+    // Token 1: partially unmasked (keys 8..23 active)
+    for (uint32_t j = 8; j < 24; ++j) h_allowed[1 * n_comp + j] = 1;
+    // Token 2: all masked (dead row, #971 invariant: zeros, no NaNs)
+    // (h_allowed remains 0 for token 2)
+    // Token 3: fully unmasked
+    for (uint32_t j = 0; j < n_comp; ++j) h_allowed[3 * n_comp + j] = 1;
+
+    std::vector<uint32_t> h_ncomp_v = {n_comp, n_comp, n_comp, n_comp};
+
+    float *d_q = nullptr, *d_raw = nullptr, *d_comp = nullptr;
+    uint8_t* d_allowed = nullptr;
+    uint32_t* d_ncomp_v = nullptr;
+    float *d_out_skip = nullptr, *d_out_plain = nullptr;
+
+    assert(hipMalloc(&d_q, h_q.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_raw, h_raw.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_comp, h_comp.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_allowed, h_allowed.size() * sizeof(uint8_t)) == hipSuccess);
+    assert(hipMalloc(&d_ncomp_v, h_ncomp_v.size() * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_out_skip, h_q.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_out_plain, h_q.size() * sizeof(float)) == hipSuccess);
+
+    assert(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_raw, h_raw.data(), h_raw.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_comp, h_comp.data(), h_comp.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_allowed, h_allowed.data(), h_allowed.size() * sizeof(uint8_t), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_ncomp_v, h_ncomp_v.data(), h_ncomp_v.size() * sizeof(uint32_t), hipMemcpyHostToDevice) == hipSuccess);
+
+    const float scale = 1.0f / std::sqrt((float)width);
+
+    // Run with AFF_DRAFT_SKIP_MASKED=0
+    setenv("AFF_DRAFT_SKIP_MASKED", "0", 1);
+    aff::mqa_attend_batch_hip(aff::KvDtype::F32, d_q, d_raw, d_comp, d_allowed, d_ncomp_v,
+                              nullptr, d_out_plain, 0, n_tokens, n_tokens, 0, n_raw, ring,
+                              n_comp, n_comp, n_head, width, n_rot, scale, nullptr, false,
+                              n_raw, 0, 0);
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    // Run with AFF_DRAFT_SKIP_MASKED=1
+    setenv("AFF_DRAFT_SKIP_MASKED", "1", 1);
+    aff::mqa_attend_batch_hip(aff::KvDtype::F32, d_q, d_raw, d_comp, d_allowed, d_ncomp_v,
+                              nullptr, d_out_skip, 0, n_tokens, n_tokens, 0, n_raw, ring,
+                              n_comp, n_comp, n_head, width, n_rot, scale, nullptr, false,
+                              n_raw, 0, 0);
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    std::vector<float> h_out_plain(h_q.size()), h_out_skip(h_q.size());
+    assert(hipMemcpy(h_out_plain.data(), d_out_plain, h_q.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(h_out_skip.data(), d_out_skip, h_q.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < h_q.size(); ++i) {
+      assert(!std::isnan(h_out_skip[i]));
+      assert(!std::isinf(h_out_skip[i]));
+      assert(!std::isnan(h_out_plain[i]));
+      assert(!std::isinf(h_out_plain[i]));
+      const float diff = std::fabs(h_out_skip[i] - h_out_plain[i]);
+      if (diff > max_diff) max_diff = diff;
+    }
+    assert(max_diff < 1e-6f);
+
+    for (void* p : {(void*)d_q, (void*)d_raw, (void*)d_comp, (void*)d_allowed, (void*)d_ncomp_v,
+                    (void*)d_out_skip, (void*)d_out_plain})
       (void)hipFree(p);
   }
 
