@@ -1,0 +1,50 @@
+FROM docker.io/rocm/dev-ubuntu-24.04:10.1.0-full
+ARG JOBS=16
+ARG AFF_GIT_SHA=unknown
+ARG AFF_VERSION=v5.1.0-rc1
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build git bash sudo passwd python3 procps iproute2 curl ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY . /opt/affinity-src
+RUN ln -s /opt/affinity-src /opt/affinity
+ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm PATH=/opt/affinity-src/build:/opt/rocm/bin:$PATH LD_LIBRARY_PATH=/opt/rocm/lib
+RUN cd /opt/affinity-src \
+ && cmake -S . -B build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DAFF_HIP=ON \
+      -DAFF_GPU_ARCH=gfx1201 \
+      -DGPU_TARGETS=gfx1201 \
+      -DAFF_VERSION=${AFF_VERSION} \
+      -DAFF_GIT_SHA=${AFF_GIT_SHA} \
+      -DAFF_NATIVE=ON \
+      -DAFF_HIPCC=/opt/rocm/bin/hipcc \
+      -DCMAKE_CXX_COMPILER=g++ \
+ && cmake --build build -j "$JOBS" \
+ && (cp build/aff-quantize build/aff_quantize 2>/dev/null || true) \
+ && mkdir -p /opt/affinity/bin \
+ && for f in /opt/affinity-src/build/*; do \
+      if [ -x "$f" ] && [ ! -d "$f" ]; then \
+        ln -sf "$f" /usr/local/bin/$(basename "$f"); \
+        ln -sf "$f" /opt/affinity/bin/$(basename "$f"); \
+      fi; \
+    done \
+ && ls -la build/affinity \
+      build/aff-info \
+      build/aff-quantize \
+      build/aff-cfgcheck \
+      build/aff-fp8check \
+      build/aff-exphash \
+      build/aff-vitcheck \
+      build/aff-engramcheck \
+      build/aff-bench \
+      build/test_prefix_cache \
+      build/test_tool_namespace \
+      build/test_cactus_accept \
+      build/test_gpu_ports \
+      build/test_moe_recon_tiles \
+      build/test_o_fp8_qdq \
+      build/test_hadamard_block32 \
+      build/test_w4_head \
+      build/test_wave2_kernels \
+      build/test_v41_indexer
+RUN if getent passwd ubuntu >/dev/null; then userdel ubuntu; fi; if getent group ubuntu >/dev/null; then groupdel ubuntu; fi
+WORKDIR /opt
+ENTRYPOINT ["/opt/affinity-src/build/affinity"]

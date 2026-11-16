@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(affinity-engine VERSION 5.0.0 LANGUAGES CXX)
+project(affinity-engine VERSION 5.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,16 +29,23 @@ if(NOT AFF_GIT_ID)
 endif()
 add_compile_definitions(AFF_BUILD_ID="${AFF_GIT_ID}")
 
-file(STRINGS "${CMAKE_SOURCE_DIR}/VERSION" AFF_VER_FILE LIMIT_COUNT 1)
-if(AFF_VER_FILE)
-  string(STRIP "${AFF_VER_FILE}" AFF_VER_FILE)
-  if(AFF_VER_FILE MATCHES "^v")
-    set(AFF_VERSION_STR "${AFF_VER_FILE}")
-  else()
-    set(AFF_VERSION_STR "v${AFF_VER_FILE}")
+if(DEFINED AFF_VERSION AND NOT "${AFF_VERSION}" STREQUAL "")
+  set(AFF_VERSION_STR "${AFF_VERSION}")
+  if(NOT AFF_VERSION_STR MATCHES "^v")
+    set(AFF_VERSION_STR "v${AFF_VERSION_STR}")
   endif()
 else()
-  set(AFF_VERSION_STR "v4.4.0")
+  file(STRINGS "${CMAKE_SOURCE_DIR}/VERSION" AFF_VER_FILE LIMIT_COUNT 1)
+  if(AFF_VER_FILE)
+    string(STRIP "${AFF_VER_FILE}" AFF_VER_FILE)
+    if(AFF_VER_FILE MATCHES "^v")
+      set(AFF_VERSION_STR "${AFF_VER_FILE}")
+    else()
+      set(AFF_VERSION_STR "v${AFF_VER_FILE}")
+    endif()
+  else()
+    set(AFF_VERSION_STR "v5.1.0-rc1")
+  endif()
 endif()
 
 if(DEFINED AFF_GIT_SHA AND NOT "${AFF_GIT_SHA}" STREQUAL "")
@@ -217,8 +224,16 @@ aff_tool(aff-quantlab tools/aff_quantlab.cpp aff_format)
 # needs no model and no card: the constants come out of tools/v41/engram_prep.py.
 aff_tool(aff-engramcheck tools/aff_engramcheck.cpp aff_format)
 aff_tool(aff-vitcheck    tools/aff_vitcheck.cpp    aff_format)
+aff_tool(aff-cfgcheck    tools/aff_cfgcheck.cpp    aff_format)
+aff_tool(aff-fp8check    tools/aff_fp8check.cpp    aff_format)
+aff_tool(aff-exphash     tools/aff_exphash.cpp     aff_format)
 aff_tool(aff-predict  tools/aff_predict.cpp)
 aff_tool(aff-profile  tools/aff_profile.cpp)
+
+add_custom_target(aff-bench ALL
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/tools/v41/bench_pp_tg.py ${CMAKE_BINARY_DIR}/aff-bench
+  COMMAND chmod +x ${CMAKE_BINARY_DIR}/aff-bench
+)
 
 # ---- tests --------------------------------------------------------------------------------------
 if(AFF_HAVE_TESTS)
