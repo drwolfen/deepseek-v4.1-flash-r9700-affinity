@@ -83,7 +83,7 @@ Wave 0 production release. Unifies 3 divergent branch histories into single clea
 
 No engine changes. README gains the v4.3 Arm 1 A/B against the v4.2.0 baseline: decode median
 19.27 vs 16.33 tok/s (+18.0%), greedy decode 14.48 vs 12.07 (+20.0%), prefill 2048 680.1 vs
-558.4 tok/s (+21.8%), batch-8 21.4 vs 10.9 tok/s (+96.3%), live 74.8k Hermes 21.0 tok/s, plus the
+558.4 tok/s (+21.8%), batch-8 21.4 vs 10.9 tok/s (+96.3%), live 74.8k agent workload 21.0 tok/s, plus the
 VRAM reclamation numbers (3,279 symmetric experts/card, +88 GPU1 bonus shards). Documents the
 decode-gated MoE recon tile cap, Radiance LDS scale prefetch, `AFF_V41_HC_FUSED`,
 `AFF_PREFILL_FREEZE_PLC`, `AFF_BONUS_SLAB` and the rejected `AFF_LMHEAD_INT4` arm (acceptance
@@ -153,7 +153,7 @@ process, which previously published nothing at all.
 - **Repeat / DRY penalties in the sampler** (carried in this release, previously uncommitted):
   `--repeat-penalty`, `--repeat-last-n` (device-side `repeat_penalty_kernel`) and sequence-level DRY
   (`--dry-delta`, `--dry-ngram`, `--dry-window`, `--dry-min-repeats`, `dry_penalty_kernel`), with
-  `AFF_DRY_DEBUG=1` gating a diagnostic log. Added after a Hermes session replayed its own
+  `AFF_DRY_DEBUG=1` gating a diagnostic log. Added after an agent session replayed its own
   `reasoning_content` and compounded 1,162 `"Hmm —"` tics across 190 messages.
 
 - **Cactus acceptance governor** (carried): `AFF_CACTUS_DELTA`, `AFF_CACTUS_CAP_R`,
@@ -193,7 +193,7 @@ process, which previously published nothing at all.
 
 ### Investigated and rejected
 
-Each of these has measurements behind it, recorded in `/mnt/fast-storage/benchmarks/ab/`.
+Each of these has measurements behind it, recorded in `./benchmarks/ab/`.
 
 | change | result | verdict |
 |---|---|---|
@@ -262,7 +262,7 @@ so no draft upgrade was available from it — and it quantified the Engram table
   (`prefix_cache.cpp`), so changing `--kv-size` drops the index and rebuilds it. It is dropped, not
   misread.
 - **Restart is required**; the binary is bind-mounted at
-  `/home/ydj/affinity-patched/affinity` and reload takes ~95–170 s for the 191 GiB container.
+  `/opt/affinity/bin/affinity` and reload takes ~95–170 s for the 191 GiB container.
 - Residency on this box moves 3130–3231 experts between boots because the free-VRAM figure at load
   depends on what else touched the cards; the banner now reports both numbers so the variance is
   attributable.

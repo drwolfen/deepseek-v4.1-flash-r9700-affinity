@@ -10,7 +10,8 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-  std::string model_dir = "/mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8";
+  const char* env_dir = std::getenv("HF_MODEL_DIR");
+  std::string model_dir = env_dir ? env_dir : "/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8";
   if (argc > 1) model_dir = argv[1];
 
   aff::ui::out("aff-vitcheck: loading ViT from %s\n", model_dir.c_str());

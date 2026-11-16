@@ -2,9 +2,9 @@
 # finish-stage-a.sh — wait for the 40-layer expert encode, assemble the uncensored container,
 # run the gates. Does NOT touch the service or the GPUs (swap/benchmark is a separate, explicit step).
 set -u
-D=/mnt/fast-storage/DeepSeek-V4.1-Flash-UNCENSORED-aff
-CK=/mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8
-B=/mnt/fast-storage/affinity/build/aff-quantize
+D=${MODEL_DIR:-/models/DeepSeek-V4.1-Flash-UNCENSORED-aff}
+CK=${HF_MODEL_DIR:-/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8}
+B=${AFF_QUANTIZE:-./build/aff-quantize}
 IM=$D/imatrix/imatrix-dsv41-262144.gguf
 CB=$D/uc-v41cb.raw
 log(){ echo "$(date +%T) $*"; }
@@ -29,7 +29,7 @@ log "assemble ok: $(tail -1 "$D/assemble.log")"
   echo "=== aff-cfgcheck ==="
   /tmp/aff-cfgcheck "$D/model-uc.aff" 2>&1
   echo "=== aff-info (head) ==="
-  /mnt/fast-storage/affinity/build/aff-info "$D/model-uc.aff" 2>&1 | head -12
+  ${AFF_INFO:-./build/aff-info} "$D/model-uc.aff" 2>&1 | head -12
   echo "=== aff-exphash unique (want 15360) ==="
   /tmp/aff-exphash "$D/model-uc.aff" 2>/dev/null | sort -u -k3 | wc -l
   echo "=== aff-fp8check ==="

@@ -8,7 +8,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 IMG=${1:?image}; shift
-M=/mnt/models2/affinity/v41; OUT=$M/abfinal-$(date +%H%M); mkdir -p $OUT
+M=${BENCH_DIR:-./benchmarks}; OUT=$M/abfinal-$(date +%H%M); mkdir -p "$OUT"
 for a in "$@"; do
   KV=69632; F=()
   case $a in

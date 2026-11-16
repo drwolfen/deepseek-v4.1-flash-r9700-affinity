@@ -1,5 +1,5 @@
 From 277934826e4236ab28028dd942ba77fae5987fb6 Mon Sep 17 00:00:00 2001
-From: drwolfen <ydjager@pm.me>
+From: drwolfen <drwolfen@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 16:59:01 +0200
 Subject: [PATCH] server: bound the no-max_tokens default
  (AFF_NOBUDGET_MAX_TOKENS)

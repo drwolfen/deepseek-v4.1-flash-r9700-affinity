@@ -2,7 +2,7 @@
 
 > **For Claude / Gemini Flash 3.8:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Port the 3 ExLlamaV3 (EXL3) architectural optimizations (`AFF_MOE_RECON_TILES` coalesced sub-tile reconstruction & L2 tile slicing, `AFF_HADAMARD_ROT` / `--hadamard` block-32 randomized Walsh-Hadamard incoherence rotation, and `AFF_PREFETCH_RING` device-planned asynchronous VRAM prefetch ring for pooled experts) into the Affinity inference engine (`/mnt/fast-storage/affinity`) with a full backup and one-command rollback plan.
+**Goal:** Port the 3 ExLlamaV3 (EXL3) architectural optimizations (`AFF_MOE_RECON_TILES` coalesced sub-tile reconstruction & L2 tile slicing, `AFF_HADAMARD_ROT` / `--hadamard` block-32 randomized Walsh-Hadamard incoherence rotation, and `AFF_PREFETCH_RING` device-planned asynchronous VRAM prefetch ring for pooled experts) into the Affinity inference engine with a full backup and one-command rollback plan.
 
 **Architecture:** All runtime changes are opt-in via environment variables (`AFF_MOE_RECON_TILES`, `AFF_HADAMARD_ROT`, `AFF_PREFETCH_RING`) and CLI flags (`aff-quantize --hadamard`), preserving 100% bit-identity and backward compatibility with existing `.aff` containers (`model-uc-1017.aff`) and persistent prefix caches (`pcache`) when unset or when running the lossless `AFF_MOE_RECON_TILES` + `AFF_PREFETCH_RING` paths.
 
@@ -15,37 +15,37 @@
 ### Task 0: Snapshot Live Binary, Service, and Source Tree + Create One-Command Rollback Script
 
 **Files:**
-- Create: `/mnt/fast-storage/affinity/scripts/backup_exl3.sh`
-- Create: `/mnt/fast-storage/affinity/scripts/rollback_exl3.sh`
-- Backup directory: `/home/ydj/affinity-patched/backups/pre-exl3-20261027/`
+- Create: `scripts/backup_exl3.sh`
+- Create: `scripts/rollback_exl3.sh`
+- Backup directory: `./backups/pre-exl3/`
 
-**Step 1: Create `/mnt/fast-storage/affinity/scripts/backup_exl3.sh`**
+**Step 1: Create `scripts/backup_exl3.sh`**
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-BACKUP_DIR="/home/ydj/affinity-patched/backups/pre-exl3-20261027"
+BACKUP_DIR="./backups/pre-exl3"
 mkdir -p "${BACKUP_DIR}"
 
 # 1. Backup live production binary and quantizer
-cp -a /home/ydj/affinity-patched/affinity "${BACKUP_DIR}/affinity.v1.1.0"
-if [ -f /mnt/fast-storage/affinity/build/aff-quantize ]; then
-  cp -a /mnt/fast-storage/affinity/build/aff-quantize "${BACKUP_DIR}/aff-quantize.v1.1.0"
+cp -a /opt/affinity/bin/affinity "${BACKUP_DIR}/affinity.v1.1.0"
+if [ -f build/aff-quantize ]; then
+  cp -a build/aff-quantize "${BACKUP_DIR}/aff-quantize.v1.1.0"
 fi
 
 # 2. Backup systemd user service
-cp -a /home/ydj/.config/systemd/user/deepseek-v41-affinity.service \
+cp -a ~/.config/systemd/user/deepseek-v41-affinity.service \
       "${BACKUP_DIR}/deepseek-v41-affinity.service.v1.1.0"
 
 # 3. Record git commit hashes and create rollback tag in both repos
-git -C /mnt/fast-storage/affinity rev-parse HEAD > "${BACKUP_DIR}/affinity_src_head.txt"
-git -C /mnt/fast-storage/affinity tag -f pre-exl3-v1.1.0
-git -C /home/ydj/deepseek-v4.1-flash-r9700-affinity rev-parse HEAD > "${BACKUP_DIR}/github_repo_head.txt"
+git rev-parse HEAD > "${BACKUP_DIR}/affinity_src_head.txt"
+git tag -f pre-exl3-v1.1.0
+git -C ./ rev-parse HEAD > "${BACKUP_DIR}/github_repo_head.txt"
 
 # 4. Archive modified/target source files
 tar -czf "${BACKUP_DIR}/affinity-src-pre-exl3.tar.gz" \
-  -C /mnt/fast-storage/affinity \
+  -C . \
   CMakeLists.txt \
   src/quant/hadamard.h \
   src/quant/hadamard.cpp \
@@ -64,20 +64,20 @@ echo "BACKUP COMPLETE: ${BACKUP_DIR}"
 cat "${BACKUP_DIR}/SHA256SUMS"
 ```
 
-**Step 2: Create `/mnt/fast-storage/affinity/scripts/rollback_exl3.sh`**
+**Step 2: Create `scripts/rollback_exl3.sh`**
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-BACKUP_DIR="/home/ydj/affinity-patched/backups/pre-exl3-20261027"
+BACKUP_DIR="./backups/pre-exl3"
 if [ ! -d "${BACKUP_DIR}" ]; then
   echo "ERROR: Backup directory ${BACKUP_DIR} not found!" >&2
   exit 1
 fi
 
 echo "[1/4] Restoring source files from pre-exl3-v1.1.0..."
-git -C /mnt/fast-storage/affinity checkout pre-exl3-v1.1.0 -- \
+git checkout pre-exl3-v1.1.0 -- \
   CMakeLists.txt \
   src/quant/hadamard.h \
   src/quant/hadamard.cpp \
@@ -91,13 +91,13 @@ git -C /mnt/fast-storage/affinity checkout pre-exl3-v1.1.0 -- \
   src/gpu/static_placement.hip \
   tools/aff_quantize.cpp
 
-echo "[2/4] Restoring production binary /home/ydj/affinity-patched/affinity..."
-cp -a "${BACKUP_DIR}/affinity.v1.1.0" /home/ydj/affinity-patched/affinity.tmp
-mv -f /home/ydj/affinity-patched/affinity.tmp /home/ydj/affinity-patched/affinity
+echo "[2/4] Restoring production binary /opt/affinity/bin/affinity..."
+cp -a "${BACKUP_DIR}/affinity.v1.1.0" /opt/affinity/bin/affinity.tmp
+mv -f /opt/affinity/bin/affinity.tmp /opt/affinity/bin/affinity
 
 echo "[3/4] Restoring systemd service..."
 cp -a "${BACKUP_DIR}/deepseek-v41-affinity.service.v1.1.0" \
-      /home/ydj/.config/systemd/user/deepseek-v41-affinity.service
+      ~/.config/systemd/user/deepseek-v41-affinity.service
 systemctl --user daemon-reload
 systemctl --user restart deepseek-v41-affinity.service
 
@@ -116,31 +116,31 @@ echo "WARNING: Server still loading slabs; check: journalctl --user -u deepseek-
 
 Run:
 ```bash
-chmod +x /mnt/fast-storage/affinity/scripts/backup_exl3.sh /mnt/fast-storage/affinity/scripts/rollback_exl3.sh
-/mnt/fast-storage/affinity/scripts/backup_exl3.sh
+chmod +x scripts/backup_exl3.sh scripts/rollback_exl3.sh
+scripts/backup_exl3.sh
 ```
-Expected: `BACKUP COMPLETE: /home/ydj/affinity-patched/backups/pre-exl3-20261027` with SHA256 checksums printed.
+Expected: `BACKUP COMPLETE: ./backups/pre-exl3` with SHA256 checksums printed.
 
 ---
 
 ## Optimization 1: EXL3 MoE Reconstruction Tiling (`AFF_MOE_RECON_TILES`)
 
 **Technical Context:**
-1. In [`/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip:573-581`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L573-L581), when `expert_gemm_wmma_kernel` runs with `MT=1, TR=true` (`kETPR=2, kEBPT=2`, which is the decode / speculative verification instantiation for `max_nt <= 16` at line 3062), `kWide` is `false`. Each thread currently executes 10 separate 1-byte non-temporal loads (`ld_nt(&cp[i])` for `i = 0..4` across `bb = 0..1`) per column group. On zero-copy PCIe tiles (`hyb` stream) and VRAM slabs, byte-granular `flat_load_ubyte` instructions fragment memory transactions.
+1. In [`src/gpu/expert_kernel.hip:573-581`](src/gpu/expert_kernel.hip#L573-L581), when `expert_gemm_wmma_kernel` runs with `MT=1, TR=true` (`kETPR=2, kEBPT=2`, which is the decode / speculative verification instantiation for `max_nt <= 16` at line 3062), `kWide` is `false`. Each thread currently executes 10 separate 1-byte non-temporal loads (`ld_nt(&cp[i])` for `i = 0..4` across `bb = 0..1`) per column group. On zero-copy PCIe tiles (`hyb` stream) and VRAM slabs, byte-granular `flat_load_ubyte` instructions fragment memory transactions.
 2. Because `g * 20` is always 4-byte aligned (`20 = 5 * 4` bytes per column group), thread `sblk = 0` (`tid & 1 == 0`) owns bytes `0..9` (`g32[0]`, `g32[1]`, and the low `uint16_t` of `g32[2]`), while thread `sblk = 2` (`tid & 1 == 1`) owns bytes `10..19` (the high `uint16_t` of `g32[2]`, `g32[3]`, and `g32[4]`). Replacing the 10 byte loads with 2 `uint32_t` loads + 1 `uint16_t` load per thread cuts load instructions by `3.33x` and coalesces wave32 reads into contiguous 320-byte bursts while remaining **100% bit-identical**.
-3. In [`/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip:3025-3069`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L3025-L3069), adding `AFF_MOE_RECON_TILES=<N>` (e.g., `8` or `16`) slices `n_tiles` into L2-resident sub-batches of `<= recon_tiles` tiles per launch so reconstructed expert tiles do not thrash R9700's 64 MiB L2 cache during large prefill or heavy miss bursts.
+3. In [`src/gpu/expert_kernel.hip:3025-3069`](src/gpu/expert_kernel.hip#L3025-L3069), adding `AFF_MOE_RECON_TILES=<N>` (e.g., `8` or `16`) slices `n_tiles` into L2-resident sub-batches of `<= recon_tiles` tiles per launch so reconstructed expert tiles do not thrash R9700's 64 MiB L2 cache during large prefill or heavy miss bursts.
 
 ### Task 1: Implement Coalesced `TR` Sub-Tile Loads and `AFF_MOE_RECON_TILES` L2 Slicing
 
 **Files:**
-- Modify: [`/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip:549-585`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L549-L585)
-- Modify: [`/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip:3025-3069`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L3025-L3069)
-- Create: `/mnt/fast-storage/affinity/tests/test_moe_recon_tiles.hip`
-- Modify: [`/mnt/fast-storage/affinity/CMakeLists.txt:303-310`](file:///mnt/fast-storage/affinity/CMakeLists.txt#L303-L310)
+- Modify: [`src/gpu/expert_kernel.hip:549-585`](src/gpu/expert_kernel.hip#L549-L585)
+- Modify: [`src/gpu/expert_kernel.hip:3025-3069`](src/gpu/expert_kernel.hip#L3025-L3069)
+- Create: `tests/test_moe_recon_tiles.hip`
+- Modify: [`CMakeLists.txt:303-310`](CMakeLists.txt#L303-L310)
 
-**Step 1: Write the failing test (`/mnt/fast-storage/affinity/tests/test_moe_recon_tiles.hip`)**
+**Step 1: Write the failing test (`tests/test_moe_recon_tiles.hip`)**
 
-Create `/mnt/fast-storage/affinity/tests/test_moe_recon_tiles.hip`:
+Create `tests/test_moe_recon_tiles.hip`:
 ```cpp
 #include "gpu/expert_kernel_hip.h"
 #include "gpu/hip_common.h"
@@ -286,22 +286,22 @@ int main() {
 }
 ```
 
-**Step 2: Register `test_moe_recon_tiles` in `/mnt/fast-storage/affinity/CMakeLists.txt` and declare `expert_set_recon_tiles` in `/mnt/fast-storage/affinity/src/gpu/expert_kernel_hip.h`**
+**Step 2: Register `test_moe_recon_tiles` in `CMakeLists.txt` and declare `expert_set_recon_tiles` in `src/gpu/expert_kernel_hip.h`**
 
-In [`/mnt/fast-storage/affinity/src/gpu/expert_kernel_hip.h:225-230`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel_hip.h#L225-L230), add:
+In [`src/gpu/expert_kernel_hip.h:225-230`](src/gpu/expert_kernel_hip.h#L225-L230), add:
 ```cpp
 void expert_set_recon_tiles(uint32_t max_tiles);
 uint32_t expert_recon_tiles();
 ```
 
-In [`/mnt/fast-storage/affinity/CMakeLists.txt:303`](file:///mnt/fast-storage/affinity/CMakeLists.txt#L303), right after `aff_hip_test(test_expert_shard expert_shard)`, add:
+In [`CMakeLists.txt:303`](CMakeLists.txt#L303), right after `aff_hip_test(test_expert_shard expert_shard)`, add:
 ```cmake
     aff_hip_test(test_moe_recon_tiles moe_recon_tiles)
 ```
 
-**Step 3: Implement coalesced `TR` sub-tile load and `AFF_MOE_RECON_TILES` slicing in `/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip`**
+**Step 3: Implement coalesced `TR` sub-tile load and `AFF_MOE_RECON_TILES` slicing in `src/gpu/expert_kernel.hip`**
 
-1. In [`/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip:549-585`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L549-L585), update the `kWide` / `TR` load block inside `expert_gemm_wmma_kernel`:
+1. In [`src/gpu/expert_kernel.hip:549-585`](src/gpu/expert_kernel.hip#L549-L585), update the `kWide` / `TR` load block inside `expert_gemm_wmma_kernel`:
 ```cpp
         constexpr bool kWide = kETPR == 1 && kEBPT == 4;
         constexpr bool kHalfTR = TR && (kETPR == 2 && kEBPT == 2);
@@ -358,7 +358,7 @@ In [`/mnt/fast-storage/affinity/CMakeLists.txt:303`](file:///mnt/fast-storage/af
           } else {
 ```
 
-2. In [`/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip:3025-3069`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L3025-L3069), add `g_recon_tiles` and sub-batch loop in `expert_gemm_wmma_hip`:
+2. In [`src/gpu/expert_kernel.hip:3025-3069`](src/gpu/expert_kernel.hip#L3025-L3069), add `g_recon_tiles` and sub-batch loop in `expert_gemm_wmma_hip`:
 ```cpp
 static int g_recon_tiles = -1;
 
@@ -418,17 +418,17 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
 
 Run:
 ```bash
-cmake -S /mnt/fast-storage/affinity -B /mnt/fast-storage/affinity/build -GNinja
-ninja -C /mnt/fast-storage/affinity/build test_moe_recon_tiles
-/mnt/fast-storage/affinity/build/test_moe_recon_tiles
+cmake -S . -B build -GNinja
+ninja -C build test_moe_recon_tiles
+build/test_moe_recon_tiles
 ```
 Expected: `PASS: test_moe_recon_tiles`
 
 **Step 5: Commit Task 1**
 
 ```bash
-git -C /mnt/fast-storage/affinity add CMakeLists.txt src/gpu/expert_kernel_hip.h src/gpu/expert_kernel.hip tests/test_moe_recon_tiles.hip
-git -C /mnt/fast-storage/affinity commit -m "perf(gpu): coalesced TR MT=1 sub-tile loads and AFF_MOE_RECON_TILES L2 slicing"
+git add CMakeLists.txt src/gpu/expert_kernel_hip.h src/gpu/expert_kernel.hip tests/test_moe_recon_tiles.hip
+git commit -m "perf(gpu): coalesced TR MT=1 sub-tile loads and AFF_MOE_RECON_TILES L2 slicing"
 ```
 
 ---
@@ -441,22 +441,22 @@ git -C /mnt/fast-storage/affinity commit -m "perf(gpu): coalesced TR MT=1 sub-ti
    $$(W H_{32,s}^T)(H_{32,s} x) = W x$$
    Because it is block-diagonal with $32 \times 32$ blocks, it commutes with TP=2 column sharding (`kEK = 64`) and requires zero changes to `ExpertShardLayout` or `expert_gemm_wmma_kernel`.
 3. Offline (`aff-quantize --hadamard`): rotates every 32-element block of expert weights before codebook fitting (`fit_codebook`) and matrix quantization (`quantize_matrix`), suppressing weight outlier spikes (`max|w|/rms(w)`) and lowering 2.875 bpw quantization error (`rel_fro`).
-4. Online (`AFF_HADAMARD_ROT=1`): inside `batch_quant_fp8_kernel` ([`batch_kernels.hip:146-185`](file:///mnt/fast-storage/affinity/src/gpu/batch_kernels.hip#L146-L185)) and `expert_swiglu_quant_kernel` ([`expert_kernel.hip:864-908`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L864-L908)), the 128-column activation tile `tile[128][33]` is already staged in LDS before computing the block amax `smax[tt]`. Applying the 5-stage block-32 butterfly in LDS before computing `m = fmaxf(m, fabsf(v))` rotates the activation into the same Hadamard basis AND suppresses activation outliers prior to E4M3 quantization.
+4. Online (`AFF_HADAMARD_ROT=1`): inside `batch_quant_fp8_kernel` ([`batch_kernels.hip:146-185`](src/gpu/batch_kernels.hip#L146-L185)) and `expert_swiglu_quant_kernel` ([`expert_kernel.hip:864-908`](src/gpu/expert_kernel.hip#L864-L908)), the 128-column activation tile `tile[128][33]` is already staged in LDS before computing the block amax `smax[tt]`. Applying the 5-stage block-32 butterfly in LDS before computing `m = fmaxf(m, fabsf(v))` rotates the activation into the same Hadamard basis AND suppresses activation outliers prior to E4M3 quantization.
 
 ### Task 2: Implement CPU & GPU Block-32 Randomized Walsh-Hadamard Rotation
 
 **Files:**
-- Modify: [`/mnt/fast-storage/affinity/src/quant/hadamard.h:38-45`](file:///mnt/fast-storage/affinity/src/quant/hadamard.h#L38-L45)
-- Modify: [`/mnt/fast-storage/affinity/src/quant/hadamard.cpp:40-50`](file:///mnt/fast-storage/affinity/src/quant/hadamard.cpp#L40-L50)
-- Modify: [`/mnt/fast-storage/affinity/tools/aff_quantize.cpp:258-265,705-715,760-775`](file:///mnt/fast-storage/affinity/tools/aff_quantize.cpp#L705-L775)
-- Modify: [`/mnt/fast-storage/affinity/src/gpu/batch_kernels.hip:146-185,2592-2603`](file:///mnt/fast-storage/affinity/src/gpu/batch_kernels.hip#L146-L185)
-- Modify: [`/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip:864-908,2822-2836`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L864-L908)
-- Create: `/mnt/fast-storage/affinity/tests/test_hadamard_block32.cpp`
-- Modify: [`/mnt/fast-storage/affinity/CMakeLists.txt:227`](file:///mnt/fast-storage/affinity/CMakeLists.txt#L227)
+- Modify: [`src/quant/hadamard.h:38-45`](src/quant/hadamard.h#L38-L45)
+- Modify: [`src/quant/hadamard.cpp:40-50`](src/quant/hadamard.cpp#L40-L50)
+- Modify: [`tools/aff_quantize.cpp:258-265,705-715,760-775`](tools/aff_quantize.cpp#L705-L775)
+- Modify: [`src/gpu/batch_kernels.hip:146-185,2592-2603`](src/gpu/batch_kernels.hip#L146-L185)
+- Modify: [`src/gpu/expert_kernel.hip:864-908,2822-2836`](src/gpu/expert_kernel.hip#L864-L908)
+- Create: `tests/test_hadamard_block32.cpp`
+- Modify: [`CMakeLists.txt:227`](CMakeLists.txt#L227)
 
-**Step 1: Write the failing unit test (`/mnt/fast-storage/affinity/tests/test_hadamard_block32.cpp`)**
+**Step 1: Write the failing unit test (`tests/test_hadamard_block32.cpp`)**
 
-Create `/mnt/fast-storage/affinity/tests/test_hadamard_block32.cpp`:
+Create `tests/test_hadamard_block32.cpp`:
 ```cpp
 #include "quant/hadamard.h"
 #include "quant/blockquant.h"
@@ -513,7 +513,7 @@ int main() {
 
 **Step 2: Add `randomized_hadamard_block32_rows` and `hadamard_block32_sign_mask` to `src/quant/hadamard.{h,cpp}`**
 
-In [`/mnt/fast-storage/affinity/src/quant/hadamard.h:40-45`](file:///mnt/fast-storage/affinity/src/quant/hadamard.h#L40-L45), add:
+In [`src/quant/hadamard.h:40-45`](src/quant/hadamard.h#L40-L45), add:
 ```cpp
 // Fixed 32-bit SplitMix64 sign mask (bit k == 1 means -1.0f, 0 means +1.0f) shared by CPU
 // aff-quantize (--hadamard) and GPU activation quantizers (AFF_HADAMARD_ROT=1).
@@ -525,7 +525,7 @@ void randomized_hadamard_block32_rows(float* x, uint64_t rows, uint64_t cols,
                                       uint32_t sign_mask = kHadamardBlock32Mask) noexcept;
 ```
 
-In [`/mnt/fast-storage/affinity/src/quant/hadamard.cpp:48`](file:///mnt/fast-storage/affinity/src/quant/hadamard.cpp#L48), add:
+In [`src/quant/hadamard.cpp:48`](src/quant/hadamard.cpp#L48), add:
 ```cpp
 void randomized_hadamard_block32_rows(float* x, uint64_t rows, uint64_t cols,
                                       uint32_t sign_mask) noexcept {
@@ -545,10 +545,10 @@ void randomized_hadamard_block32_rows(float* x, uint64_t rows, uint64_t cols,
 }
 ```
 
-**Step 3: Wire `--hadamard` into `/mnt/fast-storage/affinity/tools/aff_quantize.cpp`**
+**Step 3: Wire `--hadamard` into `tools/aff_quantize.cpp`**
 
-1. Include `"quant/hadamard.h"` at line 15 of [`/mnt/fast-storage/affinity/tools/aff_quantize.cpp`](file:///mnt/fast-storage/affinity/tools/aff_quantize.cpp#L15).
-2. Add `bool use_hadamard = false;` at line 245, and `else if (a == "--hadamard") use_hadamard = true;` at line 259 of [`/mnt/fast-storage/affinity/tools/aff_quantize.cpp`](file:///mnt/fast-storage/affinity/tools/aff_quantize.cpp#L259).
+1. Include `"quant/hadamard.h"` at line 15 of [`tools/aff_quantize.cpp`](tools/aff_quantize.cpp#L15).
+2. Add `bool use_hadamard = false;` at line 245, and `else if (a == "--hadamard") use_hadamard = true;` at line 259 of [`tools/aff_quantize.cpp`](tools/aff_quantize.cpp#L259).
 3. At line 706 (inside the codebook sampling loop right after `mxfp4_dequant`) and line 763 (inside `encode_one` right after `mxfp4_dequant`), add:
 ```cpp
         if (use_hadamard) randomized_hadamard_block32_rows(deq.data(), rows, cols);
@@ -556,7 +556,7 @@ void randomized_hadamard_block32_rows(float* x, uint64_t rows, uint64_t cols,
 
 **Step 4: Wire `AFF_HADAMARD_ROT=1` into GPU activation quantizers (`batch_kernels.hip` and `expert_kernel.hip`)**
 
-1. In [`/mnt/fast-storage/affinity/src/gpu/batch_kernels.hip:145-185`](file:///mnt/fast-storage/affinity/src/gpu/batch_kernels.hip#L145-L185), add a template parameter `bool Hadamard32 = false` to `batch_quant_fp8_kernel`:
+1. In [`src/gpu/batch_kernels.hip:145-185`](src/gpu/batch_kernels.hip#L145-L185), add a template parameter `bool Hadamard32 = false` to `batch_quant_fp8_kernel`:
 ```cpp
 template <class Src, bool Hadamard32 = false>
 __global__ __launch_bounds__(kQThreads) void batch_quant_fp8_kernel(
@@ -611,7 +611,7 @@ __global__ __launch_bounds__(kQThreads) void batch_quant_fp8_kernel(
     }
     part[kk][tt] = m;
 ```
-And in `batch_quant_fp8_hip` ([`batch_kernels.hip:2592`](file:///mnt/fast-storage/affinity/src/gpu/batch_kernels.hip#L2592)), check `AFF_HADAMARD_ROT`:
+And in `batch_quant_fp8_hip` ([`batch_kernels.hip:2592`](src/gpu/batch_kernels.hip#L2592)), check `AFF_HADAMARD_ROT`:
 ```cpp
 void batch_quant_fp8_hip(const float* x, uint8_t* out, float* scales, uint32_t dim, uint32_t nb,
                          uint32_t x_off, void* stream) {
@@ -628,11 +628,11 @@ void batch_quant_fp8_hip(const float* x, uint8_t* out, float* scales, uint32_t d
   }
 }
 ```
-2. Apply the identical `template <bool Hadamard32 = false>` block to `expert_swiglu_quant_kernel` and `expert_swiglu_quant_hip` in [`/mnt/fast-storage/affinity/src/gpu/expert_kernel.hip:864-908,2822-2836`](file:///mnt/fast-storage/affinity/src/gpu/expert_kernel.hip#L864-L908).
+2. Apply the identical `template <bool Hadamard32 = false>` block to `expert_swiglu_quant_kernel` and `expert_swiglu_quant_hip` in [`src/gpu/expert_kernel.hip:864-908,2822-2836`](src/gpu/expert_kernel.hip#L864-L908).
 
-**Step 5: Register `test_hadamard_block32` in `/mnt/fast-storage/affinity/CMakeLists.txt`, build, and test**
+**Step 5: Register `test_hadamard_block32` in `CMakeLists.txt`, build, and test**
 
-In [`/mnt/fast-storage/affinity/CMakeLists.txt:227`](file:///mnt/fast-storage/affinity/CMakeLists.txt#L227), add:
+In [`CMakeLists.txt:227`](CMakeLists.txt#L227), add:
 ```cmake
   add_executable(test_hadamard_block32 tests/test_hadamard_block32.cpp)
   target_link_libraries(test_hadamard_block32 PRIVATE aff_format)
@@ -641,16 +641,16 @@ In [`/mnt/fast-storage/affinity/CMakeLists.txt:227`](file:///mnt/fast-storage/af
 
 Run:
 ```bash
-ninja -C /mnt/fast-storage/affinity/build test_hadamard_block32 aff-quantize
-/mnt/fast-storage/affinity/build/test_hadamard_block32
+ninja -C build test_hadamard_block32 aff-quantize
+build/test_hadamard_block32
 ```
 Expected: `PASS: test_hadamard_block32`
 
 **Step 6: Commit Task 2**
 
 ```bash
-git -C /mnt/fast-storage/affinity add CMakeLists.txt src/quant/hadamard.h src/quant/hadamard.cpp tools/aff_quantize.cpp src/gpu/batch_kernels.hip src/gpu/expert_kernel.hip tests/test_hadamard_block32.cpp
-git -C /mnt/fast-storage/affinity commit -m "feat(quant,gpu): add EXL3 block-32 randomized Walsh-Hadamard rotation (--hadamard / AFF_HADAMARD_ROT)"
+git add CMakeLists.txt src/quant/hadamard.h src/quant/hadamard.cpp tools/aff_quantize.cpp src/gpu/batch_kernels.hip src/gpu/expert_kernel.hip tests/test_hadamard_block32.cpp
+git commit -m "feat(quant,gpu): add EXL3 block-32 randomized Walsh-Hadamard rotation (--hadamard / AFF_HADAMARD_ROT)"
 ```
 
 ---
@@ -658,26 +658,26 @@ git -C /mnt/fast-storage/affinity commit -m "feat(quant,gpu): add EXL3 block-32 
 ## Optimization 3: EXL3 Adaptive Asynchronous Prefetch Ring (`AFF_PREFETCH_RING`)
 
 **Technical Context:**
-1. As documented in [`/mnt/fast-storage/affinity/src/gpu/static_placement.hip:96-98`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.hip#L96-L98), zero-copy PCIe reads from `pool_dev_` inside `expert_gemm_wmma_kernel` inflate GEMM execution several times over because `expert_gemm_wmma_kernel` reads `gate`, `up`, and `down` at column-group strides (`20B` codes + `3B` fields per row) and re-reads the expert across multiple tiles when `counts[e] > 64`.
+1. As documented in [`src/gpu/static_placement.hip:96-98`](src/gpu/static_placement.hip#L96-L98), zero-copy PCIe reads from `pool_dev_` inside `expert_gemm_wmma_kernel` inflate GEMM execution several times over because `expert_gemm_wmma_kernel` reads `gate`, `up`, and `down` at column-group strides (`20B` codes + `3B` fields per row) and re-reads the expert across multiple tiles when `counts[e] > 64`.
 2. With `AFF_PREFETCH_RING=<slots>` (e.g., `AFF_PREFETCH_RING=16`, allocating `16 * 3.04 MiB = 48.6 MiB` of VRAM per card BEFORE slab sizing in `StaticPlacement::init`):
-   - `moe_plan_kernel` ([`/mnt/fast-storage/affinity/src/gpu/moe_plan.hip:294-333`](file:///mnt/fast-storage/affinity/src/gpu/moe_plan.hip#L294-L333)) already identifies every pooled (non-resident) expert (`cls == 1`, index `m_idx = j - n_res`).
+   - `moe_plan_kernel` ([`src/gpu/moe_plan.hip:294-333`](src/gpu/moe_plan.hip#L294-L333)) already identifies every pooled (non-resident) expert (`cls == 1`, index `m_idx = j - n_res`).
    - When `a.pref_slab != nullptr` and `m_idx < a.pref_cap`, `moe_plan_kernel` records the host pool shard address `base` into `a.pref_src[m_idx]`, records `s_npool` into `a.status->n_pool`, and points the pooled expert's `ExpertTile` (`T.data`, `T.fields`, `T.rscales`) at the VRAM prefetch slot `a.pref_slab + (size_t)m_idx * a.shard.stride`!
-   - Right after `ev_q` on the `hyb` stream ([`static_placement.hip:1956`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.hip#L1956)), while the compute stream `st` is busy running resident experts' `gate` and `up` GEMMs, `hyb` runs `moe_prefetch_pack_hip(d_pref_slab_[dv], d_pref_src_[dv], plan_st_[dv], shard_.stride, pref_slots_, hyb)` — a linear 128-bit (`uint4`) coalesced burst copy from `pool_dev_` into `d_pref_slab_[dv]`.
+   - Right after `ev_q` on the `hyb` stream ([`static_placement.hip:1956`](src/gpu/static_placement.hip#L1956)), while the compute stream `st` is busy running resident experts' `gate` and `up` GEMMs, `hyb` runs `moe_prefetch_pack_hip(d_pref_slab_[dv], d_pref_src_[dv], plan_st_[dv], shard_.stride, pref_slots_, hyb)` — a linear 128-bit (`uint4`) coalesced burst copy from `pool_dev_` into `d_pref_slab_[dv]`.
    - Then `hyb`'s `gate`, `up`, and `down` `expert_gemm_wmma_hip` launches read the prefetched expert shards at **640 GB/s GDDR6 VRAM / L2 bandwidth** instead of scattered zero-copy PCIe reads, with **zero host synchronization (`hipStreamSynchronize`)** and **100% bit-identity**!
 
 ### Task 3: Implement Device-Planned Asynchronous VRAM Prefetch Ring (`AFF_PREFETCH_RING`)
 
 **Files:**
-- Modify: [`/mnt/fast-storage/affinity/src/gpu/moe_plan.h:50-57,160-185`](file:///mnt/fast-storage/affinity/src/gpu/moe_plan.h#L50-L57)
-- Modify: [`/mnt/fast-storage/affinity/src/gpu/moe_plan.hip:294-333,369-422`](file:///mnt/fast-storage/affinity/src/gpu/moe_plan.hip#L294-L333)
-- Modify: [`/mnt/fast-storage/affinity/src/gpu/static_placement.h:545-555`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.h#L545-L555)
-- Modify: [`/mnt/fast-storage/affinity/src/gpu/static_placement.hip:190-196,374-395,890-920,1725-1745,1956-1964`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.hip#L890-L920)
-- Create: `/mnt/fast-storage/affinity/tests/test_prefetch_ring.hip`
-- Modify: [`/mnt/fast-storage/affinity/CMakeLists.txt:305`](file:///mnt/fast-storage/affinity/CMakeLists.txt#L305)
+- Modify: [`src/gpu/moe_plan.h:50-57,160-185`](src/gpu/moe_plan.h#L50-L57)
+- Modify: [`src/gpu/moe_plan.hip:294-333,369-422`](src/gpu/moe_plan.hip#L294-L333)
+- Modify: [`src/gpu/static_placement.h:545-555`](src/gpu/static_placement.h#L545-L555)
+- Modify: [`src/gpu/static_placement.hip:190-196,374-395,890-920,1725-1745,1956-1964`](src/gpu/static_placement.hip#L890-L920)
+- Create: `tests/test_prefetch_ring.hip`
+- Modify: [`CMakeLists.txt:305`](CMakeLists.txt#L305)
 
 **Step 1: Extend `MoePlanArgs` and `moe_plan.h` with `pref_slab`, `pref_src`, `pref_cap`, and `moe_prefetch_pack_hip`**
 
-In [`/mnt/fast-storage/affinity/src/gpu/moe_plan.h:167-185`](file:///mnt/fast-storage/affinity/src/gpu/moe_plan.h#L167-L185), add to `MoePlanArgs`:
+In [`src/gpu/moe_plan.h:167-185`](src/gpu/moe_plan.h#L167-L185), add to `MoePlanArgs`:
 ```cpp
   // Optional VRAM prefetch ring for pooled (cls == 1) experts (AFF_PREFETCH_RING=N).
   // When pref_slab != nullptr and (j - n_res) < pref_cap, moe_plan_kernel writes the pooled
@@ -687,7 +687,7 @@ In [`/mnt/fast-storage/affinity/src/gpu/moe_plan.h:167-185`](file:///mnt/fast-st
   const uint8_t** pref_src  = nullptr;
   uint32_t        pref_cap  = 0;
 ```
-And declare after `moe_plan_hip` in [`/mnt/fast-storage/affinity/src/gpu/moe_plan.h:182`](file:///mnt/fast-storage/affinity/src/gpu/moe_plan.h#L182):
+And declare after `moe_plan_hip` in [`src/gpu/moe_plan.h:182`](src/gpu/moe_plan.h#L182):
 ```cpp
 // Linear uint4 coalesced burst copy of `min(status->n_uniq - status->n_res, pref_cap)` pooled
 // expert shards from `pref_src[i]` into `pref_slab + i * stride` on `stream` (the hybrid stream).
@@ -696,9 +696,9 @@ void moe_prefetch_pack_hip(uint8_t* pref_slab, const uint8_t* const* pref_src,
                            void* stream);
 ```
 
-**Step 2: Implement `pref_slab` redirection and `moe_prefetch_pack_hip` in `/mnt/fast-storage/affinity/src/gpu/moe_plan.hip`**
+**Step 2: Implement `pref_slab` redirection and `moe_prefetch_pack_hip` in `src/gpu/moe_plan.hip`**
 
-In [`/mnt/fast-storage/affinity/src/gpu/moe_plan.hip:294-305`](file:///mnt/fast-storage/affinity/src/gpu/moe_plan.hip#L294-L305), update `base` inside the `for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads)` loop:
+In [`src/gpu/moe_plan.hip:294-305`](src/gpu/moe_plan.hip#L294-L305), update `base` inside the `for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads)` loop:
 ```cpp
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) {
     const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
@@ -711,7 +711,7 @@ In [`/mnt/fast-storage/affinity/src/gpu/moe_plan.hip:294-305`](file:///mnt/fast-
       base = a.pref_slab + (size_t)pidx * a.shard.stride;
     }
 ```
-And add `moe_prefetch_pack_kernel` and `moe_prefetch_pack_hip` at the bottom of [`/mnt/fast-storage/affinity/src/gpu/moe_plan.hip:388`](file:///mnt/fast-storage/affinity/src/gpu/moe_plan.hip#L388):
+And add `moe_prefetch_pack_kernel` and `moe_prefetch_pack_hip` at the bottom of [`src/gpu/moe_plan.hip:388`](src/gpu/moe_plan.hip#L388):
 ```cpp
 __global__ __launch_bounds__(256) void moe_prefetch_pack_kernel(
     uint8_t* __restrict__ pref_slab, const uint8_t* const* __restrict__ pref_src,
@@ -746,13 +746,13 @@ void moe_prefetch_pack_hip(uint8_t* pref_slab, const uint8_t* const* pref_src,
 
 **Step 3: Allocate `d_pref_slab_[dv]` and `d_pref_src_[dv]` in `StaticPlacement` and wire into `run_batch_device`**
 
-1. In [`/mnt/fast-storage/affinity/src/gpu/static_placement.h:549`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.h#L549), add:
+1. In [`src/gpu/static_placement.h:549`](src/gpu/static_placement.h#L549), add:
 ```cpp
   uint8_t* d_pref_slab_[8] = {};
   const uint8_t** d_pref_src_[8] = {};
   uint32_t pref_cap_ = 0;
 ```
-2. In [`/mnt/fast-storage/affinity/src/gpu/static_placement.hip:192`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.hip#L192) (inside `StaticPlacement::~StaticPlacement()`), add `d_pref_slab_[i]` and `d_pref_src_[i]` to the cleanup loop:
+2. In [`src/gpu/static_placement.hip:192`](src/gpu/static_placement.hip#L192) (inside `StaticPlacement::~StaticPlacement()`), add `d_pref_slab_[i]` and `d_pref_src_[i]` to the cleanup loop:
 ```cpp
     for (void* p : {(void*)plan_col_[i], (void*)plan_cnt_[i], (void*)plan_st_[i],
                     (void*)d_imat_w2_[i], (void*)d_pref_slab_[i], (void*)d_pref_src_[i]})
@@ -760,7 +760,7 @@ void moe_prefetch_pack_hip(uint8_t* pref_slab, const uint8_t* const* pref_src,
     d_pref_slab_[i] = nullptr;
     d_pref_src_[i] = nullptr;
 ```
-3. In [`/mnt/fast-storage/affinity/src/gpu/static_placement.hip:891`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.hip#L891) (right after `const uint64_t slot_stride = this->slot_stride();` and BEFORE the `hipMemGetInfo` slab-sizing loop so `freeb` automatically accounts for the prefetch ring!), add:
+3. In [`src/gpu/static_placement.hip:891`](src/gpu/static_placement.hip#L891) (right after `const uint64_t slot_stride = this->slot_stride();` and BEFORE the `hipMemGetInfo` slab-sizing loop so `freeb` automatically accounts for the prefetch ring!), add:
 ```cpp
   pref_cap_ = 0;
   if (const char* pr = std::getenv("AFF_PREFETCH_RING"); pr && *pr) {
@@ -781,13 +781,13 @@ void moe_prefetch_pack_hip(uint8_t* pref_slab, const uint8_t* const* pref_src,
     }
   }
 ```
-4. In [`/mnt/fast-storage/affinity/src/gpu/static_placement.hip:1738`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.hip#L1738) (when populating `MoePlanArgs A;`), add:
+4. In [`src/gpu/static_placement.hip:1738`](src/gpu/static_placement.hip#L1738) (when populating `MoePlanArgs A;`), add:
 ```cpp
         A.pref_slab = d_pref_slab_[dv];
         A.pref_src  = d_pref_src_[dv];
         A.pref_cap  = pref_cap_;
 ```
-5. In [`/mnt/fast-storage/affinity/src/gpu/static_placement.hip:1956`](file:///mnt/fast-storage/affinity/src/gpu/static_placement.hip#L1956) (on the `hyb` stream right before the `for (uint32_t b = 4; b < 8; ++b)` missing-expert GEMM loop), launch `moe_prefetch_pack_hip`:
+5. In [`src/gpu/static_placement.hip:1956`](src/gpu/static_placement.hip#L1956) (on the `hyb` stream right before the `for (uint32_t b = 4; b < 8; ++b)` missing-expert GEMM loop), launch `moe_prefetch_pack_hip`:
 ```cpp
       { AFF_XTRACE((int)dv, 8, hyb);
       if (plan_on && pref_cap_ && d_pref_slab_[dv] && d_pref_src_[dv]) {
@@ -797,9 +797,9 @@ void moe_prefetch_pack_hip(uint8_t* pref_slab, const uint8_t* const* pref_src,
       for (uint32_t b = 4; b < 8; ++b) {
 ```
 
-**Step 4: Write the unit test (`/mnt/fast-storage/affinity/tests/test_prefetch_ring.hip`), register in `CMakeLists.txt`, and run**
+**Step 4: Write the unit test (`tests/test_prefetch_ring.hip`), register in `CMakeLists.txt`, and run**
 
-Create `/mnt/fast-storage/affinity/tests/test_prefetch_ring.hip`:
+Create `tests/test_prefetch_ring.hip`:
 ```cpp
 #include "gpu/moe_plan.h"
 #include "gpu/hip_common.h"
@@ -864,24 +864,24 @@ int main() {
 }
 ```
 
-In [`/mnt/fast-storage/affinity/CMakeLists.txt:305`](file:///mnt/fast-storage/affinity/CMakeLists.txt#L305), add:
+In [`CMakeLists.txt:305`](CMakeLists.txt#L305), add:
 ```cmake
     aff_hip_test(test_prefetch_ring prefetch_ring)
 ```
 
 Run:
 ```bash
-ninja -C /mnt/fast-storage/affinity/build test_prefetch_ring test_moe_plan
-/mnt/fast-storage/affinity/build/test_prefetch_ring
-/mnt/fast-storage/affinity/build/test_moe_plan
+ninja -C build test_prefetch_ring test_moe_plan
+build/test_prefetch_ring
+build/test_moe_plan
 ```
 Expected: `PASS: test_prefetch_ring` and `PASS` on `test_moe_plan`.
 
 **Step 5: Commit Task 3**
 
 ```bash
-git -C /mnt/fast-storage/affinity add CMakeLists.txt src/gpu/moe_plan.h src/gpu/moe_plan.hip src/gpu/static_placement.h src/gpu/static_placement.hip tests/test_prefetch_ring.hip
-git -C /mnt/fast-storage/affinity commit -m "perf(gpu): add EXL3 device-planned async VRAM prefetch ring (AFF_PREFETCH_RING)"
+git add CMakeLists.txt src/gpu/moe_plan.h src/gpu/moe_plan.hip src/gpu/static_placement.h src/gpu/static_placement.hip tests/test_prefetch_ring.hip
+git commit -m "perf(gpu): add EXL3 device-planned async VRAM prefetch ring (AFF_PREFETCH_RING)"
 ```
 
 ---
@@ -889,27 +889,27 @@ git -C /mnt/fast-storage/affinity commit -m "perf(gpu): add EXL3 device-planned 
 ## Task 4: Full Build, Complete Test Suite Verification, and Production Deployment
 
 **Files:**
-- Build: `/mnt/fast-storage/affinity/build/affinity` and `/mnt/fast-storage/affinity/build/aff-quantize`
-- Install: `/home/ydj/affinity-patched/affinity`
-- Modify: [`/home/ydj/.config/systemd/user/deepseek-v41-affinity.service`](file:///home/ydj/.config/systemd/user/deepseek-v41-affinity.service)
+- Build: `build/affinity` and `build/aff-quantize`
+- Install: `/opt/affinity/bin/affinity`
+- Modify: [`~/.config/systemd/user/deepseek-v41-affinity.service`](file://~/.config/systemd/user/deepseek-v41-affinity.service)
 
 **Step 1: Build all binaries and run the complete `ctest` suite**
 
 Run:
 ```bash
-ninja -C /mnt/fast-storage/affinity/build affinity aff-quantize
-ctest --test-dir /mnt/fast-storage/affinity/build --output-on-failure
+ninja -C build affinity aff-quantize
+ctest --test-dir build --output-on-failure
 ```
 Expected: `100% tests passed, 0 tests failed`.
 
 **Step 2: Install new binary atomically and update `deepseek-v41-affinity.service`**
 
-In [`/home/ydj/.config/systemd/user/deepseek-v41-affinity.service`](file:///home/ydj/.config/systemd/user/deepseek-v41-affinity.service), add `-e AFF_MOE_RECON_TILES=8` and `-e AFF_PREFETCH_RING=8` to the `docker run` environment flags (note: do **not** enable `AFF_HADAMARD_ROT=1` on the existing un-rotated `model-uc-1017.aff` container; `AFF_HADAMARD_ROT=1` is only used with containers quantized with `aff-quantize --hadamard`).
+In [`~/.config/systemd/user/deepseek-v41-affinity.service`](file://~/.config/systemd/user/deepseek-v41-affinity.service), add `-e AFF_MOE_RECON_TILES=8` and `-e AFF_PREFETCH_RING=8` to the `docker run` environment flags (note: do **not** enable `AFF_HADAMARD_ROT=1` on the existing un-rotated `model-uc-1017.aff` container; `AFF_HADAMARD_ROT=1` is only used with containers quantized with `aff-quantize --hadamard`).
 
 Run:
 ```bash
-cp -a /mnt/fast-storage/affinity/build/affinity /home/ydj/affinity-patched/affinity.new
-mv -f /home/ydj/affinity-patched/affinity.new /home/ydj/affinity-patched/affinity
+cp -a build/affinity /opt/affinity/bin/affinity.new
+mv -f /opt/affinity/bin/affinity.new /opt/affinity/bin/affinity
 ```
 
 **Step 3: Restart `deepseek-v41-affinity.service` at a request boundary and verify health + throughput**
@@ -927,4 +927,4 @@ curl -sf http://127.0.0.1:8000/v1/models
 Expected:
 - Log shows `prefetch ring: 8 slots/card (24.3 MiB/card) allocated on hybrid stream`.
 - `curl` returns `DeepSeek-V4.1-Flash-UNCENSORED` HTTP 200.
-- If any check fails or output quality degrades, execute `/mnt/fast-storage/affinity/scripts/rollback_exl3.sh` immediately.
+- If any check fails or output quality degrades, execute `scripts/rollback_exl3.sh` immediately.

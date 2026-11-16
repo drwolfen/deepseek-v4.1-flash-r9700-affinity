@@ -11,19 +11,19 @@ CK=/path/to/hf/DeepSeek-V4.1-Flash
 IMNAME=imatrix-dsv41-262144.gguf
 T=${1:-16}
 ME=$(hostname -s)
-B=$HOME/aff-v41/bin/aff-quantize
+B=${AFF_QUANTIZE:-$HUBDIR/bin/aff-quantize}
 ts() { date +%T; }
 
 if [ "$ME" = amdnas ]; then
-  LOCAL=1; SRC=$CK; OUT=$HUBDIR/experts; CB=$HUBDIR/v41cb.raw; IM=/mnt/models2/affinity/v41/imatrix/$IMNAME
+  LOCAL=1; SRC=$CK; OUT=$HUBDIR/experts; CB=$HUBDIR/v41cb.raw; IM=${IMATRIX:-$HUBDIR/imatrix/$IMNAME}
   hub() { bash -c "$1"; }
 else
-  LOCAL=0; SRC=$HOME/aff-v41/src; OUT=$HOME/aff-v41/out; CB=$HOME/aff-v41/v41cb.raw; IM=$HOME/aff-v41/$IMNAME
+  LOCAL=0; SRC=$HUBDIR/src; OUT=$HUBDIR/out; CB=$HUBDIR/v41cb.raw; IM=$HUBDIR/$IMNAME
   hub() { ssh -o BatchMode=yes $HUB "$1"; }
   mkdir -p "$SRC" "$OUT"
   rsync -a $HUB:$CK/config.json $HUB:$CK/model.safetensors.index.json "$SRC/" || exit 1
   rsync -a $HUB:$HUBDIR/v41cb.raw "$CB" || exit 1
-  rsync -a $HUB:/mnt/models2/affinity/v41/imatrix/$IMNAME "$IM" || exit 1
+  rsync -a $HUB:$HUBDIR/imatrix/$IMNAME "$IM" || exit 1
 fi
 mkdir -p "$OUT"
 hub "mkdir -p $HUBDIR/claims $HUBDIR/experts"

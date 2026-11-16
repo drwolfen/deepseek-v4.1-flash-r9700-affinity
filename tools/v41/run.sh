@@ -19,8 +19,8 @@
 #    69632, which is 302 more resident experts a card. Size it to the context you actually want.
 set -euo pipefail
 
-MODELS=/mnt/models2/affinity/v41
-CKPT=/path/to/hf/DeepSeek-V4.1-Flash
+MODELS=${MODELS:-/models/affinity/v41}
+CKPT=${CKPT:-/models/hf/DeepSeek-V4.1-Flash}
 PORT=8099
 POOL="--host-pool-mib 138000 --host-pool-reserve-mib 512"
 

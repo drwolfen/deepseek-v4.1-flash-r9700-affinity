@@ -39,7 +39,7 @@ patches*).
 | PCIe | GPUs link at **Gen5 ×16**, but the switch **uplink runs Gen3 ×16 (8.0 GT/s)** — the host Xeon is a PCIe-3.0 CPU. |
 | Host OS | **Ubuntu 24.04.5 LTS** (Noble Numbat), kernel 7.0.0, ROCm 10.1.0 |
 | Engine build | Docker image `deepseek-affinity:v5.0.0` (ROCm 10.1.0-full, `gfx1201`) |
-| Serving ports | Dual active: `:8000` (Docker container) and `:8080` (`r9v-proxy-8080.py` for Hermes `local-heavy`) |
+| Serving ports | Dual active: `:8000` (Docker container) and `:8080` (local port-8080 TCP proxy for agent pipeline) |
 
 ### Minimum RAM
 
@@ -178,18 +178,18 @@ docker run --name deepseek-affinity \
   -e AFF_NOBUDGET_MAX_TOKENS=16384 -e AFF_HC_FUSED_V2=1 -e AFF_HC_CHAINED=1 \
   -e AFF_HC_CHAINED_MIN_ROWS=1 -e AFF_SPARSE_INDEXER=1 -e AFF_INDEXER_SCORE_BUDGET_MB=36 \
   -p 8000:8000 \
-  -v /mnt/fast-storage:/mnt/fast-storage \
+  -v /models:/models \
   deepseek-affinity:v5.0.0 \
-    -m /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.aff \
-    --tokenizer /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json \
+    -m /models/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.aff \
+    --tokenizer /models/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json \
     --host 0.0.0.0 --port 8000 \
     --raw-completions \
     --gpu-headroom-mib 384 \
     --dspark on \
-    --dspark-model /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.dspark.aff \
-    --engram /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.engram \
-    --engram-tables /mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8 \
-    --prefix-cache-dir /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/pcache \
+    --dspark-model /models/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.dspark.aff \
+    --engram /models/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/model-uc-1017.engram \
+    --engram-tables /models/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8 \
+    --prefix-cache-dir /models/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/pcache \
     --prefix-cache-gib 64 \
     --persistent-prefix-cache \
     --kv-size 327680 \
@@ -197,7 +197,7 @@ docker run --name deepseek-affinity \
     --host-pool-mib 200000 --host-pool-reserve-mib 1024 \
     --placement-strategy demand \
     --placement-hysteresis 1.6 --placement-min-gain 3.0 \
-    --placement-save /mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/placement.affprof \
+    --placement-save /models/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff/placement.affprof \
     --prefill-chunk-size 2816 \
     --default-effort 75 \
     --repeat-penalty 1.1 --repeat-last-n 96 --dry-delta 40 \

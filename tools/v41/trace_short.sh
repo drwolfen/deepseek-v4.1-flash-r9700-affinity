@@ -5,8 +5,8 @@
 # 2) --dump-logits 10 --tokens <ids> with AFF_NORM_TRACE=1: top-10 next-token logits + per-sublayer
 #    sums of squares, engram and draft OFF, static placement.
 set -uo pipefail
-IMG=${1:?image}; TEXT=${2:-The capital of France is}; OUT=${3:-/mnt/models2/affinity/v41/trace_$(date +%H%M)}
-M=/mnt/models2/affinity/v41
+IMG=${1:?image}; TEXT=${2:-The capital of France is}; OUT=${3:-${BENCH_DIR:-./benchmarks}/trace_$(date +%H%M)}
+M=${MODELS:-/models/affinity/v41}
 run() { docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt label=disable --network host \
   --ipc host --ulimit memlock=-1:-1 --shm-size 16g -e HIP_VISIBLE_DEVICES=0,1 "$@"; }
 common=(-m /m/model.aff --tokenizer /ck/tokenizer.json --dspark off --host-pool-mib 138000

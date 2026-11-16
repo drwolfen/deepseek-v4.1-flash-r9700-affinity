@@ -3,9 +3,10 @@
 # Adjust MODELS to where the .aff files live. Mirrors deploy/deepseek-v41-affinity.service.
 set -eu
 
-MODELS=${MODELS:-/mnt/fast-storage/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff}
-TOKENIZER=${TOKENIZER:-/mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json}
-ENGRAM_TABLES=${ENGRAM_TABLES:-/mnt/fast-storage/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8}
+MODELS=${MODELS:-/models/DeepSeek-V4.1-Flash-1017-UNCENSORED-aff}
+TOKENIZER=${TOKENIZER:-/models/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8/tokenizer.json}
+ENGRAM_TABLES=${ENGRAM_TABLES:-/models/LLM-Models/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8}
+STORAGE_DIR=${STORAGE_DIR:-/models}
 IMAGE=${IMAGE:-deepseek-affinity:v5.0.0}
 NAME=${NAME:-deepseek-affinity}
 
@@ -32,7 +33,7 @@ exec docker run --rm --name "$NAME" \
   -e AFF_SPARSE_INDEXER=1 \
   -e AFF_INDEXER_SCORE_BUDGET_MB=36 \
   -p 8000:8000 \
-  -v /mnt/fast-storage:/mnt/fast-storage \
+  -v "$STORAGE_DIR":/models \
   "$IMAGE" \
     -m "$MODELS/model-uc-1017.aff" \
     --tokenizer "$TOKENIZER" \

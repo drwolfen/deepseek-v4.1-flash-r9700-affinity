@@ -4,8 +4,7 @@
 # nothing is installed on it. hipcc + ROCm clang come from the image venv _rocm_sdk_devel tree; AFF_HIPCC is passed
 # explicitly so affinity CMake derives ROCM_ROOT = that tree (its default find_program would pick /opt/venv/bin/hipcc
 # and derive /opt/venv, which has no lib/llvm/bin). Build context = a copy of the repo checkout minus .git.
-# Source of this file: ~/Claude/infra/amdnas/deployed/build/affinity-docker/Dockerfile (deployed to
-# amdnas:/mnt/models2/build/affinity-docker/).
+# Container build recipe for affinity on gfx1201.
 FROM kyuz0/vllm-therock-gfx1201:rocm7.14.0-torch2.11.0-vllm0.27.1
 ARG SDK=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel
 COPY affinity /opt/affinity-src

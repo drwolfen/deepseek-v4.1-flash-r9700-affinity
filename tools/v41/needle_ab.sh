@@ -4,7 +4,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 IMG=${1:?image}; shift; ARMS=${*:-off on}
-M=/mnt/models2/affinity/v41; OUT=$M/needle-ab-$(date +%H%M); mkdir -p $OUT
+M=${FIXTURES_DIR:-./fixtures}; OUT=${BENCH_DIR:-./benchmarks}/needle-ab-$(date +%H%M); mkdir -p "$OUT"
 for a in $ARMS; do
   E=(); [ "$a" = on ] && E=(--engram /m/model.engram --engram-tables /ck)
   ./run.sh serve "$IMG" nab-$a --kv-size 69632 --kv-commit 69632 --max-tokens-floor 0 "${E[@]}" >/dev/null

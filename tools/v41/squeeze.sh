@@ -24,13 +24,15 @@
 #
 # Every arm's server log is followed to the end, so the exit report (hit rate, prefix-cache
 # counters) is kept — `run.sh serve` uses --rm, and the 09-22 bench lost it that way.
-# ⚠️ Run as `bash squeeze.sh`, not ./squeeze.sh, if it ever lives on /mnt/models2 (SELinux).
+# ⚠️ Run as `bash squeeze.sh`, not ./squeeze.sh, if execution permissions require (SELinux).
 set -uo pipefail
 cd "$(dirname "$0")"
 IMG=${1:-local/affinity:v41-noqrms}; shift || true
 ARMS=${*:-needle0 needle backed prefix draft draftram demand chunk}
 CONTROL=local/affinity:v41-seed
-OUT=/mnt/models2/affinity/v41/squeeze-$(date +%Y%m%d-%H%M)
+FIXTURES_DIR=${FIXTURES_DIR:-./fixtures}
+PCACHE_DIR=${PCACHE_DIR:-./pcache}
+OUT=${BENCH_DIR:-./benchmarks}/squeeze-$(date +%Y%m%d-%H%M)
 mkdir -p "$OUT"
 BASE=(--kv-size 69632 --kv-commit 69632 --engram /m/model.engram --engram-tables /ck
       --max-tokens-floor 0)
@@ -55,13 +57,13 @@ arm() {   # arm <name> <extra flags...> -- <workload function>   (ARM_IMG overri
 }
 
 w_backed() { ./run.sh bench n4k.txt n8k.txt n16k.txt n32k.txt n48k.txt n64k.txt
-             URL=$URL python3 -u turn2.py /mnt/models2/affinity/v41/n16k.txt n16k
-             URL=$URL python3 -u turn2.py /mnt/models2/affinity/v41/n64k.txt n64k; }
-w_prefix() { URL=$URL python3 -u turn2.py /mnt/models2/affinity/v41/n16k.txt n16k
-             URL=$URL python3 -u turn2.py /mnt/models2/affinity/v41/n64k.txt n64k; }
+             URL=$URL python3 -u turn2.py "$FIXTURES_DIR/n16k.txt" n16k
+             URL=$URL python3 -u turn2.py "$FIXTURES_DIR/n64k.txt" n64k; }
+w_prefix() { URL=$URL python3 -u turn2.py "$FIXTURES_DIR/n16k.txt" n16k
+             URL=$URL python3 -u turn2.py "$FIXTURES_DIR/n64k.txt" n64k; }
 w_short()  { ./run.sh bench n16k.txt n48k.txt; }
-w_needle() { local M=/mnt/models2/affinity/v41
-             URL=$URL python3 -u needle.py $M/n4k.txt $M/n16k.txt $M/n64k.txt; }
+w_needle() { local M="$FIXTURES_DIR"
+             URL=$URL python3 -u needle.py "$M/n4k.txt" "$M/n16k.txt" "$M/n64k.txt"; }
 w_draft()  { URL=$URL python3 -u draftacc.py; ./run.sh bench n16k.txt; }
 
 for a in $ARMS; do
@@ -71,7 +73,7 @@ for a in $ARMS; do
     draft)  arm draft --dspark on -- w_draft ;;
     draftram) arm draftram --dspark on --dspark-placement ram -- w_draft ;;
     backed) arm backed -- w_backed ;;
-    prefix) mkdir -p /mnt/models2/affinity/v41/pcache
+    prefix) mkdir -p "$PCACHE_DIR"
             arm prefix --prefix-cache-dir /m/pcache --prefix-cache-gib 64 -- w_prefix ;;
     demand) arm demand --placement-strategy demand -- w_short ;;
     chunk)  arm chunk --prefill-chunk-size 2816 -- w_short ;;
