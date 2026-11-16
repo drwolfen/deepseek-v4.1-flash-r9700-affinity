@@ -219,14 +219,29 @@ static std::size_t tool_block_close_end(const std::string& s, std::size_t at) {
                                   std::string("</") + ds + " calls>",
                                   std::string("</") + ds + "calls>",
                                   std::string("</") + ds + ">"}) {
-      const std::size_t p = s.find(cl, at);
-      if (p != std::string::npos) return p + cl.size();
+      for (size_t p = s.find(cl, at); p != std::string::npos; p = s.find(cl, p + 1)) {
+        const size_t after = p + cl.size();
+        size_t p_closer = s.find("</" + ds + " parameter>", after);
+        size_t p_closer2 = s.find("</" + ds + "parameter>", after);
+        size_t p_closer3 = s.find("</parameter>", after);
+        size_t closer = std::min({p_closer, p_closer2, p_closer3});
+        size_t next_open = std::min({s.find("<" + ds + " calls", after),
+                                     s.find("<" + ds + "tool_calls", after)});
+        if (closer != std::string::npos && (next_open == std::string::npos || closer < next_open))
+          continue;
+        return p + cl.size();
+      }
     }
     return std::string::npos;
   }
   // Marker-less form: the first </invoke> after the open (the bare form has no wrapper close).
-  const std::size_t p = s.find("</invoke>", at);
-  return p == std::string::npos ? std::string::npos : p + std::string("</invoke>").size();
+  for (size_t p = s.find("</invoke>", at); p != std::string::npos; p = s.find("</invoke>", p + 1)) {
+    const size_t after = p + 9;
+    size_t closer = s.find("</parameter>", after);
+    if (closer != std::string::npos) continue;
+    return p + 9;
+  }
+  return std::string::npos;
 }
 
 int main(int argc, char** argv) {

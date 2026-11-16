@@ -455,8 +455,8 @@ std::string encode_messages(const std::vector<ChatMsg>& in, const EncodeOpts& op
 namespace {
 
 // The reference's _read_until_stop: the EARLIEST of the stops wins, not the first listed.
-size_t read_until(size_t i, const std::string& t, const std::vector<std::string>& stops,
-                  std::string* content, std::string* matched) {
+[[maybe_unused]] size_t read_until(size_t i, const std::string& t, const std::vector<std::string>& stops,
+                                   std::string* content, std::string* matched) {
   size_t best = t.size();
   const std::string* hit = nullptr;
   for (const std::string& s : stops) {
@@ -625,14 +625,88 @@ std::string repair_bare_dsml(const std::string& s, ThinkingMode mode) {
   return t.substr(0, body_start) + body;
 }
 
+namespace {
+
+// Counts open and close tags from `from` forward to check whether a candidate tag sits inside
+// an unclosed tool call or invoke.
+class QuotedCall {
+ public:
+  QuotedCall(const std::string& text, size_t from, std::string open, std::string close)
+      : text_(text), open_(std::move(open)), close_(std::move(close)),
+        next_open_(text.find(open_, from)), next_close_(text.find(close_, from)) {}
+
+  bool open_before(size_t to) {
+    for (; next_open_ != std::string::npos && next_open_ + open_.size() <= to;
+         next_open_ = text_.find(open_, next_open_ + open_.size())) {
+      ++depth_;
+    }
+    for (; next_close_ != std::string::npos && next_close_ + close_.size() <= to;
+         next_close_ = text_.find(close_, next_close_ + close_.size())) {
+      --depth_;
+    }
+    return depth_ > 0;
+  }
+
+ private:
+  const std::string& text_;
+  std::string open_, close_;
+  size_t next_open_, next_close_;
+  long depth_ = 0;
+};
+
+size_t skip_ws_local(const std::string& s, size_t pos) {
+  while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == '\r')) {
+    ++pos;
+  }
+  return pos;
+}
+
+bool is_valid_json_non_string(const std::string& raw) {
+  size_t p = skip_ws_local(raw, 0);
+  if (p >= raw.size()) return false;
+  if (raw.compare(p, 4, "true") == 0) return skip_ws_local(raw, p + 4) == raw.size();
+  if (raw.compare(p, 5, "false") == 0) return skip_ws_local(raw, p + 5) == raw.size();
+  if (raw.compare(p, 4, "null") == 0) return skip_ws_local(raw, p + 4) == raw.size();
+  if (raw[p] == '-' || (raw[p] >= '0' && raw[p] <= '9')) {
+    char* endptr = nullptr;
+    (void)std::strtod(raw.c_str() + p, &endptr);
+    if (!endptr || endptr == raw.c_str() + p) return false;
+    return skip_ws_local(raw, (size_t)(endptr - raw.c_str())) == raw.size();
+  }
+  if (raw[p] == '[' || raw[p] == '{') {
+    std::vector<char> stack;
+    bool in_str = false, esc = false;
+    for (size_t i = p; i < raw.size(); ++i) {
+      char c = raw[i];
+      if (in_str) {
+        if (esc) esc = false;
+        else if (c == '\\') esc = true;
+        else if (c == '"') in_str = false;
+        continue;
+      }
+      if (c == '"') in_str = true;
+      else if (c == '[' || c == '{') stack.push_back(c);
+      else if (c == ']') {
+        if (stack.empty() || stack.back() != '[') return false;
+        stack.pop_back();
+        if (stack.empty()) return skip_ws_local(raw, i + 1) == raw.size();
+      } else if (c == '}') {
+        if (stack.empty() || stack.back() != '{') return false;
+        stack.pop_back();
+        if (stack.empty()) return skip_ws_local(raw, i + 1) == raw.size();
+      }
+    }
+    return stack.empty() && !in_str;
+  }
+  return false;
+}
+
+}  // namespace
+
 ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
   ParsedMessage out;
   const std::string text = repair_bare_dsml(text_in, mode);
   const std::string dsml = kDsml;
-  const std::string tc_open_v4  = std::string("\n\n<") + dsml + "tool_calls";
-  const std::string tc_open_v41 = std::string("\n\n<") + dsml + " calls";
-  const std::string tc_open_v41_raw = std::string("<") + dsml + " calls";
-  const std::string tc_open_v4_raw  = std::string("<") + dsml + "tool_calls";
 
   auto fail = [&](const char* why) {
     out.ok = false;
@@ -644,53 +718,128 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
   };
 
   size_t i = 0;
-  std::string chunk, stop;
-
-  const std::vector<std::string> open_markers = {tc_open_v4, tc_open_v41, tc_open_v4_raw, tc_open_v41_raw};
-
   if (mode == ThinkingMode::Thinking) {
-    std::vector<std::string> think_stops = {kThinkEnd};
-    think_stops.insert(think_stops.end(), open_markers.begin(), open_markers.end());
-    i = read_until(i, text, think_stops, &chunk, &stop);
-    if (stop != kThinkEnd) return fail("missing </think>");
-    out.reasoning_content = chunk;
+    const std::string te_str(kThinkEnd);
+    size_t te = text.find(te_str);
+    if (te == std::string::npos) return fail("missing </think>");
+    out.reasoning_content = text.substr(0, te);
+    i = te + te_str.size();
   }
 
-  std::vector<std::string> content_stops = {kEosStr};
-  content_stops.insert(content_stops.end(), open_markers.begin(), open_markers.end());
-  i = read_until(i, text, content_stops, &chunk, &stop);
-  out.content = chunk;
+  const std::string tc_open_v41 = "<" + dsml + " calls";
+  const std::string tc_open_v4  = "<" + dsml + "tool_calls";
+  const std::string tc_open_xml = "<tool_call>";
+  const std::string inv_bare    = "<invoke name=\"";
 
-  const bool is_tool_open = std::find(open_markers.begin(), open_markers.end(), stop) != open_markers.end();
+  const std::vector<std::string> open_markers = {
+    "\n\n" + tc_open_v41, "\n\n" + tc_open_v4,
+    tc_open_v41, tc_open_v4,
+    "\n\n" + tc_open_xml, tc_open_xml
+  };
 
-  if (is_tool_open) {
-    const std::string tc_close_v4   = std::string("</") + dsml + "tool_calls>";
-    const std::string tc_close_v41  = std::string("</") + dsml + " calls>";
-    const std::string inv_open_v4   = std::string("<") + dsml + "invoke";
-    const std::string inv_open_v41  = std::string("<") + dsml + " invoke";
-    const std::string inv_close_v4  = std::string("</") + dsml + "invoke";
-    const std::string inv_close_v41 = std::string("</") + dsml + " invoke";
-    const std::string par_open_v4   = std::string("<") + dsml + "parameter";
-    const std::string par_open_v41  = std::string("<") + dsml + " parameter";
-    const std::string par_close_v4  = std::string("/") + dsml + "parameter";
-    const std::string par_close_v41 = std::string("/") + dsml + " parameter";
+  std::string accumulated_content;
 
-    // Inside the block: alternating `invoke` headers and `parameter` bodies until the close.
-    // Both V4 (no leading space) and V4.1 (leading space) tag spellings are accepted at each step
-    // so a single space-drop inside a V4.1 block does not abort the parse.
-    while (i < text.size()) {
-      i = read_until(i, text, {inv_open_v4, inv_open_v41, tc_close_v4, tc_close_v41}, &chunk, &stop);
-      if (chunk != ">\n") return fail("tool call format: expected '>\\n'");
-      if (stop == tc_close_v4 || stop == tc_close_v41) break;
-      if (stop.empty()) return fail("unterminated tool_calls block");
+  while (i < text.size()) {
+    size_t next_block = std::string::npos;
+    size_t opener_len = 0;
+    bool is_bare_inv = false;
 
-      i = read_until(i, text, {par_open_v4, par_open_v41, inv_close_v4, inv_close_v41}, &chunk, &stop);
-      // ` name="X">\n`
-      const size_t nq = chunk.find("name=\"");
-      const size_t ne = nq == std::string::npos ? std::string::npos : chunk.find("\">\n", nq + 6);
-      if (nq == std::string::npos || ne == std::string::npos) return fail("tool name format");
+    for (const auto& marker : open_markers) {
+      size_t pos = text.find(marker, i);
+      if (pos != std::string::npos && pos < next_block) {
+        next_block = pos;
+        opener_len = marker.size();
+        is_bare_inv = false;
+      }
+    }
+
+    if (next_block == std::string::npos) {
+      size_t pos = text.find(inv_bare, i);
+      if (pos != std::string::npos && pos < next_block) {
+        next_block = pos;
+        opener_len = 0;
+        is_bare_inv = true;
+      }
+    }
+
+    if (next_block == std::string::npos) {
+      const std::string eos(kEosStr);
+      size_t eos_pos = text.find(eos, i);
+      size_t end_pos = (eos_pos != std::string::npos) ? eos_pos : text.size();
+      std::string tail = text.substr(i, end_pos - i);
+      if (!tail.empty()) {
+        if (!accumulated_content.empty() && accumulated_content.back() != '\n' && tail.front() != '\n')
+          accumulated_content += "\n";
+        accumulated_content += tail;
+      }
+      break;
+    }
+
+    std::string leading = text.substr(i, next_block - i);
+    if (!leading.empty()) {
+      if (!accumulated_content.empty() && accumulated_content.back() != '\n' && leading.front() != '\n')
+        accumulated_content += "\n";
+      accumulated_content += leading;
+    }
+
+    size_t p = next_block + opener_len;
+    if (!is_bare_inv) {
+      size_t gt = text.find('>', p);
+      if (gt == std::string::npos) return fail("unterminated tool_calls open tag");
+      p = gt + 1;
+    }
+
+    const std::string cl_v41 = "</" + dsml + " calls>";
+    const std::string cl_v4  = "</" + dsml + "tool_calls>";
+    const std::string cl_xml = "</tool_call>";
+
+    bool in_block = true;
+    while (in_block && p < text.size()) {
+      p = skip_ws_local(text, p);
+      if (p >= text.size()) break;
+
+      if (text.compare(p, cl_v41.size(), cl_v41) == 0) { p += cl_v41.size(); break; }
+      if (text.compare(p, cl_v4.size(), cl_v4) == 0) { p += cl_v4.size(); break; }
+      if (text.compare(p, cl_xml.size(), cl_xml) == 0) { p += cl_xml.size(); break; }
+
+      std::string inv_open_v41 = "<" + dsml + " invoke";
+      std::string inv_open_v4  = "<" + dsml + "invoke";
+      std::string inv_open_bare = "<invoke";
+      std::string inv_open_func = "<function=";
+
+      size_t inv_len = 0;
+      bool is_func_syntax = false;
+      if (text.compare(p, inv_open_v41.size(), inv_open_v41) == 0) inv_len = inv_open_v41.size();
+      else if (text.compare(p, inv_open_v4.size(), inv_open_v4) == 0) inv_len = inv_open_v4.size();
+      else if (text.compare(p, inv_open_bare.size(), inv_open_bare) == 0) inv_len = inv_open_bare.size();
+      else if (text.compare(p, inv_open_func.size(), inv_open_func) == 0) {
+        inv_len = inv_open_func.size();
+        is_func_syntax = true;
+      }
+
+      if (inv_len == 0) {
+        if (is_bare_inv) break;
+        return fail("tool call format: expected invoke or block close");
+      }
+
+      p += inv_len;
       ToolCall tc;
-      tc.name = chunk.substr(nq + 6, ne - nq - 6);
+      if (is_func_syntax) {
+        size_t gt = text.find('>', p);
+        if (gt == std::string::npos) return fail("tool name format");
+        tc.name = text.substr(p, gt - p);
+        p = gt + 1;
+      } else {
+        size_t nq = text.find("name=\"", p);
+        if (nq == std::string::npos) return fail("tool name format");
+        size_t ne = text.find('"', nq + 6);
+        if (ne == std::string::npos) return fail("tool name format");
+        tc.name = text.substr(nq + 6, ne - (nq + 6));
+        size_t gt = text.find('>', ne);
+        if (gt == std::string::npos) return fail("tool name format");
+        p = gt + 1;
+      }
+
       const size_t sep = tc.name.find("::");
       if (sep != std::string::npos) {
         tc.ns = tc.name.substr(0, sep);
@@ -699,47 +848,173 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
 
       std::string args = "{";
       std::set<std::string> seen;
-      bool first = true;
-      while (stop == par_open_v4 || stop == par_open_v41) {
-        i = read_until(i, text, {par_close_v4, par_close_v41}, &chunk, &stop);
-        // ` name="k" string="true|false">value<`
-        const size_t kq = chunk.find("name=\"");
-        const size_t k_end = kq == std::string::npos ? std::string::npos : chunk.find("\" string=\"", kq + 6);
-        if (kq == std::string::npos || k_end == std::string::npos) return fail("parameter format");
-        const std::string key = chunk.substr(kq + 6, k_end - kq - 6);
-        const size_t sv = k_end + 10;
-        const size_t se = chunk.find("\">", sv);
-        if (se == std::string::npos) return fail("parameter format");
-        const std::string is_str = chunk.substr(sv, se - sv);
-        if (is_str != "true" && is_str != "false") return fail("parameter string= must be true|false");
-        std::string val = chunk.substr(se + 2);
-        if (!val.empty() && val.back() == '<') val.pop_back();
+      bool first_param = true;
 
-        // The reference rejects a repeated parameter; a silently duplicated JSON key would otherwise
-        // reach the caller and be resolved differently by whichever parser reads it.
+      const std::string pc_v41 = "</" + dsml + " parameter>";
+      const std::string pc_v4  = "</" + dsml + "parameter>";
+      const std::string pc_bare = "</parameter>";
+
+      const std::string po_v41 = "<" + dsml + " parameter";
+      const std::string po_v4  = "<" + dsml + "parameter";
+      const std::string po_bare = "<parameter";
+
+      const std::string ic_v41 = "</" + dsml + " invoke>";
+      const std::string ic_v4  = "</" + dsml + "invoke>";
+      const std::string ic_bare = "</invoke>";
+      const std::string ic_func = "</function>";
+
+      while (p < text.size()) {
+        p = skip_ws_local(text, p);
+        if (p >= text.size()) break;
+
+        if (text.compare(p, ic_v41.size(), ic_v41) == 0) { p += ic_v41.size(); break; }
+        if (text.compare(p, ic_v4.size(), ic_v4) == 0) { p += ic_v4.size(); break; }
+        if (text.compare(p, ic_bare.size(), ic_bare) == 0) { p += ic_bare.size(); break; }
+        if (text.compare(p, ic_func.size(), ic_func) == 0) { p += ic_func.size(); break; }
+
+        size_t p_len = 0;
+        bool is_func_param = false;
+        if (text.compare(p, po_v41.size(), po_v41) == 0) p_len = po_v41.size();
+        else if (text.compare(p, po_v4.size(), po_v4) == 0) p_len = po_v4.size();
+        else if (text.compare(p, po_bare.size(), po_bare) == 0) {
+          if (p + 11 <= text.size() && text.compare(p, 11, "<parameter=") == 0) {
+            p_len = 11;
+            is_func_param = true;
+          } else {
+            p_len = po_bare.size();
+          }
+        }
+
+        if (p_len == 0) {
+          if (text.compare(p, cl_v41.size(), cl_v41) == 0 ||
+              text.compare(p, cl_v4.size(), cl_v4) == 0 ||
+              text.compare(p, cl_xml.size(), cl_xml) == 0) {
+            break;
+          }
+          return fail("parameter format: expected parameter opener or invoke close");
+        }
+
+        p += p_len;
+        std::string key, is_str = "true";
+        if (is_func_param) {
+          size_t gt = text.find('>', p);
+          if (gt == std::string::npos) return fail("parameter format");
+          key = text.substr(p, gt - p);
+          p = gt + 1;
+        } else {
+          size_t kq = text.find("name=\"", p);
+          if (kq == std::string::npos) return fail("parameter format: missing name=\"");
+          size_t ke = text.find('"', kq + 6);
+          if (ke == std::string::npos) return fail("parameter format");
+          key = text.substr(kq + 6, ke - (kq + 6));
+          size_t sq = text.find("string=\"", ke);
+          size_t gt = text.find('>', ke);
+          if (gt == std::string::npos) return fail("parameter format: missing '>'");
+          if (sq != std::string::npos && sq < gt) {
+            size_t se = text.find('"', sq + 8);
+            if (se == std::string::npos || se > gt) return fail("parameter format");
+            is_str = text.substr(sq + 8, se - (sq + 8));
+          }
+          if (is_str != "true" && is_str != "false")
+            return fail("parameter string= must be true|false");
+          p = gt + 1;
+        }
+
         if (seen.count(key)) return fail("duplicate parameter name");
         seen.insert(key);
-        if (!first) args += ", ";
-        first = false;
-        args += json_quote(key) + ": " + (is_str == "true" ? json_quote(val) : val);
 
-        i = read_until(i, text, {par_open_v4, par_open_v41, inv_close_v4, inv_close_v41}, &chunk, &stop);
-        if (chunk != ">\n") return fail("parameter format: expected '>\\n'");
+        const size_t val_start = p;
+        QuotedCall q_inv1(text, val_start, inv_open_v41, ic_v41);
+        QuotedCall q_inv2(text, val_start, inv_open_v4, ic_v4);
+        QuotedCall q_inv3(text, val_start, inv_open_bare, ic_bare);
+        QuotedCall q_tc(text, val_start, "<tool_call>", "</tool_call>");
+        QuotedCall q_fn(text, val_start, "<function=", "</function>");
+
+        auto is_in_quoted_call = [&](size_t to) {
+          return q_inv1.open_before(to) || q_inv2.open_before(to) ||
+                 q_inv3.open_before(to) || q_tc.open_before(to) ||
+                 q_fn.open_before(to);
+        };
+
+        size_t best_close = std::string::npos;
+        size_t best_close_len = 0;
+
+        auto test_candidate = [&](size_t at, size_t clen, bool respect_quotes) -> bool {
+          if (respect_quotes && is_in_quoted_call(at)) return false;
+          const size_t after = skip_ws_local(text, at + clen);
+          if (after == text.size()) return true;
+          if (text.compare(after, po_v41.size(), po_v41) == 0 ||
+              text.compare(after, po_v4.size(), po_v4) == 0 ||
+              text.compare(after, po_bare.size(), po_bare) == 0 ||
+              text.compare(after, ic_v41.size(), ic_v41) == 0 ||
+              text.compare(after, ic_v4.size(), ic_v4) == 0 ||
+              text.compare(after, ic_bare.size(), ic_bare) == 0 ||
+              text.compare(after, ic_func.size(), ic_func) == 0 ||
+              text.compare(after, cl_v41.size(), cl_v41) == 0 ||
+              text.compare(after, cl_v4.size(), cl_v4) == 0 ||
+              text.compare(after, cl_xml.size(), cl_xml) == 0) {
+            if (is_str == "false") {
+              std::string cand_val = text.substr(val_start, at - val_start);
+              if (!is_valid_json_non_string(cand_val)) return false;
+            }
+            return true;
+          }
+          return false;
+        };
+
+        for (const bool respect_quotes : {true, false}) {
+          size_t scan = val_start;
+          while (scan < text.size()) {
+            size_t next_c = std::string::npos;
+            size_t next_clen = 0;
+            for (const auto& tag : {pc_v41, pc_v4, pc_bare}) {
+              size_t cand = text.find(tag, scan);
+              if (cand != std::string::npos && (next_c == std::string::npos || cand < next_c)) {
+                next_c = cand;
+                next_clen = tag.size();
+              }
+            }
+            if (next_c == std::string::npos) break;
+            if (test_candidate(next_c, next_clen, respect_quotes)) {
+              best_close = next_c;
+              best_close_len = next_clen;
+              break;
+            }
+            scan = next_c + 1;
+          }
+          if (best_close != std::string::npos) break;
+        }
+
+        if (best_close == std::string::npos) {
+          return fail("unclosed parameter");
+        }
+
+        std::string val = text.substr(val_start, best_close - val_start);
+        p = best_close + best_close_len;
+
+        if (!first_param) args += ", ";
+        first_param = false;
+        args += json_quote(key) + ": " + (is_str == "true" ? json_quote(val) : val);
       }
+
       args += "}";
       tc.arguments = args;
-      out.tool_calls.push_back(tc);
+      out.tool_calls.push_back(std::move(tc));
     }
-    i = read_until(i, text, {kEosStr}, &chunk, &stop);
-    if (!chunk.empty()) return fail("content after tool calls");
-  } else if (stop != kEosStr && !stop.empty()) {
-    return fail("unexpected stop token");
+
+    i = p;
   }
 
-  // A special token loose in the text means the parse mis-framed something. When tool_calls have
-  // already been framed after </think>, allow the reasoning block to have quoted `<think>` or
-  // `｜DSML｜` in prose without discarding the valid tool call.
-  for (const char* sp : {kBos, kEosStr, kThinkStart, kThinkEnd, kDsml}) {
+  out.content = accumulated_content;
+
+  const std::string eos(kEosStr);
+  size_t ep = out.content.rfind(eos);
+  if (ep != std::string::npos && ep + eos.size() == out.content.size()) {
+    out.content.resize(ep);
+  }
+
+  // A special token loose in the text means the parse mis-framed something.
+  for (const char* sp : {kBos, kEosStr, kThinkStart, kThinkEnd}) {
     if (out.content.find(sp) != std::string::npos) return fail("special token in content");
     if (out.tool_calls.empty() && out.reasoning_content.find(sp) != std::string::npos)
       return fail("special token in content");

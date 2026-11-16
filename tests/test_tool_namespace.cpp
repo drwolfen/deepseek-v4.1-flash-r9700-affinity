@@ -106,6 +106,77 @@ int main() {
   ParsedMessage pm_bad = parse_completion(v41_bad, ThinkingMode::Thinking);
   assert(!pm_bad.ok);
 
+  // 5. PR #1020 (a): Argument containing literal DSML parameter/invoke/calls tags
+  std::string literal_dsml =
+      "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"inner\">\n"
+      "<｜DSML｜ parameter name=\"x\" string=\"true\">hello world</｜DSML｜ parameter>\n"
+      "</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+  std::string v41_embedded =
+      "Thinking of code...</think>\n\n<｜DSML｜ calls>\n"
+      "<｜DSML｜ invoke name=\"bash\">\n"
+      "<｜DSML｜ parameter name=\"command\" string=\"true\">cat <<'EOF'\n" +
+      literal_dsml +
+      "\nEOF\n</｜DSML｜ parameter>\n"
+      "</｜DSML｜ invoke>\n"
+      "</｜DSML｜ calls><｜end▁of▁sentence｜>";
+  ParsedMessage pm_embedded = parse_completion(v41_embedded, ThinkingMode::Thinking);
+  assert(pm_embedded.ok);
+  assert(pm_embedded.tool_calls.size() == 1);
+  assert(pm_embedded.tool_calls[0].name == "bash");
+  assert(pm_embedded.tool_calls[0].arguments.find("hello world") != std::string::npos);
+  assert(pm_embedded.tool_calls[0].arguments.find("inner") != std::string::npos);
+
+  // 6. PR #1020 (b): Two tool calls separated by a sentence where call #1 holds embedded tags
+  std::string v41_split =
+      "I will run the command and inspect the file.</think>\n\n<｜DSML｜ calls>\n"
+      "<｜DSML｜ invoke name=\"bash\">\n"
+      "<｜DSML｜ parameter name=\"command\" string=\"true\">grep -n '</｜DSML｜ parameter>' test.cpp</｜DSML｜ parameter>\n"
+      "</｜DSML｜ invoke>\n"
+      "</｜DSML｜ calls>\n"
+      "Now check the README:\n"
+      "<｜DSML｜ calls>\n"
+      "<｜DSML｜ invoke name=\"read_file\">\n"
+      "<｜DSML｜ parameter name=\"path\" string=\"true\">README.md</｜DSML｜ parameter>\n"
+      "</｜DSML｜ invoke>\n"
+      "</｜DSML｜ calls><｜end▁of▁sentence｜>";
+  ParsedMessage pm_split = parse_completion(v41_split, ThinkingMode::Thinking);
+  assert(pm_split.ok);
+  assert(pm_split.tool_calls.size() == 2);
+  assert(pm_split.tool_calls[0].name == "bash");
+  assert(pm_split.tool_calls[0].arguments == R"({"command": "grep -n '</｜DSML｜ parameter>' test.cpp"})");
+  assert(pm_split.tool_calls[1].name == "read_file");
+  assert(pm_split.tool_calls[1].arguments == R"({"path": "README.md"})");
+  assert(pm_split.content.find("Now check the README:") != std::string::npos);
+
+  // 7. PR #1020 (c): Unclosed / malformed fallback safety
+  // (i) unclosed parameter tag
+  std::string v41_unclosed_param =
+      "Thinking...</think>\n\n<｜DSML｜ calls>\n"
+      "<｜DSML｜ invoke name=\"bash\">\n"
+      "<｜DSML｜ parameter name=\"command\" string=\"true\">ls -la\n"
+      "</｜DSML｜ invoke>\n"
+      "</｜DSML｜ calls>";
+  ParsedMessage pm_unclosed = parse_completion(v41_unclosed_param, ThinkingMode::Thinking);
+  assert(!pm_unclosed.ok);
+  assert(pm_unclosed.tool_calls.empty());
+
+  // (ii) unclosed invoke tag
+  std::string v41_unclosed_inv =
+      "Thinking...</think>\n\n<｜DSML｜ calls>\n"
+      "<｜DSML｜ invoke name=\"bash\">\n"
+      "<｜DSML｜ parameter name=\"command\" string=\"true\">ls</｜DSML｜ parameter>\n";
+  ParsedMessage pm_unclosed_inv = parse_completion(v41_unclosed_inv, ThinkingMode::Thinking);
+  assert(!pm_unclosed_inv.ok);
+  assert(pm_unclosed_inv.tool_calls.empty());
+
+  // (iii) malformed XML tag
+  std::string v41_malformed =
+      "Thinking...</think>\n\n<｜DSML｜ calls>\n"
+      "<｜DSML｜ invoke invalid>\n"
+      "</｜DSML｜ calls>";
+  ParsedMessage pm_malformed = parse_completion(v41_malformed, ThinkingMode::Thinking);
+  assert(!pm_malformed.ok);
+
   std::printf("PASS: test_tool_namespace\n");
   return 0;
 }
