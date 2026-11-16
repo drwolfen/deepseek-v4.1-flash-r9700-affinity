@@ -546,6 +546,10 @@ struct DenseGpu::Impl {
   };
   std::vector<Dev> dev;
   TpContext tp;
+  uint16_t* h_embed_pinned = nullptr;
+  uint16_t* d_embed_uva = nullptr;
+  size_t embed_bytes = 0;
+  uint32_t embed_n_embd = 0;
   ihipStream_t* const* streams() {
     for (size_t r = 0; r < dev.size(); ++r) sp[r] = (ihipStream_t*)dev[r].stream;
     return sp;
@@ -558,6 +562,11 @@ enum StageSlot { kStgMv = 0, kStgMvg = 1, kStgQ = 2, kStgKv = 3, kStgShexp = 4 }
 
 DenseGpu::~DenseGpu() {
   if (!impl_) return;
+  if (impl_->h_embed_pinned) {
+    (void)hipHostFree(impl_->h_embed_pinned);
+    impl_->h_embed_pinned = nullptr;
+    impl_->d_embed_uva = nullptr;
+  }
   if (impl_->tp.ready) tp_free(&impl_->tp);
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
@@ -798,6 +807,12 @@ Model::DenseOps DenseGpu::ops() {
   o.block_reduce = &DenseGpu::block_reduce_cb;
   o.fused_ok = &DenseGpu::fused_ok_cb;
   o.hc_read = &DenseGpu::hc_read_cb;
+  o.embed_init = [](void* c, uint64_t v, uint64_t e, const void* s, std::string* err) {
+    return static_cast<DenseGpu*>(c)->embed_host_init(v, e, s, err);
+  };
+  o.embed_uva_ptr = [](void* c) {
+    return static_cast<DenseGpu*>(c)->embed_dev_ptr();
+  };
   return o;
 }
 
@@ -976,50 +991,6 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
       }
       return -1;
     }
-    if (hipMalloc(&s.data, nbytes) != hipSuccess) return -1;
-    s.data_bytes = nbytes;   // amdnas-fixes weight-verify
-    if (s.ncols == cols) {
-      // Row and Rep: the slice is contiguous in the container's row-major layout.
-      AFF_HIP_CHECK(hipMemcpy(s.data, (const uint8_t*)host + s.row0 * cols * elem, nbytes,
-                              hipMemcpyHostToDevice));
-    } else {
-      // Col: a column band, so `rows` separate runs. Load-time only, and hipMemcpy2D expresses the
-      // stride to the driver rather than issuing `rows` separate calls.
-      AFF_HIP_CHECK(hipMemcpy2D(s.data, s.ncols * elem,
-                                (const uint8_t*)host + s.col0 * elem, cols * elem,
-                                s.ncols * elem, s.nrows, hipMemcpyHostToDevice));
-    }
-    if (sc_bytes) {
-      if (hipMalloc((void**)&s.scales, sc_bytes) != hipSuccess) return -1;
-      s.scales_bytes = sc_bytes;   // amdnas-fixes weight-verify
-      if (sh_sc_cols == sc_cols) {
-        AFF_HIP_CHECK(hipMemcpy(s.scales, scales + (s.row0 / 128) * sc_cols, sc_bytes,
-                                hipMemcpyHostToDevice));
-      } else {
-        AFF_HIP_CHECK(hipMemcpy2D(s.scales, sh_sc_cols, scales + s.col0 / 128, sc_cols,
-                                  sh_sc_cols, s.nrows / 128, hipMemcpyHostToDevice));
-      }
-    }
-    // Fragment order, in place. The W8A8 GEMM otherwise reads A through
-    // `Wp -> registers -> LDS -> barrier -> LDS -> fragment`; preshuffled, a wave reads its whole A
-    // fragment with one coalesced 8-byte-a-lane load.
-    //
-    // This is the ONLY layout, not a second copy — the one reader that needed row-major was
-    // `matvec_fp8_hip` via `forward_token`, which the supported configuration never calls, since with
-    // DSpark on generation is seed/draft/verify and all of those are batched.
-    //
-    // A Col shard's row length is its own `ncols` and is stored that way, so the permutation and the
-    // GEMM both use `s.ncols` and a Col split needs nothing special.
-    if (ps_for(name) && quant == AFF_FP8_E4M3 && (s.nrows % 16) == 0 && (s.ncols % 16) == 0) {
-      void* tmp = nullptr;
-      if (hipMalloc(&tmp, nbytes) != hipSuccess) return -1;
-      AFF_HIP_CHECK(hipMemcpy(tmp, s.data, nbytes, hipMemcpyDeviceToDevice));
-      preshuffle_fp8_hip((const uint8_t*)tmp, (uint8_t*)s.data, (uint32_t)s.nrows,
-                         (uint32_t)s.ncols, nullptr);
-      AFF_HIP_CHECK(hipDeviceSynchronize());
-      AFF_HIP_CHECK(hipFree(tmp));
-      s.ps = true;
-    }
     static const bool lmhead_int4_only = [] {
       const char* l = std::getenv("AFF_LMHEAD_INT4");
       return l && *l && std::strcmp(l, "0") != 0;
@@ -1029,28 +1000,102 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
       const char* l = std::getenv("AFF_LMHEAD_INT4");
       return (d && *d && std::strcmp(d, "0") != 0) || (l && *l && std::strcmp(l, "0") != 0);
     }();
+    const bool is_w4_chunked_output = want_w4_head && lmhead_int4_only && name &&
+                                      !std::strcmp(name, "output") && quant == AFF_BF16 &&
+                                      (s.ncols % 256) == 0;
     bool freed_bf16 = false;
-    if (want_w4_head && name && !std::strcmp(name, "output") && quant == AFF_BF16 &&
-        (s.ncols % 256) == 0) {
+
+    if (is_w4_chunked_output) {
+      // Radiance 2ec647c: chunked staging trim (CH = 1024) avoids 1.3 GiB peak VRAM allocation
       const uint64_t w4_bytes = s.nrows * (s.ncols / 2);
       const uint64_t w4s_bytes = s.nrows * (s.ncols / 128) * sizeof(uint16_t);
-      if (hipMalloc((void**)&s.w4_data, w4_bytes) == hipSuccess &&
-          hipMalloc((void**)&s.w4_scales, w4s_bytes) == hipSuccess) {
-        quantize_bf16_to_w4_g128_hip((const uint16_t*)s.data, s.w4_data, s.w4_scales,
-                                     (uint32_t)s.nrows, (uint32_t)s.ncols, nullptr);
-        AFF_HIP_CHECK(hipDeviceSynchronize());
-        placed += w4_bytes + w4s_bytes;
-        if (lmhead_int4_only) {
-          AFF_HIP_CHECK(hipFree(s.data));
-          s.data = nullptr;
-          freed_bf16 = true;
-        }
-        aff::ui::err("dense-gpu: quantised %s shard %zu to int4_g128 (%.1f MiB vs %.1f MiB bf16%s)\n",
-                     name, d, (w4_bytes + w4s_bytes) / 1048576.0, nbytes / 1048576.0,
-                     freed_bf16 ? ", freed bf16 shard" : "");
-      } else {
+      if (hipMalloc((void**)&s.w4_data, w4_bytes) != hipSuccess ||
+          hipMalloc((void**)&s.w4_scales, w4s_bytes) != hipSuccess) {
         if (s.w4_data) { (void)hipFree(s.w4_data); s.w4_data = nullptr; }
         if (s.w4_scales) { (void)hipFree(s.w4_scales); s.w4_scales = nullptr; }
+        return -1;
+      }
+      constexpr uint64_t kChunkRows = 1024;
+      const uint64_t chunk_bytes = std::min<uint64_t>(kChunkRows, s.nrows) * s.ncols * elem;
+      uint16_t* d_chunk = nullptr;
+      if (hipMalloc((void**)&d_chunk, chunk_bytes) != hipSuccess) {
+        if (s.w4_data) { (void)hipFree(s.w4_data); s.w4_data = nullptr; }
+        if (s.w4_scales) { (void)hipFree(s.w4_scales); s.w4_scales = nullptr; }
+        return -1;
+      }
+      for (uint64_t r = 0; r < s.nrows; r += kChunkRows) {
+        const uint64_t cur_r = std::min<uint64_t>(kChunkRows, s.nrows - r);
+        AFF_HIP_CHECK(hipMemcpy(d_chunk, (const uint8_t*)host + (s.row0 + r) * cols * elem,
+                                cur_r * s.ncols * elem, hipMemcpyHostToDevice));
+        quantize_bf16_to_w4_g128_hip(d_chunk, s.w4_data + r * (s.ncols / 2),
+                                     s.w4_scales + r * (s.ncols / 128),
+                                     (uint32_t)cur_r, (uint32_t)s.ncols, nullptr);
+      }
+      AFF_HIP_CHECK(hipDeviceSynchronize());
+      AFF_HIP_CHECK(hipFree(d_chunk));
+      s.data = nullptr;
+      s.data_bytes = 0;
+      freed_bf16 = true;
+      placed += w4_bytes + w4s_bytes;
+      aff::ui::err("dense-gpu: chunked-quantised %s shard %zu to int4_g128 (%.1f MiB, trimmed %.1f MiB bf16 peak)\n",
+                   name, d, (w4_bytes + w4s_bytes) / 1048576.0, nbytes / 1048576.0);
+    } else {
+      if (hipMalloc(&s.data, nbytes) != hipSuccess) return -1;
+      s.data_bytes = nbytes;   // amdnas-fixes weight-verify
+      if (s.ncols == cols) {
+        // Row and Rep: the slice is contiguous in the container's row-major layout.
+        AFF_HIP_CHECK(hipMemcpy(s.data, (const uint8_t*)host + s.row0 * cols * elem, nbytes,
+                                hipMemcpyHostToDevice));
+      } else {
+        // Col: a column band, so `rows` separate runs. Load-time only, and hipMemcpy2D expresses the
+        // stride to the driver rather than issuing `rows` separate calls.
+        AFF_HIP_CHECK(hipMemcpy2D(s.data, s.ncols * elem,
+                                  (const uint8_t*)host + s.col0 * elem, cols * elem,
+                                  s.ncols * elem, s.nrows, hipMemcpyHostToDevice));
+      }
+      if (sc_bytes) {
+        if (hipMalloc((void**)&s.scales, sc_bytes) != hipSuccess) return -1;
+        s.scales_bytes = sc_bytes;   // amdnas-fixes weight-verify
+        if (sh_sc_cols == sc_cols) {
+          AFF_HIP_CHECK(hipMemcpy(s.scales, scales + (s.row0 / 128) * sc_cols, sc_bytes,
+                                  hipMemcpyHostToDevice));
+        } else {
+          AFF_HIP_CHECK(hipMemcpy2D(s.scales, sh_sc_cols, scales + s.col0 / 128, sc_cols,
+                                    sh_sc_cols, s.nrows / 128, hipMemcpyHostToDevice));
+        }
+      }
+      if (ps_for(name) && quant == AFF_FP8_E4M3 && (s.nrows % 16) == 0 && (s.ncols % 16) == 0) {
+        void* tmp = nullptr;
+        if (hipMalloc(&tmp, nbytes) != hipSuccess) return -1;
+        AFF_HIP_CHECK(hipMemcpy(tmp, s.data, nbytes, hipMemcpyDeviceToDevice));
+        preshuffle_fp8_hip((const uint8_t*)tmp, (uint8_t*)s.data, (uint32_t)s.nrows,
+                           (uint32_t)s.ncols, nullptr);
+        AFF_HIP_CHECK(hipDeviceSynchronize());
+        AFF_HIP_CHECK(hipFree(tmp));
+        s.ps = true;
+      }
+      if (want_w4_head && name && !std::strcmp(name, "output") && quant == AFF_BF16 &&
+          (s.ncols % 256) == 0) {
+        const uint64_t w4_bytes = s.nrows * (s.ncols / 2);
+        const uint64_t w4s_bytes = s.nrows * (s.ncols / 128) * sizeof(uint16_t);
+        if (hipMalloc((void**)&s.w4_data, w4_bytes) == hipSuccess &&
+            hipMalloc((void**)&s.w4_scales, w4s_bytes) == hipSuccess) {
+          quantize_bf16_to_w4_g128_hip((const uint16_t*)s.data, s.w4_data, s.w4_scales,
+                                       (uint32_t)s.nrows, (uint32_t)s.ncols, nullptr);
+          AFF_HIP_CHECK(hipDeviceSynchronize());
+          placed += w4_bytes + w4s_bytes;
+          if (lmhead_int4_only) {
+            AFF_HIP_CHECK(hipFree(s.data));
+            s.data = nullptr;
+            freed_bf16 = true;
+          }
+          aff::ui::err("dense-gpu: quantised %s shard %zu to int4_g128 (%.1f MiB vs %.1f MiB bf16%s)\n",
+                       name, d, (w4_bytes + w4s_bytes) / 1048576.0, nbytes / 1048576.0,
+                       freed_bf16 ? ", freed bf16 shard" : "");
+        } else {
+          if (s.w4_data) { (void)hipFree(s.w4_data); s.w4_data = nullptr; }
+          if (s.w4_scales) { (void)hipFree(s.w4_scales); s.w4_scales = nullptr; }
+        }
       }
     }
     placed += (freed_bf16 ? 0ull : nbytes) + sc_bytes;
@@ -2336,6 +2381,56 @@ void DenseGpu::hc_seed(const float* embed, uint32_t n_embd, uint32_t n_hc) {
                                    hipMemcpyHostToDevice, D.stream));
     if (shift_pre_) seed_pre_identity(D.d_pre_prev, n_hc, 1, D.stream);
   }
+}
+
+bool DenseGpu::embed_host_init(uint64_t vocab, uint64_t n_embd, const void* host_src, std::string* err) {
+  if (!impl_ || !host_src || !vocab || !n_embd) {
+    if (err) *err = "embed_host_init: invalid arguments";
+    return false;
+  }
+  const size_t nbytes = (size_t)vocab * n_embd * sizeof(uint16_t);
+  impl_->embed_bytes = nbytes;
+  impl_->embed_n_embd = (uint32_t)n_embd;
+
+  hipError_t aerr = hipHostMalloc((void**)&impl_->h_embed_pinned, nbytes,
+                                  hipHostMallocMapped | hipHostMallocPortable);
+  if (aerr != hipSuccess || !impl_->h_embed_pinned) {
+    if (err) *err = "hipHostMalloc mapped failed for embed_tokens (" + std::to_string(nbytes / 1048576) + " MiB)";
+    return false;
+  }
+  std::memcpy(impl_->h_embed_pinned, host_src, nbytes);
+
+  void* d_ptr = nullptr;
+  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
+    void* dev_p = nullptr;
+    hipError_t gerr = hipHostGetDevicePointer(&dev_p, impl_->h_embed_pinned, 0);
+    if (gerr != hipSuccess || !dev_p) {
+      if (err) *err = "hipHostGetDevicePointer failed on device " + std::to_string(impl_->dev[d].id);
+      (void)hipHostFree(impl_->h_embed_pinned);
+      impl_->h_embed_pinned = nullptr;
+      return false;
+    }
+    if (d == 0) d_ptr = dev_p;
+  }
+  impl_->d_embed_uva = (uint16_t*)d_ptr;
+  aff::ui::err("dense-gpu: host-pinned embed_tokens (%.1f MiB, UVA dev ptr %p) active on %zu ranks\n",
+               nbytes / 1048576.0, impl_->d_embed_uva, impl_->dev.size());
+  return true;
+}
+
+const uint16_t* DenseGpu::embed_dev_ptr() const {
+  return impl_ ? impl_->d_embed_uva : nullptr;
+}
+
+const uint16_t* DenseGpu::embed_host_ptr() const {
+  return impl_ ? impl_->h_embed_pinned : nullptr;
+}
+
+void DenseGpu::embed_tokens_gather(const uint32_t* ids, uint32_t n, float* out_emb, void* stream) {
+  if (!impl_ || !impl_->d_embed_uva || !ids || !n || !out_emb) return;
+  const uint32_t ne = impl_->embed_n_embd ? impl_->embed_n_embd : b_norm_rows_;
+  embed_tokens_gather_hip(impl_->d_embed_uva, ids, out_emb, n, ne, stream);
 }
 
 void DenseGpu::hc_read(float* dst, uint32_t n_embd, uint32_t n_hc) {

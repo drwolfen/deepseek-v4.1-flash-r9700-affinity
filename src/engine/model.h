@@ -560,6 +560,8 @@ public:
     // half an answer that still looks like text.
     bool (*block_reduce)(void* ctx, uint32_t n_embd) = nullptr;
     void (*hc_read)(void* ctx, float* dst, uint32_t n_embd, uint32_t n_hc) = nullptr;
+    bool (*embed_init)(void* ctx, uint64_t vocab, uint64_t n_embd, const void* src, std::string* err) = nullptr;
+    const uint16_t* (*embed_uva_ptr)(void* ctx) = nullptr;
     void* ctx = nullptr;
   };
   void set_dense_ops(const DenseOps& d) { dops_ = d; }
@@ -1041,6 +1043,7 @@ private:
   ModelConfig cfg_;
   std::vector<LayerWeights> layers_;
   const uint16_t* embed_ = nullptr;
+  const uint16_t* embed_uva_ = nullptr;
   DenseW head_;
   const float* out_norm_ = nullptr;
   ExpertFfnBatch ffnb_ = nullptr;

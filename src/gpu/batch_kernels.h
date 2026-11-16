@@ -424,4 +424,24 @@ bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float
                           float* out, uint32_t rows, uint32_t cols, uint32_t nt,
                           uint32_t out_col_stride, int out_token_major, void* stream);
 
+// Host-Pinned / UVA embed_tokens gather (Radiance 1c10454 / AFF_EMBED_HOST). Read-only loads.
+void embed_tokens_gather_hip(const uint16_t* embed_table, const uint32_t* token_ids,
+                            float* out_emb, uint32_t n_tokens, uint32_t n_embd, void* stream);
+
+// Hyper-Connection kernel refresh (Radiance c896a87, 222cbe7, b0a58b5).
+bool hc_fused_v2_enabled();
+bool hc_chained_enabled();
+
+void batch_hc_read_fused_v2_hip(const uint16_t* h, const float* w, const void* downv,
+                                long dld, const unsigned short* injw, unsigned short* dout,
+                                unsigned short* inj, float* scaleout, const void* upv,
+                                long uld, const unsigned short* dbuf, float* out_norm,
+                                long rows, long n, int hc, long lr, long hrow, float eps,
+                                void* stream, uint32_t* sync_counters = nullptr);
+
+void batch_hc_chained_decode_hip(const uint16_t* h, const float* w, const void* downv,
+                                 long dld, const void* upv, long uld, unsigned short* dout,
+                                 float* out_norm, long rows, long n, int hc, long lr,
+                                 void* stream, uint32_t* sync_counters = nullptr);
+
 } // namespace aff

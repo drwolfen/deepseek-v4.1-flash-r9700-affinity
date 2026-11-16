@@ -126,6 +126,11 @@ public:
   bool hc_ready() const { return hc_ok_; }
   // Seed all lanes from the token embedding at the start of a token.
   void hc_seed(const float* embed_host, uint32_t n_embd, uint32_t n_hc);
+  // Host-Pinned embed_tokens mapped for multi-GPU UVA access (AFF_EMBED_HOST).
+  bool embed_host_init(uint64_t vocab, uint64_t n_embd, const void* host_src, std::string* err);
+  const uint16_t* embed_dev_ptr() const;
+  const uint16_t* embed_host_ptr() const;
+  void embed_tokens_gather(const uint32_t* ids, uint32_t n, float* out_emb, void* stream = nullptr);
   // control + reduce + rms_norm, leaving `norm` on device on both cards and copied to `norm_host`
   // for the router top-k, the expert dispatch and the indexer — the one sync per sublayer this
   // design is left with. `defer` leaves that copy in flight for norm_collect().

@@ -369,6 +369,20 @@ bool Model::load(const std::string& aff_path, std::string* err) {
 
   Binder b{aff_, &dops_};
   embed_         = b.bf16("token_embd");
+  static const bool aff_embed_host = [] {
+    const char* s = std::getenv("AFF_EMBED_HOST");
+    return s && *s && std::strcmp(s, "0") != 0;
+  }();
+  if (aff_embed_host && dops_.embed_init && embed_) {
+    std::string emb_err;
+    if (dops_.embed_init(dops_.ctx, cfg_.vocab, cfg_.n_embd, embed_, &emb_err)) {
+      if (dops_.embed_uva_ptr) {
+        embed_uva_ = dops_.embed_uva_ptr(dops_.ctx);
+      }
+    } else {
+      aff::ui::err("model: AFF_EMBED_HOST init failed: %s; keeping default\n", emb_err.c_str());
+    }
+  }
   head_          = b.dense("output");
   out_norm_      = b.f32("output_norm");
   hc_head_fn_    = b.dense("hc_head_fn");
@@ -963,8 +977,9 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
 
   // Every HC lane starts as the token embedding.
   if (embed_) {
+    const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
     std::vector<float> e(E);
-    bf16_dequant(embed_ + (size_t)token_id * E, E, e.data());
+    bf16_dequant(src_emb + (size_t)token_id * E, E, e.data());
     for (uint32_t h = 0; h < HC; ++h) std::memcpy(s->hc.data() + (size_t)h * E, e.data(), E * 4);
     if (dev_hc) dops_.hc_seed(dops_.ctx, e.data(), E, HC);
   }
@@ -1734,7 +1749,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         const float* src = vision->embeddings + (size_t)(g - vision->start) * E;
         std::memcpy(emb.data() + (size_t)b * E, src, E * sizeof(float));
       } else {
-        bf16_dequant(embed_ + (size_t)ids[g] * E, E, emb.data() + (size_t)b * E);
+        const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
+        bf16_dequant(src_emb + (size_t)ids[g] * E, E, emb.data() + (size_t)b * E);
       }
     }
     // Not `return false`: every reason this can refuse was checked once before the loop, and by
@@ -2456,11 +2472,15 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
   // same reason: it is what `begin` uploads, and a caller-local one is why that upload has to drain.
   if (dspark_emb_.size() != (size_t)B * E) {
     dspark_emb_.assign((size_t)B * E, 0.0f);
+    const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
     for (uint32_t b = 1; b < B; ++b)
-      bf16_dequant(embed_ + (size_t)cfg_.dspark_noise_token * E, E,
+      bf16_dequant(src_emb + (size_t)cfg_.dspark_noise_token * E, E,
                    dspark_emb_.data() + (size_t)b * E);
   }
-  bf16_dequant(embed_ + (size_t)first_id * E, E, dspark_emb_.data());
+  {
+    const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
+    bf16_dequant(src_emb + (size_t)first_id * E, E, dspark_emb_.data());
+  }
   if (const char* e = std::getenv("AFF_SLOT_DEBUG")) { (void)e;
     uint64_t v = 1469598103934665603ull;
     for (size_t i = 0; i < (size_t)E; ++i) { uint32_t bits; std::memcpy(&bits, &dspark_emb_[i], 4); v ^= bits; v *= 1099511628211ull; }

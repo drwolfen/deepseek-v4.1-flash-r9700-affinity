@@ -994,6 +994,30 @@ __global__ void expert_scatter_slots_kernel(const uint16_t* __restrict__ y, floa
   }
 }
 
+__global__ void expert_scatter_slots_summed_kernel(const uint16_t* __restrict__ y, float* __restrict__ block,
+                                                   const uint32_t* __restrict__ ord,
+                                                   const uint32_t* __restrict__ run,
+                                                   uint32_t nb_tok, uint32_t nb_stride,
+                                                   uint32_t total, bool first_pass) {
+  const uint16_t* __restrict__ row = y + (size_t)blockIdx.x * total;
+  for (uint32_t t = threadIdx.x; t < nb_tok; t += blockDim.x) {
+    const uint32_t a = run[t], b = run[t + 1];
+    if (a == b) {
+      if (first_pass) {
+        block[(size_t)blockIdx.x * nb_stride + t] = 0.0f;
+      }
+      continue;
+    }
+    float acc = 0.0f;
+    for (uint32_t i = a; i < b; ++i) acc += bf16_to_f32_dev(row[ord[i]]);
+    if (first_pass) {
+      block[(size_t)blockIdx.x * nb_stride + t] = acc;
+    } else {
+      block[(size_t)blockIdx.x * nb_stride + t] += acc;
+    }
+  }
+}
+
 // Scatter a [dim][nt] result back into the chunk's [dim][nb] accumulator, applying each token's own
 // router weight on the way. The weight cannot ride along in the GEMM's `wscale` because it differs
 // per COLUMN and the GEMM's scale is per matrix.
@@ -1009,6 +1033,21 @@ __global__ void expert_scatter_tokens_kernel(const float* __restrict__ src, floa
   const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= nt || d >= dim) return;
   atomicAdd(&dst[(size_t)d * nb + tok[t]], w[t] * src[(size_t)d * nt + t]);
+}
+
+__global__ void expert_scatter_tokens_summed_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                                                    const uint32_t* __restrict__ tok,
+                                                    const float* __restrict__ w, uint32_t dim,
+                                                    uint32_t nb, uint32_t nt, bool first_pass) {
+  const uint32_t t = blockIdx.y * blockDim.y + threadIdx.y;
+  const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= nt || d >= dim) return;
+  const float val = w[t] * src[(size_t)d * nt + t];
+  if (first_pass) {
+    dst[(size_t)d * nb + tok[t]] = val;
+  } else {
+    atomicAdd(&dst[(size_t)d * nb + tok[t]], val);
+  }
 }
 
 // Each matrix carries its own activation. The down projections of six experts share an output vector
@@ -1799,7 +1838,9 @@ bool expert_ffn_tokens_hip(const DeviceExpert& e, const float* cb, const float* 
     AFF_HIP_CHECK(hipGetLastError());
   }
   if (!expert_gemm_tokens_hip(e.down, cb, u_tile, y_tile, T, 1.0f, stream)) return false;
-  {
+  if (moe_summed_down_enabled()) {
+    expert_scatter_tokens_summed_hip(y_tile, d_block, d_tok, d_w, hidden, nb, T, /*first_pass=*/false, stream);
+  } else {
     const dim3 blk(64, 4);
     const dim3 grd((hidden + blk.x - 1) / blk.x, (T + blk.y - 1) / blk.y);
     hipLaunchKernelGGL(expert_scatter_tokens_kernel, grd, blk, 0, st, y_tile, d_block, d_tok, d_w,
@@ -2898,6 +2939,45 @@ void expert_scatter_slots_hip(const uint16_t* y, float* block, const uint32_t* o
   if (!dim || !nb_tok || !total) return;
   hipLaunchKernelGGL(expert_scatter_slots_kernel, dim3(dim), dim3(256), 0, (hipStream_t)stream, y,
                      block, ord, run, nb_tok, nb_stride, total);
+  AFF_HIP_CHECK(hipGetLastError());
+}
+
+bool moe_summed_down_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_MOE_SUMMED_DOWN");
+    return s && *s && std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
+bool moe_tail_skip_enabled(uint32_t n_tokens) {
+  // Avalon 9e4f26f: disable TAIL_SKIP whenever n_tokens > 16
+  if (n_tokens > 16u) return false;
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_MOE_TAIL_SKIP");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
+void expert_scatter_slots_summed_hip(const uint16_t* y, float* block, const uint32_t* ord,
+                                     const uint32_t* run, uint32_t dim, uint32_t nb_tok,
+                                     uint32_t nb_stride, uint32_t total, bool first_pass,
+                                     void* stream) {
+  if (!dim || !nb_tok || !total) return;
+  hipLaunchKernelGGL(expert_scatter_slots_summed_kernel, dim3(dim), dim3(256), 0, (hipStream_t)stream,
+                     y, block, ord, run, nb_tok, nb_stride, total, first_pass);
+  AFF_HIP_CHECK(hipGetLastError());
+}
+
+void expert_scatter_tokens_summed_hip(const float* src, float* dst, const uint32_t* tok,
+                                      const float* w, uint32_t dim, uint32_t nb, uint32_t nt,
+                                      bool first_pass, void* stream) {
+  if (!dim || !nb || !nt) return;
+  const dim3 blk(64, 4);
+  const dim3 grd((dim + blk.x - 1) / blk.x, (nt + blk.y - 1) / blk.y);
+  hipLaunchKernelGGL(expert_scatter_tokens_summed_kernel, grd, blk, 0, (hipStream_t)stream,
+                     src, dst, tok, w, dim, nb, nt, first_pass);
   AFF_HIP_CHECK(hipGetLastError());
 }
 

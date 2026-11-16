@@ -3683,5 +3683,225 @@ bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float
   return true;
 }
 
+// ------------------------------------------------------------------------------------------------
+// Wave 2 Phase 2B: Host-pinned UVA gather & Hyper-Connection refresh
+// ------------------------------------------------------------------------------------------------
+
+__global__ void embed_tokens_gather_kernel(const uint16_t* __restrict__ embed_table,
+                                           const uint32_t* __restrict__ token_ids,
+                                           float* __restrict__ out_emb,
+                                           uint32_t n_tokens, uint32_t n_embd) {
+  const uint32_t t = blockIdx.y;
+  if (t >= n_tokens) return;
+  const uint32_t token_id = token_ids[t];
+  const uint16_t* __restrict__ row = embed_table + (size_t)token_id * n_embd;
+  float* __restrict__ out_row = out_emb + (size_t)t * n_embd;
+  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x) {
+    out_row[i] = wmma::bf16_to_f32(row[i]);
+  }
+}
+
+void embed_tokens_gather_hip(const uint16_t* embed_table, const uint32_t* token_ids,
+                            float* out_emb, uint32_t n_tokens, uint32_t n_embd, void* stream) {
+  if (!n_tokens || !n_embd || !embed_table || !token_ids || !out_emb) return;
+  const uint32_t block_x = 256;
+  const uint32_t grid_x = (n_embd + block_x - 1) / block_x;
+  AFF_BLAUNCH(embed_tokens_gather_kernel, dim3(grid_x, n_tokens), dim3(block_x), 0,
+              (hipStream_t)stream, embed_table, token_ids, out_emb, n_tokens, n_embd);
+}
+
+bool hc_fused_v2_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_HC_FUSED_V2");
+    return s && *s && std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
+bool hc_chained_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_HC_CHAINED");
+    return s && *s && std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
+// Barrier ordering LDS only, leaving global loads in flight across workgroup (Radiance 222cbe7)
+__device__ __forceinline__ void hc_lds_barrier() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+// e4m3x8_bf16 on codes in registers (Radiance 222cbe7)
+__device__ __forceinline__ uint4 e4m3x8_bf16v(uint2 c, float sc) {
+  uint4 res;
+  uint16_t* out = (uint16_t*)&res;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    uint32_t b0 = (c.x >> (i * 8)) & 0xFFu;
+    out[i] = wmma::f32_to_bf16(e4m3_decode(b0) * sc);
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    uint32_t b1 = (c.y >> (i * 8)) & 0xFFu;
+    out[4 + i] = wmma::f32_to_bf16(e4m3_decode(b1) * sc);
+  }
+  return res;
+}
+
+// Role wait for ticket-based fused grid (Radiance c896a87)
+__device__ __forceinline__ void hc_role_wait(uint32_t* __restrict__ sync, uint32_t na, uint32_t nb_all) {
+  if (!sync) return;
+  if (threadIdx.x == 0) {
+    const unsigned long long t0 = wall_clock64();
+    while (__hip_atomic_load(&sync[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < na) {
+      __builtin_amdgcn_s_sleep(1);
+      if (wall_clock64() - t0 > 50000000ull) break; // 0.5s timeout protection
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    if (__hip_atomic_fetch_add(&sync[2], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u == nb_all) {
+      __hip_atomic_store(&sync[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&sync[1], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&sync[2], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+  __syncthreads();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+}
+
+// Fused decode kernel A+B (Radiance c896a87 & 222cbe7)
+__global__ __launch_bounds__(256) void hc_read_fused_v2_kernel(
+    const uint16_t* __restrict__ h, const float* __restrict__ w,
+    const void* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
+    unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+    float* __restrict__ scaleout, const void* __restrict__ upv, long uld,
+    const unsigned short* __restrict__ dbuf, float* __restrict__ out_norm,
+    long rows, long n, int hc, long lr, long hrow, float eps,
+    uint32_t* __restrict__ sync, uint32_t na, uint32_t nb_all) {
+  __shared__ __attribute__((aligned(16))) float s_lds[512];
+  __shared__ uint32_t s_ticket;
+
+  if (threadIdx.x == 0) {
+    s_ticket = sync ? __hip_atomic_fetch_add(&sync[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
+                    : blockIdx.x;
+  }
+  __syncthreads();
+  const uint32_t ticket = s_ticket;
+
+  if (ticket < na) {
+    // Ticket in role A: down-mix & norm
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t r = 0; r < (uint32_t)rows; ++r) {
+      for (uint32_t i = tid; i < (uint32_t)n; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int c = 0; c < hc; ++c) {
+          const uint16_t hv = h[r * hrow + (size_t)c * n + i];
+          acc += wmma::bf16_to_f32(hv);
+        }
+        acc *= (1.0f / (float)hc);
+        if (w) acc *= (w[i] + eps);
+        s_lds[i & 511u] = acc;
+      }
+    }
+    __threadfence();
+    if (threadIdx.x == 0 && sync) {
+      __hip_atomic_fetch_add(&sync[1], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  } else {
+    // Ticket in role B: wait on A, then compute up-mix
+    hc_role_wait(sync, na, nb_all);
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t r = 0; r < (uint32_t)rows; ++r) {
+      for (uint32_t i = tid; i < (uint32_t)n; i += blockDim.x) {
+        float sum = 0.0f;
+        for (int c = 0; c < hc; ++c) {
+          sum += wmma::bf16_to_f32(h[r * hrow + (size_t)c * n + i]);
+        }
+        sum *= (1.0f / (float)hc);
+        if (w) sum *= (w[i] + eps);
+        if (dout) dout[r * n + i] = wmma::f32_to_bf16(sum);
+        if (out_norm) out_norm[r * n + i] = sum;
+      }
+    }
+  }
+}
+
+void batch_hc_read_fused_v2_hip(const uint16_t* h, const float* w, const void* downv,
+                                long dld, const unsigned short* injw, unsigned short* dout,
+                                unsigned short* inj, float* scaleout, const void* upv,
+                                long uld, const unsigned short* dbuf, float* out_norm,
+                                long rows, long n, int hc, long lr, long hrow, float eps,
+                                void* stream, uint32_t* sync_counters) {
+  if (!h || !rows || !n || hc <= 0) return;
+  const uint32_t na = (n + 255u) / 256u;
+  const uint32_t nb = na;
+  const uint32_t total_blocks = na + nb;
+  AFF_BLAUNCH(hc_read_fused_v2_kernel, dim3(total_blocks), dim3(256), 0, (hipStream_t)stream,
+              h, w, downv, dld, injw, dout, inj, scaleout, upv, uld, dbuf, out_norm,
+              rows, n, hc, lr, hrow, eps, sync_counters, na, nb);
+}
+
+// Chained decode forms G (1..8 rows), S (9..16 rows), B3 (Radiance b0a58b5)
+template <int FORM>
+__global__ __launch_bounds__(256) void hc_chained_decode_kernel(
+    const uint16_t* __restrict__ h, const float* __restrict__ w,
+    const void* __restrict__ downv, long dld, const void* __restrict__ upv, long uld,
+    unsigned short* __restrict__ dout, float* __restrict__ out_norm,
+    long rows, long n, int hc, long lr, uint32_t* __restrict__ sync) {
+  const uint32_t tid = threadIdx.x;
+  __shared__ __attribute__((aligned(16))) float s_tile[256];
+
+  // Chained synchronization: thread 0 acquires slot
+  if (sync && tid == 0) {
+    while (__hip_atomic_load(&sync[0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < (uint32_t)blockIdx.x) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+  __syncthreads();
+
+  for (uint32_t r = 0; r < (uint32_t)rows; ++r) {
+    for (uint32_t i = blockIdx.x * blockDim.x + tid; i < (uint32_t)n; i += gridDim.x * blockDim.x) {
+      float acc = 0.0f;
+      #pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        if (c < hc) {
+          const uint16_t hv = h[r * (size_t)hc * n + (size_t)c * n + i];
+          acc += wmma::bf16_to_f32(hv);
+        }
+      }
+      acc *= (1.0f / (float)hc);
+      if (w) acc *= w[i];
+      if (FORM == 1) {
+        // Form S (scale applied after dot)
+        acc = fmaxf(acc, -65504.0f);
+      }
+      if (dout) dout[r * n + i] = wmma::f32_to_bf16(acc);
+      if (out_norm) out_norm[r * n + i] = acc;
+    }
+  }
+
+  __syncthreads();
+  if (sync && tid == 0) {
+    __hip_atomic_fetch_add(&sync[0], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+  }
+}
+
+void batch_hc_chained_decode_hip(const uint16_t* h, const float* w, const void* downv,
+                                 long dld, const void* upv, long uld, unsigned short* dout,
+                                 float* out_norm, long rows, long n, int hc, long lr,
+                                 void* stream, uint32_t* sync_counters) {
+  if (!h || !rows || !n || hc <= 0) return;
+  const uint32_t grid = (n + 255u) / 256u;
+  if (rows <= 8) {
+    // Form G (1..8 rows)
+    AFF_BLAUNCH((hc_chained_decode_kernel<0>), dim3(grid), dim3(256), 0, (hipStream_t)stream,
+                h, w, downv, dld, upv, uld, dout, out_norm, rows, n, hc, lr, sync_counters);
+  } else {
+    // Form S (9..16 rows)
+    AFF_BLAUNCH((hc_chained_decode_kernel<1>), dim3(grid), dim3(256), 0, (hipStream_t)stream,
+                h, w, downv, dld, upv, uld, dout, out_norm, rows, n, hc, lr, sync_counters);
+  }
+}
 
 } // namespace aff

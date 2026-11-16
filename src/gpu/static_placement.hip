@@ -2106,8 +2106,14 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         AFF_HIP_CHECK(hipStreamWaitEvent(st, I.ev_dn[dv][es], 0));
       }
       { AFF_XTRACE((int)dv, 6, st);
-      expert_scatter_slots_hip((const uint16_t*)bydn_[dv], d_block[dv], (const uint32_t*)bord_[dv],
-                               (const uint32_t*)brun_[dv], hidden, nb_tok, nb_stride, taken, st); }
+      if (moe_summed_down_enabled()) {
+        expert_scatter_slots_summed_hip((const uint16_t*)bydn_[dv], d_block[dv], (const uint32_t*)bord_[dv],
+                                        (const uint32_t*)brun_[dv], hidden, nb_tok, nb_stride, taken,
+                                        /*first_pass=*/false, st);
+      } else {
+        expert_scatter_slots_hip((const uint16_t*)bydn_[dv], d_block[dv], (const uint32_t*)bord_[dv],
+                                 (const uint32_t*)brun_[dv], hidden, nb_tok, nb_stride, taken, st);
+      } }
       trace::g_xt.hyb_tiles[dv] += n_miss_tiles;
 
       taken_all += taken;

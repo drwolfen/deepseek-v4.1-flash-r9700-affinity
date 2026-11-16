@@ -253,6 +253,19 @@ void expert_scatter_slots_hip(const uint16_t* y, float* block, const uint32_t* o
                               const uint32_t* run, uint32_t dim, uint32_t nb_tok,
                               uint32_t nb_stride, uint32_t total, void* stream = nullptr);
 
+// Wave 2 Phase 2B: Summed MoE Down GEMM & Tail Skip control (Avalon e09e775, 3370955, 4021443, 9e4f26f)
+bool moe_summed_down_enabled();
+bool moe_tail_skip_enabled(uint32_t n_tokens);
+
+void expert_scatter_slots_summed_hip(const uint16_t* y, float* block, const uint32_t* ord,
+                                     const uint32_t* run, uint32_t dim, uint32_t nb_tok,
+                                     uint32_t nb_stride, uint32_t total, bool first_pass,
+                                     void* stream = nullptr);
+
+void expert_scatter_tokens_summed_hip(const float* src, float* dst, const uint32_t* tok,
+                                      const float* w, uint32_t dim, uint32_t nb, uint32_t nt,
+                                      bool first_pass, void* stream = nullptr);
+
 // Gather `nt` token columns out of a dim-major [dim][nb] chunk arena into a compact [dim][nt] tile,
 // which is what the above consumes.
 void expert_gather_tokens_hip(const float* src, float* dst, const uint32_t* tok, uint32_t dim,
