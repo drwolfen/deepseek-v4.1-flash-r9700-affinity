@@ -94,6 +94,8 @@ struct Sha256 {
   }
 };
 
+static const uint8_t kRoot[32] = {};
+
 // key = SHA256(fingerprint || parent || token ids). The fingerprint rides in every link rather than
 // only the first, so a store written by a different container or cache geometry cannot match at any
 // depth. `parent` null is the root.
@@ -101,7 +103,6 @@ void block_key(uint64_t fp, const uint8_t* parent, const uint32_t* ids, uint32_t
                uint8_t out[32]) {
   Sha256 s;
   s.update(&fp, sizeof fp);
-  static const uint8_t kRoot[32] = {};
   s.update(parent ? parent : kRoot, 32);
   s.update(ids, (size_t)n * sizeof(uint32_t));
   s.final(out);
@@ -112,6 +113,7 @@ constexpr uint64_t kAlign = 4096;              // O_DIRECT wants offsets, length
 constexpr uint32_t kBlockMagic = 0x52424C4Bu;  // "RBLK"
 constexpr uint32_t kCkptMagic  = 0x52434B50u;  // "RCKP"
 constexpr uint32_t kIndexMagic = 0x52494458u;  // "RIDX"
+constexpr uint32_t kCkptFlagDelta = 1u;        // state-only delta checkpoint
 constexpr uint64_t kRestoreArenaBytes = 64ull << 20;
 
 uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
@@ -122,6 +124,16 @@ uint32_t next_pow2(uint32_t v) {
   return p;
 }
 
+bool read_exact(int fd, void* dst, uint64_t bytes, uint64_t off) {
+  uint64_t done = 0;
+  while (done < bytes) {
+    const ssize_t r = ::pread(fd, (uint8_t*)dst + done, (size_t)(bytes - done), (off_t)(off + done));
+    if (r <= 0) return false;
+    done += (uint64_t)r;
+  }
+  return true;
+}
+
 // The header at the front of every slot. Fixed size so a slot's payload starts on an aligned
 // offset, and self-describing so a persistent store can be validated rather than trusted.
 struct SlotHeader {
@@ -130,7 +142,7 @@ struct SlotHeader {
   uint64_t fingerprint = 0;
   uint64_t payload_bytes = 0;
   uint32_t pos = 0;            // checkpoint: the position it restores to
-  uint32_t reserved = 0;
+  uint32_t flags = 0;          // bit 0: kCkptFlagDelta (state-only delta checkpoint)
   uint8_t  key[32] = {};
   uint8_t  parent[32] = {};    // checkpoint: the block key it hangs off, so lookup is one probe
 };
@@ -198,6 +210,7 @@ bool PrefixCache::build_layout(std::string* err) {
     if (err) *err = "no regions to cache";
     return false;
   }
+  roll_payload_ = roll;
   blk_payload_ = app;
   // A checkpoint carries the rings AND everything the partial block has emitted so far, which is
   // what lets it restore to an arbitrary position rather than only to a block boundary. Sized for
@@ -236,6 +249,8 @@ bool PrefixCache::open(const Options& o, const std::vector<KvRegion>& regions, c
   if (!o.block_tokens) { if (err) *err = "block_tokens must be positive"; return false; }
   opt_ = o; io_ = io; fp_ = fingerprint;
   if (!opt_.ranks) opt_.ranks = 1;
+  const char* delta_env = std::getenv("AFF_PCACHE_DELTA");
+  opt_.delta = (!delta_env || (*delta_env && *delta_env != '0')) && o.delta;
   for (const KvRegion& r : regions) {
     if (!r.row_bytes || !r.rows) continue;
     (r.ratio ? app_ : roll_).push_back(r);
@@ -550,6 +565,25 @@ int32_t PrefixCache::find_ckpt(const uint8_t* parent, const uint32_t* ids, uint3
   return best;
 }
 
+int32_t PrefixCache::find_base_block(const uint8_t* parent, uint32_t pos, const uint32_t* tail_ids, uint32_t tail_len) {
+  if (!parent || !tail_len) return -1;
+  for (uint32_t s = 0; s < blk_.size(); ++s) {
+    if (!blk_[s].used) continue;
+    if (blk_[s].pos == pos && std::memcmp(blk_[s].parent, parent, 32) == 0) {
+      if (!impl_ || impl_->blk_fd < 0) return (int32_t)s;
+      alignas(kAlign) uint8_t hdr_buf[kAlign];
+      if (!read_exact(impl_->blk_fd, hdr_buf, kAlign, (uint64_t)s * blk_slot_)) continue;
+      const SlotHeader* bh = (const SlotHeader*)hdr_buf;
+      const uint32_t* btok = (const uint32_t*)(hdr_buf + sizeof(SlotHeader));
+      if (bh->magic == kBlockMagic && bh->fingerprint == fp_ &&
+          std::memcmp(btok, tail_ids, (size_t)tail_len * sizeof(uint32_t)) == 0) {
+        return (int32_t)s;
+      }
+    }
+  }
+  return -1;
+}
+
 uint32_t PrefixCache::chain(const uint32_t* ids, uint32_t n, std::vector<uint8_t>* keys) const {
   const uint32_t B = opt_.block_tokens;
   const uint32_t nb = n / B;
@@ -585,18 +619,6 @@ uint32_t PrefixCache::lookup(const uint32_t* ids, uint32_t n, uint32_t* blocks_m
 }
 
 // ---- restore ---------------------------------------------------------------------------------------
-
-namespace {
-bool read_exact(int fd, void* dst, uint64_t bytes, uint64_t off) {
-  uint64_t done = 0;
-  while (done < bytes) {
-    const ssize_t r = ::pread(fd, (uint8_t*)dst + done, (size_t)(bytes - done), (off_t)(off + done));
-    if (r <= 0) return false;
-    done += (uint64_t)r;
-  }
-  return true;
-}
-}  // namespace
 
 bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* err) {
   if (!ready_ || !n_restore) return false;
@@ -692,17 +714,56 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     off += (uint64_t)kSavedRanks * r.rows * r.row_bytes;
   }
   if (tail) {
-    const uint32_t t0 = nfull * B;
-    for (uint32_t ri = 0; ri < app_.size(); ++ri) {
-      uint64_t o, row0, nrows;
-      region_span(app_, kSavedRanks, t0, t0 + tail, ri, &o, &row0, &nrows);
-      if (!nrows) continue;
-      for (uint32_t rk = 0; rk < opt_.ranks; ++rk)
-        if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, row0, nrows,
-                      impl_->ckbuf + off + o)) {
-          if (err) *err = "prefix cache: the engine refused a restored partial block";
-          return false;
-        }
+    const bool is_delta = ((h->flags & kCkptFlagDelta) != 0) || ck_[cs].state_only;
+    if (is_delta) {
+      const int32_t bs = find_base_block(parent, (nfull + 1) * B, ids + (size_t)nfull * B, tail);
+      if (bs < 0) {
+        ++st_.verify_misses;
+        drop(cs, true);
+        if (err) *err = "prefix cache: state-only checkpoint missing base block in store";
+        return false;
+      }
+      if (!read_exact(impl_->blk_fd, impl_->rbuf[0], blk_slot_, (uint64_t)bs * blk_slot_)) {
+        if (err) *err = std::string("prefix cache: base block read failed: ") + std::strerror(errno);
+        return false;
+      }
+      const SlotHeader* bh = (const SlotHeader*)impl_->rbuf[0];
+      const uint32_t* btok = (const uint32_t*)(impl_->rbuf[0] + sizeof(SlotHeader));
+      if (bh->magic != kBlockMagic || bh->fingerprint != fp_ ||
+          std::memcmp(btok, ids + (size_t)nfull * B, (size_t)tail * sizeof(uint32_t)) != 0) {
+        ++st_.verify_misses;
+        drop(bs, false);
+        drop(cs, true);
+        if (err) *err = "prefix cache: base block failed verification";
+        return false;
+      }
+      st_.bytes_read += blk_slot_;
+      for (uint32_t ri = 0; ri < app_.size(); ++ri) {
+        uint64_t o, row0, nrows;
+        region_span(app_, kSavedRanks, 0, tail, ri, &o, &row0, &nrows);
+        if (!nrows) continue;
+        const uint64_t base_row0 = (uint64_t)nfull * (B / app_[ri].ratio);
+        for (uint32_t rk = 0; rk < opt_.ranks; ++rk)
+          if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, base_row0, nrows,
+                        impl_->rbuf[0] + hdr + o)) {
+            if (err) *err = "prefix cache: the engine refused a restored delta partial block";
+            return false;
+          }
+      }
+      ++st_.delta_ckpts_restored;
+    } else {
+      const uint32_t t0 = nfull * B;
+      for (uint32_t ri = 0; ri < app_.size(); ++ri) {
+        uint64_t o, row0, nrows;
+        region_span(app_, kSavedRanks, t0, t0 + tail, ri, &o, &row0, &nrows);
+        if (!nrows) continue;
+        for (uint32_t rk = 0; rk < opt_.ranks; ++rk)
+          if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, row0, nrows,
+                        impl_->ckbuf + off + o)) {
+            if (err) *err = "prefix cache: the engine refused a restored partial block";
+            return false;
+          }
+      }
     }
   }
   touch(cs, true);
@@ -773,6 +834,7 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
     }
     Slot& sl = blk_[s];
     std::memcpy(sl.key, h->key, 32);
+    std::memcpy(sl.parent, i ? keys.data() + (size_t)(i - 1) * 32 : kRoot, 32);
     sl.n_tokens = B; sl.pos = h->pos;
     uint32_t b; std::memcpy(&b, sl.key, 4); b &= impl_->blk_mask;
     sl.hnext = impl_->blk_bucket[b];
@@ -784,6 +846,16 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
       impl_->jobs.push_back(Impl::Job{false, (uint32_t)s, bi});
     }
     impl_->cv_job.notify_one();
+    if (opt_.delta) {
+      const uint8_t* blk_parent = i ? keys.data() + (size_t)(i - 1) * 32 : kRoot;
+      uint32_t pb; std::memcpy(&pb, blk_parent, 4); pb &= impl_->ck_mask;
+      for (uint32_t cs_idx = impl_->ck_bucket[pb]; cs_idx != kNil; cs_idx = ck_[cs_idx].hnext) {
+        if (!ck_[cs_idx].used || std::memcmp(ck_[cs_idx].parent, blk_parent, 32) != 0) continue;
+        if (ck_[cs_idx].pos > i * B && ck_[cs_idx].pos < (i + 1) * B) {
+          ck_[cs_idx].state_only = true;
+        }
+      }
+    }
   }
 
   // ---- WHICH END OF A REQUEST AGES OUT FIRST, AND WHY IT IS THE DEEP END -------------------------
@@ -809,16 +881,23 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
 
   // The checkpoint. One per publish, at exactly the position the engine is at, which is what lets
   // the next turn resume without replaying anything.
-  static const uint8_t kRoot[32] = {};
   const uint8_t* parent = nfull ? keys.data() + (size_t)(nfull - 1) * 32 : kRoot;
   const int32_t cs = claim(true);
   if (cs < 0) return true;
+  bool is_delta = false;
+  if (opt_.delta && tail > 0) {
+    if (find_base_block(parent, (nfull + 1) * B, ids + (size_t)nfull * B, tail) >= 0) {
+      is_delta = true;
+    }
+  }
   const uint32_t bi = acquire_stage();
   uint8_t* buf = impl_->stage[bi];
   SlotHeader* h = (SlotHeader*)buf;
   *h = SlotHeader{};
   h->magic = kCkptMagic; h->n_tokens = tail; h->fingerprint = fp_;
-  h->payload_bytes = ck_payload_; h->pos = n;
+  h->flags = is_delta ? kCkptFlagDelta : 0;
+  h->payload_bytes = is_delta ? roll_payload_ : ck_payload_;
+  h->pos = n;
   std::memcpy(h->parent, parent, 32);
   block_key(fp_, parent, ids + (size_t)nfull * B, tail, h->key);
   if (tail) std::memcpy(buf + sizeof(SlotHeader), ids + (size_t)nfull * B,
@@ -834,7 +913,7 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
       }
     off += (uint64_t)kSavedRanks * r.rows * r.row_bytes;
   }
-  if (tail) {
+  if (!is_delta && tail) {
     const uint32_t t0 = nfull * B;
     for (uint32_t ri = 0; ri < app_.size(); ++ri) {
       uint64_t o, row0, nrows;
@@ -853,11 +932,13 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
   std::memcpy(sl.key, h->key, 32);
   std::memcpy(sl.parent, parent, 32);
   sl.n_tokens = tail; sl.pos = n;
+  sl.state_only = is_delta;
   uint32_t b; std::memcpy(&b, sl.parent, 4); b &= impl_->ck_mask;
   sl.hnext = impl_->ck_bucket[b];
   impl_->ck_bucket[b] = (uint32_t)cs;
   touch(cs, true);
   ++st_.ckpts_written;
+  if (is_delta) ++st_.delta_ckpts_written;
   {
     std::lock_guard<std::mutex> lk(impl_->m);
     impl_->jobs.push_back(Impl::Job{true, (uint32_t)cs, bi});

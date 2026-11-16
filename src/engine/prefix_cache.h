@@ -95,6 +95,7 @@ struct PrefixCacheStats {
   uint64_t lookups = 0, hits = 0;
   uint64_t tokens_restored = 0, tokens_prefilled = 0;
   uint64_t blocks_written = 0, blocks_evicted = 0, ckpts_written = 0;
+  uint64_t delta_ckpts_written = 0, delta_ckpts_restored = 0;
   uint64_t bytes_read = 0, bytes_written = 0;
   uint64_t verify_misses = 0;      // key matched, token ids did not — a collision, caught
 };
@@ -112,6 +113,7 @@ class PrefixCache {
     // resume points that the sessions in flight each have one.
     uint32_t    ckpt_percent = 25;
     uint32_t    ranks = 1;            // cards to restore to; ONE of them is stored — see KvIo
+    bool        delta = true;         // State-only delta checkpoints (AFF_PCACHE_DELTA)
   };
 
   PrefixCache() = default;
@@ -129,6 +131,7 @@ class PrefixCache {
             uint64_t fingerprint, std::string* err);
   void close();
   bool ready() const { return ready_; }
+  bool delta_enabled() const { return opt_.delta; }
 
   // Tokens of `ids` that the store holds a resume point for — always a multiple of block_tokens,
   // and 0 when there is nothing to reuse. Reads the index only; no I/O.
@@ -174,7 +177,7 @@ class PrefixCache {
   // constant rather than a literal so the two places that would have to change together — the
   // layout and the restore fan-out — cannot drift.
   static constexpr uint32_t kSavedRanks = 1;
-  uint64_t blk_payload_ = 0, ck_payload_ = 0;   // bytes of rows
+  uint64_t blk_payload_ = 0, ck_payload_ = 0, roll_payload_ = 0;   // bytes of rows
   uint64_t blk_slot_ = 0, ck_slot_ = 0;         // header + payload, rounded to the I/O alignment
   bool ready_ = false;
   PrefixCacheStats st_{};
@@ -193,6 +196,8 @@ class PrefixCache {
     uint32_t n_tokens = 0;
     uint32_t pos = 0;
     bool     used = false;
+    bool     state_only = false;
+    uint8_t  pad[2] = {};
   };
   std::vector<Slot> blk_, ck_;
 
@@ -203,6 +208,7 @@ class PrefixCache {
   // Fills `keys` with the chained key of every full block of `ids`, and returns how many there are.
   uint32_t chain(const uint32_t* ids, uint32_t n, std::vector<uint8_t>* keys) const;
   int32_t  find(const uint8_t* key) const;
+  int32_t  find_base_block(const uint8_t* parent, uint32_t pos, const uint32_t* tail_ids, uint32_t tail_len);
   // The longest checkpoint hanging off `parent` whose tail is a prefix of `ids[0, avail)`. Several
   // can share a parent — one per turn of the same conversation — so the chain is walked rather than
   // probed, and a candidate is confirmed by recomputing its key over this prompt's own tokens,

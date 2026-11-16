@@ -3338,8 +3338,8 @@ int main(int argc, char** argv) {
     const Model::PhaseProfile p_before = model.profile();
     const auto t_dec0 = std::chrono::steady_clock::now();
     const uint32_t made = spec_decode(slot, st, blk, ids.empty() ? 1u : ids.back(), hist, total_budget,
-                                      /*ignore_eos_=*/raw_mode && req.ignore_eos, [&](uint32_t id) {
-      if ((int32_t)id == tok.eos() && !(raw_mode && req.ignore_eos)) return false;
+                                      /*ignore_eos_=*/req.ignore_eos, [&](uint32_t id) {
+      if ((int32_t)id == tok.eos() && !req.ignore_eos) return false;
       raw += tok.vocab_size() ? tok.decode_one(id) : std::string();
       if (raw_mode) {
         size_t safe = raw.size();
