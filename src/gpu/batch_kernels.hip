@@ -3729,7 +3729,7 @@ bool hc_chained_enabled() {
 uint32_t hc_chained_min_rows() {
   static const uint32_t min_rows = [] {
     const char* s = std::getenv("AFF_HC_CHAINED_MIN_ROWS");
-    return (s && *s) ? (uint32_t)std::strtoul(s, nullptr, 10) : 8u;
+    return (s && *s) ? (uint32_t)std::strtoul(s, nullptr, 10) : 1u;
   }();
   return min_rows;
 }
