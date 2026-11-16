@@ -3706,8 +3706,15 @@ void embed_tokens_gather_hip(const uint16_t* embed_table, const uint32_t* token_
   if (!n_tokens || !n_embd || !embed_table || !token_ids || !out_emb) return;
   const uint32_t block_x = 256;
   const uint32_t grid_x = (n_embd + block_x - 1) / block_x;
-  AFF_BLAUNCH(embed_tokens_gather_kernel, dim3(grid_x, n_tokens), dim3(block_x), 0,
-              (hipStream_t)stream, embed_table, token_ids, out_emb, n_tokens, n_embd);
+  // Hardware gridDim.y max is 65535 on RDNA. Chunking n_tokens into slices <= 65535 guards against
+  // hardware overflow for long prefill (>65535 rows up to 262144 context).
+  constexpr uint32_t kMaxGridY = 65535;
+  for (uint32_t t_off = 0; t_off < n_tokens; t_off += kMaxGridY) {
+    const uint32_t chunk = std::min(n_tokens - t_off, kMaxGridY);
+    AFF_BLAUNCH(embed_tokens_gather_kernel, dim3(grid_x, chunk), dim3(block_x), 0,
+                (hipStream_t)stream, embed_table, token_ids + t_off,
+                out_emb + (size_t)t_off * n_embd, chunk, n_embd);
+  }
 }
 
 bool hc_fused_v2_enabled() {

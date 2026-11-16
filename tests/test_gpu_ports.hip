@@ -195,6 +195,54 @@ int main() {
       (void)hipFree(p);
   }
 
+  // 4. Test long prefill >65535-row hardware gridDim.y overflow guard (n = 70000, #1006)
+  {
+    const uint32_t n_tokens = 70000;
+    const uint32_t n_embd = 64;
+    std::vector<uint32_t> h_ids(n_tokens, 0u);
+    h_ids[0] = 7u;
+    h_ids[65535] = 42u;
+    h_ids[69999] = 123u;
+
+    const uint32_t vocab_size = 256;
+    std::vector<uint16_t> h_table((size_t)vocab_size * n_embd);
+    for (uint32_t v = 0; v < vocab_size; ++v) {
+      for (uint32_t d = 0; d < n_embd; ++d) {
+        h_table[(size_t)v * n_embd + d] = f32_to_bf16_cpu((float)(v * 100 + d) * 0.125f);
+      }
+    }
+
+    uint16_t* d_table = nullptr;
+    uint32_t* d_ids = nullptr;
+    float* d_out = nullptr;
+    assert(hipMalloc(&d_table, h_table.size() * sizeof(uint16_t)) == hipSuccess);
+    assert(hipMalloc(&d_ids, h_ids.size() * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_out, (size_t)n_tokens * n_embd * sizeof(float)) == hipSuccess);
+
+    assert(hipMemcpy(d_table, h_table.data(), h_table.size() * sizeof(uint16_t),
+                     hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_ids, h_ids.data(), h_ids.size() * sizeof(uint32_t),
+                     hipMemcpyHostToDevice) == hipSuccess);
+
+    embed_tokens_gather_hip(d_table, d_ids, d_out, n_tokens, n_embd, nullptr);
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    const uint32_t check_rows[] = {0u, 65535u, 69999u};
+    for (uint32_t r : check_rows) {
+      std::vector<float> h_row(n_embd);
+      assert(hipMemcpy(h_row.data(), d_out + (size_t)r * n_embd, n_embd * sizeof(float),
+                       hipMemcpyDeviceToHost) == hipSuccess);
+      const uint32_t vid = h_ids[r];
+      for (uint32_t d = 0; d < n_embd; ++d) {
+        const float expected = bf16_to_f32_cpu(h_table[(size_t)vid * n_embd + d]);
+        assert(std::fabs(h_row[d] - expected) < 1e-5f);
+      }
+    }
+
+    for (void* p : {(void*)d_table, (void*)d_ids, (void*)d_out})
+      (void)hipFree(p);
+  }
+
   std::printf("PASS: test_gpu_ports on gfx1201\n");
   return 0;
 }

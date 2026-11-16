@@ -685,7 +685,6 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
   // Batched: n tokens already give the grid its width, so spend head-grouping on K/V reuse.
   const uint32_t nhb = kHeadsPerBlk;
   const size_t lds = ((size_t)nhb * (n_raw_max + n_comp_max) + nhb) * sizeof(float);
-  const dim3 g((n_head + nhb - 1) / nhb, n), b(kAttnThreads);
   hipStream_t st = (hipStream_t)stream;
   const uint32_t sd = (uint32_t)kv_row_bytes(dt, width, n_rot);
   const uint32_t nope = width - n_rot;
@@ -693,27 +692,40 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
     const char* v = std::getenv("AFF_DRAFT_RING_MASK_SKIP");
     return v && *v && std::strcmp(v, "0") != 0;
   }();
+  // Hardware gridDim.y max is 65535 on RDNA. Chunking n into slices <= 65535 guards against
+  // hardware overflow for long prefill (>65535 rows up to 262144 context).
+  constexpr uint32_t kMaxGridY = 65535;
+  for (uint32_t t_off = 0; t_off < n; t_off += kMaxGridY) {
+    const uint32_t chunk_n = std::min(n - t_off, kMaxGridY);
+    const dim3 g((n_head + nhb - 1) / nhb, chunk_n), b(kAttnThreads);
+    const uint32_t b0_chunk = b0 + t_off;
+    const uint32_t pos0_chunk = pos0 + t_off;
+    const uint32_t* n_comp_v_chunk = n_comp_v ? (n_comp_v + t_off) : nullptr;
+    const uint8_t* allowed_chunk = allowed ? (allowed + (size_t)t_off * max_comp) : nullptr;
 #define AFF_ATTB(DTV, QBV)                                                                         \
-  do {                                                                                             \
-    if (draft_mask_skip) {                                                                         \
-      hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, true>), g, b, lds, st, q, raw, comp,   \
-                         allowed, n_comp_v, sinks, out, b0, pos0, sliding, ring, max_comp,         \
-                         n_head, width, nope, sd, scale, nhb, flat_n, flat_raw0, raw_floor);      \
-    } else {                                                                                       \
-      hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, false>), g, b, lds, st, q, raw, comp,  \
-                         allowed, n_comp_v, sinks, out, b0, pos0, sliding, ring, max_comp,         \
-                         n_head, width, nope, sd, scale, nhb, flat_n, flat_raw0, raw_floor);      \
-    }                                                                                              \
-  } while (0)
+    do {                                                                                           \
+      if (draft_mask_skip) {                                                                       \
+        hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, true>), g, b, lds, st, q, raw, comp, \
+                           allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk, pos0_chunk,       \
+                           sliding, ring, max_comp, n_head, width, nope, sd, scale, nhb, flat_n,   \
+                           flat_raw0, raw_floor);                                                  \
+      } else {                                                                                     \
+        hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, false>), g, b, lds, st, q, raw, comp,\
+                           allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk, pos0_chunk,       \
+                           sliding, ring, max_comp, n_head, width, nope, sd, scale, nhb, flat_n,   \
+                           flat_raw0, raw_floor);                                                  \
+      }                                                                                            \
+    } while (0)
 #define AFF_ATTQ(DTV) do { if (q_bf16) AFF_ATTB(DTV, true); else AFF_ATTB(DTV, false); } while (0)
-  switch (dt) {
-    case KvDtype::F32:   AFF_ATTQ(0); break;
-    case KvDtype::FP8:   AFF_ATTQ(2); break;
-    case KvDtype::MIXED: AFF_ATTQ(3); break;
-    case KvDtype::FP8R:  AFF_ATTQ(4); break;
-  }
+    switch (dt) {
+      case KvDtype::F32:   AFF_ATTQ(0); break;
+      case KvDtype::FP8:   AFF_ATTQ(2); break;
+      case KvDtype::MIXED: AFF_ATTQ(3); break;
+      case KvDtype::FP8R:  AFF_ATTQ(4); break;
+    }
 #undef AFF_ATTQ
 #undef AFF_ATTB
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 

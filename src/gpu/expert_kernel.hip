@@ -1761,10 +1761,14 @@ void expert_gather_tokens_hip(const float* src, float* dst, const uint32_t* tok,
                               uint32_t nb, uint32_t nt, void* stream) {
   if (!nt || !dim) return;
   const dim3 blk(64, 4);
-  const dim3 grd((dim + blk.x - 1) / blk.x, (nt + blk.y - 1) / blk.y);
-  hipLaunchKernelGGL(expert_gather_tokens_kernel, grd, blk, 0, (hipStream_t)stream, src, dst, tok,
-                     dim, nb, nt);
-  AFF_HIP_CHECK(hipGetLastError());
+  constexpr uint32_t kMaxChunk = 65535u * 4u;
+  for (uint32_t off = 0; off < nt; off += kMaxChunk) {
+    const uint32_t cur_nt = std::min(nt - off, kMaxChunk);
+    const dim3 grd((dim + blk.x - 1) / blk.x, (cur_nt + blk.y - 1) / blk.y);
+    hipLaunchKernelGGL(expert_gather_tokens_kernel, grd, blk, 0, (hipStream_t)stream, src,
+                       dst + (size_t)off * dim, tok + off, dim, nb, cur_nt);
+    AFF_HIP_CHECK(hipGetLastError());
+  }
 }
 
 bool expert_gemm_tokens_hip(const DeviceMatrix& m, const float* cb, const float* x, float* y,
@@ -2975,10 +2979,15 @@ void expert_scatter_tokens_summed_hip(const float* src, float* dst, const uint32
                                       bool first_pass, void* stream) {
   if (!dim || !nb || !nt) return;
   const dim3 blk(64, 4);
-  const dim3 grd((dim + blk.x - 1) / blk.x, (nt + blk.y - 1) / blk.y);
-  hipLaunchKernelGGL(expert_scatter_tokens_summed_kernel, grd, blk, 0, (hipStream_t)stream,
-                     src, dst, tok, w, dim, nb, nt, first_pass);
-  AFF_HIP_CHECK(hipGetLastError());
+  constexpr uint32_t kMaxChunk = 65535u * 4u;
+  for (uint32_t off = 0; off < nt; off += kMaxChunk) {
+    const uint32_t cur_nt = std::min(nt - off, kMaxChunk);
+    const dim3 grd((dim + blk.x - 1) / blk.x, (cur_nt + blk.y - 1) / blk.y);
+    hipLaunchKernelGGL(expert_scatter_tokens_summed_kernel, grd, blk, 0, (hipStream_t)stream,
+                       src + (size_t)off * dim, dst, tok + off, w ? w + off : nullptr,
+                       dim, nb, cur_nt, first_pass && off == 0);
+    AFF_HIP_CHECK(hipGetLastError());
+  }
 }
 
 // ---- the device weight layout ----------------------------------------------------------------

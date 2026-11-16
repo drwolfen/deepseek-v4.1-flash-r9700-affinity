@@ -930,20 +930,34 @@ void idx_block_max_hip(const float* scores, float* bsc, const uint32_t* nkeys, u
                        uint32_t sstride, uint32_t bstride, uint32_t nb_blocks, uint32_t block,
                        uint32_t keys_all, void* stream) {
   if (!nb || !nb_blocks || !block) return;
-  const dim3 g((nb_blocks + 255u) / 256u, nb), b(256);
-  hipLaunchKernelGGL(idx_block_max_kernel, g, b, 0, (hipStream_t)stream, scores, bsc, nkeys,
-                     sstride, bstride, nb_blocks, block, keys_all);
-  AFF_HIP_CHECK(hipGetLastError());
+  constexpr uint32_t kMaxGridY = 65535;
+  for (uint32_t t_off = 0; t_off < nb; t_off += kMaxGridY) {
+    const uint32_t chunk = std::min(nb - t_off, kMaxGridY);
+    const dim3 g((nb_blocks + 255u) / 256u, chunk), b(256);
+    hipLaunchKernelGGL(idx_block_max_kernel, g, b, 0, (hipStream_t)stream,
+                       scores + (size_t)t_off * sstride,
+                       bsc + (size_t)t_off * bstride,
+                       nkeys ? nkeys + t_off : nullptr,
+                       sstride, bstride, nb_blocks, block, keys_all);
+    AFF_HIP_CHECK(hipGetLastError());
+  }
 }
 
 void idx_apply_cand_hip(float* scores, const uint8_t* cand, const uint32_t* nkeys, uint32_t nb,
                         uint32_t sstride, uint32_t cstride, uint32_t keys_max, uint32_t block,
                         uint32_t keys_all, void* stream) {
   if (!nb || !keys_max || !block) return;
-  const dim3 g((keys_max + 255u) / 256u, nb), b(256);
-  hipLaunchKernelGGL(idx_apply_cand_kernel, g, b, 0, (hipStream_t)stream, scores, cand, nkeys,
-                     sstride, cstride, block, keys_all);
-  AFF_HIP_CHECK(hipGetLastError());
+  constexpr uint32_t kMaxGridY = 65535;
+  for (uint32_t t_off = 0; t_off < nb; t_off += kMaxGridY) {
+    const uint32_t chunk = std::min(nb - t_off, kMaxGridY);
+    const dim3 g((keys_max + 255u) / 256u, chunk), b(256);
+    hipLaunchKernelGGL(idx_apply_cand_kernel, g, b, 0, (hipStream_t)stream,
+                       scores + (size_t)t_off * sstride,
+                       cand + (size_t)t_off * cstride,
+                       nkeys ? nkeys + t_off : nullptr,
+                       sstride, cstride, block, keys_all);
+    AFF_HIP_CHECK(hipGetLastError());
+  }
 }
 
 }  // namespace aff
