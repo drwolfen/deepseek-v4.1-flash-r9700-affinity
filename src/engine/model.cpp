@@ -2671,7 +2671,11 @@ bool Model::forward_kl_eval(const uint32_t* ids, uint32_t n, const std::string& 
     const uint32_t tok_in = ids[pos];
     const uint32_t target_tok = ids[pos + 1];
 
-    forward_token(tok_in, &st, nullptr, nullptr, &logits, true);
+    if (!forward_prefill(&tok_in, 1, &st, nullptr, nullptr, &logits, true)) {
+      aff::ui::err("fatal: forward_prefill failed at pos %u\n", pos);
+      std::fclose(f);
+      return false;
+    }
 
     float max_logit = -1e30f;
     for (float v : logits) {
