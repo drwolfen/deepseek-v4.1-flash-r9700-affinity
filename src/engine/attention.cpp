@@ -107,4 +107,54 @@ void build_key_list(const AttnConfig& c, uint64_t cur_pos, uint32_t ratio,
   for (uint64_t i = 0; i < n_selected; ++i) keys->push_back(selected[i]);
 }
 
+bool indexer_short_seq_skip(uint32_t seqused, uint32_t topk) noexcept {
+  return seqused <= topk;
+}
+
+IndexerChunkMeta build_indexer_chunk_metadata(uint32_t pos0, uint32_t chunk_len,
+                                              uint32_t ratio, uint32_t n_comp_start,
+                                              uint32_t n_comp_end, uint32_t kv_owner,
+                                              uint32_t idx_owner, uint32_t sub_batch_size,
+                                              bool sparse_indexer_on, uint32_t topk) {
+  IndexerChunkMeta meta;
+  meta.chunk_pos0 = pos0;
+  meta.chunk_len  = chunk_len;
+  meta.total_keys = n_comp_end;
+  meta.kv_owner   = kv_owner;
+  meta.idx_owner  = idx_owner;
+  meta.skip_query = sparse_indexer_on && indexer_short_seq_skip(pos0 + chunk_len, topk);
+
+  meta.ncomp.resize(chunk_len);
+  uint32_t cur = n_comp_start;
+  for (uint32_t b = 0; b < chunk_len; ++b) {
+    const uint32_t pos = pos0 + b;
+    if (ratio && (pos + 1) % ratio == 0 && cur < n_comp_end) {
+      ++cur;
+    }
+    meta.ncomp[b] = cur;
+  }
+
+  const uint32_t step = sub_batch_size ? sub_batch_size : chunk_len;
+  for (uint32_t g0 = 0; g0 < chunk_len; g0 += step) {
+    const uint32_t gn = std::min<uint32_t>(step, chunk_len - g0);
+    meta.sub_starts.push_back(g0);
+    meta.sub_lens.push_back(gn);
+  }
+
+  return meta;
+}
+
+IndexerSubChunkView slice_indexer_subchunk(const IndexerChunkMeta& meta, uint32_t sub_idx) {
+  IndexerSubChunkView v;
+  v.sub_idx = sub_idx;
+  if (sub_idx < meta.sub_starts.size()) {
+    v.token_start = meta.sub_starts[sub_idx];
+    v.token_len   = meta.sub_lens[sub_idx];
+    v.skip_query  = meta.skip_query;
+    v.ncomp       = meta.ncomp.empty() ? nullptr : (meta.ncomp.data() + v.token_start);
+    v.kv_keys     = meta.total_keys;
+  }
+  return v;
+}
+
 } // namespace aff

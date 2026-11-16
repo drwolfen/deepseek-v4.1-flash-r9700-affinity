@@ -565,7 +565,7 @@ bool Model::load(const std::string& aff_path, std::string* err) {
     if (cfg_.v41 && cfg_.ratio_for(l) && !cfg_.is_index_source(l)) {
       owner = UINT32_MAX;
       for (uint32_t k = l + 1; k-- > 0;)
-        if (cfg_.is_index_source(k)) { owner = k; break; }
+        if (cfg_.is_index_source(k) && cfg_.ratio_for(k) == cfg_.ratio_for(l)) { owner = k; break; }
       if (owner == UINT32_MAX) {
         if (err) *err = "layer " + std::to_string(l) + " compresses but no index-source precedes it";
         return false;
@@ -1048,7 +1048,12 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     // V4.1 runs an indexer on its index-source layers, whatever their ratio — `ratio == 4` was V4's
     // way of naming the same set and is false for every V4.1 layer. `is_index_source` is the
     // identity-preserving form: on V4 it IS `ratio == 4`.
-    const bool idx_may_run = cfg_.is_index_source(l) && w.idx_wq_b &&
+    static const bool sparse_indexer_on = [] {
+      const char* v = std::getenv("AFF_SPARSE_INDEXER");
+      return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    const bool skip_short_seq = sparse_indexer_on && indexer_short_seq_skip(pos, cfg_.index_topk);
+    const bool idx_may_run = !skip_short_seq && cfg_.is_index_source(l) && w.idx_wq_b &&
                              cfg_.index_topk < st.n_comp + 1u;
     const bool host_norm = !dev_hc || idx_may_run;
     if (dev_hc) {
@@ -1828,7 +1833,12 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // asking for qr_norm and `norm` when no token needs them costs a copy per layer.
       // `is_index_source`, not `ratio == 4`: the two name the same set on V4, and only the first
       // names anything at all on V4.1. Guarded on w.ratio because the divisor below is the layer's.
-      const bool idx_may_run = w.ratio && cfg_.is_index_source(l) && w.idx_wq_b &&
+      static const bool sparse_indexer_on = [] {
+        const char* v = std::getenv("AFF_SPARSE_INDEXER");
+        return v && *v && std::strcmp(v, "0") != 0;
+      }();
+      const bool skip_short_seq = sparse_indexer_on && indexer_short_seq_skip(pos0 + live, cfg_.index_topk);
+      const bool idx_may_run = !skip_short_seq && w.ratio && cfg_.is_index_source(l) && w.idx_wq_b &&
                                cfg_.index_topk < st.n_comp + live / w.ratio + 1u;
       // Null, not `normb`: neither host buffer this sublayer could ask for has a reader. The
       // compressors take `norm` on device and the indexer's query projection takes `qr_norm` there,
@@ -1933,6 +1943,11 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       uint32_t idx_keys = 0;
       const uint32_t n_comp_end = st.n_comp + n_out;   // what the device just emitted, in total
       const bool shares_kv = w.ratio && w.kv_owner != l;
+
+      // Wave 3 Item 1: Prefill chunk metadata built once per request chunk range (vLLM PR #67712 pattern)
+      IndexerChunkMeta chunk_meta = build_indexer_chunk_metadata(
+          pos0, live, w.ratio, st.n_comp, n_comp_end, w.kv_owner, idx_owner_[l], kAttnBatch,
+          sparse_indexer_on, cfg_.index_topk);
       for (uint32_t b = 0; b < live; ++b) {
         const uint32_t pos = pos0 + b;
         {                                            // the host's own copy of the sliding window
@@ -1997,11 +2012,13 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // below is the batched device work. They were charged to one timer and read as "attention".
       AFF_PH(indexer);
 
-      // Pass two: the ring, and attention. kAttnBatch tokens per launch, and the ring is wide
-      // enough that committing all of them first cannot overwrite a row one of them still needs.
+      // Pass two: the ring, and attention sliced across query sub-chunks (vLLM PR #67712 pattern).
       const uint32_t raw_floor = (replay_cut < cfg_.n_layer && l > replay_cut) ? replay_floor_pos : 0u;
-      for (uint32_t g0 = 0; g0 < live; g0 += kAttnBatch) {
-        const uint32_t gn = std::min<uint32_t>(kAttnBatch, live - g0);
+      const size_t n_sub = chunk_meta.sub_starts.size();
+      for (size_t sub_idx = 0; sub_idx < n_sub; ++sub_idx) {
+        IndexerSubChunkView sub = slice_indexer_subchunk(chunk_meta, (uint32_t)sub_idx);
+        const uint32_t g0 = sub.token_start;
+        const uint32_t gn = sub.token_len;
         if (!bops_.kv_commit(bops_.ctx, l, g0, gn, pos0 + g0, W, ROT)) return false;
         // Null `allowed`: the indexer left the admission mask on device, in the buffer this reads.
         if (!bops_.attend(bops_.ctx, l, g0, gn, pos0 + g0, nullptr, mstride, ncompb.data() + g0, kq,

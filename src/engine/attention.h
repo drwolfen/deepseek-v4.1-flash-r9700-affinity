@@ -84,4 +84,37 @@ void build_key_list(const AttnConfig& c, uint64_t cur_pos, uint32_t ratio,
                     const uint64_t* selected, uint64_t n_selected,
                     std::vector<uint64_t>* keys);
 
+// Wave 3: Prefill chunk metadata and short-seq skip (vLLM PR #67712 & Radiance 8fa226e/be623ba)
+// Reuses KV-side metadata across query sub-chunks and skips query-side index selection when seqused <= 512.
+struct IndexerChunkMeta {
+  uint32_t chunk_pos0 = 0;
+  uint32_t chunk_len  = 0;
+  uint32_t total_keys = 0;
+  uint32_t kv_owner   = 0;
+  uint32_t idx_owner  = 0;
+  bool     skip_query = false; // Radiance fast-path: seqused <= 512
+  std::vector<uint32_t> ncomp; // Per-token compressed row counts
+  std::vector<uint32_t> sub_starts; // Sub-chunk start offsets
+  std::vector<uint32_t> sub_lens;   // Sub-chunk lengths
+};
+
+struct IndexerSubChunkView {
+  uint32_t sub_idx     = 0;
+  uint32_t token_start = 0;
+  uint32_t token_len   = 0;
+  uint32_t kv_keys     = 0;
+  bool     skip_query  = false;
+  const uint32_t* ncomp = nullptr;
+};
+
+bool indexer_short_seq_skip(uint32_t seqused, uint32_t topk = 512) noexcept;
+
+IndexerChunkMeta build_indexer_chunk_metadata(uint32_t pos0, uint32_t chunk_len,
+                                              uint32_t ratio, uint32_t n_comp_start,
+                                              uint32_t n_comp_end, uint32_t kv_owner,
+                                              uint32_t idx_owner, uint32_t sub_batch_size,
+                                              bool sparse_indexer_on, uint32_t topk = 512);
+
+IndexerSubChunkView slice_indexer_subchunk(const IndexerChunkMeta& meta, uint32_t sub_idx);
+
 } // namespace aff
