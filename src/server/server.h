@@ -95,7 +95,7 @@ struct GenResult {
 enum class Delta { Content, Reasoning };
 
 #ifndef AFF_VERSION
-#define AFF_VERSION "v5.1.0"
+#define AFF_VERSION "v5.1.1"
 #endif
 
 #ifndef AFF_GIT_SHA
@@ -168,6 +168,8 @@ private:
 
 // Exposed for testing.
 bool parse_completion_request(const std::string& body, bool chat, CompletionRequest* out);
+size_t utf8_safe_end(const std::string& s, size_t limit);
+std::string sanitize_utf8(const std::string& s);
 std::string json_escape(const std::string& s);
 
 } // namespace aff

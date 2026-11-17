@@ -668,16 +668,19 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
       region_span(app_, kSavedRanks, 0, B, ri, &off, &row0, &nrows);
       // The batch's rows for this region, contiguous: the slots hold one block each and the cards
       // want one run across all of them.
-      for (uint32_t i = 0; i < g; ++i)
-        std::memcpy(impl_->gather + (uint64_t)i * seg, impl_->rbuf[i] + hdr + off, (size_t)seg);
-      // The SAME bytes to every card. They are bit-identical on the machine — see KvIo — so this is
-      // a fan-out and not a broadcast of one card's opinion.
-      for (uint32_t rk = 0; rk < opt_.ranks; ++rk)
+      for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
+        const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
+        if (rk == 0 || (kSavedRanks > 1 && rk < kSavedRanks)) {
+          for (uint32_t i = 0; i < g; ++i)
+            std::memcpy(impl_->gather + (uint64_t)i * seg,
+                        impl_->rbuf[i] + hdr + off + (uint64_t)src_rk * seg, (size_t)seg);
+        }
         if (!io_.load(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * rpb, (uint64_t)g * rpb,
                       impl_->gather)) {
           if (err) *err = "prefix cache: the engine refused a restored block";
           return false;
         }
+      }
     }
   }
 
@@ -706,11 +709,14 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
   st_.bytes_read += ck_slot_;
   uint64_t off = hdr;
   for (const KvRegion& r : roll_) {
-    for (uint32_t rk = 0; rk < opt_.ranks; ++rk)
-      if (!io_.load(io_.ctx, r.part, r.layer, rk, 0, r.rows, impl_->ckbuf + off)) {
+    for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
+      const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
+      if (!io_.load(io_.ctx, r.part, r.layer, rk, 0, r.rows,
+                    impl_->ckbuf + off + (uint64_t)src_rk * r.rows * r.row_bytes)) {
         if (err) *err = "prefix cache: the engine refused a restored ring";
         return false;
       }
+    }
     off += (uint64_t)kSavedRanks * r.rows * r.row_bytes;
   }
   if (tail) {
@@ -739,16 +745,20 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
       }
       st_.bytes_read += blk_slot_;
       for (uint32_t ri = 0; ri < app_.size(); ++ri) {
-        uint64_t o, row0, nrows;
-        region_span(app_, kSavedRanks, 0, tail, ri, &o, &row0, &nrows);
+        uint64_t base_off, base_row0_in_blk, base_nrows;
+        region_span(app_, kSavedRanks, 0, B, ri, &base_off, &base_row0_in_blk, &base_nrows);
+        const uint64_t nrows = tail / app_[ri].ratio;
         if (!nrows) continue;
-        const uint64_t base_row0 = (uint64_t)nfull * (B / app_[ri].ratio);
-        for (uint32_t rk = 0; rk < opt_.ranks; ++rk)
+        const uint64_t base_row0 = (uint64_t)nfull * base_nrows;
+        for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
+          const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
           if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, base_row0, nrows,
-                        impl_->rbuf[0] + hdr + o)) {
+                        impl_->rbuf[0] + hdr + base_off +
+                            (uint64_t)src_rk * base_nrows * app_[ri].row_bytes)) {
             if (err) *err = "prefix cache: the engine refused a restored delta partial block";
             return false;
           }
+        }
       }
       ++st_.delta_ckpts_restored;
     } else {
@@ -757,12 +767,15 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
         uint64_t o, row0, nrows;
         region_span(app_, kSavedRanks, t0, t0 + tail, ri, &o, &row0, &nrows);
         if (!nrows) continue;
-        for (uint32_t rk = 0; rk < opt_.ranks; ++rk)
+        for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
+          const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
           if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, row0, nrows,
-                        impl_->ckbuf + off + o)) {
+                        impl_->ckbuf + off + o +
+                            (uint64_t)src_rk * nrows * app_[ri].row_bytes)) {
             if (err) *err = "prefix cache: the engine refused a restored partial block";
             return false;
           }
+        }
       }
     }
   }

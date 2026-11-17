@@ -106,20 +106,131 @@ bool send_all(int fd, const char* d, size_t n) {
   }
   return true;
 }
+constexpr const char* kUtf8Replacement = "\xEF\xBF\xBD";
+
+// Validate one UTF-8 codepoint starting at s[i..n). Returns valid byte length (1..4),
+// or 0 if ill-formed and sets *skip to the maximal ill-formed subpart length (1..3).
+size_t utf8_next(const char* s, size_t i, size_t n, size_t* skip) {
+  const uint8_t b0 = (uint8_t)s[i];
+  if (b0 < 0x80) return 1;
+  if (b0 >= 0xC2 && b0 <= 0xDF) {
+    if (i + 1 < n && (((uint8_t)s[i + 1] & 0xC0) == 0x80)) return 2;
+    *skip = 1;
+    return 0;
+  }
+  if (b0 >= 0xE0 && b0 <= 0xEF) {
+    if (i + 1 < n) {
+      const uint8_t b1 = (uint8_t)s[i + 1];
+      const bool b1_ok = (b0 == 0xE0) ? (b1 >= 0xA0 && b1 <= 0xBF)
+                       : (b0 == 0xED) ? (b1 >= 0x80 && b1 <= 0x9F)
+                                      : (b1 >= 0x80 && b1 <= 0xBF);
+      if (b1_ok) {
+        if (i + 2 < n && (((uint8_t)s[i + 2] & 0xC0) == 0x80)) return 3;
+        *skip = 2;
+        return 0;
+      }
+    }
+    *skip = 1;
+    return 0;
+  }
+  if (b0 >= 0xF0 && b0 <= 0xF4) {
+    if (i + 1 < n) {
+      const uint8_t b1 = (uint8_t)s[i + 1];
+      const bool b1_ok = (b0 == 0xF0) ? (b1 >= 0x90 && b1 <= 0xBF)
+                       : (b0 == 0xF4) ? (b1 >= 0x80 && b1 <= 0x8F)
+                                      : (b1 >= 0x80 && b1 <= 0xBF);
+      if (b1_ok) {
+        if (i + 2 < n && (((uint8_t)s[i + 2] & 0xC0) == 0x80)) {
+          if (i + 3 < n && (((uint8_t)s[i + 3] & 0xC0) == 0x80)) return 4;
+          *skip = 3;
+          return 0;
+        }
+        *skip = 2;
+        return 0;
+      }
+    }
+    *skip = 1;
+    return 0;
+  }
+  *skip = 1;
+  return 0;
+}
 } // namespace
 
+size_t utf8_safe_end(const std::string& s, size_t limit) {
+  if (limit > s.size()) limit = s.size();
+  if (limit == 0) return 0;
+  if ((uint8_t)s[limit - 1] < 0x80) return limit;
+
+  size_t lead = limit - 1;
+  size_t cont = 0;
+  while (lead > 0 && cont < 3 && (((uint8_t)s[lead] & 0xC0) == 0x80)) {
+    --lead;
+    ++cont;
+  }
+  const uint8_t b0 = (uint8_t)s[lead];
+  if ((b0 & 0xC0) == 0x80 || b0 < 0xC2 || b0 > 0xF4) return limit;
+
+  const size_t have = limit - lead;
+  const size_t need = b0 >= 0xF0 ? 4 : b0 >= 0xE0 ? 3 : 2;
+  if (have >= need) return limit;
+
+  if (have >= 2) {
+    const uint8_t b1 = (uint8_t)s[lead + 1];
+    if (b0 == 0xE0 && (b1 < 0xA0 || b1 > 0xBF)) return limit;
+    if (b0 == 0xED && (b1 < 0x80 || b1 > 0x9F)) return limit;
+    if (b0 == 0xF0 && (b1 < 0x90 || b1 > 0xBF)) return limit;
+    if (b0 == 0xF4 && (b1 < 0x80 || b1 > 0x8F)) return limit;
+  }
+  return lead;
+}
+
+std::string sanitize_utf8(const std::string& s) {
+  std::string o;
+  o.reserve(s.size());
+  const size_t n = s.size();
+  for (size_t i = 0; i < n;) {
+    size_t skip = 1;
+    const size_t len = utf8_next(s.data(), i, n, &skip);
+    if (len > 0) {
+      o.append(s, i, len);
+      i += len;
+    } else {
+      o += kUtf8Replacement;
+      i += skip;
+    }
+  }
+  return o;
+}
+
 std::string json_escape(const std::string& s) {
-  std::string o; o.reserve(s.size() + 16);
-  for (unsigned char c : s) {
-    switch (c) {
-      case '"': o += "\\\""; break;
-      case '\\': o += "\\\\"; break;
-      case '\n': o += "\\n"; break;
-      case '\r': o += "\\r"; break;
-      case '\t': o += "\\t"; break;
-      default:
-        if (c < 0x20) { char b[8]; std::snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
-        else o.push_back((char)c);
+  std::string o;
+  o.reserve(s.size() + 16);
+  const size_t n = s.size();
+  for (size_t i = 0; i < n;) {
+    const unsigned char c = (unsigned char)s[i];
+    if (c < 0x80) {
+      switch (c) {
+        case '"': o += "\\\""; break;
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n"; break;
+        case '\r': o += "\\r"; break;
+        case '\t': o += "\\t"; break;
+        default:
+          if (c < 0x20) { char b[8]; std::snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+          else o.push_back((char)c);
+      }
+      ++i;
+      continue;
+    }
+    size_t skip = 1;
+    const size_t len = utf8_next(s.data(), i, n, &skip);
+    if (len > 0) {
+      o.append(s, i, len);
+      i += len;
+    } else {
+      o += kUtf8Replacement;
+      i += skip;
     }
   }
   return o;

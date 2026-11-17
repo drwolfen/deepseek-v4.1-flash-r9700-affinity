@@ -217,11 +217,181 @@ void test_prefix_cache_delta() {
   std::printf("PASS: test_prefix_cache_delta\n");
 }
 
+struct MultiRegionContext {
+  struct RegBuf {
+    uint8_t part;
+    uint32_t layer;
+    uint64_t row_bytes;
+    uint64_t rows;
+    uint32_t ratio;
+    std::vector<uint8_t> data[2]; // per rank
+  };
+  std::vector<RegBuf> regs;
+
+  RegBuf* find(uint8_t part, uint32_t layer) {
+    for (auto& r : regs) {
+      if (r.part == part && r.layer == layer) return &r;
+    }
+    return nullptr;
+  }
+};
+
+bool multi_save(void* ctx, uint8_t part, uint32_t layer, uint32_t rank,
+                uint64_t row0, uint64_t nrows, void* dst) {
+  auto* c = static_cast<MultiRegionContext*>(ctx);
+  if (rank >= 2) return false;
+  auto* r = c->find(part, layer);
+  if (!r || row0 + nrows > r->rows) return false;
+  std::memcpy(dst, r->data[rank].data() + row0 * r->row_bytes,
+              (size_t)(nrows * r->row_bytes));
+  return true;
+}
+
+bool multi_load(void* ctx, uint8_t part, uint32_t layer, uint32_t rank,
+                uint64_t row0, uint64_t nrows, const void* src) {
+  auto* c = static_cast<MultiRegionContext*>(ctx);
+  if (rank >= 2) return false;
+  auto* r = c->find(part, layer);
+  if (!r || row0 + nrows > r->rows) return false;
+  std::memcpy(r->data[rank].data() + row0 * r->row_bytes, src,
+              (size_t)(nrows * r->row_bytes));
+  return true;
+}
+
+void test_prefix_cache_delta_multiregion_tp2() {
+  char temp_template[] = "/tmp/aff_pcache_tp2_XXXXXX";
+  char* temp_dir = ::mkdtemp(temp_template);
+  assert(temp_dir != nullptr);
+  std::string cache_dir(temp_dir);
+
+  const uint32_t B = 512;
+  const uint32_t total_tokens = 2560; // > 2048
+
+  // 2 rolling rings + 6 heterogeneous append-only regions (Comp, Idx8, IdxScale across 2 layers)
+  MultiRegionContext sim;
+  std::vector<aff::KvRegion> regions;
+  auto add_reg = [&](uint8_t part, uint32_t layer, uint64_t row_bytes, uint64_t rows,
+                     uint32_t ratio) {
+    aff::KvRegion kr{part, layer, row_bytes, rows, ratio};
+    regions.push_back(kr);
+    MultiRegionContext::RegBuf rb;
+    rb.part = part;
+    rb.layer = layer;
+    rb.row_bytes = row_bytes;
+    rb.rows = rows;
+    rb.ratio = ratio;
+    for (int rk = 0; rk < 2; ++rk) {
+      rb.data[rk].resize((size_t)(rows * row_bytes));
+      for (size_t i = 0; i < rb.data[rk].size(); ++i) {
+        // Replicated bit-identical across ranks (as required by KvIo invariant)
+        rb.data[rk][i] = (uint8_t)(((i * 131 + part * 17 + layer * 53 + 19) ^ (i >> 7)) & 0xFF);
+      }
+    }
+    sim.regs.push_back(std::move(rb));
+  };
+
+  add_reg(/*part=*/0, /*layer=*/0, 2048, 8, 0);   // Raw ring L0
+  add_reg(/*part=*/4, /*layer=*/0, 512,  4, 0);   // Hist ring L0
+  add_reg(/*part=*/1, /*layer=*/0, 1024, total_tokens,     1); // Comp L0 (ratio 1)
+  add_reg(/*part=*/2, /*layer=*/0, 512,  total_tokens / 8, 8); // Idx8 L0 (ratio 8)
+  add_reg(/*part=*/3, /*layer=*/0, 64,   total_tokens / 8, 8); // IdxScale L0 (ratio 8)
+  add_reg(/*part=*/1, /*layer=*/1, 1024, total_tokens,     1); // Comp L1 (ratio 1)
+  add_reg(/*part=*/2, /*layer=*/1, 512,  total_tokens / 8, 8); // Idx8 L1 (ratio 8)
+  add_reg(/*part=*/3, /*layer=*/1, 64,   total_tokens / 8, 8); // IdxScale L1 (ratio 8)
+
+  // Save golden snapshot of all regions & ranks
+  std::vector<std::vector<uint8_t>> golden(sim.regs.size());
+  for (size_t ri = 0; ri < sim.regs.size(); ++ri) golden[ri] = sim.regs[ri].data[0];
+
+  aff::KvIo io{&multi_save, &multi_load, &sim};
+  aff::PrefixCache::Options opt;
+  opt.dir = cache_dir;
+  opt.block_tokens = B;
+  opt.budget_bytes = 256ull << 20;
+  opt.ckpt_percent = 25;
+  opt.queue_depth = 2;
+  opt.ranks = 2; // Dual R9700 TP=2
+  opt.delta = true;
+
+  const uint64_t fp = 0xCAFEBABE12345678ull;
+  std::string err;
+  aff::PrefixCache cache;
+  assert(cache.open(opt, regions, io, fp, &err));
+  assert(cache.ready());
+  assert(cache.delta_enabled());
+
+  std::vector<uint32_t> ids(total_tokens);
+  for (uint32_t i = 0; i < total_tokens; ++i) ids[i] = 5000 + i * 7;
+
+  // Step 1: Publish pos = 1805 (3 * 512 + 269, tail = 269). Base block 4 (pos=2048) does not exist yet.
+  const uint32_t pos1 = 1805;
+  assert(cache.publish(ids.data(), pos1, &err));
+  cache.drain();
+  assert(cache.stats().blocks_written == 3);
+  assert(cache.stats().delta_ckpts_written == 0);
+
+  // Step 2: Cross 2048 (4 * 512) -> block 3 (1536..2048) is published, marking pos=1805 state_only=true.
+  assert(cache.publish(ids.data(), 2048, &err));
+  cache.drain();
+  assert(cache.stats().blocks_written == 4);
+
+  // Zero out BOTH ranks across ALL regions before restoring pos = 1805 via delta path
+  for (auto& r : sim.regs) {
+    for (int rk = 0; rk < 2; ++rk) std::fill(r.data[rk].begin(), r.data[rk].end(), 0);
+  }
+
+  uint32_t matched = 0;
+  assert(cache.lookup(ids.data(), pos1, &matched) == pos1);
+  assert(matched == 3);
+  assert(cache.restore(ids.data(), pos1, &err));
+  assert(cache.stats().delta_ckpts_restored == 1);
+
+  // Verify 100% byte-for-byte equality across ALL regions and ALL ranks!
+  for (size_t ri = 0; ri < sim.regs.size(); ++ri) {
+    const auto& r = sim.regs[ri];
+    const uint64_t expected_rows = r.ratio == 0 ? r.rows : (pos1 / r.ratio);
+    const size_t expected_bytes = (size_t)(expected_rows * r.row_bytes);
+    for (int rk = 0; rk < 2; ++rk) {
+      assert(std::memcmp(r.data[rk].data(), golden[ri].data(), expected_bytes) == 0);
+    }
+  }
+
+  // Step 3: Publish pos = 1850 (tail = 314) when base block 2048 already exists -> emits delta directly
+  const uint32_t pos2 = 1850;
+  // Restore golden data to sim before publishing pos2
+  for (size_t ri = 0; ri < sim.regs.size(); ++ri) {
+    sim.regs[ri].data[0] = golden[ri];
+    sim.regs[ri].data[1] = golden[ri];
+  }
+  assert(cache.publish(ids.data(), pos2, &err));
+  cache.drain();
+  assert(cache.stats().delta_ckpts_written == 1);
+
+  for (auto& r : sim.regs) {
+    for (int rk = 0; rk < 2; ++rk) std::fill(r.data[rk].begin(), r.data[rk].end(), 0);
+  }
+  assert(cache.restore(ids.data(), pos2, &err));
+  assert(cache.stats().delta_ckpts_restored == 2);
+  for (size_t ri = 0; ri < sim.regs.size(); ++ri) {
+    const auto& r = sim.regs[ri];
+    const uint64_t expected_rows = r.ratio == 0 ? r.rows : (pos2 / r.ratio);
+    const size_t expected_bytes = (size_t)(expected_rows * r.row_bytes);
+    for (int rk = 0; rk < 2; ++rk) {
+      assert(std::memcmp(r.data[rk].data(), golden[ri].data(), expected_bytes) == 0);
+    }
+  }
+
+  cache.close();
+  rm_rf(cache_dir);
+  std::printf("PASS: test_prefix_cache_delta_multiregion_tp2\n");
+}
+
 }  // namespace
 
 int main() {
   test_ignore_eos_parsing();
   test_prefix_cache_delta();
+  test_prefix_cache_delta_multiregion_tp2();
   std::printf("PASS: all prefix cache and ignore_eos tests passed.\n");
   return 0;
 }

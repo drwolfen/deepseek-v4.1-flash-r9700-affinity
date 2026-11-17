@@ -1,4 +1,5 @@
 #include "engine/chat_encode.h"
+#include "server/server.h"
 #include <cassert>
 #include <cstdio>
 #include <string>
@@ -176,6 +177,54 @@ int main() {
       "</｜DSML｜ calls>";
   ParsedMessage pm_malformed = parse_completion(v41_malformed, ThinkingMode::Thinking);
   assert(!pm_malformed.ok);
+
+  // 8. Strict UTF-8 streaming holdback, EOS sanitization, and validating json_escape
+  {
+    const std::string rep = "\xEF\xBF\xBD";
+
+    // (a) Multi-byte token split: fullwidth bar '｜' (0xEF 0xBD 0x9C)
+    const std::string bar = "\xEF\xBD\x9C";
+    assert(utf8_safe_end(bar.substr(0, 1), 1) == 0);
+    assert(utf8_safe_end(bar.substr(0, 2), 2) == 0);
+    assert(utf8_safe_end(bar, 3) == 3);
+
+    // (b) 4-byte emoji split: '🚀' (0xF0 0x9F 0x9A 0x80)
+    const std::string rocket = "\xF0\x9F\x9A\x80";
+    assert(utf8_safe_end("hi" + rocket.substr(0, 1), 3) == 2);
+    assert(utf8_safe_end("hi" + rocket.substr(0, 2), 4) == 2);
+    assert(utf8_safe_end("hi" + rocket.substr(0, 3), 5) == 2);
+    assert(utf8_safe_end("hi" + rocket, 6) == 6);
+
+    // (c) Early EOS inside <think> at position 173-174 with incomplete 2-byte prefix (0xE2 0x80 / 0xEF 0xBD)
+    std::string think_prefix(173, 'a');
+    std::string eos_e2 = think_prefix + "\xE2\x80";
+    assert(utf8_safe_end(eos_e2, eos_e2.size()) == 173);
+    std::string eos_flushed = sanitize_utf8(eos_e2.substr(173));
+    assert(eos_flushed == rep);
+    assert(json_escape(eos_flushed) == rep);
+
+    std::string eos_ef = think_prefix + "\xEF\xBD";
+    assert(utf8_safe_end(eos_ef, eos_ef.size()) == 173);
+    assert(sanitize_utf8(eos_ef.substr(173)) == rep);
+    assert(json_escape(eos_ef) == think_prefix + rep);
+
+    // (d) Lone continuations & invalid lead bytes are NOT held back infinitely and sanitize to U+FFFD
+    assert(utf8_safe_end("\x80", 1) == 1);
+    assert(utf8_safe_end("\xFF", 1) == 1);
+    assert(utf8_safe_end("\xED\xA0", 2) == 2); // surrogate prefix cannot become valid UTF-8
+    assert(json_escape("\x80") == rep);
+    assert(json_escape("\xFF") == rep);
+    assert(json_escape("\xED\xA0\x80") == rep + rep + rep);
+    assert(json_escape("\xE0\x80\xAF") == rep + rep + rep); // overlong 3-byte
+    assert(json_escape("\xF0\x80\x80\xAF") == rep + rep + rep + rep); // overlong 4-byte
+
+    // (e) Truncated UTF-8 followed by quote or ASCII + standard JSON escapes
+    assert(json_escape("\xE2\x80\"abc") == rep + "\\\"abc");
+    assert(json_escape("\xEF\xBDxyz") == rep + "xyz");
+    assert(json_escape("\xF0\x9F\x9A!") == rep + "!");
+    assert(json_escape("a\n\t\"\\b") == "a\\n\\t\\\"\\\\b");
+    assert(json_escape("北京" + bar + rocket) == "北京" + bar + rocket);
+  }
 
   std::printf("PASS: test_tool_namespace\n");
   return 0;

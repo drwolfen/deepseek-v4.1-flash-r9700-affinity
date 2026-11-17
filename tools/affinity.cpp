@@ -3300,12 +3300,7 @@ int main(int argc, char** argv) {
     // between them puts half a character in a JSON string, which is not valid UTF-8 and not valid
     // JSON. Back the cut up to the last complete character; the rest goes out with the next token.
     auto utf8_end = [](const std::string& s, size_t end) -> size_t {
-      if (end == 0 || (uint8_t)s[end - 1] < 0x80) return end;
-      size_t lead = end - 1;
-      while (lead && ((uint8_t)s[lead] & 0xC0) == 0x80) --lead;
-      const uint8_t c = (uint8_t)s[lead];
-      const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
-      return lead + need <= end ? end : lead;
+      return aff::utf8_safe_end(s, end);
     };
 
     // The model card's settings unless the request overrides them, and a random seed so two
@@ -3353,10 +3348,11 @@ int main(int argc, char** argv) {
           for (const auto& stop : req.stop)
             for (size_t n = std::min(stop.empty() ? size_t(0) : stop.size()-1, safe-streamed); n; --n)
               if (raw.compare(safe-n,n,stop,0,n)==0) { safe-=n; break; }
-          safe = utf8_end(raw,safe);
+          safe = std::max(streamed, utf8_end(raw, safe));
         }
         if (safe > streamed) {
-          const auto piece=raw.substr(streamed,safe-streamed);streamed=safe;
+          const auto piece = aff::sanitize_utf8(raw.substr(streamed, safe - streamed));
+          streamed = safe;
           if (!sink(piece,Delta::Content,false)) return false;
         }
         if (stopped) raw.resize(safe);
@@ -3370,9 +3366,9 @@ int main(int argc, char** argv) {
         if (te == std::string::npos)
           for (size_t back = std::min(think_end.size() - 1, safe_r - think_streamed); back; --back)
             if (raw.compare(safe_r - back, back, think_end, 0, back) == 0) { safe_r -= back; break; }
-        if (te == std::string::npos) safe_r = utf8_end(raw, safe_r);
+        if (te == std::string::npos) safe_r = std::max(think_streamed, utf8_end(raw, safe_r));
         if (safe_r > think_streamed) {
-          const std::string piece = raw.substr(think_streamed, safe_r - think_streamed);
+          const std::string piece = aff::sanitize_utf8(raw.substr(think_streamed, safe_r - think_streamed));
           think_streamed = safe_r;
           if (!sink(piece, Delta::Reasoning, false)) return false;
         }
@@ -3431,10 +3427,10 @@ int main(int argc, char** argv) {
         for (const std::string& sen : sentinels)
           for (size_t back = std::min(sen.size() - 1, safe - streamed); back; --back)
             if (raw.compare(safe - back, back, sen, 0, back) == 0) { safe -= back; break; }
-        safe = utf8_end(raw, safe);
+        safe = std::max(streamed, utf8_end(raw, safe));
       }
       if (safe > streamed) {
-        const std::string piece = raw.substr(streamed, safe - streamed);
+        const std::string piece = aff::sanitize_utf8(raw.substr(streamed, safe - streamed));
         streamed = safe;
         if (!sink(piece, Delta::Content, false)) return false;
       }
@@ -3496,21 +3492,24 @@ int main(int argc, char** argv) {
     // whole turn is reasoning, and flushing it as content would hand the caller deliberation as an
     // answer.
     if (open_think) {
-      if (think_streamed < raw.size()) sink(raw.substr(think_streamed), Delta::Reasoning, false);
+      if (think_streamed < raw.size())
+        sink(aff::sanitize_utf8(raw.substr(think_streamed)), Delta::Reasoning, false);
     } else if (!saw_marker && streamed < raw.size()) {
-      sink(raw.substr(streamed), Delta::Content, false);
+      sink(aff::sanitize_utf8(raw.substr(streamed)), Delta::Content, false);
     }
 
+    const std::string clean_raw = aff::sanitize_utf8(raw);
+
     if (raw_mode) {
-      res->content = raw;
+      res->content = clean_raw;
       res->finish_reason = hit_budget ? "length" : "stop";
       sink("", Delta::Content, true);
       return;
     }
 
     const ThinkingMode tm = eo.thinking_mode;
-    ParsedMessage pm = parse_completion(raw + kEosStr, tm);
-    if (tm == ThinkingMode::Thinking && raw.find(kThinkEnd) == std::string::npos) {
+    ParsedMessage pm = parse_completion(clean_raw + kEosStr, tm);
+    if (tm == ThinkingMode::Thinking && clean_raw.find(kThinkEnd) == std::string::npos) {
       // The model sometimes writes a complete tool-call block inside the reasoning channel and
       // EOSes without ever closing <think>. Its intent is a tool call, just in the wrong
       // channel. Re-parse the raw text in Chat mode, which skips the think-block framing and
@@ -3521,7 +3520,7 @@ int main(int argc, char** argv) {
       // reasoning_content — NOT raw, which still holds the DSML block. Replaying raw back as
       // reasoning_content would re-encode the tool-call markup INSIDE the next turn's
       //  span and poison the model's view of its own prior turn.
-      ParsedMessage recovered = parse_completion(raw + kEosStr, ThinkingMode::Chat);
+      ParsedMessage recovered = parse_completion(clean_raw + kEosStr, ThinkingMode::Chat);
       if (recovered.ok && !recovered.tool_calls.empty()) {
         res->reasoning_content = recovered.content;
         static std::atomic<uint64_t> tc_seq{0};
@@ -3537,7 +3536,7 @@ int main(int argc, char** argv) {
       // answer, and returning it as `content` hands the caller the model's deliberation as if it had
       // replied. Said on stderr too, because an empty content with finish_reason "length" is easy
       // for a client to render as "the model stopped" when the cause is a budget.
-      res->reasoning_content = raw;
+      res->reasoning_content = clean_raw;
       res->finish_reason = "length";
       aff::ui::err("server: the reasoning block did not close within the %u token budget (%s), so "
                    "there is no answer to return. Raise it with --max-tokens-floor, or send "
@@ -3550,7 +3549,7 @@ int main(int argc, char** argv) {
       // Premature EOS (or stop string) inside <think> well below the token budget. Returning
       // finish_reason "length" here misleads agent harnesses into thinking-budget-exhaustion abort
       // paths instead of empty-turn / thinking-prefill continuation nudges.
-      res->reasoning_content = raw;
+      res->reasoning_content = clean_raw;
       res->finish_reason = "stop";
       aff::ui::err("server: the reasoning block ended early at %u/%u tokens before </think>; "
                    "returning finish_reason \"stop\" with reasoning_content only.\n",
@@ -3559,7 +3558,7 @@ int main(int argc, char** argv) {
     } else if (!pm.ok) {
       // A generation the parser cannot frame is still the model's output, and the client gets it
       // rather than an error: the alternative is discarding a turn because its markup was odd.
-      res->content = raw;
+      res->content = clean_raw;
       res->finish_reason = "stop";
     } else {
       res->content = pm.content;
