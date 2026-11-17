@@ -19,9 +19,10 @@ DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, and Gem
 **Model files (1017 revision):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)  
 **Model files (legacy 0925):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)  
 
-**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v5.1.0`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v5.1.0) | **Bake-Off Reports:** [**`v5.1.0 & MoonMath-1017`**](docs/benchmarks/2026-11-16-v5.1-and-moonmath-1017-bakeoff.md) · [**`v5.0.0 & Radiance v2.1`**](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md)
+**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v5.1.1`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v5.1.1) | **Bake-Off Reports:** [**`v5.1.0 & MoonMath-1017`**](docs/benchmarks/2026-11-16-v5.1-and-moonmath-1017-bakeoff.md) · [**`v5.0.0 & Radiance v2.1`**](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md)
 
 **Release Highlights (Waves 0–4 Progression):**
+- **v5.1.1** (`63cd104`): Hotfix for multi-region/multi-rank (`TP=2`) delta prefix-cache restore offsets (`PrefixCache::restore()` now indexes `impl_->rbuf[0]` via the full `B`-token `region_span` layout and per-rank stride across heterogeneous `app_` regions; on-disk `pcache` remains intact without wiping) and strict UTF-8 streaming holdback (`utf8_safe_end`), EOS/final-flush sanitization (`sanitize_utf8`), and validating `json_escape` (`U+FFFD` replacement for truncated/malformed sequences). 6/6 CPU unit tests PASS (including 6-region `TP=2` `pos=1805` delta restore and UTF-8/JSON edge cases).
 - **v5.1.0** (`839665f`): DSpark ring-attention tile skip (`AFF_DRAFT_SKIP_MASKED=1`, **+22.2%** decode speedup: 16.93 -> 20.69 tok/s), paired `temp=0` DSpark acceptance **`73.33%`** on `MoonMath-1017` (vs 67.52% on v5.0.0, **+5.81 pp**; **80.0%** on code, **+9.0%** paired mean gen), compact state-only delta prefix cache (`AFF_PCACHE_DELTA=1`, 1.42× multi-turn TTFT speedup), `ignore_eos=true` raw streaming, GPU `gridDim.y > 65535` overflow guard (#1006) for deep contexts, DSML nested XML tool-argument protection and multi-call invoke splitting (#1020), MoE stream RAW barrier validation (#983, #984). Retained `AFF_ATTN_LOOKAHEAD=0` default (regressed median decode by -11.4%). Verified 3,416 resident experts, [314, 302] MiB active free VRAM, 0 OOM / 0 spill. 6/6 CPU unit tests PASS.
 - **v5.0.0** (`264e8d5`): RDNA 4 gfx1201 sparse indexer (`AFF_SPARSE_INDEXER=1`, `index_topk=512`), `K_VECS_PADDED=136` + 8B Q staging, 4-pass 256-bucket radix top-512, Wave32 tie compaction, live-`seqused` ragged causal prefill. Score budget scratch bounded to 36 MiB (`<= 48 MiB/card`), expanding GPU resident capacity to **3,416 MoE experts (+49)** with `[356, 354] MiB` free VRAM (`0 OOM / 0 spill`). Long-context: **14.40× @64K** & **13.15× @128K** prefix-reused prefill (128K TTFT `56.6s -> 4.3s`, `22.55 tok/s` decode). Cold uncached prefill `963.66 tok/s` @32K & `990.98 tok/s` @64K (`25.18 tok/s` decode). Needle retrieval **4/4 (100%)** across 4K–128K, `refattn.py` **99.98%** parity, `quant_eval` **92.5%** (111/120), 9/9 tests PASS.
 - **v4.5.0** (`9ec7c47`): Fused & chained hybrid compute (`AFF_HC_FUSED_V2=1`, `AFF_HC_CHAINED=1`, `AFF_HC_CHAINED_MIN_ROWS=1`) -> **`23.73 tok/s` decode median (`24.37` peak)**, **`22.4 tok/s` batch-8 aggregate**, `0.000000 nats` 8,184-tok KL (`PPL 2.6057`), `90.83%` `quant_eval`, 8/8 tests PASS. Documented rejected toggles (`AFF_EMBED_HOST=0` as `token_embd` already host-mmap'd at 0 MiB VRAM; `AFF_MOE_SUMMED_DOWN=0`).
@@ -40,7 +41,7 @@ DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, and Gem
 | RAM | 754 GiB DDR4 (2 NUMA nodes) |
 | PCIe | GPUs link at **Gen5 ×16**, but the switch **uplink runs Gen3 ×16 (8.0 GT/s)** — the host Xeon is a PCIe-3.0 CPU. |
 | Host OS | **Ubuntu 24.04.5 LTS** (Noble Numbat), kernel 7.0.0, ROCm 10.1.0 |
-| Engine build | Docker image `deepseek-affinity:v5.1.0` (ROCm 10.1.0-full, `gfx1201`) |
+| Engine build | Docker image `deepseek-affinity:v5.1.1` (ROCm 10.1.0-full, `gfx1201`) |
 | Serving ports | Dual active: `:8000` (Docker container) and `:8080` (local port-8080 TCP proxy for agent pipeline) |
 
 ### Minimum RAM
@@ -73,6 +74,7 @@ Full methodology, telemetry charts, and raw outputs are documented in [`docs/ben
 | **Wave 2 (v4.5.0)** | `9ec7c47` | **23.73 tok/s** (24.37 peak) | **22.4 tok/s** | 1,215 tok/s | 3,367 | 0/20 (0%) | 8/8 PASS |
 | **Wave 3 (v5.0.0)** | `264e8d5` | **23.73 tok/s** | **22.4 tok/s** | **21,448 tok/s (14.4×)** | **3,416 (+49)** | **0/20 (0%)** | **9/9 PASS** |
 | **Wave 4A (v5.1.0)** | `839665f` | **20.69 tok/s** (22.63 peak) | **22.4 tok/s** | **21,448 tok/s (14.4×)** | **3,416** | **0/20 (0%)** | **6/6 PASS** |
+| **Wave 4B (v5.1.1 Hotfix)** | `63cd104` | **20.69 tok/s** (22.63 peak) | **22.4 tok/s** | **21,448 tok/s (14.4×)** | **3,416** | **0/20 (0%)** | **6/6 PASS** |
 
 ### Wave 3 / Wave 4 Long-Context Prefill Acceleration (`v5.0.0`)
 
@@ -164,6 +166,7 @@ These are the local changes and backports published in this repository's history
 | [`39e48c6`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/39e48c6) | **#980, #992 AFF_ATTN_LOOKAHEAD & Wave32 DPP**: RDNA 4 decode KV prefetch and Wave32 cross-lane DPP reductions | evaluated across workloads; regressed median decode -11.4% (20.69 → 18.33 tok/s), retained as opt-in knob (default 0) |
 | [`1276495`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/1276495) | **#983, #984 MoE stream join invariants & multi-row dedup**: document stream join invariants and test multi-row unique-read deduplication across concurrent streams | proves memory barrier correctness across asynchronous stream execution |
 | [`70b3aba`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/70b3aba), [`839665f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/839665f) | **Wave 4A (`v5.1.0`) release**: tools (`aff-cfgcheck`, `aff-fp8check`, `aff-exphash`, `aff-bench`), defaults (`AFF_ATTN_LOOKAHEAD=0`, `AFF_DRAFT_SKIP_MASKED=1`, `AFF_PCACHE_DELTA=1`), version bump `v5.1.0` | 6/6 CPU unit tests PASS; MoonMath-1017 paired DSpark acceptance **73.33%** (+5.81 pp over v5.0.0; +9.0% paired mean gen); 3,416 resident experts, [314, 302] MiB free VRAM |
+| [`63cd104`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/63cd104) | **`v5.1.1` hotfix**: fix `PrefixCache::restore()` multi-region/multi-rank (`TP=2`) delta base-block offset + per-rank striding; strict UTF-8 streaming holdback (`utf8_safe_end`), EOS `sanitize_utf8`, and validating `json_escape` (`U+FFFD` replacement) | prevents delta prefix-cache multi-region offset mismatch & malformed UTF-8 JSON chunks on early EOS; 6/6 CPU unit tests PASS (including `pos=1805` 6-region `TP=2` delta restore) |
 
 ### V4.1 / multimodal port (fork `v41` branch, also in this history)
 
@@ -221,7 +224,7 @@ AFF_PCACHE_DELTA=1
 ### Building the Docker Container (ROCm 10.1)
 
 ```sh
-docker build -f Dockerfile -t deepseek-affinity:v5.1.0 .
+docker build -f Dockerfile -t deepseek-affinity:v5.1.1 .
 ```
 
 ### Serving DeepSeek-V4.1-Flash (Production Topology)
@@ -242,7 +245,7 @@ docker run --name deepseek-affinity \
   -e AFF_DRAFT_SKIP_MASKED=1 -e AFF_ATTN_LOOKAHEAD=0 -e AFF_PCACHE_DELTA=1 \
   -p 8000:8000 \
   -v /models:/models \
-  deepseek-affinity:v5.1.0 \
+  deepseek-affinity:v5.1.1 \
     -m /models/DeepSeek-V4.1-Flash-1017-MoonMath-aff/model-moonmath-1017.aff \
     --tokenizer /models/LLM-Models/DeepSeek-V4.1-Flash-1017-MoonMath-FP8/tokenizer.json \
     --host 0.0.0.0 --port 8000 \
@@ -270,7 +273,7 @@ docker run --name deepseek-affinity \
 Health endpoint check:
 ```sh
 curl -sS http://127.0.0.1:8000/health
-# {"status":"ok","version":"v5.1.0","git_sha":"...","resident_experts":3416,"free_vram_mib":[204,300]}
+# {"status":"ok","version":"v5.1.1","git_sha":"...","resident_experts":3416,"free_vram_mib":[204,300]}
 ```
 
 ---
