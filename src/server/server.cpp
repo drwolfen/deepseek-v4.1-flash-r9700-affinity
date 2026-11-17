@@ -296,6 +296,9 @@ static std::vector<std::string> raw_elements(const std::string& arr) {
 
 bool parse_completion_request(const std::string& body, bool chat, CompletionRequest* out) {
   out->raw_prompt = !chat;
+  out->thinking_mode.clear();
+  out->reasoning_effort.clear();
+  out->suppress_final_think = false;
   if (const char* p = find_top_key(body, "ignore_eos")) out->ignore_eos = std::strncmp(skip_ws(p), "true", 4) == 0;
   if (const char* p = find_top_key(body, "model")) { const char* q = p; out->model = read_json_string(q); }
   // `max_completion_tokens` is the current OpenAI spelling and `max_tokens` the deprecated one;
@@ -349,9 +352,13 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
     };
     if (!ctk.empty()) check_bool_think(ctk);
     if (out->thinking_mode.empty()) check_bool_think(body);
-    if (out->thinking_mode.empty() &&
-        (out->reasoning_effort == "none" || out->reasoning_effort == "off" || out->reasoning_effort == "0"))
-      out->thinking_mode = "chat";
+    if (out->reasoning_effort == "none" || out->reasoning_effort == "off" || out->reasoning_effort == "0") {
+      if (out->thinking_mode == "thinking") {
+        out->suppress_final_think = true;
+      } else {
+        out->thinking_mode = "chat";
+      }
+    }
   }
   if (const char* p = find_top_key(body, "tool_choice")) { const char* q = p; out->tool_choice = read_json_string(q); }
   out->response_format = raw_value(body, "response_format");

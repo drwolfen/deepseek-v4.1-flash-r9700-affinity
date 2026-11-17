@@ -68,6 +68,7 @@ struct CompletionRequest {
   std::string response_format;            // the raw JSON object, rendered into the system message
   std::string reasoning_effort;           // "low" | "high" | "max"
   std::string thinking_mode;              // "thinking" | "chat"
+  bool suppress_final_think = false;      // reasoning_effort="none" while keeping thinking prefix cache
   bool has_temperature = false;           // so a server default is distinguishable from a request
   bool has_top_p = false;
 };
@@ -95,7 +96,7 @@ struct GenResult {
 enum class Delta { Content, Reasoning };
 
 #ifndef AFF_VERSION
-#define AFF_VERSION "v5.1.1"
+#define AFF_VERSION "v5.1.2"
 #endif
 
 #ifndef AFF_GIT_SHA

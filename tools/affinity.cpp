@@ -18,6 +18,7 @@
 #include "engine/chat_encode.h"
 #include "engine/prefix_cache.h"
 #include "engine/cactus.h"
+#include "engine/thinking_budget.h"
 #include "vision/vit.h"
 
 #include "ui/dashboard.h"
@@ -435,6 +436,15 @@ int main(int argc, char** argv) {
   uint32_t imatrix_save_chunks = 100;
 #endif
   int default_effort = 75;
+  int think_reply_reserve = 4096;
+  if (const char* v = std::getenv("AFF_THINK_REPLY_RESERVE"))
+    think_reply_reserve = std::max(0, std::atoi(v));
+  int think_loop_repeats = 3;
+  if (const char* v = std::getenv("AFF_THINK_LOOP_REPEATS"))
+    think_loop_repeats = std::max(0, std::atoi(v));
+  bool think_freeze_breaker = true;
+  if (const char* v = std::getenv("AFF_THINK_FREEZE_BREAKER"))
+    think_freeze_breaker = std::atoi(v) != 0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto nxt = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -444,6 +454,9 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = (uint16_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--max-tokens-floor") max_tokens_floor = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--default-effort") default_effort = std::max(1, std::min(100, std::atoi(nxt())));
+    else if (a == "--thinking-reply-reserve") think_reply_reserve = std::max(0, std::atoi(nxt()));
+    else if (a == "--thinking-loop-repeats") think_loop_repeats = std::max(0, std::atoi(nxt()));
+    else if (a == "--thinking-freeze-breaker") think_freeze_breaker = std::atoi(nxt()) != 0;
     else if (a == "-p" || a == "--prompt") { prompt = nxt(); one_shot = true; }
     else if (a == "--temp") { sample_cfg.temperature = std::strtof(nxt(), nullptr); sampling_set = true; }
     else if (a == "--top-k") { sample_cfg.top_k = (uint32_t)std::strtoul(nxt(), nullptr, 10); sampling_set = true; }
@@ -650,6 +663,15 @@ int main(int argc, char** argv) {
         "                              256000, 0 honours the caller). Reasoning and answer share\n"
         "                              one budget, so a client that hardcodes a small max_tokens\n"
         "                              gets a truncated reasoning block and no answer.\n"
+        "      --thinking-reply-reserve N\n"
+        "                              tokens reserved for the final reply before force-closing\n"
+        "                              </think> (default 4096, env AFF_THINK_REPLY_RESERVE; 0 off)\n"
+        "      --thinking-loop-repeats N\n"
+        "                              force-close </think> after N repeats of a 64-tok span\n"
+        "                              (default 3, env AFF_THINK_LOOP_REPEATS; 0 off)\n"
+        "      --thinking-freeze-breaker 0|1\n"
+        "                              close </think> on low-diversity newline churn after 512\n"
+        "                              thinking tokens (default 1, env AFF_THINK_FREEZE_BREAKER)\n"
         "\n"
         "One-shot generation\n"
         "  -p, --prompt TEXT           generate once to stdout instead of serving\n"
@@ -1014,6 +1036,25 @@ int main(int argc, char** argv) {
   Tokenizer tok;
   if (!tok_path.empty() && !tok.load(tok_path, &err))
     aff::ui::err("warning: tokenizer: %s\n", err.c_str());
+
+  std::vector<int32_t> think_marker_ids;
+  std::vector<int32_t> think_close_ids;
+  std::vector<int32_t> think_nl_ids;
+  if (tok.vocab_size()) {
+    for (uint32_t id : tok.encode(kThinkEnd, false))
+      think_marker_ids.push_back((int32_t)id);
+    for (uint32_t id : tok.encode(std::string("\n") + kThinkEnd + "\n\n", false))
+      think_close_ids.push_back((int32_t)id);
+    auto add_nl = [&](const std::string& s) {
+      for (uint32_t id : tok.encode(s, false)) {
+        const int32_t iid = (int32_t)id;
+        if (std::find(think_nl_ids.begin(), think_nl_ids.end(), iid) == think_nl_ids.end())
+          think_nl_ids.push_back(iid);
+      }
+    };
+    add_nl("\n");
+    add_nl("\n\n");
+  }
 
 
 #ifdef AFF_WITH_HIP
@@ -2071,7 +2112,8 @@ int main(int argc, char** argv) {
                          // Teacher forcing, and a PARAMETER rather than a capture because this
                          // lambda is defined above where `force_ids` is parsed. Only ever non-null
                          // from the one-shot benchmark path; the server never forces.
-                         const std::vector<uint32_t>* force = nullptr) -> uint32_t {
+                         const std::vector<uint32_t>* force = nullptr,
+                         ThinkingBudget* budget = nullptr) -> uint32_t {
     const uint32_t B = dspark_on ? c.dspark_block : 0u;
     const bool draft_on = dspark_on && c.dspark_block > 0;
     // Sized from the checkpoint, not from B: dspark_draft writes dspark_block_size ids through this
@@ -2228,9 +2270,14 @@ int main(int argc, char** argv) {
       }
       // Position 0 leaves the draft's window nothing to look at, which happens only for a
       // single-token prompt. One unspeculated block gets past it.
+      const uint32_t rem_out = max_new - generated;
       uint32_t nd = 0;
-      const bool skip_draft = kBackoff && zero_run >= kBackoff;
-      if (draft_on && st.pos && !skip_draft) {
+      const bool forcing = budget && budget->injecting();
+      const bool skip_draft = !forcing && kBackoff && zero_run >= kBackoff;
+      if (forcing) {
+        nd = (uint32_t)std::min<std::size_t>(
+            {budget->pending_close_tokens(), (std::size_t)B, (std::size_t)(rem_out - 1u)});
+      } else if (draft_on && st.pos && !skip_draft) {
         if (!model.dspark_draft(next, &st, draft.data())) {
           aff::ui::fatal("fatal: dspark_draft refused at position %u\n", st.pos);
           std::abort();
@@ -2309,15 +2356,23 @@ int main(int argc, char** argv) {
           aff::ui::err("spec-conf P=%u nd=%u conf=[%s]\n", st.pos, nd, cs.c_str());
         }
       }
+      if (!forcing) nd = std::min(nd, rem_out - 1u);
       if (skip_draft) zero_run = 0;   // this step was the backoff; draft again next block
       const uint32_t P = st.pos;
       if (slot_dbg && nd) {
         std::string ds;
-        for (uint32_t i = 0; i < nd; ++i) ds += std::to_string(draft[i]) + (i + 1 < nd ? "," : "");
-        aff::ui::err("slot %u DRAFT P=%u next=%u -> [%s]\n", slot, P, next, ds.c_str());
+        for (uint32_t i = 0; i < nd; ++i)
+          ds += std::to_string(forcing ? (uint32_t)budget->pending_close_token(i) : draft[i]) +
+                (i + 1 < nd ? "," : "");
+        aff::ui::err("slot %u DRAFT P=%u next=%u -> [%s]%s\n", slot, P, next, ds.c_str(),
+                     forcing ? " (forced)" : "");
       }
       fed[0] = next;
-      for (uint32_t i = 0; i < nd; ++i) fed[1 + i] = draft[i];
+      if (forcing) {
+        for (uint32_t i = 0; i < nd; ++i) fed[1 + i] = (uint32_t)budget->pending_close_token(i);
+      } else {
+        for (uint32_t i = 0; i < nd; ++i) fed[1 + i] = draft[i];
+      }
       // The proposals the target is asked to price, and the uniforms its draws use. Position j is
       // the target's prediction for fed[j+1], so that is the proposal at j; the last position has
       // none and is the bonus token.
@@ -2326,7 +2381,9 @@ int main(int argc, char** argv) {
         vb.query.assign(nd + 1, 0xFFFFFFFFu);
         dry_ids_for(vb.dry_ids);
         vb.uniforms.assign(2u * (nd + 1), 0.0f);
-        for (uint32_t j = 0; j < nd; ++j) vb.query[j] = fed[j + 1];
+        if (!forcing) {
+          for (uint32_t j = 0; j < nd; ++j) vb.query[j] = fed[j + 1];
+        }
         for (uint32_t j = 0; j <= nd; ++j) {
           vb.uniforms[2 * j + 0] = (float)uni(rng);
           vb.uniforms[2 * j + 1] = (float)uni(rng);
@@ -2371,7 +2428,10 @@ int main(int argc, char** argv) {
       uint32_t k = 0;
       uint32_t reject_tok = 0;
       bool rejected = false;
-      if (!sc) {
+      if (forcing) {
+        k = nd;
+        rejected = false;
+      } else if (!sc) {
         while (k < nd && vb.greedy[k] == fed[k + 1]) ++k;
         for (uint32_t j = 0; j < nd; ++j) match[j] = vb.greedy[j] == fed[j + 1];
       } else {
@@ -2383,16 +2443,34 @@ int main(int argc, char** argv) {
         if (k < nd) { rejected = true; reject_tok = vb.draws[k].tok_excl; }
         for (uint32_t j = 0; j < nd; ++j) match[j] = accept_u[j] < accept_prob(j);
       }
-      if (slot_dbg && nd) {
+      // The token at position k: the target's own, from whichever rule applied above.
+      uint32_t tail = !sc ? vb.greedy[k] : (rejected ? reject_tok : vb.draws[k].tok);
+      bool close_cut = false;
+      if (budget) {
+        for (uint32_t i = 0; i <= k; ++i) {
+          const int32_t cand = (int32_t)((i < k) ? fed[i + 1] : tail);
+          const auto dec = budget->apply(cand);
+          if (dec.cut) {
+            k = i;
+            tail = (uint32_t)dec.token;
+            close_cut = true;
+            break;
+          }
+          if (i == k) tail = (uint32_t)dec.token;
+        }
+      }
+      if (slot_dbg && nd && !forcing) {
         std::string gs;
         for (uint32_t i = 0; i < nd; ++i)
           gs += std::to_string(!sc ? vb.greedy[i] : vb.draws[i].tok) + (i + 1 < nd ? "," : "");
         aff::ui::err("slot %u VERIFY P=%u k=%u target=[%s]\n", slot, P, k, gs.c_str());
       }
-      my_blocks++; my_accepted += k;
-      zero_run = (nd && k == 0) ? zero_run + 1u : 0u;   // streak of drafted blocks that accepted none
-      model.note_block(nd, k, match.data());
-      // Positions P..P+k are real; P+k+1 holds vb.greedy[k] and is fed by the next block.
+      if (!forcing && !close_cut) {
+        my_blocks++; my_accepted += k;
+        zero_run = (nd && k == 0) ? zero_run + 1u : 0u;   // streak of drafted blocks that accepted none
+        model.note_block(nd, k, match.data());
+      }
+      // Positions P..P+k are real; P+k+1 holds tail and is fed by the next block.
       model.rollback(&st, P + k + 1);
       if (n_slots_gt1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       if (slot_dbg) { tap_hash_prev = dense_gpu.tap_hash_debug();
@@ -2400,7 +2478,7 @@ int main(int argc, char** argv) {
       const double step_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_t0).count();
       step.unlock();                    // the cards are free from here; the rest is host-side
-      if (adaptive_width_on && nd > 0) {
+      if (adaptive_width_on && nd > 0 && !forcing && !close_cut) {
         const uint32_t q_off = std::min<uint32_t>(nd + 1, kMaxQ - 1);
         last_clean_accept = (k == nd);
         // Update step cost EMA after warmup (ignore first 2 cold steps per width, clamp outliers).
@@ -2460,10 +2538,8 @@ int main(int argc, char** argv) {
             surv_ema[d] = 0.80f * surv_ema[d];
         }
       }
-      seed_n = vb.tap_rows ? k + 1 : 0u;
+      seed_n = vb.tap_rows ? std::min<uint32_t>(vb.tap_rows, k + 1) : 0u;
       seed_pos0 = P;
-      // The token at position k: the target's own, from whichever rule applied above.
-      uint32_t tail = !sc ? vb.greedy[k] : (rejected ? reject_tok : vb.draws[k].tok);
       // ---- TEACHER FORCING, AND ONLY AT WIDTH 1 --------------------------------------------------
       //
       // Decode throughput is a property of the token stream as much as of the code: the token
@@ -2975,6 +3051,7 @@ int main(int argc, char** argv) {
 
     EncodeOpts eo;
     eo.thinking_mode = req.thinking_mode == "chat" ? ThinkingMode::Chat : ThinkingMode::Thinking;
+    eo.suppress_final_think = req.suppress_final_think && eo.thinking_mode == ThinkingMode::Thinking;
     // `max` by default, which is what the card evaluates its agentic scores at. The level is only a
     // text prefix telling the model how hard to think, so it costs nothing to set and everything to
     // get wrong; a client that wants a faster, shallower answer sends "low".
@@ -2986,9 +3063,22 @@ int main(int argc, char** argv) {
     eo.v41 = model.config().v41;
     if (eo.v41) {
       const std::string& e = req.reasoning_effort;
-      int b = e == "low" ? 50 : e == "medium" ? 60 : e == "high" ? 75 : e == "xhigh" ? 90 : e == "max" ? 100 : default_effort;
-      if (!e.empty() && e.find_first_not_of("0123456789") == std::string::npos && e.size() <= 3)
+      int b = default_effort;
+      if (e == "none" || e == "off" || e == "0") {
+        b = default_effort;
+      } else if (e == "low") {
+        b = 50;
+      } else if (e == "medium") {
+        b = 60;
+      } else if (e == "high") {
+        b = 75;
+      } else if (e == "xhigh") {
+        b = 90;
+      } else if (e == "max") {
+        b = 100;
+      } else if (!e.empty() && e.find_first_not_of("0123456789") == std::string::npos && e.size() <= 3) {
         b = std::max(1, std::min(100, std::atoi(e.c_str())));
+      }
       eo.effort_budget = b;
     }
     // A conversation with nothing in it is refused rather than encoded. The prompt would be four
@@ -3294,7 +3384,10 @@ int main(int argc, char** argv) {
     // client's transcript as if it were the reply — but dropping it is just as wrong, because a
     // client that renders reasoning has nothing to render. So it goes out as `reasoning_content`
     // until the block closes, and as content after.
-    bool open_think = !raw_mode && eo.thinking_mode == ThinkingMode::Thinking;
+    const ThinkingMode gen_tm = (eo.thinking_mode == ThinkingMode::Thinking && !eo.suppress_final_think)
+                                    ? ThinkingMode::Thinking
+                                    : ThinkingMode::Chat;
+    bool open_think = !raw_mode && gen_tm == ThinkingMode::Thinking;
     size_t think_streamed = 0;
     // A token boundary is not a character boundary: an emoji arrives as two tokens, and cutting
     // between them puts half a character in a JSON string, which is not valid UTF-8 and not valid
@@ -3325,6 +3418,29 @@ int main(int argc, char** argv) {
     sc.dry_min_repeats = sample_cfg.dry_min_repeats;
     sc.seed = req.seed ? req.seed : (uint64_t)std::random_device{}();
 
+
+    const bool arm_budget = !raw_mode && eo.thinking_mode == ThinkingMode::Thinking &&
+                            !eo.suppress_final_think && !think_close_ids.empty() &&
+                            total_budget > think_close_ids.size() + 1 && think_reply_reserve > 0;
+    BudgetHook budget_hook;
+    ThinkingBudget budget;
+    ThinkingBudget* budget_ptr = nullptr;
+    if (arm_budget) {
+      budget_hook.close_token_ids = think_close_ids;
+      budget_hook.marker_token_ids = think_marker_ids;
+      budget_hook.hard_limit_remaining =
+          reply_reserve_within(think_reply_reserve, (int)total_budget);
+      budget_hook.loop_span = 64;
+      budget_hook.loop_repeats = think_loop_repeats;
+      budget_hook.freeze_enabled = think_freeze_breaker;
+      budget_hook.freeze_min_tokens = 512;
+      budget_hook.freeze_window = 256;
+      budget_hook.freeze_nl_thresh = 64;
+      budget_hook.freeze_distinct_max = 36;
+      budget_hook.freeze_nl_token_ids = think_nl_ids;
+      budget = ThinkingBudget(&budget_hook, (int)total_budget);
+      budget_ptr = &budget;
+    }
 
     run_view = {ids.size(), total_budget, hist.size(), 0.0, std::chrono::steady_clock::now()};
     // Per-request speculation accounting. The counters are global and cumulative, so a snapshot
@@ -3436,7 +3552,11 @@ int main(int argc, char** argv) {
       }
       if (hit_stop) { raw.resize(stop_at); return false; }
       return true;
-    }, &sc);
+    }, &sc, nullptr, budget_ptr);
+    if (arm_budget && budget.force_closed()) {
+      aff::ui::err("server: thinking budget force-closed </think> at %d/%u tokens (reason=%s)\n",
+                   budget.thought_tokens(), total_budget, budget.close_reason());
+    }
     res->prompt_tokens = (uint32_t)ids.size();
     res->completion_tokens = made;
     // Back to the idle banner: the stage was moved to prefill and then decode by this request, and
@@ -3507,7 +3627,7 @@ int main(int argc, char** argv) {
       return;
     }
 
-    const ThinkingMode tm = eo.thinking_mode;
+    const ThinkingMode tm = gen_tm;
     ParsedMessage pm = parse_completion(clean_raw + kEosStr, tm);
     if (tm == ThinkingMode::Thinking && clean_raw.find(kThinkEnd) == std::string::npos) {
       // The model sometimes writes a complete tool-call block inside the reasoning channel and

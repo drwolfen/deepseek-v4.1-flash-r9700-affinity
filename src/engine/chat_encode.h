@@ -63,6 +63,9 @@ struct EncodeOpts {
   // V4.1 renamed them ("<｜DSML｜ calls>" etc.) and that is NOT ported yet.
   bool            v41              = false;
   int             effort_budget    = 100;
+  // When true, keeps idx==0 effort prompt and historical <think>...</think>
+  // intact, replacing only the final trailing assistant <think> with </think>.
+  bool            suppress_final_think = false;
 };
 
 // The prompt for a conversation, ending in the assistant prefix and its think marker.

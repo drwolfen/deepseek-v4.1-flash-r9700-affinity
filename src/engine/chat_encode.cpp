@@ -438,13 +438,17 @@ std::string encode_messages(const std::vector<ChatMsg>& in, const EncodeOpts& op
         out += tt;
       } else {
         out += kAssistant;
-        out += thinking ? kThinkStart : kThinkEnd;
+        const bool is_final = (idx + 1 == msgs.size());
+        out += (thinking && !(opts.suppress_final_think && is_final)) ? kThinkStart : kThinkEnd;
         out += tt;
       }
     } else if (m.role == "user" || m.role == "developer") {
       out += kAssistant;
-      if (thinking && (!drop || (int)idx >= last_user)) out += kThinkStart;
-      else                                              out += kThinkEnd;
+      const bool is_final = (idx + 1 == msgs.size());
+      if (thinking && (!drop || (int)idx >= last_user) && !(opts.suppress_final_think && is_final))
+        out += kThinkStart;
+      else
+        out += kThinkEnd;
     }
   }
   return out;
