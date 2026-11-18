@@ -318,7 +318,7 @@ __global__ void hist2_kernel(HistJob a, HistJob b, uint32_t n, uint32_t pos0, ui
   const uint32_t dst = (pos0 + src) & (hist - 1u);
   for (uint32_t i = threadIdx.x; i < j.width; i += blockDim.x) {
     j.hkv[(size_t)dst * j.width + i] = j.kv[(size_t)src * j.width + i];
-    j.hsc[(size_t)dst * j.width + i] = j.sc[(size_t)src * j.width + i];
+    if (j.sc) j.hsc[(size_t)dst * j.width + i] = j.sc[(size_t)src * j.width + i];
   }
 }
 

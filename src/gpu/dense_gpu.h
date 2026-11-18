@@ -753,7 +753,11 @@ private:
                              uint32_t aff_line = __builtin_LINE());
   bool     q8_ok(int32_t h, uint64_t cols) const;
 
+  bool     ensure_by(uint32_t need_rows, std::string* err = nullptr);
+  bool     ensure_btm(uint32_t need_rows, std::string* err = nullptr);
+
   uint32_t b_cap_ = 0, b_nb_ = 0, b_live_ = 0, b_pos0_ = 0, b_mid_ = 0;
+  uint32_t b_qr_cap_ = 0, b_g_cap_ = 0, b_u_cap_ = 0, b_y_cap_ = 0, b_tm_cap_ = 0;
   uint32_t b_vocab_ = 0;                        // 0 until batch_init
   uint32_t b_tapin_ = 0;                        // 0 until draft_init
 };

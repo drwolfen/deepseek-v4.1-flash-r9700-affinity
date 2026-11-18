@@ -2165,6 +2165,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
   if (plan_on && (++plan_calls_ & 511u) == 0u) {
     for (size_t dv = 0; dv < R; ++dv) {
       if (!plan_st_[dv]) continue;
+      if (hipSetDevice(devs_[dv]) != hipSuccess) continue;
       MoePlanStatus S{};
       if (hipMemcpy(&S, plan_st_[dv], sizeof S, hipMemcpyDeviceToHost) != hipSuccess) continue;
       if (S.bad > plan_bad_ || S.over > plan_over_) {
