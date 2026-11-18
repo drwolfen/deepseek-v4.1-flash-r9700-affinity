@@ -4864,12 +4864,12 @@ bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
         // Level two. Only inside what the source published — and only if it actually published for
         // THIS token: a stale set from the previous one would be a plausible wrong answer.
         if (a_cand_src_[slot_] != (int64_t)a.cand_source) return false;
-        idx_apply_cand_hip(D.i_sc, D.a_cand, nullptr, 1, a_maxcomp_, cand_blocks_cap_, a.n_keys,
+        idx_apply_cand_hip(D.i_sc, D.a_cand, nullptr, 1, a.n_keys, cand_blocks_cap_, a.n_keys,
                            cand_block_, a.n_keys, st);
       } else if (layer == (uint32_t)a.cand_source) {
         // Level one, into the byte mask the layers after this one read.
         cand_note(layer, a.n_keys, nblk, a.cand_topk_blocks);
-        idx_block_max_hip(D.i_sc, D.i_bsc, nullptr, 1, a_maxcomp_, cand_blocks_cap_, nblk,
+        idx_block_max_hip(D.i_sc, D.i_bsc, nullptr, 1, a.n_keys, cand_blocks_cap_, nblk,
                           cand_block_, a.n_keys, st);
         idx_topk_mask_hip(D.i_bsc, D.a_cand, nullptr, 1, cand_blocks_cap_, cand_blocks_cap_, nblk,
                           a.cand_topk_blocks, st);
@@ -4973,11 +4973,11 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
         if (nblk > cand_blocks_cap_) return false;
         if ((int64_t)layer > (int64_t)a.cand_source) {
           if (b_cand_src_[slot_] != (int64_t)a.cand_source) return false;
-          idx_apply_cand_hip(D.i_sc, cand, D.i_nc + t0, nt, a_maxcomp_, cand_blocks_cap_, n_keys,
+          idx_apply_cand_hip(D.i_sc, cand, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, n_keys,
                              cand_block_, n_keys, st);
         } else if (layer == (uint32_t)a.cand_source) {
           cand_note(layer, n_keys, nblk, a.cand_topk_blocks);
-          idx_block_max_hip(D.i_sc, D.i_bsc, D.i_nc + t0, nt, a_maxcomp_, cand_blocks_cap_, nblk,
+          idx_block_max_hip(D.i_sc, D.i_bsc, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, nblk,
                             cand_block_, n_keys, st);
           idx_topk_mask_hip(D.i_bsc, cand, D.i_ncb + t0, nt, cand_blocks_cap_, cand_blocks_cap_,
                             nblk, a.cand_topk_blocks, st);
@@ -5660,6 +5660,20 @@ bool DenseGpu::batch_hc_read(uint32_t b, float* dst, uint32_t n_embd, uint32_t n
                                D.stream));
   AFF_DRAIN_AT(D, aff::BlockSite::HcRead);
   std::memcpy(dst, D.h_y, (size_t)n * sizeof(float));
+  return true;
+}
+
+bool DenseGpu::batch_hc_read_pre(uint32_t b, float* dst, uint32_t n_hc) {
+  if (!b_nb_ || !dst || !n_hc || b >= b_nb_) return false;
+  Impl::Dev& D = impl_->dev[0];
+  const float* const pre_last = shift_pre_ ? D.b_pre_prev : D.b_pre;
+  if (!pre_last) return false;
+  AFF_HIP_CHECK(hipSetDevice(D.id));
+  batch_column_f32_hip(pre_last, D.d_g, n_hc, b_nb_, b, D.stream);
+  AFF_HIP_CHECK(hipMemcpyAsync(D.h_y, D.d_g, (size_t)n_hc * sizeof(float), hipMemcpyDeviceToHost,
+                               D.stream));
+  AFF_DRAIN_AT(D, aff::BlockSite::HcRead);
+  std::memcpy(dst, D.h_y, (size_t)n_hc * sizeof(float));
   return true;
 }
 
@@ -6569,6 +6583,9 @@ Model::BatchOps DenseGpu::batch_ops() {
   };
   o.hc_read = [](void* c, uint32_t b, float* d, uint32_t ne, uint32_t nh) {
     return static_cast<DenseGpu*>(c)->batch_hc_read(b, d, ne, nh);
+  };
+  o.hc_read_pre = [](void* c, uint32_t b, float* d, uint32_t nh) {
+    return static_cast<DenseGpu*>(c)->batch_hc_read_pre(b, d, nh);
   };
   o.router_hash = [](void* c, int32_t h, uint32_t ne, uint64_t nd, uint32_t k, const uint32_t* sel,
                      const uint32_t* nsel, int np, float rs, float* wt) {

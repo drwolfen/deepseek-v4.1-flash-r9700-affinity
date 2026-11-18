@@ -290,6 +290,8 @@ struct DsparkWeights {
 
 class Model {
 public:
+  Model() = default;
+  ~Model();
   bool load(const std::string& aff_path, std::string* err);
   // The companion container written by `aff-quantize --dspark`. Call AFTER load(): it binds
   // against the config the main container carried, and its stages register their weights through
@@ -679,6 +681,8 @@ public:
     // the host to run the reference epilogue there. The block path does not use this: `collapse`
     // below does the same arithmetic for every position at once, on the card.
     bool (*hc_read)(void* ctx, uint32_t b, float* dst, uint32_t n_embd, uint32_t n_hc) = nullptr;
+    // V4.1: read the last sublayer's per-lane pre_mix column [n_hc] for token b from device.
+    bool (*hc_read_pre)(void* ctx, uint32_t b, float* dst, uint32_t n_hc) = nullptr;
     // The head's epilogue for the whole block, in three kernels, leaving the normed hidden state
     // in VRAM in both layouts the head can consume. This is `draft_collapse` with the target's
     // handles rather than the draft's — literally the same function, because the reference
@@ -815,6 +819,10 @@ public:
   // chunk rather than per layer so it cannot become a cost. The engine does nothing with it.
   using PrefillProgress = void (*)(void* ctx, uint32_t done, uint32_t total);
   void set_prefill_progress(PrefillProgress f, void* ctx) { pp_ = f; pp_ctx_ = ctx; }
+  // Optional liveness heartbeat checked before each prefill chunk. Returning false rolls back
+  // SeqState cleanly to the committed chunk boundary and aborts forward_prefill.
+  using PrefillAlive = bool (*)(void* ctx);
+  void set_prefill_alive(PrefillAlive f, void* ctx) { pa_ = f; pa_ctx_ = ctx; }
   // The acceptance counters, which the decode loop owns because only it knows what was accepted.
   // Always recorded, not just under AFF_PROFILE: acceptance is the term the whole speculative
   // speedup is linear in, so a run that does not report it has not been measured.
@@ -1058,6 +1066,10 @@ private:
   mutable PhaseProfile prof_{};
   PrefillProgress pp_ = nullptr;
   void* pp_ctx_ = nullptr;
+  PrefillAlive pa_ = nullptr;
+  void* pa_ctx_ = nullptr;
+  struct PrefillScratch;
+  mutable std::unique_ptr<PrefillScratch> pscratch_;
   // The draft block's seed embeddings, sized once on the first block and then only row 0 rewritten.
   // See dspark_draft: rows 1..B-1 are the noise token in every block there will ever be.
   mutable std::vector<float> dspark_emb_;

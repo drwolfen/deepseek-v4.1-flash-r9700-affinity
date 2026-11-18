@@ -1,5 +1,6 @@
 #include "gpu/attention_gpu.h"
 #include "gpu/batch_kernels.h"
+#include "gpu/indexer_gpu.h"
 #include "gpu/moe_plan.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -530,6 +531,173 @@ int main() {
                     (void*)d_ord, (void*)d_run, (void*)d_slot_col, (void*)d_tiles,
                     (void*)d_counts, (void*)d_status, (void*)d_bg, (void*)d_bu,
                     (void*)d_bydn, (void*)d_pref_slab, (void*)d_pref_src})
+      (void)hipFree(p);
+  }
+
+  // 8. Test multi-token sparse indexer candidate stride & <=k invalid-key guard
+  {
+    const uint32_t nt = 6, n_keys = 1024, block = 8, nb_blocks = n_keys / block;
+    const uint32_t topk_blocks = 16, topk = 64, adm_stride = 128;
+    std::vector<uint32_t> h_nk = {900, 960, 1000, 1024, 912, 999};
+    std::vector<uint32_t> h_nkb(nt);
+    for (uint32_t t = 0; t < nt; ++t) h_nkb[t] = (h_nk[t] + block - 1u) / block;
+
+    std::vector<float> h_sc_src((size_t)nt * n_keys, -INFINITY);
+    std::vector<float> h_sc_tgt((size_t)nt * n_keys, -INFINITY);
+    for (uint32_t t = 0; t < nt; ++t) {
+      for (uint32_t s = 0; s < h_nk[t]; ++s) {
+        const uint32_t b = s / block;
+        // Distinct winning candidate blocks per token plus lower-ranked blocks with huge target
+        // scores so any OOB stride mismatch immediately admits wrong indices.
+        const bool hot_src = ((b + t * 5u) % 7u) == 0u;
+        h_sc_src[(size_t)t * n_keys + s] =
+            (s % 13u == 0u) ? -INFINITY : (hot_src ? (50.0f - (float)b * 0.1f) : 0.25f);
+        h_sc_tgt[(size_t)t * n_keys + s] =
+            hot_src ? (10.0f + std::sin((float)(s + t * 19u)) * 2.0f) : (200.0f - (float)s * 0.01f);
+      }
+    }
+
+    // Exact CPU reference for two-level candidate filtering
+    std::vector<std::vector<uint32_t>> ref_adm(nt);
+    for (uint32_t t = 0; t < nt; ++t) {
+      const uint32_t nk = h_nk[t], nblk = h_nkb[t];
+      std::vector<std::pair<float, uint32_t>> bmax(nblk);
+      for (uint32_t b = 0; b < nblk; ++b) {
+        float m = -INFINITY;
+        const uint32_t lo = b * block, hi = std::min(lo + block, nk);
+        for (uint32_t s = lo; s < hi; ++s) m = std::fmax(m, h_sc_src[(size_t)t * n_keys + s]);
+        if (b == (nk - 1u) / block) m = INFINITY;
+        bmax[b] = {m, b};
+      }
+      std::stable_sort(bmax.begin(), bmax.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+      });
+      std::vector<uint8_t> cand_blk(nblk, 0u);
+      for (uint32_t i = 0; i < std::min(topk_blocks, nblk); ++i) {
+        if (bmax[i].first > -INFINITY) cand_blk[bmax[i].second] = 1u;
+      }
+      std::vector<std::pair<float, uint32_t>> valid;
+      for (uint32_t s = 0; s < nk; ++s) {
+        if (!cand_blk[s / block]) continue;
+        const float v = h_sc_tgt[(size_t)t * n_keys + s];
+        if (v > -INFINITY) valid.push_back({v, s});
+      }
+      std::stable_sort(valid.begin(), valid.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+      });
+      const uint32_t take = std::min<uint32_t>(topk, (uint32_t)valid.size());
+      for (uint32_t i = 0; i < take; ++i) ref_adm[t].push_back(valid[i].second);
+      std::sort(ref_adm[t].begin(), ref_adm[t].end());
+    }
+
+    float *d_sc_src = nullptr, *d_sc_tgt = nullptr, *d_bsc = nullptr;
+    uint8_t *d_cand = nullptr, *d_mask = nullptr;
+    uint32_t *d_nk = nullptr, *d_nkb = nullptr, *d_adm = nullptr, *d_admn = nullptr;
+    assert(hipMalloc(&d_sc_src, (size_t)nt * n_keys * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_sc_tgt, (size_t)nt * n_keys * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_bsc, (size_t)nt * nb_blocks * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_cand, (size_t)nt * nb_blocks) == hipSuccess);
+    assert(hipMalloc(&d_mask, (size_t)nt * n_keys) == hipSuccess);
+    assert(hipMalloc(&d_nk, nt * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_nkb, nt * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_adm, (size_t)nt * adm_stride * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_admn, nt * sizeof(uint32_t)) == hipSuccess);
+
+    assert(hipMemcpy(d_sc_src, h_sc_src.data(), (size_t)nt * n_keys * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_sc_tgt, h_sc_tgt.data(), (size_t)nt * n_keys * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_nk, h_nk.data(), nt * sizeof(uint32_t), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_nkb, h_nkb.data(), nt * sizeof(uint32_t), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemset(d_cand, 0, (size_t)nt * nb_blocks) == hipSuccess);
+    assert(hipMemset(d_mask, 0, (size_t)nt * n_keys) == hipSuccess);
+
+    aff::idx_block_max_hip(d_sc_src, d_bsc, d_nk, nt, n_keys, nb_blocks, nb_blocks, block, n_keys, nullptr);
+    aff::idx_topk_mask_hip(d_bsc, d_cand, d_nkb, nt, nb_blocks, nb_blocks, nb_blocks, topk_blocks, nullptr);
+    aff::idx_apply_cand_hip(d_sc_tgt, d_cand, d_nk, nt, n_keys, nb_blocks, n_keys, block, n_keys, nullptr);
+    aff::idx_topk_mask_hip(d_sc_tgt, d_mask, d_nk, nt, n_keys, n_keys, n_keys, topk, nullptr,
+                           nullptr, d_adm, d_admn, adm_stride);
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    std::vector<uint8_t> h_mask((size_t)nt * n_keys);
+    std::vector<uint32_t> h_adm((size_t)nt * adm_stride), h_admn(nt);
+    assert(hipMemcpy(h_mask.data(), d_mask, h_mask.size(), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(h_adm.data(), d_adm, h_adm.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(h_admn.data(), d_admn, nt * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+
+    for (uint32_t t = 0; t < nt; ++t) {
+      assert(h_admn[t] == (uint32_t)ref_adm[t].size());
+      for (uint32_t i = 0; i < h_admn[t]; ++i) {
+        assert(h_adm[(size_t)t * adm_stride + i] == ref_adm[t][i]);
+        assert(h_mask[(size_t)t * n_keys + ref_adm[t][i]] == 1u);
+      }
+      uint32_t cnt = 0;
+      for (uint32_t s = 0; s < n_keys; ++s) cnt += h_mask[(size_t)t * n_keys + s] ? 1u : 0u;
+      assert(cnt == h_admn[t]);
+    }
+    for (void* p : {(void*)d_sc_src, (void*)d_sc_tgt, (void*)d_bsc, (void*)d_cand, (void*)d_mask,
+                    (void*)d_nk, (void*)d_nkb, (void*)d_adm, (void*)d_admn})
+      (void)hipFree(p);
+
+    // Spread TopkScratch path with n_keys <= k and -INFINITY entries
+    const uint32_t sp_nb = 2, sp_stride = 4096, sp_k = 512, sp_adm_stride = 512;
+    std::vector<uint32_t> h_sp_nk = {300, 512};
+    std::vector<float> h_sp_sc((size_t)sp_nb * sp_stride, -INFINITY);
+    std::vector<std::vector<uint32_t>> ref_sp(sp_nb);
+    for (uint32_t t = 0; t < sp_nb; ++t) {
+      for (uint32_t s = 0; s < h_sp_nk[t]; ++s) {
+        if ((s + t) % 3u != 0u) {
+          h_sp_sc[(size_t)t * sp_stride + s] = 1.0f + (float)s * 0.01f;
+          ref_sp[t].push_back(s);
+        }
+      }
+    }
+    uint64_t state_b = 0, tie_b = 0;
+    const uint64_t hist_b = aff::idx_topk_scratch_bytes(4u, &state_b, &tie_b);
+    aff::TopkScratch sp{};
+    sp.tok_cap = 4u;
+    float* d_sp_sc = nullptr;
+    uint8_t* d_sp_mask = nullptr;
+    uint32_t *d_sp_nk = nullptr, *d_sp_adm = nullptr, *d_sp_admn = nullptr;
+    assert(hipMalloc(&sp.hist, hist_b) == hipSuccess);
+    assert(hipMalloc(&sp.state, state_b) == hipSuccess);
+    assert(hipMalloc(&sp.tie, tie_b) == hipSuccess);
+    assert(hipMemset(sp.hist, 0, hist_b) == hipSuccess);
+    assert(hipMemset(sp.state, 0, state_b) == hipSuccess);
+    assert(hipMemset(sp.tie, 0, tie_b) == hipSuccess);
+    assert(hipMalloc(&d_sp_sc, (size_t)sp_nb * sp_stride * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_sp_mask, (size_t)sp_nb * sp_stride) == hipSuccess);
+    assert(hipMalloc(&d_sp_nk, sp_nb * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_sp_adm, (size_t)sp_nb * sp_adm_stride * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_sp_admn, sp_nb * sizeof(uint32_t)) == hipSuccess);
+
+    assert(hipMemcpy(d_sp_sc, h_sp_sc.data(), (size_t)sp_nb * sp_stride * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_sp_nk, h_sp_nk.data(), sp_nb * sizeof(uint32_t), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemset(d_sp_mask, 0, (size_t)sp_nb * sp_stride) == hipSuccess);
+    assert(hipMemset(d_sp_admn, 0, sp_nb * sizeof(uint32_t)) == hipSuccess);
+
+    aff::idx_topk_mask_hip(d_sp_sc, d_sp_mask, d_sp_nk, sp_nb, sp_stride, sp_stride, sp_stride,
+                           sp_k, nullptr, &sp, d_sp_adm, d_sp_admn, sp_adm_stride);
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    std::vector<uint8_t> h_sp_mask((size_t)sp_nb * sp_stride);
+    std::vector<uint32_t> h_sp_adm((size_t)sp_nb * sp_adm_stride), h_sp_admn(sp_nb);
+    assert(hipMemcpy(h_sp_mask.data(), d_sp_mask, h_sp_mask.size(), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(h_sp_adm.data(), d_sp_adm, h_sp_adm.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(h_sp_admn.data(), d_sp_admn, sp_nb * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+
+    for (uint32_t t = 0; t < sp_nb; ++t) {
+      assert(h_sp_admn[t] == (uint32_t)ref_sp[t].size());
+      for (uint32_t i = 0; i < h_sp_admn[t]; ++i) {
+        assert(h_sp_adm[(size_t)t * sp_adm_stride + i] == ref_sp[t][i]);
+      }
+      for (uint32_t s = 0; s < sp_stride; ++s) {
+        const uint8_t want = (s < h_sp_nk[t] && h_sp_sc[(size_t)t * sp_stride + s] > -INFINITY) ? 1u : 0u;
+        assert(h_sp_mask[(size_t)t * sp_stride + s] == want);
+      }
+    }
+    for (void* p : {(void*)sp.hist, (void*)sp.state, (void*)sp.tie, (void*)d_sp_sc,
+                    (void*)d_sp_mask, (void*)d_sp_nk, (void*)d_sp_adm, (void*)d_sp_admn})
       (void)hipFree(p);
   }
 

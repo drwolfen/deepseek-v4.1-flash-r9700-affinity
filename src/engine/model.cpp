@@ -740,6 +740,26 @@ bool Model::load_dspark(const std::string& path, std::string* err) {
   return true;
 }
 
+struct Model::PrefillScratch {
+  std::vector<float> emb, normb, blockh, rlogb, iqb, swb, sw;
+  std::vector<float> hg, hu, ha, embd, norm, flat, pre;
+  std::vector<uint32_t> selb, nselb, ncompb, sel;
+  std::vector<uint8_t> handled, residentb, eng_alive;
+  std::vector<int32_t> tap_at;
+  std::vector<uint32_t> draft_selb, draft_nselb;
+  std::vector<float> draft_swb;
+  std::vector<uint8_t> draft_handled;
+};
+
+namespace {
+template <class T>
+inline void ensure_size(std::vector<T>& v, size_t n) {
+  if (v.size() < n) v.resize(n);
+}
+}  // namespace
+
+Model::~Model() = default;
+
 // Nothing here is sized by the context window any more — see LayerState. The device allocators are
 // what grow with --kv-size, and they are the ones that should.
 void Model::init_state(SeqState* s, uint64_t max_pos) const {
@@ -1620,24 +1640,30 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
   const uint32_t chunk = std::min(cap, n);
   if (chunk < 2 && n > 1) return false;
 
-  std::vector<float> emb((size_t)chunk * E);
-  std::vector<float> normb((size_t)chunk * E);       // the FFN sublayer's host expert tier, lazily
-  std::vector<float> blockh((size_t)chunk * E), rlogb((size_t)chunk * NE);
-  // The chunk's whole routing, [live][n_expert_used], so the batched pass can group by expert.
-  std::vector<uint32_t> selb, nselb;
-  std::vector<float> swb;
-  std::vector<uint8_t> handled;
-  std::vector<float> iqb((size_t)chunk * INH * IHD);
-  // Per-token compressed-row counts for a sub-batch's worth of attention.
-  std::vector<uint32_t> ncompb;
-  std::vector<uint8_t> residentb;         // AFF_FORCE_RESIDENT's mask, rebuilt per layer
-  std::vector<uint32_t> sel(cfg_.n_expert_used);
-  std::vector<float> sw(cfg_.n_expert_used);
+  if (!pscratch_) pscratch_ = std::make_unique<PrefillScratch>();
+  PrefillScratch& sc = *pscratch_;
+  ensure_size(sc.emb, (size_t)chunk * E);
+  ensure_size(sc.sel, cfg_.n_expert_used);
+  ensure_size(sc.sw, cfg_.n_expert_used);
+  auto& emb = sc.emb;
+  auto& normb = sc.normb;
+  auto& blockh = sc.blockh;
+  auto& rlogb = sc.rlogb;
+  auto& selb = sc.selb;
+  auto& nselb = sc.nselb;
+  auto& swb = sc.swb;
+  auto& handled = sc.handled;
+  auto& iqb = sc.iqb;
+  auto& ncompb = sc.ncompb;
+  auto& residentb = sc.residentb;
+  auto& sel = sc.sel;
+  auto& sw = sc.sw;
 
   // Which slot of the tap plane each layer writes, or -1. Resolved once rather than searched per
   // layer: dspark_taps is three entries and the loop is 43 layers a chunk.
   const uint32_t NT = (uint32_t)cfg_.dspark_taps.size();
-  std::vector<int32_t> tap_at;
+  auto& tap_at = sc.tap_at;
+  tap_at.clear();
   uint32_t tap_pos0 = 0, tap_rows = 0;
   if (blk) {
     blk->greedy.assign(blk->per_position_head ? n : 0u, 0u);
@@ -1747,6 +1773,11 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
     // Before the chunk, not after: a display should name what is being worked on, and the last
     // chunk's completion is this function returning.
     if (pp_) pp_(pp_ctx_, base, n);
+    if (pa_ && !pa_(pa_ctx_)) {
+      rollback(s, s->pos);
+      if (blk) blk->tap_rows = 0;
+      return false;
+    }
     const uint32_t pos0 = s->pos;
     for (uint32_t b = 0; b < live; ++b) {
       uint32_t g = base + b;
@@ -1777,7 +1808,13 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
       eng_ids_.resize((size_t)live * eng_c_.n_layer * eng_c_.n_cols);
       eng_rows_.resize((size_t)eng_c_.n_layer * live * eng_in_dim);
-      eng_h_.push(ids + base, live, pos0, eng_ids_.data());
+      const uint8_t* alive_ptr = nullptr;
+      if (is_image_chunk) {
+        ensure_size(sc.eng_alive, live);
+        std::fill_n(sc.eng_alive.data(), live, (uint8_t)0);
+        alive_ptr = sc.eng_alive.data();
+      }
+      eng_h_.push(ids + base, live, pos0, eng_ids_.data(), alive_ptr);
       parallel_for((uint64_t)eng_c_.n_layer * live, 64, [&](uint64_t j0, uint64_t j1) {
         for (uint64_t j = j0; j < j1; ++j) {
           const uint32_t i = (uint32_t)(j / live);
@@ -1790,22 +1827,6 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
 
     const bool early_replay_chunk = (replay_cut < cfg_.n_layer && base + live <= replay_from);
     const uint32_t layer_limit = early_replay_chunk ? (replay_cut + 1u) : cfg_.n_layer;
-    if (early_replay_chunk) {
-      for (uint32_t l = layer_limit; l < cfg_.n_layer; ++l) {
-        LayerState& st_skip = s->layer[l];
-        const uint32_t r_skip = layers_[l].ratio;
-        for (uint32_t b = 0; b < live; ++b) {
-          const uint32_t pos = pos0 + b;
-          st_skip.raw_head = (st_skip.raw_head + 1) % cfg_.sliding;
-          if (st_skip.n_raw < cfg_.sliding) ++st_skip.n_raw;
-          if (r_skip && layers_[l].kv_owner != l && (pos + 1) % r_skip == 0 &&
-              st_skip.n_comp < s->layer[layers_[l].kv_owner].n_comp) {
-            if (cfg_.v41) ++st_skip.n_idx_comp;
-            ++st_skip.n_comp;
-          }
-        }
-      }
-    }
 
     for (uint32_t l = 0; l < layer_limit; ++l) {
       const LayerWeights& w = layers_[l];
@@ -1920,6 +1941,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
                                1.0f / std::sqrt((float)(IHD * INH))))
             return false;
         } else {
+          ensure_size(iqb, (size_t)live * INH * IHD);
           float* y = iqb.data();
           if (!bops_.mv_host(bops_.ctx, 1, &h, &r, QR, 1, &y)) return false;
         }
@@ -1937,7 +1959,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // would destroy rows its own early tokens still need — see attn_ring_slots().
       const float kq = 1.0f / std::sqrt((float)W);
       const uint32_t mstride = (uint32_t)st.comp_rows;
-      ncompb.assign(live, 0u);
+      ensure_size(ncompb, live);
+      std::fill_n(ncompb.data(), live, 0u);
       // One launch for the whole chunk once pass one has walked it, rather than a host scoring pass
       // per token. The per-token counts go with it: the compressed cache grows inside a chunk, so
       // each token sees its own prefix of it.
@@ -2049,11 +2072,13 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       const bool dev_hash = hashed && routed_experts && w.router_w && w.router_gpu >= 0 &&
                             bops_.router_hash && bops_.norm_fetch;
       bool norm_live = !dev_route && !dev_hash;
+      if (norm_live) ensure_size(normb, (size_t)live * E);
       if (!bops_.hc_pre(bops_.ctx, w.hc_ffn_fn.gpu, w.hc_ffn_scale_gpu, w.hc_ffn_base_gpu,
                         w.ffn_norm_gpu, E, HC, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
                         norm_live ? normb.data() : nullptr))
         return false;
       if (!dev_route && !hashed && w.router_w && w.router_gpu >= 0) {
+        ensure_size(rlogb, (size_t)live * NE);
         if (!bops_.router(bops_.ctx, w.router_gpu, NE, E, rlogb.data())) return false;
       }
       AFF_PH(router);
@@ -2067,8 +2092,11 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // Route every token BEFORE dispatching any of them: the batched pass groups by expert, which
       // it cannot do while the selections are still arriving one token at a time.
       const uint32_t KS = cfg_.n_expert_used;
-      selb.resize((size_t)live * KS); swb.resize((size_t)live * KS);
-      handled.resize((size_t)live * KS); nselb.assign(live, 0u);
+      ensure_size(selb, (size_t)live * KS);
+      ensure_size(swb, (size_t)live * KS);
+      ensure_size(handled, (size_t)live * KS);
+      ensure_size(nselb, live);
+      std::fill_n(nselb.data(), live, 0u);
       // On device when it can be: the logits are already there, and only the selection comes back
       // instead of the whole chunk's `norm`.
       //
@@ -2244,11 +2272,18 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         // No batched dispatch at all: this is the CPU-only build, and the routed experts run on the
         // same host kernel forward_token uses. One engine, so no divergence to have.
         if (!norm_live) {
+          ensure_size(normb, (size_t)live * E);
           if (!bops_.norm_fetch(bops_.ctx, normb.data())) return false;
           norm_live = true;
         }
-        std::fill(blockh.begin(), blockh.begin() + (size_t)live * E, 0.0f);
-        std::vector<float> hg(cfg_.moe_inter), hu(cfg_.moe_inter), ha(cfg_.moe_inter);
+        ensure_size(blockh, (size_t)live * E);
+        std::fill_n(blockh.data(), (size_t)live * E, 0.0f);
+        ensure_size(sc.hg, cfg_.moe_inter);
+        ensure_size(sc.hu, cfg_.moe_inter);
+        ensure_size(sc.ha, cfg_.moe_inter);
+        auto& hg = sc.hg;
+        auto& hu = sc.hu;
+        auto& ha = sc.ha;
         for (uint32_t b = 0; b < live; ++b) {
           const float* xb = normb.data() + (size_t)b * E;
           float* ob = blockh.data() + (size_t)b * E;
@@ -2258,8 +2293,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
             const ExpertMatrixView mg = fetch ? fetch(fetch_ctx, l, e, 0) : expert_view(l, e, 0);
             const ExpertMatrixView mu = fetch ? fetch(fetch_ctx, l, e, 1) : expert_view(l, e, 1);
             const ExpertMatrixView md = fetch ? fetch(fetch_ctx, l, e, 2) : expert_view(l, e, 2);
-            std::fill(hg.begin(), hg.end(), 0.0f);
-            std::fill(hu.begin(), hu.end(), 0.0f);
+            std::fill_n(hg.data(), cfg_.moe_inter, 0.0f);
+            std::fill_n(hu.data(), cfg_.moe_inter, 0.0f);
             expert_gemv_scaled_mt(mg, cb_, xb, 1.0f, hg.data());
             expert_gemv_scaled_mt(mu, cb_, xb, 1.0f, hu.data());
             swiglu(hg.data(), hu.data(), cfg_.moe_inter, cfg_.swiglu_limit, ha.data());
@@ -2299,6 +2334,23 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         }
       }
       AFF_PH(hyper);
+    }
+
+    if (early_replay_chunk) {
+      for (uint32_t l = layer_limit; l < cfg_.n_layer; ++l) {
+        LayerState& st_skip = s->layer[l];
+        const uint32_t r_skip = layers_[l].ratio;
+        for (uint32_t b = 0; b < live; ++b) {
+          const uint32_t pos = pos0 + b;
+          st_skip.raw_head = (st_skip.raw_head + 1) % cfg_.sliding;
+          if (st_skip.n_raw < cfg_.sliding) ++st_skip.n_raw;
+          if (r_skip && layers_[l].kv_owner != l && (pos + 1) % r_skip == 0 &&
+              st_skip.n_comp < s->layer[layers_[l].kv_owner].n_comp) {
+            if (cfg_.v41) ++st_skip.n_idx_comp;
+            ++st_skip.n_comp;
+          }
+        }
+      }
     }
 
     s->pos += live;
@@ -2393,21 +2445,35 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // is the epilogue the block path moved onto the card precisely because it is expensive. Doing
       // it for a caller who discards the result was pure cost.
       if (!bops_.hc_read(bops_.ctx, live - 1, s->hc.data(), E, HC)) return false;
-      std::vector<float> embd(E), norm(E);
+      ensure_size(sc.embd, E);
+      ensure_size(sc.norm, E);
+      float* embd = sc.embd.data();
+      float* norm = sc.norm.data();
       if (hc_head_fn_ && hc_head_scale_ && hc_head_base_) {
-        std::vector<float> flat((size_t)HC * E), pre(HC);
-        rms_norm_noweight(s->hc.data(), (uint64_t)HC * E, cfg_.rms_eps, flat.data());
-        matvec_bf16((const uint16_t*)hc_head_fn_.data, flat.data(), HC, (uint64_t)HC * E,
-                    pre.data());
+        ensure_size(sc.flat, (size_t)HC * E);
+        ensure_size(sc.pre, HC);
+        rms_norm_noweight(s->hc.data(), (uint64_t)HC * E, cfg_.rms_eps, sc.flat.data());
+        matvec_bf16((const uint16_t*)hc_head_fn_.data, sc.flat.data(), HC, (uint64_t)HC * E,
+                    sc.pre.data());
         for (uint32_t i = 0; i < HC; ++i)
-          pre[i] = sigmoid(pre[i] * hc_head_scale_[0] + hc_head_base_[i]) + cfg_.hc_eps;
-        hc_reduce(s->hc.data(), pre.data(), E, HC, embd.data());
+          sc.pre[i] = sigmoid(sc.pre[i] * hc_head_scale_[0] + hc_head_base_[i]) + cfg_.hc_eps;
+        hc_reduce(s->hc.data(), sc.pre.data(), E, HC, embd);
+      } else if (cfg_.v41) {
+        if (bops_.hc_read_pre) {
+          if (!bops_.hc_read_pre(bops_.ctx, live - 1, s->last_ffn_pre, HC)) return false;
+          s->last_ffn_pre_valid = true;
+        }
+        if (s->last_ffn_pre_valid) {
+          hc_reduce(s->hc.data(), s->last_ffn_pre, E, HC, embd);
+        } else {
+          std::memcpy(embd, s->hc.data(), (size_t)E * 4);
+        }
       } else {
-        std::memcpy(embd.data(), s->hc.data(), E * 4);
+        std::memcpy(embd, s->hc.data(), (size_t)E * 4);
       }
-      rms_norm(embd.data(), out_norm_, E, cfg_.rms_eps, norm.data());
+      rms_norm(embd, out_norm_, E, cfg_.rms_eps, norm);
       logits->assign(cfg_.vocab, 0.0f);
-      if (head_) dense_mv(head_, norm.data(), cfg_.vocab, E, logits->data());
+      if (head_) dense_mv(head_, norm, cfg_.vocab, E, logits->data());
       AFF_PH(head);
     }
     base += live;
@@ -2500,7 +2566,8 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
     const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
     bf16_dequant(src_emb + (size_t)first_id * E, E, dspark_emb_.data());
   }
-  if (const char* e = std::getenv("AFF_SLOT_DEBUG")) { (void)e;
+  static const bool slot_debug = std::getenv("AFF_SLOT_DEBUG") != nullptr;
+  if (slot_debug) {
     uint64_t v = 1469598103934665603ull;
     for (size_t i = 0; i < (size_t)E; ++i) { uint32_t bits; std::memcpy(&bits, &dspark_emb_[i], 4); v ^= bits; v *= 1099511628211ull; }
     aff::ui::err("slot-hash dspark_emb row0 first_id=%u P=%u hash=%016llx\n",
@@ -2516,9 +2583,16 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
   const uint32_t win_lo = P - hist;
   const float kq = 1.0f / std::sqrt((float)W);
 
-  std::vector<uint32_t> selb((size_t)B * KS), nselb(B);
-  std::vector<float> swb((size_t)B * KS);
-  std::vector<uint8_t> handled((size_t)B * KS);
+  if (!pscratch_) pscratch_ = std::make_unique<PrefillScratch>();
+  PrefillScratch& sc = *pscratch_;
+  ensure_size(sc.draft_selb, (size_t)B * KS);
+  ensure_size(sc.draft_nselb, B);
+  ensure_size(sc.draft_swb, (size_t)B * KS);
+  ensure_size(sc.draft_handled, (size_t)B * KS);
+  auto& selb = sc.draft_selb;
+  auto& nselb = sc.draft_nselb;
+  auto& swb = sc.draft_swb;
+  auto& handled = sc.draft_handled;
 
   for (uint32_t st = 0; st < NS; ++st) {
     const LayerWeights& w = D.stage[st];
@@ -2571,7 +2645,7 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
                            dev_plan ? nullptr : nselb.data()))
       return false;
     AFF_PH(draft_route);
-    std::fill(handled.begin(), handled.end(), (uint8_t)0);
+    std::fill_n(handled.data(), (size_t)B * KS, (uint8_t)0);
     drops_.ffn_batch(drops_.ctx, st, selb.data(), swb.data(), B, KS, handled.data());
     // ---- the guard, and where it moves to under the device build -------------------------------
     //

@@ -671,6 +671,7 @@ private:
   bool     batch_block_add(const float* src, uint32_t n_embd);
   bool     batch_block_reduce(uint32_t n_embd);
   bool     batch_hc_read(uint32_t b, float* dst, uint32_t n_embd, uint32_t n_hc);
+  bool     batch_hc_read_pre(uint32_t b, float* dst, uint32_t n_hc);
   bool     batch_hc_tap(uint32_t slot, uint32_t n_taps, uint32_t b_lo, uint32_t n_keep,
                         uint32_t row0, uint32_t rows_cap, uint32_t n_embd, uint32_t n_hc);
   bool     batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_taps, uint32_t b_lo,
