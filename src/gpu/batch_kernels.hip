@@ -2294,6 +2294,12 @@ __global__ void batch_column_bf16_kernel(const uint16_t* __restrict__ src, float
   if (i < n) dst[i] = wmma::bf16_to_f32(src[(size_t)i * nb + b]);
 }
 
+__global__ void batch_column_f32_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                                        uint32_t n, uint32_t nb, uint32_t b) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = src[(size_t)i * nb + b];
+}
+
 // `h.mean(dim=2)` straight into the plane the draft's projection reads, token-major, with no host
 // copy on either side of it.
 //
@@ -3460,6 +3466,13 @@ void batch_column_bf16_hip(const uint16_t* src, float* dst, uint32_t n, uint32_t
   const uint32_t thr = 256;
   AFF_BLAUNCH(batch_column_bf16_kernel, dim3((n + thr - 1) / thr), dim3(thr), 0,
                      (hipStream_t)stream, src, dst, n, nb, b);
+}
+
+void batch_column_f32_hip(const float* src, float* dst, uint32_t n, uint32_t nb, uint32_t b,
+                          void* stream) {
+  const uint32_t thr = 256;
+  AFF_BLAUNCH(batch_column_f32_kernel, dim3((n + thr - 1) / thr), dim3(thr), 0,
+              (hipStream_t)stream, src, dst, n, nb, b);
 }
 
 void batch_hc_tap_hip(const uint16_t* hc, float* tap, uint32_t n_embd, uint32_t n_hc, uint32_t nb,

@@ -380,6 +380,8 @@ void batch_head_combine_hip(const float* own, const float* peers, uint32_t npeer
 // attention kernel can consume it unchanged.
 void batch_column_bf16_hip(const uint16_t* src, float* dst, uint32_t n, uint32_t nb, uint32_t b,
                            void* stream);
+void batch_column_f32_hip(const float* src, float* dst, uint32_t n, uint32_t nb, uint32_t b,
+                          void* stream);
 
 // The router's top-k, on the device where the logits already are. One block per token.
 //

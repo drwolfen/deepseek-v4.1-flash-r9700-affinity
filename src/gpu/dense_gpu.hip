@@ -5663,6 +5663,20 @@ bool DenseGpu::batch_hc_read(uint32_t b, float* dst, uint32_t n_embd, uint32_t n
   return true;
 }
 
+bool DenseGpu::batch_hc_read_pre(uint32_t b, float* dst, uint32_t n_hc) {
+  if (!b_nb_ || !dst || !n_hc || b >= b_nb_) return false;
+  Impl::Dev& D = impl_->dev[0];
+  const float* const pre_last = shift_pre_ ? D.b_pre_prev : D.b_pre;
+  if (!pre_last) return false;
+  AFF_HIP_CHECK(hipSetDevice(D.id));
+  batch_column_f32_hip(pre_last, D.d_g, n_hc, b_nb_, b, D.stream);
+  AFF_HIP_CHECK(hipMemcpyAsync(D.h_y, D.d_g, (size_t)n_hc * sizeof(float), hipMemcpyDeviceToHost,
+                               D.stream));
+  AFF_DRAIN_AT(D, aff::BlockSite::HcRead);
+  std::memcpy(dst, D.h_y, (size_t)n_hc * sizeof(float));
+  return true;
+}
+
 // ---- the DSpark tap, and why it has no host side at all ------------------------------------------
 //
 // `h.mean(dim=2)` — the activation DSpark conditions its draft on — for one tap layer of one chunk.
@@ -6569,6 +6583,9 @@ Model::BatchOps DenseGpu::batch_ops() {
   };
   o.hc_read = [](void* c, uint32_t b, float* d, uint32_t ne, uint32_t nh) {
     return static_cast<DenseGpu*>(c)->batch_hc_read(b, d, ne, nh);
+  };
+  o.hc_read_pre = [](void* c, uint32_t b, float* d, uint32_t nh) {
+    return static_cast<DenseGpu*>(c)->batch_hc_read_pre(b, d, nh);
   };
   o.router_hash = [](void* c, int32_t h, uint32_t ne, uint64_t nd, uint32_t k, const uint32_t* sel,
                      const uint32_t* nsel, int np, float rs, float* wt) {
