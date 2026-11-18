@@ -4864,12 +4864,12 @@ bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
         // Level two. Only inside what the source published — and only if it actually published for
         // THIS token: a stale set from the previous one would be a plausible wrong answer.
         if (a_cand_src_[slot_] != (int64_t)a.cand_source) return false;
-        idx_apply_cand_hip(D.i_sc, D.a_cand, nullptr, 1, a_maxcomp_, cand_blocks_cap_, a.n_keys,
+        idx_apply_cand_hip(D.i_sc, D.a_cand, nullptr, 1, a.n_keys, cand_blocks_cap_, a.n_keys,
                            cand_block_, a.n_keys, st);
       } else if (layer == (uint32_t)a.cand_source) {
         // Level one, into the byte mask the layers after this one read.
         cand_note(layer, a.n_keys, nblk, a.cand_topk_blocks);
-        idx_block_max_hip(D.i_sc, D.i_bsc, nullptr, 1, a_maxcomp_, cand_blocks_cap_, nblk,
+        idx_block_max_hip(D.i_sc, D.i_bsc, nullptr, 1, a.n_keys, cand_blocks_cap_, nblk,
                           cand_block_, a.n_keys, st);
         idx_topk_mask_hip(D.i_bsc, D.a_cand, nullptr, 1, cand_blocks_cap_, cand_blocks_cap_, nblk,
                           a.cand_topk_blocks, st);
@@ -4973,11 +4973,11 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
         if (nblk > cand_blocks_cap_) return false;
         if ((int64_t)layer > (int64_t)a.cand_source) {
           if (b_cand_src_[slot_] != (int64_t)a.cand_source) return false;
-          idx_apply_cand_hip(D.i_sc, cand, D.i_nc + t0, nt, a_maxcomp_, cand_blocks_cap_, n_keys,
+          idx_apply_cand_hip(D.i_sc, cand, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, n_keys,
                              cand_block_, n_keys, st);
         } else if (layer == (uint32_t)a.cand_source) {
           cand_note(layer, n_keys, nblk, a.cand_topk_blocks);
-          idx_block_max_hip(D.i_sc, D.i_bsc, D.i_nc + t0, nt, a_maxcomp_, cand_blocks_cap_, nblk,
+          idx_block_max_hip(D.i_sc, D.i_bsc, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, nblk,
                             cand_block_, n_keys, st);
           idx_topk_mask_hip(D.i_bsc, cand, D.i_ncb + t0, nt, cand_blocks_cap_, cand_blocks_cap_,
                             nblk, a.cand_topk_blocks, st);

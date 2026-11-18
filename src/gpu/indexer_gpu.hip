@@ -633,7 +633,8 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mark_kernel(
 
   for (uint32_t i = n_keys + g0; i < clr; i += str) row[i] = 0;
   if (n_keys <= k) {
-    for (uint32_t i = g0; i < n_keys; i += str) row[i] = 1;
+    for (uint32_t i = g0; i < n_keys; i += str)
+      row[i] = (mono(sc[i]) > KEY_NEG_INF) ? 1u : 0u;
     return;
   }
   const uint32_t T = state[(size_t)t * 4u];
@@ -665,9 +666,8 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
   const uint32_t n_keys = nk0 < stride ? nk0 : stride;
   if (n_keys <= k) {
     if (adm) {
-      uint32_t* a = adm + (size_t)t * adm_stride;
-      for (uint32_t i = tid; i < n_keys && i < adm_stride; i += kTopkThr) a[i] = i;
-      if (tid == 0) admn[t] = n_keys < adm_stride ? n_keys : adm_stride;
+      compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
     }
     return;
   }
@@ -785,7 +785,8 @@ __global__ void idx_block_max_kernel(const float* __restrict__ sc, float* __rest
   const uint32_t t = blockIdx.y;
   const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
   if (b >= nb_blocks) return;
-  const uint32_t keys = nkeys ? nkeys[t] : keys_all;
+  const uint32_t nk0 = nkeys ? nkeys[t] : keys_all;
+  const uint32_t keys = nk0 < keys_all ? nk0 : keys_all;
   const uint32_t lo = b * block;
   float m = -INFINITY;
   if (lo < keys) {
@@ -806,7 +807,8 @@ __global__ void idx_apply_cand_kernel(float* __restrict__ sc, const uint8_t* __r
                                       uint32_t cstride, uint32_t block, uint32_t keys_all) {
   const uint32_t t = blockIdx.y;
   const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint32_t keys = nkeys ? nkeys[t] : keys_all;
+  const uint32_t nk0 = nkeys ? nkeys[t] : keys_all;
+  const uint32_t keys = nk0 < keys_all ? nk0 : keys_all;
   if (s >= keys) return;
   if (!cand[(size_t)t * cstride + s / block]) sc[(size_t)t * sstride + s] = -INFINITY;
 }
