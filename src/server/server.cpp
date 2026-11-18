@@ -3,14 +3,17 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cctype>
-#include <cstring>
-#include <cstdlib>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <thread>
 
@@ -18,6 +21,122 @@ namespace aff {
 
 namespace {
 const char* skip_ws(const char* p) { while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') ++p; return p; }
+
+struct JsonSpan {
+  size_t start = 0;
+  size_t end = 0;
+};
+
+// Scans a top-level JSON object in a single pass, recording byte spans for every top-level key.
+// Rejects non-object inputs, unclosed strings, and unbalanced braces/brackets.
+bool scan_top_level_object(const std::string& s,
+                           std::vector<std::pair<std::string, JsonSpan>>* fields) {
+  fields->clear();
+  auto skip_w = [&](size_t p) {
+    while (p < s.size() && (s[p] == ' ' || s[p] == '\n' || s[p] == '\t' || s[p] == '\r')) ++p;
+    return p;
+  };
+  auto scan_str_end = [&](size_t q0) -> size_t {
+    for (size_t k = q0 + 1; k < s.size(); ++k) {
+      if (s[k] == '\\') {
+        if (k + 1 >= s.size()) return std::string::npos;
+        ++k;
+      } else if (s[k] == '"') {
+        return k;
+      }
+    }
+    return std::string::npos;
+  };
+
+  size_t i = skip_w(0);
+  if (i >= s.size() || s[i] != '{') return false;
+  i = skip_w(i + 1);
+  if (i < s.size() && s[i] == '}') return skip_w(i + 1) == s.size();
+
+  while (i < s.size()) {
+    i = skip_w(i);
+    if (i >= s.size() || s[i] != '"') return false;
+    const size_t k1 = scan_str_end(i);
+    if (k1 == std::string::npos) return false;
+    std::string key;
+    key.reserve(k1 - i - 1);
+    bool simple = true;
+    for (size_t k = i + 1; k < k1; ++k) {
+      if (s[k] == '\\') { simple = false; break; }
+    }
+    if (simple) {
+      key.assign(s, i + 1, k1 - i - 1);
+    } else {
+      for (size_t k = i + 1; k < k1; ++k) {
+        if (s[k] == '\\' && k + 1 < k1) {
+          ++k;
+          switch (s[k]) {
+            case 'n': key.push_back('\n'); break;
+            case 't': key.push_back('\t'); break;
+            case 'r': key.push_back('\r'); break;
+            case '"': key.push_back('"'); break;
+            case '\\': key.push_back('\\'); break;
+            default: key.push_back(s[k]); break;
+          }
+        } else {
+          key.push_back(s[k]);
+        }
+      }
+    }
+    i = skip_w(k1 + 1);
+    if (i >= s.size() || s[i] != ':') return false;
+    i = skip_w(i + 1);
+    if (i >= s.size()) return false;
+    const size_t vstart = i;
+    size_t vend = i;
+    if (s[i] == '"') {
+      const size_t s1 = scan_str_end(i);
+      if (s1 == std::string::npos) return false;
+      vend = s1 + 1;
+    } else if (s[i] == '{' || s[i] == '[') {
+      size_t depth = 0;
+      bool in_str = false, esc = false, closed = false;
+      for (size_t k = i; k < s.size(); ++k) {
+        const char c = s[k];
+        if (in_str) {
+          if (esc) esc = false;
+          else if (c == '\\') esc = true;
+          else if (c == '"') in_str = false;
+          continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '{' || c == '[') ++depth;
+        else if (c == '}' || c == ']') {
+          if (--depth == 0) { vend = k + 1; closed = true; break; }
+        }
+      }
+      if (!closed) return false;
+    } else {
+      size_t k = i;
+      while (k < s.size() && s[k] != ',' && s[k] != '}' &&
+             s[k] != ' ' && s[k] != '\n' && s[k] != '\t' && s[k] != '\r') {
+        ++k;
+      }
+      if (k == i) return false;
+      vend = k;
+    }
+    fields->emplace_back(std::move(key), JsonSpan{vstart, vend});
+    i = skip_w(vend);
+    if (i >= s.size()) return false;
+    if (s[i] == '}') return skip_w(i + 1) == s.size();
+    if (s[i] != ',') return false;
+    ++i;
+  }
+  return false;
+}
+
+const JsonSpan* find_field(const std::vector<std::pair<std::string, JsonSpan>>& fields,
+                           const char* key) {
+  for (const auto& kv : fields) {
+    if (kv.first == key) return &kv.second;
+  }
+  return nullptr;
+}
 
 // A key at the TOP level of `s`. The plain search matches the same name anywhere, nested objects
 // included: a get_weather tool with a "temperature" property would otherwise be read as the
@@ -101,7 +220,11 @@ std::string read_json_string(const char*& p) {
 bool send_all(int fd, const char* d, size_t n) {
   while (n) {
     const ssize_t w = ::send(fd, d, n, MSG_NOSIGNAL);
-    if (w <= 0) return false;
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (w == 0) return false;
     d += w; n -= (size_t)w;
   }
   return true;
@@ -272,12 +395,12 @@ static std::string raw_value(const std::string& s, const char* key) {
   return {};
 }
 
-// Top-level elements of a JSON array, as raw text.
-static std::vector<std::string> raw_elements(const std::string& arr) {
+// Top-level elements of a JSON array in s[lo..hi), as raw text.
+static std::vector<std::string> raw_elements_range(const std::string& arr, size_t lo, size_t hi) {
   std::vector<std::string> out;
   size_t depth = 0, start = std::string::npos;
   bool in_str = false, esc = false;
-  for (size_t i = 0; i < arr.size(); ++i) {
+  for (size_t i = lo; i < hi; ++i) {
     const char c = arr[i];
     if (in_str) {
       if (esc) esc = false;
@@ -295,44 +418,60 @@ static std::vector<std::string> raw_elements(const std::string& arr) {
 }
 
 bool parse_completion_request(const std::string& body, bool chat, CompletionRequest* out) {
+  *out = CompletionRequest{};
   out->raw_prompt = !chat;
-  out->thinking_mode.clear();
-  out->reasoning_effort.clear();
-  out->suppress_final_think = false;
-  if (const char* p = find_top_key(body, "ignore_eos")) out->ignore_eos = std::strncmp(skip_ws(p), "true", 4) == 0;
-  if (const char* p = find_top_key(body, "model")) { const char* q = p; out->model = read_json_string(q); }
+
+  std::vector<std::pair<std::string, JsonSpan>> fields;
+  if (!scan_top_level_object(body, &fields)) return false;
+
+  auto field_ptr = [&](const char* key) -> const char* {
+    const JsonSpan* sp = find_field(fields, key);
+    return sp ? (body.c_str() + sp->start) : nullptr;
+  };
+  auto field_str = [&](const char* key) -> std::string {
+    const JsonSpan* sp = find_field(fields, key);
+    if (!sp) return {};
+    const char c = body[sp->start];
+    if (c != '{' && c != '[') return {};
+    return body.substr(sp->start, sp->end - sp->start);
+  };
+
+  if (const char* p = field_ptr("ignore_eos")) out->ignore_eos = std::strncmp(p, "true", 4) == 0;
+  if (const char* p = field_ptr("model")) { const char* q = p; out->model = read_json_string(q); }
   // `max_completion_tokens` is the current OpenAI spelling and `max_tokens` the deprecated one;
   // clients send either, and reading only one silently ignores the caller's limit.
   for (const char* k : {"max_tokens", "max_completion_tokens"})
-    if (const char* p = find_top_key(body, k)) {
+    if (const char* p = field_ptr(k)) {
       out->max_tokens = (uint32_t)std::strtoul(p, nullptr, 10);
       out->has_max_tokens = true;
     }
-  if (const char* p = find_top_key(body, "temperature")) { out->temperature = std::strtof(p, nullptr); out->has_temperature = true; }
-  if (const char* p = find_top_key(body, "top_p")) { out->top_p = std::strtof(p, nullptr); out->has_top_p = true; }
-  if (const char* p = find_top_key(body, "top_k")) out->top_k = (uint32_t)std::strtoul(p, nullptr, 10);
-  if (const char* p = find_top_key(body, "min_p")) out->min_p = std::strtof(p, nullptr);
-  if (const char* p = find_top_key(body, "repeat_penalty")) out->repeat_penalty = std::strtof(p, nullptr);
-  else if (const char* p = find_top_key(body, "repetition_penalty")) out->repeat_penalty = std::strtof(p, nullptr);
-  if (const char* p = find_top_key(body, "repeat_last_n")) out->repeat_last_n = (uint32_t)std::strtoul(p, nullptr, 10);
-  if (const char* p = find_top_key(body, "dry_delta")) out->dry_delta = std::strtof(p, nullptr);
-  if (const char* p = find_top_key(body, "seed")) out->seed = std::strtoull(p, nullptr, 10);
-  if (const char* p = find_top_key(body, "n")) out->n = (uint32_t)std::strtoul(p, nullptr, 10);
-  if (const char* p = find_top_key(body, "stream")) { p = skip_ws(p); out->stream = std::strncmp(p, "true", 4) == 0; }
+  if (const char* p = field_ptr("temperature")) { out->temperature = std::strtof(p, nullptr); out->has_temperature = true; }
+  if (const char* p = field_ptr("top_p")) { out->top_p = std::strtof(p, nullptr); out->has_top_p = true; }
+  if (const char* p = field_ptr("top_k")) out->top_k = (uint32_t)std::strtoul(p, nullptr, 10);
+  if (const char* p = field_ptr("min_p")) out->min_p = std::strtof(p, nullptr);
+  if (const char* p = field_ptr("repeat_penalty")) out->repeat_penalty = std::strtof(p, nullptr);
+  else if (const char* p = field_ptr("repetition_penalty")) out->repeat_penalty = std::strtof(p, nullptr);
+  if (const char* p = field_ptr("repeat_last_n")) out->repeat_last_n = (uint32_t)std::strtoul(p, nullptr, 10);
+  if (const char* p = field_ptr("dry_delta")) out->dry_delta = std::strtof(p, nullptr);
+  if (const char* p = field_ptr("seed")) out->seed = std::strtoull(p, nullptr, 10);
+  if (const char* p = field_ptr("n")) out->n = (uint32_t)std::strtoul(p, nullptr, 10);
+  if (const char* p = field_ptr("stream")) out->stream = std::strncmp(p, "true", 4) == 0;
   // include_usage lives inside stream_options, so it is one level down and the top-level search
   // cannot see it. Pull the sub-object out and search that.
-  const std::string stream_options = raw_value(body, "stream_options");
-  if (const char* p = find_top_key(stream_options, "include_usage")) {
-    p = skip_ws(p);
-    out->include_usage = std::strncmp(p, "true", 4) == 0;
+  const std::string stream_options = field_str("stream_options");
+  if (!stream_options.empty()) {
+    if (const char* p = find_top_key(stream_options, "include_usage")) {
+      p = skip_ws(p);
+      out->include_usage = std::strncmp(p, "true", 4) == 0;
+    }
   }
-  if (const char* p = find_top_key(body, "reasoning_effort")) {
-    const char* q = skip_ws(p);
+  if (const char* p = field_ptr("reasoning_effort")) {
+    const char* q = p;
     if (*q == '"') out->reasoning_effort = read_json_string(q);
     else if (std::isdigit((unsigned char)*q)) out->reasoning_effort = std::to_string(std::strtoul(q, nullptr, 10));
   }
-  if (const char* p = find_top_key(body, "thinking_mode")) { const char* q = p; out->thinking_mode = read_json_string(q); }
-  const std::string ctk = raw_value(body, "chat_template_kwargs");
+  if (const char* p = field_ptr("thinking_mode")) { const char* q = p; out->thinking_mode = read_json_string(q); }
+  const std::string ctk = field_str("chat_template_kwargs");
   if (out->reasoning_effort.empty() && !ctk.empty()) {
     if (const char* p = find_top_key(ctk, "reasoning_effort")) {
       const char* q = skip_ws(p);
@@ -341,17 +480,23 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
     }
   }
   if (out->thinking_mode.empty()) {
-    auto check_bool_think = [&](const std::string& obj) {
+    if (!ctk.empty()) {
       for (const char* k : {"enable_thinking", "thinking"}) {
-        if (const char* p = find_top_key(obj, k)) {
+        if (const char* p = find_top_key(ctk, k)) {
           p = skip_ws(p);
           if (std::strncmp(p, "false", 5) == 0) out->thinking_mode = "chat";
           else if (std::strncmp(p, "true", 4) == 0) out->thinking_mode = "thinking";
         }
       }
-    };
-    if (!ctk.empty()) check_bool_think(ctk);
-    if (out->thinking_mode.empty()) check_bool_think(body);
+    }
+    if (out->thinking_mode.empty()) {
+      for (const char* k : {"enable_thinking", "thinking"}) {
+        if (const char* p = field_ptr(k)) {
+          if (std::strncmp(p, "false", 5) == 0) out->thinking_mode = "chat";
+          else if (std::strncmp(p, "true", 4) == 0) out->thinking_mode = "thinking";
+        }
+      }
+    }
     if (out->reasoning_effort == "none" || out->reasoning_effort == "off" || out->reasoning_effort == "0") {
       if (out->thinking_mode == "thinking") {
         out->suppress_final_think = true;
@@ -360,81 +505,56 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
       }
     }
   }
-  if (const char* p = find_top_key(body, "tool_choice")) { const char* q = p; out->tool_choice = read_json_string(q); }
-  out->response_format = raw_value(body, "response_format");
+  if (const char* p = field_ptr("tool_choice")) { const char* q = p; out->tool_choice = read_json_string(q); }
+  out->response_format = field_str("response_format");
 
   // tools[] -> the `function` object of each, verbatim. The wrapper is dropped here because that is
   // what the container's encoder renders (`tools_from_openai_format`). If the outer wrapper carries
   // a 1017 `namespace` field, inject it into `fn` so `chat_encode` qualifies `name` as `ns::name`.
-  for (const std::string& t : raw_elements(raw_value(body, "tools"))) {
-    std::string fn = raw_value(t, "function");
-    const std::string outer_ns = raw_value(t, "namespace");
-    if (fn.empty()) {
-      fn = t;                  // already unwrapped, which some clients send
-    } else if (!outer_ns.empty() && raw_value(fn, "namespace").empty()) {
-      const size_t rbrace = fn.rfind('}');
-      if (rbrace != std::string::npos) {
-        fn = fn.substr(0, rbrace) + ",\"namespace\":" + outer_ns + "}";
+  if (const JsonSpan* tsp = find_field(fields, "tools")) {
+    if (body[tsp->start] == '[') {
+      for (const std::string& t : raw_elements_range(body, tsp->start, tsp->end)) {
+        std::string fn = raw_value(t, "function");
+        const std::string outer_ns = raw_value(t, "namespace");
+        if (fn.empty()) {
+          fn = t;                  // already unwrapped, which some clients send
+        } else if (!outer_ns.empty() && raw_value(fn, "namespace").empty()) {
+          const size_t rbrace = fn.rfind('}');
+          if (rbrace != std::string::npos) {
+            fn = fn.substr(0, rbrace) + ",\"namespace\":" + outer_ns + "}";
+          }
+        }
+        out->tools.push_back(std::move(fn));
       }
     }
-    out->tools.push_back(fn);
   }
 
-  if (const char* p = find_top_key(body, "stop")) {
-    const char* q = skip_ws(p);
+  if (const char* p = field_ptr("stop")) {
+    const char* q = p;
     if (*q == '[') { ++q; while (*q && *q != ']') { q = skip_ws(q); if (*q == '"') out->stop.push_back(read_json_string(q)); else ++q; if (*q == ',') ++q; } }
     else if (*q == '"') out->stop.push_back(read_json_string(q));
   }
 
   if (chat) {
-    size_t p = body.find("\"messages\"");
-    if (p == std::string::npos) return false;
-    p = body.find('[', p);
-    const char* q = body.c_str() + p + 1;
-    while (*q && *q != ']') {
-      if (*q == '{') {
-        ChatMessage m;
-        const size_t obj = (size_t)(q - body.c_str());
-        // Braces INSIDE a string are text, not structure. A tool result carrying truncated JSON --
-        // `head -c 200` on an API response is enough -- otherwise unbalances this count: the object
-        // never closes, `e` stays at `obj`, `sub` is the single byte "{", the role reads empty and
-        // the message is DROPPED. Every later message is then scanned from the wrong offset, so the
-        // conversation the model sees stops growing while the client keeps appending to it. The
-        // model answers the same stale prompt every turn, repeats itself, and finally degenerates.
-        // Silent, content-dependent, and worse the longer the session runs.
-        //
-        // find_top_key, raw_value and raw_elements all track strings already; this scanner is the
-        // one that did not. `if (depth &&` also stops a leading `}` from wrapping size_t to SIZE_MAX.
-        size_t depth = 0, e = obj;
-        bool in_str = false, esc = false;
-        for (size_t i = obj; i < body.size(); ++i) {
-          const char c = body[i];
-          if (in_str) {
-            if (esc) esc = false;
-            else if (c == '\\') esc = true;
-            else if (c == '"') in_str = false;
-            continue;
-          }
-          if (c == '"') { in_str = true; continue; }
-          if (c == '{') ++depth;
-          else if (c == '}') { if (depth && --depth == 0) { e = i; break; } }
-        }
-        const std::string sub = body.substr(obj, e - obj + 1);
-        if (const char* r = find_top_key(sub, "role")) { const char* z = r; m.role = read_json_string(z); }
-        // OpenAI renamed `system` to `developer`, and llama.cpp maps it back the same way. The
-        // container happens to define a `developer` role of its own that renders as a USER turn --
-        // taking the name at face value would put the caller's system instructions in the user's
-        // mouth. `function` is the retired spelling of `tool`.
+    const JsonSpan* mspan = find_field(fields, "messages");
+    if (!mspan || body[mspan->start] != '[') return false;
+    for (const std::string& sub : raw_elements_range(body, mspan->start, mspan->end)) {
+      if (sub.empty() || sub.front() != '{') continue;
+      ChatMessage m;
+      std::vector<std::pair<std::string, JsonSpan>> mfields;
+      if (scan_top_level_object(sub, &mfields)) {
+        auto mptr = [&](const char* key) -> const char* {
+          const JsonSpan* sp = find_field(mfields, key);
+          return sp ? (sub.c_str() + sp->start) : nullptr;
+        };
+        if (const char* r = mptr("role")) { const char* z = r; m.role = read_json_string(z); }
         if (m.role == "developer") m.role = "system";
         else if (m.role == "function") m.role = "tool";
-        // `content` is a string OR an array of typed blocks. Every agent harness sends the array
-        // form, and reading it as a string yields "" — a message the model receives as empty, which
-        // it answers by saying nobody has asked it anything.
-        if (const char* c = find_top_key(sub, "content")) {
-          const char* z = skip_ws(c);
+        if (const JsonSpan* csp = find_field(mfields, "content")) {
+          const char* z = sub.c_str() + csp->start;
           if (*z == '[') {
             std::string joined;
-            for (const std::string& blk : raw_elements(raw_value(sub, "content"))) {
+            for (const std::string& blk : raw_elements_range(sub, csp->start, csp->end)) {
               if (const char* t = find_top_key(blk, "text")) {
                 const char* w = t;
                 const std::string piece = read_json_string(w);
@@ -457,13 +577,11 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
               }
             }
             m.content = joined;
-          } else {
-            const char* w = c;
+          } else if (*z == '"') {
+            const char* w = z;
             m.content = read_json_string(w);
             size_t sent_pos = m.role == "user" ? m.content.find("<｜deepseek_image｜>") : std::string::npos;
             if (sent_pos != std::string::npos) {
-              // Search only after the sentinel: prose that merely quotes the sentinel
-              // (and separately mentions data:image/) must not be decoded as an image.
               size_t b64_pos = m.content.find("data:image/", sent_pos);
               if (b64_pos != std::string::npos) {
                 size_t end_pos = m.content.find_first_of(" \t\r\n)]}\"", b64_pos);
@@ -473,66 +591,187 @@ bool parse_completion_request(const std::string& body, bool chat, CompletionRequ
             }
           }
         }
-        if (const char* c = find_top_key(sub, "reasoning_content")) { const char* z = c; m.reasoning_content = read_json_string(z); }
-        if (const char* c = find_top_key(sub, "tool_call_id")) { const char* z = c; m.tool_call_id = read_json_string(z); }
-        for (const std::string& tc : raw_elements(raw_value(sub, "tool_calls"))) {
-          ToolCallIO c2;
-          if (const char* z = find_top_key(tc, "id")) { const char* w = z; c2.id = read_json_string(w); }
-          if (const char* z = find_top_key(tc, "namespace")) { const char* w = z; c2.ns = read_json_string(w); }
-          const std::string fn = raw_value(tc, "function");
-          const std::string& src = fn.empty() ? tc : fn;
-          if (c2.ns.empty()) {
-            if (const char* z = find_top_key(src, "namespace")) { const char* w = z; c2.ns = read_json_string(w); }
+        if (const char* c = mptr("reasoning_content")) { const char* z = c; m.reasoning_content = read_json_string(z); }
+        if (const char* c = mptr("tool_call_id")) { const char* z = c; m.tool_call_id = read_json_string(z); }
+        if (const JsonSpan* tcsp = find_field(mfields, "tool_calls")) {
+          if (sub[tcsp->start] == '[') {
+            for (const std::string& tc : raw_elements_range(sub, tcsp->start, tcsp->end)) {
+              ToolCallIO c2;
+              if (const char* z = find_top_key(tc, "id")) { const char* w = z; c2.id = read_json_string(w); }
+              if (const char* z = find_top_key(tc, "namespace")) { const char* w = z; c2.ns = read_json_string(w); }
+              const std::string fn = raw_value(tc, "function");
+              const std::string& src = fn.empty() ? tc : fn;
+              if (c2.ns.empty()) {
+                if (const char* z = find_top_key(src, "namespace")) { const char* w = z; c2.ns = read_json_string(w); }
+              }
+              if (const char* z = find_top_key(src, "name")) { const char* w = z; c2.name = read_json_string(w); }
+              if (const char* z = find_top_key(src, "arguments")) { const char* w = z; c2.arguments = read_json_string(w); }
+              const size_t sep = c2.name.find("::");
+              if (sep != std::string::npos) {
+                if (c2.ns.empty()) c2.ns = c2.name.substr(0, sep);
+                c2.name = c2.name.substr(sep + 2);
+              }
+              if (!c2.name.empty()) m.tool_calls.push_back(std::move(c2));
+            }
           }
-          if (const char* z = find_top_key(src, "name")) { const char* w = z; c2.name = read_json_string(w); }
-          if (const char* z = find_top_key(src, "arguments")) { const char* w = z; c2.arguments = read_json_string(w); }
-          const size_t sep = c2.name.find("::");
-          if (sep != std::string::npos) {
-            if (c2.ns.empty()) c2.ns = c2.name.substr(0, sep);
-            c2.name = c2.name.substr(sep + 2);
-          }
-          if (!c2.name.empty()) m.tool_calls.push_back(std::move(c2));
         }
-        if (!m.role.empty()) out->messages.push_back(std::move(m));
-        q = body.c_str() + e + 1;
-      } else ++q;
+      }
+      if (!m.role.empty()) out->messages.push_back(std::move(m));
     }
     return !out->messages.empty();
   }
-  if (const char* p = find_top_key(body, "prompt")) { const char* q = p; out->prompt = read_json_string(q); }
+  if (const char* p = field_ptr("prompt")) { const char* q = p; out->prompt = read_json_string(q); }
   return !out->prompt.empty();
 }
 
-// Reassembles a chunked body: each chunk is a hex length, CRLF, that many bytes, CRLF, ending at a
-// zero-length chunk. Without this a streamed request reads as empty and is answered as malformed.
-static std::string dechunk(const std::string& in) {
+namespace {
+struct ChunkedDecoder {
+  size_t pos = 0;
+  bool done = false;
+  bool error = false;
   std::string out;
-  size_t i = 0;
-  while (i < in.size()) {
-    const size_t eol = in.find("\r\n", i);
-    if (eol == std::string::npos) break;
-    const size_t len = (size_t)std::strtoul(in.substr(i, eol - i).c_str(), nullptr, 16);
-    if (len == 0) break;
-    if (eol + 2 + len > in.size()) break;
-    out.append(in, eol + 2, len);
-    i = eol + 2 + len + 2;
+
+  // Advances over complete chunks in `buf` starting at `pos`.
+  // Returns true if the terminal 0-length chunk + CRLF has been consumed.
+  bool feed(const std::string& buf) {
+    while (!done && pos < buf.size()) {
+      const size_t eol = buf.find("\r\n", pos);
+      if (eol == std::string::npos) break;
+      const char* line = buf.c_str() + pos;
+      char* endptr = nullptr;
+      const unsigned long len = std::strtoul(line, &endptr, 16);
+      if (endptr == line) { error = true; return false; }
+      // Allow optional whitespace or ;chunk-ext after hex digits up to CRLF.
+      for (const char* q = endptr; q < buf.c_str() + eol; ++q) {
+        if (*q == ';') break;
+        if (*q != ' ' && *q != '\t') { error = true; return false; }
+      }
+      if (len == 0) {
+        if (buf.size() >= eol + 4 && buf.compare(eol + 2, 2, "\r\n") == 0) {
+          pos = eol + 4;
+          done = true;
+          return true;
+        }
+        const size_t tr_end = buf.find("\r\n\r\n", eol);
+        if (tr_end != std::string::npos) {
+          pos = tr_end + 4;
+          done = true;
+          return true;
+        }
+        break;
+      }
+      if (buf.size() < eol + 2 + len + 2) break;
+      if (buf[eol + 2 + len] != '\r' || buf[eol + 2 + len + 1] != '\n') {
+        error = true;
+        return false;
+      }
+      out.append(buf, eol + 2, len);
+      pos = eol + 2 + len + 2;
+    }
+    return done;
   }
-  return out;
+};
+} // namespace
+
+bool fd_alive(int fd) {
+  if (fd < 0) return false;
+  pollfd pfd{};
+  pfd.fd = fd;
+  pfd.events = POLLRDHUP;
+  int pr = 0;
+  do {
+    pr = ::poll(&pfd, 1, 0);
+  } while (pr < 0 && errno == EINTR);
+  if (pr < 0) return false;
+  if ((pfd.revents & (POLLERR | POLLHUP | POLLRDHUP)) != 0) return false;
+  char b = 0;
+  ssize_t n = 0;
+  do {
+    n = ::recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+  } while (n < 0 && errno == EINTR);
+  if (n == 0) return false;
+  if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
+  return true;
 }
 
-// Blocks until a slot frees. FIFO is not promised: any free slot will do, and a waiter that loses
-// a wakeup race simply waits again — the predicate is re-checked, so no request is lost.
-uint32_t Server::acquire_slot() {
+std::string make_sse_keepalive_chunk(const std::string& envelope, const std::string& obj,
+                                     const std::string& model_name, bool is_chat) {
+  return "data: {" + envelope + obj + "\",\"model\":\"" + json_escape(model_name) +
+         "\",\"choices\":[{\"index\":0," +
+         std::string(is_chat ? "\"delta\":{}" : "\"text\":\"\"") + "}]}\n\n";
+}
+
+bool dechunk_http_body(const std::string& in, std::string* out) {
+  ChunkedDecoder dec;
+  const bool complete = dec.feed(in);
+  if (dec.error) return false;
+  *out = std::move(dec.out);
+  return complete;
+}
+
+// Strict FIFO waiter queue waking every 1s to drop disconnected sockets and emit
+// OpenAI-SDK-visible empty-delta SSE keepalive chunks every 15s for streaming waiters.
+int32_t Server::acquire_slot(int fd, bool stream, const std::string& envelope,
+                             const std::string& obj, bool is_chat,
+                             std::chrono::steady_clock::time_point* last_send) {
+  const uint64_t all_busy = n_slots_ >= 64 ? ~0ull : ((1ull << n_slots_) - 1);
+  constexpr auto kWakeInterval = std::chrono::seconds(1);
+  constexpr auto kKeepAlive = std::chrono::seconds(15);
+
   std::unique_lock<std::mutex> lk(slot_mu_);
-  slot_cv_.wait(lk, [&] { return slot_busy_ != (n_slots_ >= 64 ? ~0ull : ((1ull << n_slots_) - 1)); });
-  for (uint32_t i = 0; i < n_slots_; ++i)
-    if (!(slot_busy_ & (1ull << i))) { slot_busy_ |= (1ull << i); return i; }
-  return 0;                                  // unreachable: the predicate guarantees a free bit
+  const uint64_t ticket = next_ticket_++;
+  wait_queue_.push_back(ticket);
+
+  auto remove_ticket = [&]() {
+    auto it = std::find(wait_queue_.begin(), wait_queue_.end(), ticket);
+    if (it != wait_queue_.end()) wait_queue_.erase(it);
+    slot_cv_.notify_all();
+  };
+
+  for (;;) {
+    if (!running_) {
+      remove_ticket();
+      return -1;
+    }
+    if (fd >= 0 && !fd_alive(fd)) {
+      remove_ticket();
+      return -1;
+    }
+    if (!wait_queue_.empty() && wait_queue_.front() == ticket && slot_busy_ != all_busy) {
+      for (uint32_t i = 0; i < n_slots_; ++i) {
+        if (!(slot_busy_ & (1ull << i))) {
+          slot_busy_ |= (1ull << i);
+          wait_queue_.pop_front();
+          slot_cv_.notify_all();
+          return (int32_t)i;
+        }
+      }
+    }
+    if (stream && fd >= 0 && last_send) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - *last_send >= kKeepAlive) {
+        const std::string ka = make_sse_keepalive_chunk(envelope, obj, model_name_, is_chat);
+        lk.unlock();
+        const bool ok = send_all(fd, ka.data(), ka.size());
+        lk.lock();
+        if (!ok) {
+          remove_ticket();
+          return -1;
+        }
+        *last_send = now;
+        continue;
+      }
+    }
+    slot_cv_.wait_for(lk, kWakeInterval, [&] {
+      return !running_ ||
+             (!wait_queue_.empty() && wait_queue_.front() == ticket && slot_busy_ != all_busy);
+    });
+  }
 }
 
 void Server::release_slot(uint32_t s) {
   { std::lock_guard<std::mutex> lk(slot_mu_); slot_busy_ &= ~(1ull << s); }
-  slot_cv_.notify_one();
+  slot_cv_.notify_all();
 }
 
 
@@ -543,33 +782,44 @@ void Server::serve_one(int fd) {
   char buf[8192];
   size_t header_end = std::string::npos, content_len = 0;
   bool chunked = false;
+  ChunkedDecoder chunk_dec;
   for (;;) {
     const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-    if (n <= 0) { ::close(fd); return; }
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      ::close(fd);
+      return;
+    }
+    if (n == 0) { ::close(fd); return; }
     req.append(buf, (size_t)n);
     if (header_end == std::string::npos) {
       header_end = req.find("\r\n\r\n");
       if (header_end != std::string::npos) {
-        // Header names are case-insensitive (RFC 7230). A client or proxy that sends
-        // `content-length:` would otherwise read as a zero-length body, and the request would be
-        // answered as malformed rather than served. Lowercasing preserves offsets.
+        // Header names are case-insensitive (RFC 7230). Lowercasing preserves offsets.
         std::string h = req.substr(0, header_end);
         for (char& c : h) c = (char)std::tolower((unsigned char)c);
-        const size_t cl = h.find("content-length:");
+        const size_t cl = h.find("\r\ncontent-length:");
         if (cl != std::string::npos)
-          content_len = (size_t)std::strtoul(req.c_str() + cl + 15, nullptr, 10);
-        // A body of unknown length arrives chunked, which is what an HTTP client sends whenever it
-        // streams the request. There is no Content-Length to wait for, so the terminator is.
-        chunked = h.find("transfer-encoding:") != std::string::npos && h.find("chunked") != std::string::npos;
+          content_len = (size_t)std::strtoul(req.c_str() + cl + 17, nullptr, 10);
+        const size_t te = h.find("\r\ntransfer-encoding:");
+        if (te != std::string::npos) {
+          const size_t te_end = h.find("\r\n", te + 20);
+          const size_t chunk_at = h.find("chunked", te + 20);
+          chunked = chunk_at != std::string::npos && (te_end == std::string::npos || chunk_at < te_end);
+        }
+        if (chunked) chunk_dec.pos = header_end + 4;
       }
     }
     if (header_end == std::string::npos) continue;
-    if (chunked) { if (req.find("\r\n0\r\n", header_end) != std::string::npos) break; continue; }
+    if (chunked) {
+      if (chunk_dec.feed(req)) break;
+      if (chunk_dec.error) { ::close(fd); return; }
+      continue;
+    }
     if (req.size() >= header_end + 4 + content_len) break;
   }
   const std::string head = req.substr(0, header_end);
-  std::string body = req.substr(header_end + 4);
-  if (chunked) body = dechunk(body);
+  const std::string body = chunked ? std::move(chunk_dec.out) : req.substr(header_end + 4);
   const bool is_chat = head.find("/v1/chat/completions") != std::string::npos;
   const bool is_comp = head.find("/v1/completions") != std::string::npos;
   const bool is_models = head.find("/v1/models") != std::string::npos;
@@ -594,6 +844,17 @@ void Server::serve_one(int fd) {
         "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", ctype.c_str(), payload.size());
     send_all(fd, h, (size_t)n);
     send_all(fd, payload.data(), payload.size());
+  };
+
+  auto send_400 = [&](const std::string& msg) {
+    const std::string e = "{\"error\":{\"message\":\"" + json_escape(msg) +
+                          "\",\"type\":\"invalid_request_error\"}}";
+    char h[256];
+    const int n = std::snprintf(h, sizeof(h),
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", e.size());
+    send_all(fd, h, (size_t)n);
+    send_all(fd, e.data(), e.size());
   };
 
   if (is_health) {
@@ -645,13 +906,17 @@ void Server::serve_one(int fd) {
 
   CompletionRequest r;
   if (!parse_completion_request(body, is_chat, &r)) {
-    const std::string j = "{\"error\":{\"message\":\"bad request\",\"type\":\"invalid_request_error\"}}";
-    char h[256];
-    const int n = std::snprintf(h, sizeof(h),
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n", j.size());
-    send_all(fd, h, (size_t)n); send_all(fd, j.data(), j.size());
+    send_400("bad request");
     ::close(fd);
     return;
+  }
+  if (ctx_.preflight_check) {
+    const std::string err_msg = ctx_.preflight_check(r);
+    if (!err_msg.empty()) {
+      send_400(err_msg);
+      ::close(fd);
+      return;
+    }
   }
 
   // `id` and `created` are required by the OpenAI schema on both the completion and every chunk of a
@@ -664,36 +929,46 @@ void Server::serve_one(int fd) {
                                std::to_string((long long)::time(nullptr)) + ",\"object\":\"";
 
   if (r.stream) {
+    const std::string obj = is_chat ? "chat.completion.chunk" : "text_completion";
     const char* h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                     "Cache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
-    send_all(fd, h, std::strlen(h));
+    if (!send_all(fd, h, std::strlen(h))) {
+      ::close(fd);
+      return;
+    }
     bool alive = true;
-    const std::string obj = is_chat ? "chat.completion.chunk" : "text_completion";
     GenResult res;
+    constexpr auto kKeepAlive = std::chrono::seconds(15);
+    auto last_send = std::chrono::steady_clock::now();
     // Held for the whole request: the slot owns this sequence's KV until the turn is done. Step-
     // level exclusion is the generator's business, not the server's.
-    const uint32_t slot = acquire_slot();
+    const int32_t slot_i = acquire_slot(fd, true, envelope, obj, is_chat, &last_send);
+    if (slot_i < 0) {
+      ::close(fd);
+      return;
+    }
+    const uint32_t slot = (uint32_t)slot_i;
     struct Rel { Server* s; uint32_t i; ~Rel() { s->release_slot(i); } } rel{this, slot};
     // The first chat delta of a stream carries the role and nothing else to say it opens an
     // assistant message; clients key the new message on it, and OpenAI itself sends it.
     bool opened = false;
-    // Last time anything was written to the stream. An empty, not-done piece is the generator's heartbeat
-    // while it withholds a tool call; after kKeepAlive of silence it becomes an SSE comment line, which
-    // every SSE/OpenAI client ignores but which resets a client's body-idle timer.
-    constexpr auto kKeepAlive = std::chrono::seconds(15);
-    auto last_send = std::chrono::steady_clock::now();
     gen_(r, [&](const std::string& piece, Delta chan, bool done) -> bool {
       if (!alive || done) return alive;
       if (piece.empty()) {
+        if (!fd_alive(fd)) {
+          alive = false;
+          return false;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now - last_send >= kKeepAlive) {
-          alive = send_all(fd, ": keep-alive\n\n", 14);
+          const std::string ka = make_sse_keepalive_chunk(envelope, obj, model_name_, is_chat);
+          alive = send_all(fd, ka.data(), ka.size());
           last_send = now;
         }
         return alive;
       }
       last_send = std::chrono::steady_clock::now();
-      std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + model_name_ +
+      std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + json_escape(model_name_) +
                       "\",\"choices\":[{\"index\":0,";
       if (is_chat) {
         const std::string role = opened ? "" : "\"role\":\"assistant\",";
@@ -726,7 +1001,7 @@ void Server::serve_one(int fd) {
     // parsed. The final chunk also carries the finish_reason, which is what tells the client a tool
     // round trip is expected rather than a finished answer.
     if (alive && is_chat && !res.tool_calls.empty()) {
-      std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + model_name_ +
+      std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + json_escape(model_name_) +
                       "\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[";
       for (size_t i = 0; i < res.tool_calls.size(); ++i) {
         if (i) j += ",";
@@ -742,7 +1017,7 @@ void Server::serve_one(int fd) {
       alive = send_all(fd, j.data(), j.size());
     }
     if (alive) {
-      std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + model_name_ +
+      std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + json_escape(model_name_) +
                       "\",\"choices\":[{\"index\":0,";
       j += is_chat ? "\"delta\":{}" : "\"text\":\"\"";
       j += ",\"finish_reason\":\"" + res.finish_reason + "\"}]}\n\n";
@@ -750,7 +1025,7 @@ void Server::serve_one(int fd) {
     }
     // OpenAI puts usage in one extra chunk with an EMPTY choices array, only when asked for it.
     if (alive && r.include_usage) {
-      const std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + model_name_ +
+      const std::string j = "data: {" + envelope + obj + "\",\"model\":\"" + json_escape(model_name_) +
                             "\",\"choices\":[]," + usage_json(res) + "}\n\n";
       alive = send_all(fd, j.data(), j.size());
     }
@@ -761,23 +1036,22 @@ void Server::serve_one(int fd) {
 
   GenResult res;
   {
-    const uint32_t slot = acquire_slot();
+    const int32_t slot_i = acquire_slot(fd, false, envelope, "", is_chat, nullptr);
+    if (slot_i < 0) {
+      ::close(fd);
+      return;
+    }
+    const uint32_t slot = (uint32_t)slot_i;
     struct Rel { Server* s; uint32_t i; ~Rel() { s->release_slot(i); } } rel{this, slot};
-    gen_(r, [](const std::string&, Delta, bool) -> bool { return true; }, &res, slot);
+    gen_(r, [fd](const std::string&, Delta, bool) -> bool { return fd_alive(fd); }, &res, slot);
   }
   if (!res.error.empty()) {
-    const std::string e = "{\"error\":{\"message\":\"" + json_escape(res.error) +
-                          "\",\"type\":\"invalid_request_error\"}}";
-    char h[256];
-    const int n = std::snprintf(h, sizeof(h),
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
-        "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", e.size());
-    send_all(fd, h, (size_t)n); send_all(fd, e.data(), e.size());
+    send_400(res.error);
     ::close(fd);
     return;
   }
   std::string j = "{" + envelope + std::string(is_chat ? "chat.completion" : "text_completion") +
-                  "\",\"model\":\"" + model_name_ + "\",\"choices\":[{\"index\":0,";
+                  "\",\"model\":\"" + json_escape(model_name_) + "\",\"choices\":[{\"index\":0,";
   if (is_chat) {
     j += "\"message\":{\"role\":\"assistant\",\"content\":\"" + json_escape(res.content) + "\"";
     // Alongside content, as DeepSeek's own API returns it. Not in the OpenAI schema, and clients
@@ -809,6 +1083,7 @@ void Server::serve_one(int fd) {
 }
 
 bool Server::start(const std::string& host, uint16_t port, GenerateFn gen, std::string* err) {
+  stop();
   gen_ = std::move(gen);
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) { if (err) *err = "socket failed"; return false; }
@@ -818,27 +1093,62 @@ bool Server::start(const std::string& host, uint16_t port, GenerateFn gen, std::
   a.sin_family = AF_INET;
   a.sin_port = htons(port);
   a.sin_addr.s_addr = (host == "0.0.0.0") ? INADDR_ANY : inet_addr(host.c_str());
-  if (::bind(listen_fd_, (sockaddr*)&a, sizeof(a)) != 0) { if (err) *err = "bind failed"; return false; }
-  if (::listen(listen_fd_, 64) != 0) { if (err) *err = "listen failed"; return false; }
+  if (::bind(listen_fd_, (sockaddr*)&a, sizeof(a)) != 0) {
+    if (err) *err = "bind failed";
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+    return false;
+  }
+  if (::listen(listen_fd_, 64) != 0) {
+    if (err) *err = "listen failed";
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+    return false;
+  }
   socklen_t sl = sizeof(a);
   ::getsockname(listen_fd_, (sockaddr*)&a, &sl);
   port_ = ntohs(a.sin_port);
   running_ = true;
-  std::thread([this] {
+  accept_thread_ = std::thread([this] {
     while (running_) {
       const int fd = ::accept(listen_fd_, nullptr, nullptr);
-      if (fd < 0) { if (!running_) break; continue; }
+      if (fd < 0) {
+        if (!running_) break;
+        if (errno == EINTR) continue;
+        break;
+      }
+      {
+        std::lock_guard<std::mutex> lk(active_mu_);
+        ++active_workers_;
+      }
       // One thread per connection. With a latency-first scheduler at B<=4 the connection count is
       // small by design, so a thread pool would be complexity without benefit.
-      std::thread([this, fd] { serve_one(fd); }).detach();
+      std::thread([this, fd] {
+        struct WorkerGuard {
+          Server* s;
+          ~WorkerGuard() {
+            std::lock_guard<std::mutex> lk(s->active_mu_);
+            if (--s->active_workers_ == 0) s->active_cv_.notify_all();
+          }
+        } wg{this};
+        serve_one(fd);
+      }).detach();
     }
-  }).detach();
+  });
   return true;
 }
 
 void Server::stop() {
   running_ = false;
-  if (listen_fd_ >= 0) { ::shutdown(listen_fd_, SHUT_RDWR); ::close(listen_fd_); listen_fd_ = -1; }
+  slot_cv_.notify_all();
+  if (listen_fd_ >= 0) {
+    ::shutdown(listen_fd_, SHUT_RDWR);
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+  }
+  if (accept_thread_.joinable()) accept_thread_.join();
+  std::unique_lock<std::mutex> lk(active_mu_);
+  active_cv_.wait(lk, [this] { return active_workers_ == 0; });
 }
 
 } // namespace aff

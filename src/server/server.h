@@ -7,11 +7,14 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <condition_variable>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace aff {
@@ -114,6 +117,9 @@ struct ServerContext {
   std::string build_stamp = AFF_BUILD_STAMP;
   std::function<int64_t()> get_resident_experts;
   std::function<std::vector<uint64_t>()> get_free_vram_mib;
+  // Optional pre-flight validator invoked after parse_completion_request and BEFORE sending
+  // HTTP 200 OK headers or acquiring a slot. Non-empty return string produces HTTP 400.
+  std::function<std::string(const CompletionRequest&)> preflight_check;
 };
 
 // Emits one piece of output. Returning false asks generation to stop (client disconnected).
@@ -130,6 +136,7 @@ using GenerateFn =
 
 class Server {
 public:
+  ~Server() { stop(); }
   bool start(const std::string& host, uint16_t port, GenerateFn gen, std::string* err);
   void stop();
   void set_model_name(const std::string& n) { model_name_ = n; }
@@ -152,23 +159,31 @@ private:
   // The generator closes over one engine. Its KV cache is now per SLOT, so two requests in
   // different slots can be in flight at once; what they still share is the per-step scratch, and
   // the generator serializes individual steps on its own lock. This pool is therefore admission
-  // control, not mutual exclusion: it hands out slots and blocks when they are all taken, which is
-  // what stops a third request from having nowhere to put its KV.
-  //
-  // With n_slots_ == 1 this degenerates to exactly the old behaviour — one request at a time, the
-  // rest queue here.
-  uint32_t acquire_slot();
+  // control, not mutual exclusion: it hands out slots in strict FIFO ticket order and drops dead
+  // sockets before assigning a slot.
+  int32_t acquire_slot(int fd, bool stream, const std::string& envelope, const std::string& obj,
+                       bool is_chat, std::chrono::steady_clock::time_point* last_send);
   void release_slot(uint32_t s);
   std::mutex slot_mu_;
   std::condition_variable slot_cv_;
   uint64_t slot_busy_ = 0;              // bit s set == slot s is taken
   uint32_t n_slots_ = 1;
+  std::deque<uint64_t> wait_queue_;
+  uint64_t next_ticket_ = 0;
   GenerateFn gen_;
   std::atomic<bool> running_{false};
+  std::thread accept_thread_;
+  std::mutex active_mu_;
+  std::condition_variable active_cv_;
+  uint32_t active_workers_ = 0;
 };
 
 // Exposed for testing.
 bool parse_completion_request(const std::string& body, bool chat, CompletionRequest* out);
+bool fd_alive(int fd);
+std::string make_sse_keepalive_chunk(const std::string& envelope, const std::string& obj,
+                                     const std::string& model_name, bool is_chat);
+bool dechunk_http_body(const std::string& in, std::string* out);
 size_t utf8_safe_end(const std::string& s, size_t limit);
 std::string sanitize_utf8(const std::string& s);
 std::string json_escape(const std::string& s);
