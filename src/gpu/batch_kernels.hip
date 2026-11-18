@@ -2882,13 +2882,23 @@ uint32_t fp8_narrow_mw(uint32_t rows) {
   return tiles >= 8u ? 1u : 8u;                          // too short to split; one block will do
 }
 
+inline bool fp8_narrow128_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_FP8_NARROW128");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
 bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_t* X,
                               const float* Sx, uint32_t cols, uint32_t nb, uint32_t x_ld,
                               uint32_t sx_ld, void* stream, bool preshuffled, const char* aff_file,
                               uint32_t aff_line) {
   if (!n || n > kGemmJobsMax || nb > wmma::kN) return false;
-  if ((cols % kFKNarrow) != 0) return false;
-  const bool use128 = (cols % kFKNarrowWide) != 0u;
+  const bool n128 = fp8_narrow128_enabled();
+  const uint32_t min_align = n128 ? kFKNarrow : kFKNarrowWide;
+  if ((cols % min_align) != 0) return false;
+  const bool use128 = n128 && ((cols % kFKNarrowWide) != 0u);
   const uint32_t k_unit = use128 ? kFKNarrow : kFKNarrowWide;
   if (gemm_profiling())
     for (uint32_t i = 0; i < n; ++i)
@@ -2977,8 +2987,9 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
   // One 16-wide token tile once nb fits in one and cols is a multiple of kFKNarrow (128), eight
   // otherwise. Keep kFKNarrowWide (256) when cols % 256 == 0 and specialize kFKNarrow (128) for
   // shapes such as TP=2 shexp_down (cols = 1152).
-  const bool narrow = nb <= wmma::kN && (cols % kFKNarrow) == 0;
-  const bool use128 = narrow && ((cols % kFKNarrowWide) != 0u);
+  const bool n128 = fp8_narrow128_enabled();
+  const bool narrow = nb <= wmma::kN && (cols % (n128 ? kFKNarrow : kFKNarrowWide)) == 0;
+  const bool use128 = narrow && n128 && ((cols % kFKNarrowWide) != 0u);
   const uint32_t nt = narrow ? 1u : kFNTiles;
   const uint32_t fn = nt * 16u;
   // The M tile. Wide calls keep the 8-wave block they were tuned with; narrow ones want as many

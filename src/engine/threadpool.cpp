@@ -2,6 +2,10 @@
 
 #include <algorithm>
 
+#ifdef __linux__
+#include <sched.h>
+#endif
+
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #define AFF_PAUSE() _mm_pause()
@@ -125,6 +129,12 @@ ThreadPool& global_pool() {
     // but on this kernel that is a wash rather than a loss, and halving the count leaves half the
     // machine out of the expert share. The pool sleeps when idle, so the extra threads cost nothing
     // when the engine is not decoding.
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0 && CPU_COUNT(&cpuset) > 0)
+      return (unsigned)CPU_COUNT(&cpuset);
+#endif
     const unsigned hc = std::thread::hardware_concurrency();
     return hc > 1 ? hc : 1u;
   }());

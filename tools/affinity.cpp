@@ -2448,7 +2448,8 @@ int main(int argc, char** argv) {
         const uint32_t q_off = std::min<uint32_t>(nd + 1, kMaxQ - 1);
         last_clean_accept = (k == nd);
         // Update step cost EMA after warmup (ignore first 2 cold steps per width, clamp outliers).
-        if (++cost_samples[q_off] > 2 && step_ms > 1.0) {
+        // Under greedy decoding (temp=0 / !sc), avoid wall-clock timing jitter altering verify width decisions (PR #967).
+        if (sc && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
           const float clamped_ms = std::min((float)step_ms, cost_ema[q_off] * 1.25f);
           cost_ema[q_off] = 0.85f * cost_ema[q_off] + 0.15f * clamped_ms;
         }
@@ -3338,7 +3339,8 @@ int main(int argc, char** argv) {
         pre_ok = model.forward_prefill(ids.data() + from, promote - from, &st, nullptr,
                                        nullptr, nullptr, true, &blk);
       }
-      if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
+      dense_gpu.sync_devices();
+      if (dense_gpu.n_slots() > 1) dense_gpu.tp_reset_seq();
       watch_prefill(false);
       if (!pre_ok || !heartbeat_fn()) {
         dash.stage(aff::ui::Stage::Serve, serve_addr);
@@ -3371,7 +3373,8 @@ int main(int argc, char** argv) {
                                        nullptr, nullptr, true, &blk,
                                        pv.count > 0 ? &pv : nullptr);
       }
-      if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
+      dense_gpu.sync_devices();
+      if (dense_gpu.n_slots() > 1) dense_gpu.tp_reset_seq();
       watch_prefill(false);
       if (!pre_ok || !heartbeat_fn()) {
         dash.stage(aff::ui::Stage::Serve, serve_addr);

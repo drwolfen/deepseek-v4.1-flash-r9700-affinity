@@ -38,6 +38,9 @@
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 namespace aff {
 
@@ -755,7 +758,15 @@ struct EngramBgWorker {
   std::thread th;
 
   EngramBgWorker() {
-    const unsigned hc = std::thread::hardware_concurrency();
+    unsigned hc = std::thread::hardware_concurrency();
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+      const int cnt = CPU_COUNT(&cpuset);
+      if (cnt > 0) hc = hc ? std::min(hc, (unsigned)cnt) : (unsigned)cnt;
+    }
+#endif
     const unsigned nthr = std::min(8u, std::max(2u, hc ? hc / 2u : 4u));
     pool = std::make_unique<aff::ThreadPool>(nthr);
     th = std::thread([this] { run(); });
@@ -1878,6 +1889,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
     // DSpark verify blocks), and overlap later slots (layer 14) asynchronously on the background
     // pool while GPUs execute layers 0..13.
     const uint32_t eng_in_dim = eng_c_.n_cols * eng_c_.head_dim;
+    const bool async_eng_tail = (eng_on_ && live >= 64u && eng_c_.n_layer > 1u);
     if (eng_on_ && eng_c_.n_layer > 0) {
       if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
       eng_ids_.resize((size_t)live * eng_c_.n_layer * eng_c_.n_cols);
@@ -1889,27 +1901,36 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         alive_ptr = sc.eng_alive.data();
       }
       eng_h_.push(ids + base, live, pos0, eng_ids_.data(), alive_ptr);
-      parallel_for((uint64_t)live, 2, [&](uint64_t t0, uint64_t t1) {
-        for (uint64_t t = t0; t < t1; ++t) {
-          eng_t_.gather(0, eng_ids_.data() + (size_t)t * eng_c_.n_layer * eng_c_.n_cols,
-                        eng_rows_.data() + (size_t)t * eng_in_dim);
+      if (live < 64u) {
+        for (uint32_t i = 0; i < eng_c_.n_layer; ++i) {
+          for (uint32_t t = 0; t < live; ++t) {
+            eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
+                          eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+          }
         }
-      });
-      if (eng_c_.n_layer > 1u) {
-        if (!sc.eng_bg) sc.eng_bg = std::make_unique<EngramBgWorker>();
-        EngramBgWorker* const bg = sc.eng_bg.get();
-        const uint32_t tail_layers = eng_c_.n_layer - 1u;
-        const uint64_t tail_jobs = (uint64_t)tail_layers * live;
-        bg->launch([this, bg, live, eng_in_dim, tail_jobs] {
-          bg->parallel_for_tail(tail_jobs, 2, [&](uint64_t j0, uint64_t j1) {
-            for (uint64_t j = j0; j < j1; ++j) {
-              const uint32_t i = 1u + (uint32_t)(j / live);
-              const uint64_t t = j % live;
-              eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
-                            eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
-            }
-          });
+      } else {
+        parallel_for((uint64_t)live, 32, [&](uint64_t t0, uint64_t t1) {
+          for (uint64_t t = t0; t < t1; ++t) {
+            eng_t_.gather(0, eng_ids_.data() + (size_t)t * eng_c_.n_layer * eng_c_.n_cols,
+                          eng_rows_.data() + (size_t)t * eng_in_dim);
+          }
         });
+        if (async_eng_tail) {
+          if (!sc.eng_bg) sc.eng_bg = std::make_unique<EngramBgWorker>();
+          EngramBgWorker* const bg = sc.eng_bg.get();
+          const uint32_t tail_layers = eng_c_.n_layer - 1u;
+          const uint64_t tail_jobs = (uint64_t)tail_layers * live;
+          bg->launch([this, bg, live, eng_in_dim, tail_jobs] {
+            bg->parallel_for_tail(tail_jobs, 32, [&](uint64_t j0, uint64_t j1) {
+              for (uint64_t j = j0; j < j1; ++j) {
+                const uint32_t i = 1u + (uint32_t)(j / live);
+                const uint64_t t = j % live;
+                eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
+                              eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+              }
+            });
+          });
+        }
       }
     }
 
@@ -1920,7 +1941,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       EngramBgWorker* w = nullptr;
       void sync() { if (w) { w->wait(); w = nullptr; } }
       ~EngramWaitGuard() { sync(); }
-    } eng_wait{eng_on_ && eng_c_.n_layer > 1u ? sc.eng_bg.get() : nullptr};
+    } eng_wait{async_eng_tail ? sc.eng_bg.get() : nullptr};
 
     for (uint32_t l = 0; l < layer_limit; ++l) {
       const LayerWeights& w = layers_[l];
