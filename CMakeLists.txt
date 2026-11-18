@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(affinity-engine VERSION 5.1.2 LANGUAGES CXX)
+project(affinity-engine VERSION 5.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,7 +44,7 @@ else()
       set(AFF_VERSION_STR "v${AFF_VER_FILE}")
     endif()
   else()
-    set(AFF_VERSION_STR "v5.1.2")
+    set(AFF_VERSION_STR "v5.2.0")
   endif()
 endif()
 

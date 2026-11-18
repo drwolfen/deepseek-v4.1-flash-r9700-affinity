@@ -290,7 +290,7 @@ struct DsparkWeights {
 
 class Model {
 public:
-  Model() = default;
+  Model();
   ~Model();
   bool load(const std::string& aff_path, std::string* err);
   // The companion container written by `aff-quantize --dspark`. Call AFTER load(): it binds

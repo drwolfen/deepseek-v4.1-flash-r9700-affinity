@@ -758,6 +758,7 @@ inline void ensure_size(std::vector<T>& v, size_t n) {
 }
 }  // namespace
 
+Model::Model() = default;
 Model::~Model() = default;
 
 // Nothing here is sized by the context window any more — see LayerState. The device allocators are

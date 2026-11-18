@@ -3239,10 +3239,19 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> hist = ids;
 
     // Prefill liveness & SSE keepalive callback (stream emits OpenAI empty-delta SSE chunk every
-    // 15s and checks fd_alive; non-stream checks fd_alive). Wave 1C hooks this into
-    // model.set_prefill_alive(...).
+    // 15s and checks fd_alive; non-stream checks fd_alive).
     std::function<bool()> heartbeat_fn = [&sink]() -> bool {
       return sink(std::string(), Delta::Content, false);
+    };
+    struct PrefillAliveGuard {
+      Model& m;
+      PrefillAliveGuard(Model& model, std::function<bool()>* fn) : m(model) {
+        m.set_prefill_alive(
+            [](void* ctx) -> bool { return (*static_cast<std::function<bool()>*>(ctx))(); }, fn);
+      }
+      ~PrefillAliveGuard() { m.set_prefill_alive(nullptr, nullptr); }
+      PrefillAliveGuard(const PrefillAliveGuard&) = delete;
+      PrefillAliveGuard& operator=(const PrefillAliveGuard&) = delete;
     };
 
     Model::BlockOut blk;
@@ -3314,15 +3323,25 @@ int main(int argc, char** argv) {
       if (b > from && b + c.sliding <= n_pre) promote = (uint32_t)b;
     }
     if (promote) {
+      if (!heartbeat_fn()) {
+        res->finish_reason = "stop";
+        sink("", Delta::Content, true);
+        return;
+      }
       std::unique_lock<std::mutex> step(engine_mu);
       dense_gpu.set_slot(slot);
       kv_reserve_for((uint64_t)promote + 2);
       watch_prefill(true);
-      const bool pre_ok = model.forward_prefill(ids.data() + from, promote - from, &st, nullptr,
-                                                nullptr, nullptr, true, &blk);
+      bool pre_ok = false;
+      {
+        PrefillAliveGuard alive_guard(model, &heartbeat_fn);
+        pre_ok = model.forward_prefill(ids.data() + from, promote - from, &st, nullptr,
+                                       nullptr, nullptr, true, &blk);
+      }
       if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       watch_prefill(false);
-      if (!pre_ok) {
+      if (!pre_ok || !heartbeat_fn()) {
+        dash.stage(aff::ui::Stage::Serve, serve_addr);
         res->finish_reason = "stop";
         sink("", Delta::Content, true);
         return;
@@ -3345,12 +3364,17 @@ int main(int argc, char** argv) {
       dense_gpu.set_slot(slot);
       kv_reserve_for((uint64_t)ids.size() + 2);
       watch_prefill(true);
-      const bool pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
-                                                nullptr, nullptr, true, &blk,
-                                                pv.count > 0 ? &pv : nullptr);
+      bool pre_ok = false;
+      {
+        PrefillAliveGuard alive_guard(model, &heartbeat_fn);
+        pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
+                                       nullptr, nullptr, true, &blk,
+                                       pv.count > 0 ? &pv : nullptr);
+      }
       if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       watch_prefill(false);
       if (!pre_ok || !heartbeat_fn()) {
+        dash.stage(aff::ui::Stage::Serve, serve_addr);
         res->finish_reason = "stop";
         sink("", Delta::Content, true);
         return;
