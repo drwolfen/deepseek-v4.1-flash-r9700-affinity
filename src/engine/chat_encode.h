@@ -85,6 +85,22 @@ struct ParsedMessage {
 // One assistant turn of model output, with or without its trailing EOS.
 ParsedMessage parse_completion(const std::string& text, ThinkingMode mode);
 
+// Incremental scanner for detecting the end of a DSML or bare `<invoke>` tool-call block
+// while ignoring embedded closing tags inside open `<parameter>` or `<invoke>` elements.
+struct ToolBlockScanState {
+  size_t pos = 0;
+  bool initialized = false;
+  int calls_depth = 0;
+  int inv_depth = 0;
+  int param_depth = 0;
+  bool saw_calls = false;
+  bool saw_inv = false;
+
+  size_t scan(const std::string& s, size_t at);
+};
+
+size_t tool_block_close_end(const std::string& s, size_t at);
+
 // Exposed for the tests and for the streaming path, which has to hold back any prefix that might
 // still turn into a tool-call marker.
 extern const char* const kToolCallsOpen;      // "\n\n<｜DSML｜tool_calls"

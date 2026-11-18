@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <set>
 
 namespace aff {
@@ -526,7 +527,8 @@ std::string repair_bare_dsml(const std::string& s, ThinkingMode mode) {
   size_t body_start = 0;
   if (mode == ThinkingMode::Thinking) {
     const size_t te = t.find(kThinkEnd);
-    if (te != std::string::npos) body_start = te + std::string(kThinkEnd).size();
+    if (te == std::string::npos) return t;
+    body_start = te + std::string(kThinkEnd).size();
   }
 
   std::string body = t.substr(body_start);
@@ -834,13 +836,13 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
         tc.name = text.substr(p, gt - p);
         p = gt + 1;
       } else {
-        size_t nq = text.find("name=\"", p);
-        if (nq == std::string::npos) return fail("tool name format");
-        size_t ne = text.find('"', nq + 6);
-        if (ne == std::string::npos) return fail("tool name format");
-        tc.name = text.substr(nq + 6, ne - (nq + 6));
-        size_t gt = text.find('>', ne);
+        size_t gt = text.find('>', p);
         if (gt == std::string::npos) return fail("tool name format");
+        size_t nq = text.find("name=\"", p);
+        if (nq == std::string::npos || nq >= gt) return fail("tool name format");
+        size_t ne = text.find('"', nq + 6);
+        if (ne == std::string::npos || ne >= gt) return fail("tool name format");
+        tc.name = text.substr(nq + 6, ne - (nq + 6));
         p = gt + 1;
       }
 
@@ -906,17 +908,20 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
           key = text.substr(p, gt - p);
           p = gt + 1;
         } else {
-          size_t kq = text.find("name=\"", p);
-          if (kq == std::string::npos) return fail("parameter format: missing name=\"");
-          size_t ke = text.find('"', kq + 6);
-          if (ke == std::string::npos) return fail("parameter format");
-          key = text.substr(kq + 6, ke - (kq + 6));
-          size_t sq = text.find("string=\"", ke);
-          size_t gt = text.find('>', ke);
+          size_t gt = text.find('>', p);
           if (gt == std::string::npos) return fail("parameter format: missing '>'");
+          size_t kq = text.find("name=\"", p);
+          if (kq == std::string::npos || kq >= gt) return fail("parameter format: missing name=\"");
+          size_t ke = text.find('"', kq + 6);
+          if (ke == std::string::npos || ke >= gt) return fail("parameter format");
+          key = text.substr(kq + 6, ke - (kq + 6));
+          size_t sq = text.find("string=\"", p);
+          if (sq != std::string::npos && sq >= kq && sq <= ke) {
+            sq = text.find("string=\"", ke + 1);
+          }
           if (sq != std::string::npos && sq < gt) {
             size_t se = text.find('"', sq + 8);
-            if (se == std::string::npos || se > gt) return fail("parameter format");
+            if (se == std::string::npos || se >= gt) return fail("parameter format");
             is_str = text.substr(sq + 8, se - (sq + 8));
           }
           if (is_str != "true" && is_str != "false")
@@ -946,8 +951,9 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
         auto test_candidate = [&](size_t at, size_t clen, bool respect_quotes) -> bool {
           if (respect_quotes && is_in_quoted_call(at)) return false;
           const size_t after = skip_ws_local(text, at + clen);
-          if (after == text.size()) return true;
-          if (text.compare(after, po_v41.size(), po_v41) == 0 ||
+          const bool next_ok =
+              after == text.size() ||
+              text.compare(after, po_v41.size(), po_v41) == 0 ||
               text.compare(after, po_v4.size(), po_v4) == 0 ||
               text.compare(after, po_bare.size(), po_bare) == 0 ||
               text.compare(after, ic_v41.size(), ic_v41) == 0 ||
@@ -956,14 +962,13 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
               text.compare(after, ic_func.size(), ic_func) == 0 ||
               text.compare(after, cl_v41.size(), cl_v41) == 0 ||
               text.compare(after, cl_v4.size(), cl_v4) == 0 ||
-              text.compare(after, cl_xml.size(), cl_xml) == 0) {
-            if (is_str == "false") {
-              std::string cand_val = text.substr(val_start, at - val_start);
-              if (!is_valid_json_non_string(cand_val)) return false;
-            }
-            return true;
+              text.compare(after, cl_xml.size(), cl_xml) == 0;
+          if (!next_ok) return false;
+          if (is_str == "false") {
+            std::string cand_val = text.substr(val_start, at - val_start);
+            if (!is_valid_json_non_string(cand_val)) return false;
           }
-          return false;
+          return true;
         };
 
         for (const bool respect_quotes : {true, false}) {
@@ -1025,6 +1030,212 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
   }
 
   return out;
+}
+
+size_t ToolBlockScanState::scan(const std::string& s, size_t at) {
+  if (!initialized) {
+    pos = at;
+    initialized = true;
+  }
+  const std::string ds(kDsml);
+  const std::string calls_o1 = "<" + ds + " calls";
+  const std::string calls_o2 = "<" + ds + "tool_calls";
+  const std::string calls_o3 = "<" + ds + "calls>";
+  const std::string calls_o4 = "<" + ds + ">";
+
+  const std::string inv_o1 = "<" + ds + " invoke";
+  const std::string inv_o2 = "<" + ds + "invoke";
+  const std::string inv_o3 = "<invoke";
+
+  const std::string par_o1 = "<" + ds + " parameter";
+  const std::string par_o2 = "<" + ds + "parameter";
+  const std::string par_o3 = "<parameter";
+
+  const std::string par_c1 = "</" + ds + " parameter>";
+  const std::string par_c2 = "</" + ds + "parameter>";
+  const std::string par_c3 = "</parameter>";
+
+  const std::string inv_c1 = "</" + ds + " invoke>";
+  const std::string inv_c2 = "</" + ds + "invoke>";
+  const std::string inv_c3 = "</invoke>";
+
+  const std::string calls_c1 = "</" + ds + " calls>";
+  const std::string calls_c2 = "</" + ds + "tool_calls>";
+  const std::string calls_c3 = "</" + ds + "calls>";
+  const std::string calls_c4 = "</" + ds + ">";
+
+  const std::string* all_tags[] = {
+      &calls_o1, &calls_o2, &calls_o3, &calls_o4,
+      &inv_o1,   &inv_o2,   &inv_o3,
+      &par_o1,   &par_o2,   &par_o3,
+      &par_c1,   &par_c2,   &par_c3,
+      &inv_c1,   &inv_c2,   &inv_c3,
+      &calls_c1, &calls_c2, &calls_c3, &calls_c4,
+  };
+
+  auto is_ws_or_gt = [](char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>';
+  };
+
+  while (pos < s.size()) {
+    const size_t lt = s.find('<', pos);
+    if (lt == std::string::npos) {
+      pos = s.size();
+      return std::string::npos;
+    }
+    pos = lt;
+    const size_t rem = s.size() - lt;
+
+    // Hold at `lt` if the tail of `s` is a strict prefix of any tracked tag so a tag split
+    // across tokens is never skipped.
+    for (const std::string* tag : all_tags) {
+      if (rem < tag->size() && tag->compare(0, rem, s, lt, rem) == 0) {
+        return std::string::npos;
+      }
+    }
+
+    auto match_open_delim = [&](const std::string& tag, bool allow_eq, bool* need_more) -> bool {
+      if (rem < tag.size() || s.compare(lt, tag.size(), tag) != 0) return false;
+      if (rem == tag.size()) { *need_more = true; return false; }
+      const char nxt = s[lt + tag.size()];
+      return is_ws_or_gt(nxt) || (allow_eq && nxt == '=');
+    };
+    auto match_exact = [&](const std::string& tag) -> bool {
+      return rem >= tag.size() && s.compare(lt, tag.size(), tag) == 0;
+    };
+
+    bool need_more = false;
+    // 1. Calls openers
+    if (match_open_delim(calls_o1, false, &need_more)) {
+      ++calls_depth; saw_calls = true; pos = lt + calls_o1.size(); continue;
+    }
+    if (need_more) return std::string::npos;
+    if (match_open_delim(calls_o2, false, &need_more)) {
+      ++calls_depth; saw_calls = true; pos = lt + calls_o2.size(); continue;
+    }
+    if (need_more) return std::string::npos;
+    if (match_exact(calls_o3)) {
+      ++calls_depth; saw_calls = true; pos = lt + calls_o3.size(); continue;
+    }
+    if (match_exact(calls_o4) && param_depth == 0 && inv_depth == 0) {
+      ++calls_depth; saw_calls = true; pos = lt + calls_o4.size(); continue;
+    }
+
+    // 2. Invoke openers
+    if (match_open_delim(inv_o1, false, &need_more)) {
+      ++inv_depth; saw_inv = true; pos = lt + inv_o1.size(); continue;
+    }
+    if (need_more) return std::string::npos;
+    if (match_open_delim(inv_o2, false, &need_more)) {
+      ++inv_depth; saw_inv = true; pos = lt + inv_o2.size(); continue;
+    }
+    if (need_more) return std::string::npos;
+    if (match_open_delim(inv_o3, false, &need_more)) {
+      ++inv_depth; saw_inv = true; pos = lt + inv_o3.size(); continue;
+    }
+    if (need_more) return std::string::npos;
+
+    // 3. Parameter openers
+    if (match_open_delim(par_o1, false, &need_more)) {
+      ++param_depth; pos = lt + par_o1.size(); continue;
+    }
+    if (need_more) return std::string::npos;
+    if (match_open_delim(par_o2, false, &need_more)) {
+      ++param_depth; pos = lt + par_o2.size(); continue;
+    }
+    if (need_more) return std::string::npos;
+    if (match_open_delim(par_o3, true, &need_more)) {
+      ++param_depth; pos = lt + par_o3.size(); continue;
+    }
+    if (need_more) return std::string::npos;
+
+    // 4. Parameter closers
+    size_t par_clen = 0;
+    if (match_exact(par_c1)) par_clen = par_c1.size();
+    else if (match_exact(par_c2)) par_clen = par_c2.size();
+    else if (match_exact(par_c3)) par_clen = par_c3.size();
+    if (par_clen) {
+      if (param_depth > 0) {
+        const size_t after = skip_ws_local(s, lt + par_clen);
+        if (after == s.size()) return std::string::npos;
+        const size_t arem = s.size() - after;
+        const std::string ds_open = "<" + ds;
+        const std::string ds_close = "</" + ds;
+        if (arem < ds_open.size() && ds_open.compare(0, arem, s, after, arem) == 0)
+          return std::string::npos;
+        if (arem < ds_close.size() && ds_close.compare(0, arem, s, after, arem) == 0)
+          return std::string::npos;
+        if (s.compare(after, ds_open.size(), ds_open) == 0 ||
+            s.compare(after, ds_close.size(), ds_close) == 0) {
+          --param_depth;
+        } else {
+          const char* next_tags[] = {"<parameter", "</parameter>", "</invoke>",
+                                     "</tool_call>", "</function>"};
+          for (const char* nt : next_tags) {
+            const size_t nlen = std::strlen(nt);
+            if (arem < nlen && std::strncmp(s.data() + after, nt, arem) == 0)
+              return std::string::npos;
+            if (arem >= nlen && s.compare(after, nlen, nt) == 0) {
+              --param_depth;
+              break;
+            }
+          }
+        }
+      }
+      pos = lt + par_clen;
+      continue;
+    }
+
+    // 5. Invoke closers
+    size_t inv_clen = 0;
+    bool bare_inv_close = false;
+    if (match_exact(inv_c1)) inv_clen = inv_c1.size();
+    else if (match_exact(inv_c2)) inv_clen = inv_c2.size();
+    else if (match_exact(inv_c3)) { inv_clen = inv_c3.size(); bare_inv_close = true; }
+    if (inv_clen) {
+      if (param_depth > 0) {
+        if (inv_depth > 1) --inv_depth;
+        pos = lt + inv_clen;
+        continue;
+      }
+      if (inv_depth > 0) --inv_depth;
+      pos = lt + inv_clen;
+      if (bare_inv_close && !saw_calls && calls_depth == 0 && inv_depth == 0 && param_depth == 0) {
+        return pos;
+      }
+      continue;
+    }
+
+    // 6. Calls closers
+    size_t calls_clen = 0;
+    if (match_exact(calls_c1)) calls_clen = calls_c1.size();
+    else if (match_exact(calls_c2)) calls_clen = calls_c2.size();
+    else if (match_exact(calls_c3)) calls_clen = calls_c3.size();
+    else if (match_exact(calls_c4)) calls_clen = calls_c4.size();
+    if (calls_clen) {
+      if (param_depth > 0 || inv_depth > 0) {
+        if (calls_depth > 1) --calls_depth;
+        pos = lt + calls_clen;
+        continue;
+      }
+      if (calls_depth > 1) {
+        --calls_depth;
+        pos = lt + calls_clen;
+        continue;
+      }
+      calls_depth = 0;
+      pos = lt + calls_clen;
+      return pos;
+    }
+
+    pos = lt + 1;
+  }
+  return std::string::npos;
+}
+
+size_t tool_block_close_end(const std::string& s, size_t at) {
+  ToolBlockScanState st;
+  return st.scan(s, at);
 }
 
 }  // namespace aff

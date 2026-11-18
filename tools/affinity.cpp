@@ -38,7 +38,9 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <string>
+#include <string_view>
 
 using namespace aff;
 
@@ -204,46 +206,7 @@ static bool load_expert_profile(const std::string& path, std::vector<float>* out
   return true;
 }
 
-// ---- marker-less (bare) tool-call support ---------------------------------------------------
-//
-// The model occasionally drops the DSML marker character and writes a bare `<invoke name="X">`
-// block. The stream hold-back keys on the marker, so without this the block streams as content and
-// a model that does not EOS after the call rambles for thousands of tokens. This returns the END
-// index of the matching close — the marked tool_calls wrapper for a wrapped block, otherwise the
-// bare `</invoke>` — so the turn can be truncated there and generation stopped. The marker char is
-// built from its UTF-8 bytes (U+FF5C) rather than typed, so this file needs no exotic literals.
-static std::size_t tool_block_close_end(const std::string& s, std::size_t at) {
-  const std::string ds = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";   // "｜DSML｜" (U+FF5C bars)
-  const bool marked = s.find(std::string("<") + ds, at) != std::string::npos;
-  if (marked) {
-    for (const std::string& cl : {std::string("</") + ds + "tool_calls>",
-                                  std::string("</") + ds + " calls>",
-                                  std::string("</") + ds + "calls>",
-                                  std::string("</") + ds + ">"}) {
-      for (size_t p = s.find(cl, at); p != std::string::npos; p = s.find(cl, p + 1)) {
-        const size_t after = p + cl.size();
-        size_t p_closer = s.find("</" + ds + " parameter>", after);
-        size_t p_closer2 = s.find("</" + ds + "parameter>", after);
-        size_t p_closer3 = s.find("</parameter>", after);
-        size_t closer = std::min({p_closer, p_closer2, p_closer3});
-        size_t next_open = std::min({s.find("<" + ds + " calls", after),
-                                     s.find("<" + ds + "tool_calls", after)});
-        if (closer != std::string::npos && (next_open == std::string::npos || closer < next_open))
-          continue;
-        return p + cl.size();
-      }
-    }
-    return std::string::npos;
-  }
-  // Marker-less form: the first </invoke> after the open (the bare form has no wrapper close).
-  for (size_t p = s.find("</invoke>", at); p != std::string::npos; p = s.find("</invoke>", p + 1)) {
-    const size_t after = p + 9;
-    size_t closer = s.find("</parameter>", after);
-    if (closer != std::string::npos) continue;
-    return p + 9;
-  }
-  return std::string::npos;
-}
+// `ToolBlockScanState` and `tool_block_close_end` live in `engine/chat_encode.h`.
 
 int main(int argc, char** argv) {
   aff::print_build_stamp("affinity");
@@ -2183,7 +2146,8 @@ int main(int argc, char** argv) {
       if (occurrences >= need)
         for (const auto& c : cont)
           if (c.second >= 2) out.push_back(c.first);
-      if (std::getenv("AFF_DRY_DEBUG"))
+      static const bool dry_dbg = std::getenv("AFF_DRY_DEBUG") != nullptr;
+      if (dry_dbg)
         aff::ui::err("dry: hist %zu ng %zu occ %u cont %zu kept %zu delta %.1f\n", hist.size(), ng,
                      occurrences, cont.size(), out.size(), (double)sc->dry_delta);
     };
@@ -2239,7 +2203,10 @@ int main(int argc, char** argv) {
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
     uint32_t next = first, generated = 0;
     bool stop = false;
+    std::vector<double> accept_u;
+    accept_u.reserve(B + 1);
     while (generated < max_new && !stop) {
+      if (sc) dry_ids_for(vb.dry_ids);
       // ONE BLOCK is one step. Taken here and dropped right after `rollback`, which is the last
       // thing in the iteration that touches the device: everything below it is host bookkeeping and
       // the emit callback, and emit writes to a socket.
@@ -2376,11 +2343,10 @@ int main(int argc, char** argv) {
       // The proposals the target is asked to price, and the uniforms its draws use. Position j is
       // the target's prediction for fed[j+1], so that is the proposal at j; the last position has
       // none and is the bonus token.
-      std::vector<double> accept_u(nd + 1);
       if (sc) {
         vb.query.assign(nd + 1, 0xFFFFFFFFu);
-        dry_ids_for(vb.dry_ids);
         vb.uniforms.assign(2u * (nd + 1), 0.0f);
+        accept_u.resize(nd + 1);
         if (!forcing) {
           for (uint32_t j = 0; j < nd; ++j) vb.query[j] = fed[j + 1];
         }
@@ -2482,8 +2448,7 @@ int main(int argc, char** argv) {
         const uint32_t q_off = std::min<uint32_t>(nd + 1, kMaxQ - 1);
         last_clean_accept = (k == nd);
         // Update step cost EMA after warmup (ignore first 2 cold steps per width, clamp outliers).
-        // Under greedy decoding (temp=0 / !sc), avoid wall-clock timing jitter altering verify width decisions (PR #967).
-        if (sc && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
+        if (++cost_samples[q_off] > 2 && step_ms > 1.0) {
           const float clamped_ms = std::min((float)step_ms, cost_ema[q_off] * 1.25f);
           cost_ema[q_off] = 0.85f * cost_ema[q_off] + 0.15f * clamped_ms;
         }
@@ -2595,7 +2560,7 @@ int main(int argc, char** argv) {
       // placement report are the result of the run and all of them still get printed.
       if (dash.quit_requested()) stop = true;
     }
-    if (std::getenv("AFF_SLOT_DEBUG"))
+    if (slot_dbg)
       aff::ui::err("LOCAL slot %u: %u blocks, %u accepted (%.2f tok/blk), %u generated\n", slot, my_blocks,
                    my_accepted, my_blocks ? (double)generated / my_blocks : 0.0, generated);
     return generated;
@@ -2617,7 +2582,6 @@ int main(int argc, char** argv) {
                   force_ids.size());
     SeqState st;
     model.init_state(&st, ids.size() + (uint64_t)n_predict + 8);
-    std::vector<float> logits;
     std::vector<uint32_t> hist = ids;
 
     // The draft's window is seeded from the prompt before the first block can be drafted: its
@@ -2659,7 +2623,7 @@ int main(int argc, char** argv) {
     // --no-routed-experts has to reach here too, not only --dump-logits, or the one flag for
     // isolating the dense path is a silent no-op in the mode the benchmark runs in.
     if (ids.size() > 1 &&
-        !model.forward_prefill(ids.data(), (uint32_t)ids.size() - 1, &st, nullptr, nullptr, &logits,
+        !model.forward_prefill(ids.data(), (uint32_t)ids.size() - 1, &st, nullptr, nullptr, nullptr,
                                !no_routed, spec ? &blk : nullptr)) {
       // With the draft on this is not a slower prefill but one that produced no tap, after which
       // the draft attends to 128 rows of zeros and proposes nothing anyone accepts.
@@ -2668,7 +2632,7 @@ int main(int argc, char** argv) {
         return 1;
       }
       for (size_t i = 0; i + 1 < ids.size(); ++i)
-        model.forward_token(ids[i], &st, nullptr, nullptr, &logits, !no_routed);
+        model.forward_token(ids[i], &st, nullptr, nullptr, nullptr, !no_routed);
     }
     watch_prefill(false);
     const auto t1 = std::chrono::steady_clock::now();
@@ -2736,6 +2700,7 @@ int main(int argc, char** argv) {
       // Median over tok/s, not ms: rotating prompts of different lengths makes ms incomparable
       // between reps while the rate stays the thing being measured.
       std::vector<double> rate_all;
+      std::vector<float> logits;
       uint64_t cap = 0;
       for (const auto& s : sets) cap = std::max<uint64_t>(cap, s.size());
       for (uint32_t r = 0; r < prefill_reps; ++r) {
@@ -2906,27 +2871,50 @@ int main(int argc, char** argv) {
   srv_ctx.get_resident_experts = [&placement]() -> int64_t {
     return (int64_t)(placement.stats().resident_experts + placement.bonus_shards());
   };
-  srv_ctx.get_free_vram_mib = [&placement]() -> std::vector<uint64_t> {
-    std::vector<uint64_t> out;
+  struct SysfsVramPaths {
+    int dev = 0;
+    std::string total_path;
+    std::string used_path;
+  };
+  std::vector<SysfsVramPaths> vram_paths;
+  {
     const std::vector<int>& devs = !placement.devices().empty() ? placement.devices() : gfx12_devices();
+    int prev = 0;
+    const bool have_prev = hipGetDevice(&prev) == hipSuccess;
     for (int d : devs) {
-      uint64_t fb = 0, tb = 0;
-      if (hip_free_vram_checked(d, &fb, &tb)) {
-        out.push_back(fb / 1048576);
-      } else {
-        size_t h_fb = 0, h_tb = 0;
-        int prev = 0;
-        const bool have_prev = hipGetDevice(&prev) == hipSuccess;
-        if (hipSetDevice(d) == hipSuccess) {
-          if (hipMemGetInfo(&h_fb, &h_tb) == hipSuccess) {
-            out.push_back((uint64_t)(h_fb / 1048576));
-          } else {
-            out.push_back(0);
-          }
-          if (have_prev) (void)hipSetDevice(prev);
-        } else {
-          out.push_back(0);
+      SysfsVramPaths sp;
+      sp.dev = d;
+      char bus[32] = {0};
+      if (hipSetDevice(d) == hipSuccess &&
+          hipDeviceGetPCIBusId(bus, (int)sizeof(bus), d) == hipSuccess && bus[0]) {
+        for (char* p = bus; *p; ++p) *p = (char)std::tolower((unsigned char)*p);
+        const std::string base = std::string("/sys/bus/pci/devices/") + bus;
+        uint64_t tmp = 0;
+        if (read_sysfs_u64(base + "/mem_info_vram_total", &tmp) &&
+            read_sysfs_u64(base + "/mem_info_vram_used", &tmp)) {
+          sp.total_path = base + "/mem_info_vram_total";
+          sp.used_path = base + "/mem_info_vram_used";
         }
+      }
+      vram_paths.push_back(std::move(sp));
+    }
+    if (have_prev) (void)hipSetDevice(prev);
+  }
+  srv_ctx.get_free_vram_mib = [vram_paths]() -> std::vector<uint64_t> {
+    std::vector<uint64_t> out;
+    out.reserve(vram_paths.size());
+    for (const auto& sp : vram_paths) {
+      uint64_t sys_total = 0, sys_used = 0;
+      if (!sp.total_path.empty() &&
+          read_sysfs_u64(sp.total_path, &sys_total) &&
+          read_sysfs_u64(sp.used_path, &sys_used) && sys_used <= sys_total) {
+        out.push_back((sys_total - sys_used) / 1048576);
+      } else if (sp.total_path.empty()) {
+        uint64_t fb = 0, tb = 0;
+        if (hip_free_vram_checked(sp.dev, &fb, &tb)) out.push_back(fb / 1048576);
+        else out.push_back(0);
+      } else {
+        out.push_back(0);
       }
     }
     return out;
@@ -2935,6 +2923,87 @@ int main(int argc, char** argv) {
   srv_ctx.get_resident_experts = []() -> int64_t { return 0; };
   srv_ctx.get_free_vram_mib = []() -> std::vector<uint64_t> { return {}; };
 #endif
+  srv_ctx.preflight_check = [&](const CompletionRequest& req) -> std::string {
+    if (req.n > 1) {
+      return "n > 1 is not supported: this engine decodes one sequence per request";
+    }
+    const std::string& tc = req.tool_choice;
+    if (!tc.empty() && tc != "auto" && tc != "none") {
+      return "tool_choice \"" + tc + "\" requires constrained decoding, which this engine does "
+             "not implement. Send \"auto\" or \"none\".";
+    }
+    std::vector<ChatMsg> msgs;
+    bool has_image = false;
+    if (req.messages.empty()) {
+      ChatMsg m; m.role = "user"; m.content = req.prompt;
+      msgs.push_back(std::move(m));
+    } else {
+      msgs.reserve(req.messages.size());
+      for (const ChatMessage& in : req.messages) {
+        if (in.role != "system" && in.role != "user" && in.role != "assistant" &&
+            in.role != "tool" && in.role != "latest_reminder") {
+          return "unsupported message role \"" + in.role + "\"";
+        }
+        if (in.role == "user" && in.has_image && !in.image_data.empty()) has_image = true;
+        ChatMsg m;
+        m.role = in.role;
+        m.content = in.content;
+        m.reasoning_content = in.reasoning_content;
+        m.tool_call_id = in.tool_call_id;
+        for (const ToolCallIO& t : in.tool_calls) m.tool_calls.push_back({t.id, t.name, t.arguments, t.ns});
+        msgs.push_back(std::move(m));
+      }
+    }
+    const bool want_tools = !req.tools.empty() && tc != "none";
+    if (want_tools || !req.response_format.empty()) {
+      if (msgs.empty() || msgs[0].role != "system") {
+        ChatMsg sys; sys.role = "system";
+        msgs.insert(msgs.begin(), std::move(sys));
+      }
+      if (want_tools)
+        for (const std::string& t : req.tools) msgs[0].tools.push_back(ToolDef{t});
+      msgs[0].response_format = req.response_format;
+    }
+    bool any_text = false;
+    for (const ChatMsg& m : msgs)
+      any_text = any_text || !m.content.empty() || !m.tool_calls.empty() || !m.tools.empty();
+    if (!any_text) {
+      return "every message is empty — if the client sends content as typed blocks, this build "
+             "reads only the \"text\" type";
+    }
+    if (!has_image && tok.vocab_size()) {
+      EncodeOpts eo;
+      eo.thinking_mode = req.thinking_mode == "chat" ? ThinkingMode::Chat : ThinkingMode::Thinking;
+      eo.suppress_final_think = req.suppress_final_think && eo.thinking_mode == ThinkingMode::Thinking;
+      eo.reasoning_effort = req.reasoning_effort == "low"  ? ReasoningEffort::Low
+                          : req.reasoning_effort == "high" ? ReasoningEffort::High
+                                                           : ReasoningEffort::Max;
+      eo.v41 = model.config().v41;
+      if (eo.v41) {
+        const std::string& e = req.reasoning_effort;
+        int b = default_effort;
+        if (e == "none" || e == "off" || e == "0") b = default_effort;
+        else if (e == "low") b = 50;
+        else if (e == "medium") b = 60;
+        else if (e == "high") b = 75;
+        else if (e == "xhigh") b = 90;
+        else if (e == "max") b = 100;
+        else if (!e.empty() && e.find_first_not_of("0123456789") == std::string::npos && e.size() <= 3)
+          b = std::max(1, std::min(100, std::atoi(e.c_str())));
+        eo.effort_budget = b;
+      }
+      const bool raw_mode = raw_completions && req.raw_prompt;
+      const std::string prompt = raw_mode ? req.prompt : encode_messages(msgs, eo);
+      const std::vector<uint32_t> ids = tok.encode(prompt, false);
+      if (ids.size() + 32 >= kMaxKvPositions) {
+        return "context_length_exceeded: the prompt is " + std::to_string(ids.size()) +
+               " tokens and this engine serves at most " +
+               std::to_string(kMaxKvPositions > 32 ? kMaxKvPositions - 32 : 0) +
+               " (--kv-size " + std::to_string(kMaxKvPositions) + ")";
+      }
+    }
+    return {};
+  };
   srv.set_context(std::move(srv_ctx));
   // amdnas-fixes weight-verify (AFF_WEIGHT_VERIFY=1): hash the read-only device state before each chat request and
   // compare it with the first result. A WEIGHT-MISMATCH names what changed; a clean line is the positive evidence.
@@ -3167,8 +3236,14 @@ int main(int argc, char** argv) {
     // The budget covers the whole generation, so it is also exactly what the state has to hold.
     weight_verify("pre-request");   // amdnas-fixes weight-verify
     model.init_state(&st, ids.size() + total_budget + 8);
-    std::vector<float> logits;
     std::vector<uint32_t> hist = ids;
+
+    // Prefill liveness & SSE keepalive callback (stream emits OpenAI empty-delta SSE chunk every
+    // 15s and checks fd_alive; non-stream checks fd_alive). Wave 1C hooks this into
+    // model.set_prefill_alive(...).
+    std::function<bool()> heartbeat_fn = [&sink]() -> bool {
+      return sink(std::string(), Delta::Content, false);
+    };
 
     Model::BlockOut blk;
     blk.per_position_head = false;
@@ -3261,16 +3336,21 @@ int main(int argc, char** argv) {
       from = promote;
     }
     if (n_pre > from) {
+      if (!heartbeat_fn()) {
+        res->finish_reason = "stop";
+        sink("", Delta::Content, true);
+        return;
+      }
       std::unique_lock<std::mutex> step(engine_mu);
       dense_gpu.set_slot(slot);
       kv_reserve_for((uint64_t)ids.size() + 2);
       watch_prefill(true);
       const bool pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
-                                                nullptr, &logits, true, &blk,
+                                                nullptr, nullptr, true, &blk,
                                                 pv.count > 0 ? &pv : nullptr);
       if (dense_gpu.n_slots() > 1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       watch_prefill(false);
-      if (!pre_ok) {
+      if (!pre_ok || !heartbeat_fn()) {
         res->finish_reason = "stop";
         sink("", Delta::Content, true);
         return;
@@ -3370,15 +3450,17 @@ int main(int argc, char** argv) {
     size_t streamed = 0;
     bool saw_marker = false;
     size_t marker_at = std::string::npos;   // where the tool-call block opened (for the close search)
-    // Every string that must be recognised whole before any of it is emitted.
-    std::vector<std::string> sentinels = req.stop;
-    sentinels.push_back(kToolCallsOpen);
-    sentinels.push_back(kToolCallsOpenV41);
-    sentinels.push_back(std::string("\n\n<") + "｜DSML｜");
-    sentinels.push_back(std::string("<") + "｜DSML｜ calls");
-    sentinels.push_back(std::string("<") + "｜DSML｜tool_calls");
-    sentinels.push_back(std::string("<") + "｜DSML｜");
-    sentinels.push_back("<invoke");            // marker-less open (see tool_block_close_end)
+    ToolBlockScanState tool_scan;
+    // Every string that must be recognised whole before any of it is emitted (zero-alloc views).
+    static constexpr std::string_view kToolSentinels[] = {
+      "\n\n<\xef\xbd\x9c" "DSML\xef\xbd\x9c" "tool_calls",
+      "\n\n<\xef\xbd\x9c" "DSML\xef\xbd\x9c" " calls",
+      "\n\n<\xef\xbd\x9c" "DSML\xef\xbd\x9c",
+      "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" " calls",
+      "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" "tool_calls",
+      "<\xef\xbd\x9c" "DSML\xef\xbd\x9c",
+      "<invoke",
+    };
     // In thinking mode the reasoning streams on its OWN channel. It must not go out as
     // `delta.content` — that puts the model's deliberation, and then a bare </think>, into the
     // client's transcript as if it were the reply — but dropping it is just as wrong, because a
@@ -3451,7 +3533,7 @@ int main(int argc, char** argv) {
     const uint32_t made = spec_decode(slot, st, blk, ids.empty() ? 1u : ids.back(), hist, total_budget,
                                       /*ignore_eos_=*/req.ignore_eos, [&](uint32_t id) {
       if ((int32_t)id == tok.eos() && !req.ignore_eos) return false;
-      raw += tok.vocab_size() ? tok.decode_one(id) : std::string();
+      if (tok.vocab_size()) raw += tok.decode_one(id);
       if (raw_mode) {
         size_t safe = raw.size();
         bool stopped = false;
@@ -3461,10 +3543,15 @@ int main(int argc, char** argv) {
           if (at != std::string::npos && at < safe) { safe = at; stopped = true; }
         }
         if (!stopped) {
+          const size_t orig_safe = safe;
+          size_t min_safe = orig_safe;
           for (const auto& stop : req.stop)
-            for (size_t n = std::min(stop.empty() ? size_t(0) : stop.size()-1, safe-streamed); n; --n)
-              if (raw.compare(safe-n,n,stop,0,n)==0) { safe-=n; break; }
-          safe = std::max(streamed, utf8_end(raw, safe));
+            for (size_t n = std::min(stop.empty() ? size_t(0) : stop.size() - 1, orig_safe - streamed); n; --n)
+              if (raw.compare(orig_safe - n, n, stop, 0, n) == 0) {
+                min_safe = std::min(min_safe, orig_safe - n);
+                break;
+              }
+          safe = std::max(streamed, utf8_end(raw, min_safe));
         }
         if (safe > streamed) {
           const auto piece = aff::sanitize_utf8(raw.substr(streamed, safe - streamed));
@@ -3475,7 +3562,7 @@ int main(int argc, char** argv) {
         return !stopped;
       }
       if (open_think) {
-        const size_t te = raw.find(think_end);
+        const size_t te = raw.find(think_end, think_streamed);
         // Everything up to the closing marker is reasoning. Hold back any tail that could still
         // BECOME that marker, or a partial "</thi" reaches the client as reasoning text.
         size_t safe_r = te == std::string::npos ? raw.size() : te;
@@ -3493,35 +3580,18 @@ int main(int argc, char** argv) {
         streamed = te + think_end.size();
       }
       // A tool call is withheld until it is complete, so nothing streams while its arguments are generated.
-      // An empty, not-done piece is a heartbeat: the server turns it into an SSE keep-alive comment when the
-      // stream has been silent too long. Without it a long call (a big `write`) exceeds a client's body-idle
-      // timeout (Node/undici: 300 s) and the client aborts the turn while the engine is still generating it.
+      // An empty, not-done piece is a heartbeat: the server turns it into an empty-delta SSE chunk when
+      // the stream has been silent too long.
       if (saw_marker) {
-        // The block opened; stop the turn the moment it closes. The model does not always EOS after
-        // a tool call (and a marker-less near-miss defeats the marker, so nothing else stops it),
-        // which is what turns a single call into a thousands-of-tokens ramble of stray tags.
-        const size_t ce = tool_block_close_end(raw, marker_at);
+        const size_t ce = tool_scan.scan(raw, marker_at);
         if (ce != std::string::npos) { raw.resize(ce); return false; }
         return sink(std::string(), Delta::Content, false);
       }
       // Hold back anything that might still become the tool-call marker. Without this the opening
       // "\n\n<" of a tool call is streamed as content and the client renders markup.
       size_t at = std::string::npos;
-      for (const char* m : {kToolCallsOpen, kToolCallsOpenV41}) {
+      for (const std::string_view m : kToolSentinels) {
         const size_t pos = raw.find(m, streamed);
-        if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
-      }
-      for (const std::string& m : {std::string("\n\n<") + "｜DSML｜",
-                                   std::string("<") + "｜DSML｜ calls",
-                                   std::string("<") + "｜DSML｜tool_calls",
-                                   std::string("<") + "｜DSML｜"}) {
-        const size_t pos = raw.find(m, streamed);
-        if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
-      }
-      // Marker-less open: the model sometimes drops the DSML bar and writes <invoke name="X">.
-      // Recognise it so the block is held back and stopped at its close (see tool_block_close_end).
-      {
-        const size_t pos = raw.find("<invoke", streamed);
         if (pos != std::string::npos && (at == std::string::npos || pos < at)) at = pos;
       }
       if (at != std::string::npos) { saw_marker = true; if (marker_at == std::string::npos) marker_at = at; }
@@ -3540,10 +3610,24 @@ int main(int argc, char** argv) {
       // Neither a marker nor a stop string may be emitted in halves, so any tail that could still
       // become one waits for the next token — as does a partial UTF-8 character.
       if (!saw_marker && !hit_stop) {
-        for (const std::string& sen : sentinels)
-          for (size_t back = std::min(sen.size() - 1, safe - streamed); back; --back)
-            if (raw.compare(safe - back, back, sen, 0, back) == 0) { safe -= back; break; }
-        safe = std::max(streamed, utf8_end(raw, safe));
+        const size_t orig_safe = safe;
+        size_t min_safe = orig_safe;
+        for (const std::string_view sen : kToolSentinels) {
+          for (size_t back = std::min(sen.size() - 1, orig_safe - streamed); back; --back)
+            if (raw.compare(orig_safe - back, back, sen.data(), back) == 0) {
+              min_safe = std::min(min_safe, orig_safe - back);
+              break;
+            }
+        }
+        for (const std::string& sen : req.stop) {
+          if (sen.empty()) continue;
+          for (size_t back = std::min(sen.size() - 1, orig_safe - streamed); back; --back)
+            if (raw.compare(orig_safe - back, back, sen.data(), back) == 0) {
+              min_safe = std::min(min_safe, orig_safe - back);
+              break;
+            }
+        }
+        safe = std::max(streamed, utf8_end(raw, min_safe));
       }
       if (safe > streamed) {
         const std::string piece = aff::sanitize_utf8(raw.substr(streamed, safe - streamed));
