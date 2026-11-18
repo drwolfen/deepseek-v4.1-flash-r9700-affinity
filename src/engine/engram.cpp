@@ -129,7 +129,9 @@ void EngramHash::push(const uint32_t* ids, uint32_t n, uint64_t pos0, int64_t* o
   }
   filled_ = pos0 + n;
 
-  std::vector<int64_t> tok(ng);
+  int64_t tok_stack[16];
+  std::vector<int64_t> tok_heap;
+  int64_t* tok = ng <= 16 ? tok_stack : (tok_heap.resize(ng), tok_heap.data());
   for (uint32_t t = 0; t < n; ++t) {
     const int64_t pos = (int64_t)(pos0 + t);
     // Look back `ng` slots. `blocked` latches: past the start of the sequence or past a dead

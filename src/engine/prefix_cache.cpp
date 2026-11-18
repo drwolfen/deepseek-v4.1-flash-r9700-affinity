@@ -128,10 +128,25 @@ bool read_exact(int fd, void* dst, uint64_t bytes, uint64_t off) {
   uint64_t done = 0;
   while (done < bytes) {
     const ssize_t r = ::pread(fd, (uint8_t*)dst + done, (size_t)(bytes - done), (off_t)(off + done));
-    if (r <= 0) return false;
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (r == 0) return false;
     done += (uint64_t)r;
   }
   return true;
+}
+
+uint32_t pp_bucket_idx(const uint8_t* parent, uint32_t pos, uint32_t mask) {
+  uint64_t h = 1469598103934665603ull;
+  uint64_t p0 = 0;
+  std::memcpy(&p0, parent, 8);
+  h ^= p0;
+  h *= 1099511628211ull;
+  h ^= (uint64_t)pos;
+  h *= 1099511628211ull;
+  return (uint32_t)(h ^ (h >> 32)) & mask;
 }
 
 // The header at the front of every slot. Fixed size so a slot's payload starts on an aligned
@@ -157,6 +172,8 @@ struct PrefixCache::Impl {
   // nothing.
   std::vector<uint32_t> blk_bucket, ck_bucket;
   uint32_t blk_mask = 0, ck_mask = 0;
+  std::vector<uint32_t> blk_pp_bucket, blk_pp_next;  // O(1) (parent, pos) index for base-block lookup
+  uint32_t blk_pp_mask = 0;
   uint32_t blk_head = kNil, blk_tail = kNil;
   uint32_t ck_head = kNil, ck_tail = kNil;
 
@@ -178,12 +195,15 @@ struct PrefixCache::Impl {
   uint64_t             gather_bytes = 0;
   uint32_t             gblocks = 0;
   uint8_t*             ckbuf = nullptr;
+  uint8_t*             hdr_buf = nullptr;
+  uint64_t             hdr_bytes = 0;
 
   ~Impl() {
     for (uint8_t* p : stage) std::free(p);
     for (uint8_t* p : rbuf) std::free(p);
     std::free(gather);
     std::free(ckbuf);
+    std::free(hdr_buf);
     if (blk_fd >= 0) ::close(blk_fd);
     if (ck_fd >= 0) ::close(ck_fd);
   }
@@ -302,6 +322,10 @@ bool PrefixCache::open(const Options& o, const std::vector<KvRegion>& regions, c
   impl_->ck_bucket.assign(next_pow2(n_ck * 2), kNil);
   impl_->blk_mask = (uint32_t)impl_->blk_bucket.size() - 1;
   impl_->ck_mask = (uint32_t)impl_->ck_bucket.size() - 1;
+  impl_->blk_pp_bucket.assign(next_pow2(n_blk * 2), kNil);
+  impl_->blk_pp_next.assign(n_blk, kNil);
+  impl_->blk_pp_mask = (uint32_t)impl_->blk_pp_bucket.size() - 1;
+  impl_->hdr_bytes = round_up(sizeof(SlotHeader) + (uint64_t)o.block_tokens * sizeof(uint32_t), kAlign);
   thread_free_lists();
 
   if (!open_files(err)) { close(); return false; }
@@ -330,7 +354,8 @@ bool PrefixCache::open(const Options& o, const std::vector<KvRegion>& regions, c
     g = std::max(g, (uint64_t)kSavedRanks * impl_->gblocks * (opt_.block_tokens / r.ratio) * r.row_bytes);
   impl_->gather_bytes = g;
   if (posix_memalign((void**)&impl_->gather, kAlign, (size_t)g) ||
-      posix_memalign((void**)&impl_->ckbuf, kAlign, (size_t)ck_slot_)) {
+      posix_memalign((void**)&impl_->ckbuf, kAlign, (size_t)ck_slot_) ||
+      posix_memalign((void**)&impl_->hdr_buf, kAlign, (size_t)impl_->hdr_bytes)) {
     if (err) *err = "cannot allocate the prefix cache gather arena";
     close(); return false;
   }
@@ -350,32 +375,29 @@ bool PrefixCache::open(const Options& o, const std::vector<KvRegion>& regions, c
       const int fd = j.ckpt ? impl_->ck_fd : impl_->blk_fd;
       const uint8_t* src = impl_->stage[j.buf];
       const uint64_t base = (uint64_t)j.slot * slot_bytes;
-      // ---- THE HEADER GOES LAST, AND THAT IS THE WHOLE COMMIT PROTOCOL ---------------------------
-      //
-      // Verification on the way back reads the header: magic, fingerprint, token count, token ids.
-      // Written front to back, a short write leaves that header COMPLETE and the payload truncated,
-      // so the slot verifies and the engine loads whatever was in the file underneath it — the one
-      // failure this cache must not have, because it is silent and it moves the emitted text.
-      // Written payload first, a torn write leaves the old header in place; its key belongs to some
-      // other prefix, so the token compare rejects it and `restore` drops the slot.
-      const uint64_t hbytes = round_up(sizeof(SlotHeader) + (uint64_t)opt_.block_tokens *
-                                       sizeof(uint32_t), kAlign);
+      const SlotHeader* hdr_p = (const SlotHeader*)src;
+      const uint64_t hbytes = impl_->hdr_bytes;
+      const uint64_t write_bytes = j.ckpt
+          ? std::min(slot_bytes, hbytes + round_up(hdr_p->payload_bytes, kAlign))
+          : slot_bytes;
       auto span = [&](uint64_t off, uint64_t bytes) -> uint64_t {
         uint64_t done = 0;
         while (done < bytes) {
           const ssize_t w = ::pwrite(fd, src + off + done, (size_t)(bytes - done),
                                      (off_t)(base + off + done));
-          if (w <= 0) {
+          if (w < 0) {
+            if (errno == EINTR) continue;
             aff::ui::err("prefix cache: write failed at slot %u+%llu: %s\n", j.slot,
                          (unsigned long long)(off + done), std::strerror(errno));
             break;
           }
+          if (w == 0) break;
           done += (uint64_t)w;
         }
         return done;
       };
-      uint64_t done = span(hbytes, slot_bytes - hbytes);
-      if (done == slot_bytes - hbytes) done += span(0, hbytes);
+      uint64_t done = span(hbytes, write_bytes - hbytes);
+      if (done == write_bytes - hbytes) done += span(0, hbytes);
       {
         std::lock_guard<std::mutex> lk(impl_->m);
         impl_->stage_free[j.buf] = true;
@@ -488,6 +510,13 @@ void PrefixCache::drop(int32_t slot, bool ckpt) {
     uint32_t* p = &bucket[b];
     while (*p != kNil && *p != i) p = &t[*p].hnext;
     if (*p == i) *p = s.hnext;
+    if (!ckpt) {
+      const uint32_t pb = pp_bucket_idx(s.parent, s.pos, impl_->blk_pp_mask);
+      uint32_t* pp = &impl_->blk_pp_bucket[pb];
+      while (*pp != kNil && *pp != i) pp = &impl_->blk_pp_next[*pp];
+      if (*pp == i) *pp = impl_->blk_pp_next[i];
+      impl_->blk_pp_next[i] = kNil;
+    }
   }
   s.hnext = kNil;
   s.used = false;
@@ -523,6 +552,13 @@ int32_t PrefixCache::claim(bool ckpt) {
     uint32_t* p = &bucket[b];
     while (*p != kNil && *p != i) p = &t[*p].hnext;
     if (*p == i) *p = s.hnext;
+    if (!ckpt) {
+      const uint32_t pb = pp_bucket_idx(s.parent, s.pos, impl_->blk_pp_mask);
+      uint32_t* pp = &impl_->blk_pp_bucket[pb];
+      while (*pp != kNil && *pp != i) pp = &impl_->blk_pp_next[*pp];
+      if (*pp == i) *pp = impl_->blk_pp_next[i];
+      impl_->blk_pp_next[i] = kNil;
+    }
     ++st_.blocks_evicted;
   }
   s.hnext = kNil;
@@ -566,19 +602,26 @@ int32_t PrefixCache::find_ckpt(const uint8_t* parent, const uint32_t* ids, uint3
 }
 
 int32_t PrefixCache::find_base_block(const uint8_t* parent, uint32_t pos, const uint32_t* tail_ids, uint32_t tail_len) {
-  if (!parent || !tail_len) return -1;
-  for (uint32_t s = 0; s < blk_.size(); ++s) {
-    if (!blk_[s].used) continue;
-    if (blk_[s].pos == pos && std::memcmp(blk_[s].parent, parent, 32) == 0) {
-      if (!impl_ || impl_->blk_fd < 0) return (int32_t)s;
-      alignas(kAlign) uint8_t hdr_buf[kAlign];
-      if (!read_exact(impl_->blk_fd, hdr_buf, kAlign, (uint64_t)s * blk_slot_)) continue;
-      const SlotHeader* bh = (const SlotHeader*)hdr_buf;
-      const uint32_t* btok = (const uint32_t*)(hdr_buf + sizeof(SlotHeader));
-      if (bh->magic == kBlockMagic && bh->fingerprint == fp_ &&
-          std::memcmp(btok, tail_ids, (size_t)tail_len * sizeof(uint32_t)) == 0) {
-        return (int32_t)s;
-      }
+  if (!parent || !tail_len || !impl_) return -1;
+  bool drained = false;
+  const uint32_t pb = pp_bucket_idx(parent, pos, impl_->blk_pp_mask);
+  for (uint32_t s = impl_->blk_pp_bucket[pb]; s != kNil; s = impl_->blk_pp_next[s]) {
+    if (!blk_[s].used || blk_[s].pos != pos || std::memcmp(blk_[s].parent, parent, 32) != 0)
+      continue;
+    if (impl_->blk_fd < 0) return (int32_t)s;
+    if (!drained) {
+      drain();
+      drained = true;
+      if (!blk_[s].used || blk_[s].pos != pos || std::memcmp(blk_[s].parent, parent, 32) != 0)
+        continue;
+    }
+    if (!read_exact(impl_->blk_fd, impl_->hdr_buf, impl_->hdr_bytes, (uint64_t)s * blk_slot_))
+      continue;
+    const SlotHeader* bh = (const SlotHeader*)impl_->hdr_buf;
+    const uint32_t* btok = (const uint32_t*)(impl_->hdr_buf + sizeof(SlotHeader));
+    if (bh->magic == kBlockMagic && bh->fingerprint == fp_ && bh->n_tokens >= tail_len &&
+        std::memcmp(btok, tail_ids, (size_t)tail_len * sizeof(uint32_t)) == 0) {
+      return (int32_t)s;
     }
   }
   return -1;
@@ -720,48 +763,61 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     off += (uint64_t)kSavedRanks * r.rows * r.row_bytes;
   }
   if (tail) {
-    const bool is_delta = ((h->flags & kCkptFlagDelta) != 0) || ck_[cs].state_only;
-    if (is_delta) {
+    bool restored_delta = false;
+    const bool try_delta = ((h->flags & kCkptFlagDelta) != 0) || ck_[cs].state_only;
+    if (try_delta) {
       const int32_t bs = find_base_block(parent, (nfull + 1) * B, ids + (size_t)nfull * B, tail);
       if (bs < 0) {
-        ++st_.verify_misses;
-        drop(cs, true);
-        if (err) *err = "prefix cache: state-only checkpoint missing base block in store";
-        return false;
-      }
-      if (!read_exact(impl_->blk_fd, impl_->rbuf[0], blk_slot_, (uint64_t)bs * blk_slot_)) {
-        if (err) *err = std::string("prefix cache: base block read failed: ") + std::strerror(errno);
-        return false;
-      }
-      const SlotHeader* bh = (const SlotHeader*)impl_->rbuf[0];
-      const uint32_t* btok = (const uint32_t*)(impl_->rbuf[0] + sizeof(SlotHeader));
-      if (bh->magic != kBlockMagic || bh->fingerprint != fp_ ||
-          std::memcmp(btok, ids + (size_t)nfull * B, (size_t)tail * sizeof(uint32_t)) != 0) {
-        ++st_.verify_misses;
-        drop(bs, false);
-        drop(cs, true);
-        if (err) *err = "prefix cache: base block failed verification";
-        return false;
-      }
-      st_.bytes_read += blk_slot_;
-      for (uint32_t ri = 0; ri < app_.size(); ++ri) {
-        uint64_t base_off, base_row0_in_blk, base_nrows;
-        region_span(app_, kSavedRanks, 0, B, ri, &base_off, &base_row0_in_blk, &base_nrows);
-        const uint64_t nrows = tail / app_[ri].ratio;
-        if (!nrows) continue;
-        const uint64_t base_row0 = (uint64_t)nfull * base_nrows;
-        for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
-          const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
-          if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, base_row0, nrows,
-                        impl_->rbuf[0] + hdr + base_off +
-                            (uint64_t)src_rk * base_nrows * app_[ri].row_bytes)) {
-            if (err) *err = "prefix cache: the engine refused a restored delta partial block";
+        if ((h->flags & kCkptFlagDelta) != 0) {
+          ++st_.verify_misses;
+          drop(cs, true);
+          if (err) *err = "prefix cache: state-only checkpoint missing base block in store";
+          return false;
+        }
+        // Full checkpoint on disk whose base block was evicted or belongs to a diverged branch:
+        // fall back to full-checkpoint restore below.
+        ck_[cs].state_only = false;
+      } else {
+        if (!read_exact(impl_->blk_fd, impl_->rbuf[0], blk_slot_, (uint64_t)bs * blk_slot_)) {
+          if (err) *err = std::string("prefix cache: base block read failed: ") + std::strerror(errno);
+          return false;
+        }
+        const SlotHeader* bh = (const SlotHeader*)impl_->rbuf[0];
+        const uint32_t* btok = (const uint32_t*)(impl_->rbuf[0] + sizeof(SlotHeader));
+        if (bh->magic != kBlockMagic || bh->fingerprint != fp_ ||
+            std::memcmp(btok, ids + (size_t)nfull * B, (size_t)tail * sizeof(uint32_t)) != 0) {
+          ++st_.verify_misses;
+          drop(bs, false);
+          if ((h->flags & kCkptFlagDelta) != 0) {
+            drop(cs, true);
+            if (err) *err = "prefix cache: base block failed verification";
             return false;
           }
+          ck_[cs].state_only = false;
+        } else {
+          st_.bytes_read += blk_slot_;
+          for (uint32_t ri = 0; ri < app_.size(); ++ri) {
+            uint64_t base_off, base_row0_in_blk, base_nrows;
+            region_span(app_, kSavedRanks, 0, B, ri, &base_off, &base_row0_in_blk, &base_nrows);
+            const uint64_t nrows = tail / app_[ri].ratio;
+            if (!nrows) continue;
+            const uint64_t base_row0 = (uint64_t)nfull * base_nrows;
+            for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
+              const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
+              if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, base_row0, nrows,
+                            impl_->rbuf[0] + hdr + base_off +
+                                (uint64_t)src_rk * base_nrows * app_[ri].row_bytes)) {
+                if (err) *err = "prefix cache: the engine refused a restored delta partial block";
+                return false;
+              }
+            }
+          }
+          ++st_.delta_ckpts_restored;
+          restored_delta = true;
         }
       }
-      ++st_.delta_ckpts_restored;
-    } else {
+    }
+    if (!restored_delta) {
       const uint32_t t0 = nfull * B;
       for (uint32_t ri = 0; ri < app_.size(); ++ri) {
         uint64_t o, row0, nrows;
@@ -852,6 +908,9 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
     uint32_t b; std::memcpy(&b, sl.key, 4); b &= impl_->blk_mask;
     sl.hnext = impl_->blk_bucket[b];
     impl_->blk_bucket[b] = (uint32_t)s;
+    const uint32_t pb_idx = pp_bucket_idx(sl.parent, sl.pos, impl_->blk_pp_mask);
+    impl_->blk_pp_next[s] = impl_->blk_pp_bucket[pb_idx];
+    impl_->blk_pp_bucket[pb_idx] = (uint32_t)s;
     touch(s, false);                              // claim() hands back the head and does not unlink
     ++st_.blocks_written;
     {
@@ -864,8 +923,15 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
       uint32_t pb; std::memcpy(&pb, blk_parent, 4); pb &= impl_->ck_mask;
       for (uint32_t cs_idx = impl_->ck_bucket[pb]; cs_idx != kNil; cs_idx = ck_[cs_idx].hnext) {
         if (!ck_[cs_idx].used || std::memcmp(ck_[cs_idx].parent, blk_parent, 32) != 0) continue;
-        if (ck_[cs_idx].pos > i * B && ck_[cs_idx].pos < (i + 1) * B) {
-          ck_[cs_idx].state_only = true;
+        if (ck_[cs_idx].pos > i * B && ck_[cs_idx].pos < (i + 1) * B && ck_[cs_idx].n_tokens > 0) {
+          // Verify that the checkpoint's tail tokens actually match this newly published block
+          // before marking it state_only (a diverged sibling branch sharing blk_parent must not
+          // corrupt this checkpoint).
+          uint8_t probe[32];
+          block_key(fp_, blk_parent, ids + (size_t)i * B, ck_[cs_idx].n_tokens, probe);
+          if (std::memcmp(probe, ck_[cs_idx].key, 32) == 0) {
+            ck_[cs_idx].state_only = true;
+          }
         }
       }
     }
@@ -970,7 +1036,8 @@ void PrefixCache::drain() {
 
 bool PrefixCache::save_index() const {
   const std::string p = opt_.dir + "/index.bin";
-  FILE* f = std::fopen(p.c_str(), "wb");
+  const std::string tmp = p + ".tmp";
+  FILE* f = std::fopen(tmp.c_str(), "wb");
   if (!f) return false;
   // The eviction lists go with the slots. They are threaded through prev/next, so restoring the
   // slots without their heads would leave two lists whose ends nothing points at.
@@ -984,8 +1051,21 @@ bool PrefixCache::save_index() const {
   bool ok = std::fwrite(&hd, sizeof hd, 1, f) == 1;
   for (uint32_t i = 0; i < blk_.size() && ok; ++i) ok = std::fwrite(&blk_[i], sizeof(Slot), 1, f) == 1;
   for (uint32_t i = 0; i < ck_.size() && ok; ++i) ok = std::fwrite(&ck_[i], sizeof(Slot), 1, f) == 1;
-  std::fclose(f);
-  return ok;
+  if (ok) ok = (std::fflush(f) == 0);
+  if (ok) {
+    const int fd = ::fileno(f);
+    if (fd >= 0 && ::fsync(fd) != 0) ok = false;
+  }
+  if (std::fclose(f) != 0) ok = false;
+  if (!ok) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  if (::rename(tmp.c_str(), p.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  return true;
 }
 
 bool PrefixCache::load_index() {
@@ -1023,12 +1103,17 @@ bool PrefixCache::load_index() {
   // them would be one more thing that can disagree with what it indexes.
   std::fill(impl_->blk_bucket.begin(), impl_->blk_bucket.end(), kNil);
   std::fill(impl_->ck_bucket.begin(), impl_->ck_bucket.end(), kNil);
+  std::fill(impl_->blk_pp_bucket.begin(), impl_->blk_pp_bucket.end(), kNil);
+  std::fill(impl_->blk_pp_next.begin(), impl_->blk_pp_next.end(), kNil);
   for (uint32_t i = 0; i < blk_.size(); ++i) {
     blk_[i].hnext = kNil;
     if (!blk_[i].used) continue;
     uint32_t b; std::memcpy(&b, blk_[i].key, 4); b &= impl_->blk_mask;
     blk_[i].hnext = impl_->blk_bucket[b];
     impl_->blk_bucket[b] = i;
+    const uint32_t pb = pp_bucket_idx(blk_[i].parent, blk_[i].pos, impl_->blk_pp_mask);
+    impl_->blk_pp_next[i] = impl_->blk_pp_bucket[pb];
+    impl_->blk_pp_bucket[pb] = i;
   }
   for (uint32_t i = 0; i < ck_.size(); ++i) {
     ck_[i].hnext = kNil;
