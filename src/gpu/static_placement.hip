@@ -2036,8 +2036,24 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
                            d_imat_cnt_ + (size_t)layer * n_expert_);
         AFF_HIP_CHECK(hipGetLastError());
       }
+      const uint8_t* q8_ptr = nullptr;
+      const float* qs_ptr = nullptr;
       { AFF_XTRACE((int)dv, 2, st);
-      batch_quant_fp8_hip(d_x[dv], (uint8_t*)bq8_[dv], (float*)bqs_[dv], hidden, nb_stride, 0, st); }
+      static const bool reuse_norm_q8 = [] {
+        const char* s = std::getenv("AFF_REUSE_NORM_Q8");
+        return !s || !*s || std::strcmp(s, "0") != 0;
+      }();
+      static const bool had_rot = [] {
+        const char* s = std::getenv("AFF_HADAMARD_ROT");
+        return s && *s && *s != '0';
+      }();
+      if (!reuse_norm_q8 || had_rot ||
+          !norm_q8_lookup(devs_[dv], d_x[dv], hidden, nb_stride, &q8_ptr, &qs_ptr)) {
+        batch_quant_fp8_hip(d_x[dv], (uint8_t*)bq8_[dv], (float*)bqs_[dv], hidden, nb_stride, 0, st);
+        q8_ptr = (const uint8_t*)bq8_[dv];
+        qs_ptr = (const float*)bqs_[dv];
+      }
+      }
       if (split) {
         AFF_HIP_CHECK(hipEventRecord(I.ev_q[dv][es], st));
         AFF_HIP_CHECK(hipStreamWaitEvent(hyb, I.ev_q[dv][es], 0));
@@ -2057,18 +2073,18 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       }
       for (uint32_t b = 4; b < 8; ++b) {
         if (!GRP.n[b]) continue;
-        expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], (const uint8_t*)bq8_[dv],
-                             (const float*)bqs_[dv], I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true);
-        expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], (const uint8_t*)bq8_[dv],
-                             (const float*)bqs_[dv], I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true);
+        expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true);
+        expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true);
       } }
       { AFF_XTRACE((int)dv, 3, st);
       for (uint32_t b = 0; b < 4; ++b) {
         if (!GRP.n[b]) continue;
-        expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], (const uint8_t*)bq8_[dv],
-                             (const float*)bqs_[dv], I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true);
-        expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], (const uint8_t*)bq8_[dv],
-                             (const float*)bqs_[dv], I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true);
+        expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true);
+        expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true);
       } }
       if (split) {
         // AFF_MOE_SINGLE_JOIN (#983, #984):

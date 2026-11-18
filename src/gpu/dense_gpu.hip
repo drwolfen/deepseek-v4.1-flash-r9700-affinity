@@ -444,6 +444,11 @@ struct DenseGpu::Impl {
     uint32_t q_cap = 0;                                   // dim this slot was sized for
     uint32_t q_dim = 0;                                   // dim currently in it: the X row stride
     const float* q8_src = nullptr;                        // which plane the slot holds, or null
+    uint8_t* q8_sw = nullptr;  float* qs_sw = nullptr;    // narrow SwiGLU FP8 scratch (<= kNarrowTok)
+    uint32_t q_sw_cap = 0;
+    const uint8_t* q8_act = nullptr;                      // active E4M3 buffer for batch_gemm_ent_q8
+    const float* qs_act = nullptr;
+    uint32_t q_active_dim = 0;
     float* h_tm = nullptr;                                // pinned, b_mid_ * b_cap_ floats
     uint8_t* b_allow = nullptr;                           // device, the same plane
     uint8_t* b_cand = nullptr;                            // the chunk's candidate blocks
@@ -619,6 +624,9 @@ DenseGpu::~DenseGpu() {
     if (D.h_norm) (void)hipHostFree(D.h_norm);
     if (D.h_tm) (void)hipHostFree(D.h_tm);
     if (D.b_allow) (void)hipFree(D.b_allow);
+    norm_q8_invalidate_dev(D.id);
+    for (void* p : {(void*)D.q8, (void*)D.qs, (void*)D.q8_sw, (void*)D.qs_sw})
+      if (p) (void)hipFree(p);
     for (StageRing* r : {&D.ncomp, &D.rsel, &D.emb, &D.eng, &D.rres}) r->free();
     if (D.b_ncomp) (void)hipFree(D.b_ncomp);
     for (void* p : {(void*)D.b_rsel, (void*)D.b_rwt, (void*)D.b_rn, (void*)D.b_rbias,
@@ -3838,6 +3846,8 @@ bool DenseGpu::q_slot(size_t r, uint32_t dim) {
   Impl::Dev& D = impl_->dev[r];
   if (dim % 128u) return false;
   if (D.q_cap < dim) {
+    norm_q8_invalidate(D.id, D.b_norm);
+    D.q8_src = nullptr;
     for (void** p : {(void**)&D.q8, (void**)&D.qs}) if (*p) { (void)hipFree(*p); *p = nullptr; }
     if (hipMalloc(&D.q8, (size_t)b_cap_ * dim) != hipSuccess) return false;
     if (hipMalloc(&D.qs, (size_t)b_cap_ * (dim / 128u) * sizeof(float)) != hipSuccess) return false;
@@ -3847,23 +3857,49 @@ bool DenseGpu::q_slot(size_t r, uint32_t dim) {
   return true;
 }
 
+bool DenseGpu::q_slot_sw(size_t r, uint32_t dim) {
+  Impl::Dev& D = impl_->dev[r];
+  if (dim % 128u) return false;
+  if (D.q_sw_cap < dim) {
+    for (void** p : {(void**)&D.q8_sw, (void**)&D.qs_sw}) if (*p) { (void)hipFree(*p); *p = nullptr; }
+    if (hipMalloc(&D.q8_sw, (size_t)kNarrowTok * dim) != hipSuccess) return false;
+    if (hipMalloc(&D.qs_sw, (size_t)kNarrowTok * (dim / 128u) * sizeof(float)) != hipSuccess)
+      return false;
+    D.q_sw_cap = dim;
+  }
+  return true;
+}
+
 bool DenseGpu::quant_act(size_t r, const float* src, uint32_t dim) {
   if (!q_slot(r, dim)) return false;
   Impl::Dev& D = impl_->dev[r];
   // Already there: hc_pre quantises `norm` in the kernel that writes it. `q8_src` is cleared by
   // every other path that overwrites the slot, so this can only match the plane actually in it.
-  if (D.q8_src == src && D.q_dim == dim) return true;
+  if (D.q8_src == src && D.q_dim == dim) {
+    D.q8_act = D.q8; D.qs_act = D.qs; D.q_active_dim = dim;
+    return true;
+  }
   batch_quant_fp8_hip(src, D.q8, D.qs, dim, b_nb_, 0, D.stream);
   D.q8_src = src;
+  D.q8_act = D.q8; D.qs_act = D.qs; D.q_active_dim = dim;
+  if (src == D.b_norm) norm_q8_publish(D.id, D.b_norm, D.q8, D.qs, dim, b_nb_);
+  else                 norm_q8_invalidate(D.id, D.b_norm);
   return true;
 }
 
 bool DenseGpu::quant_act_swiglu(size_t r, const float* g, const float* u, uint32_t dim,
                                 float limit) {
-  if (!q_slot(r, dim)) return false;
   Impl::Dev& D = impl_->dev[r];
+  if (b_nb_ <= kNarrowTok && q_slot_sw(r, dim)) {
+    batch_swiglu_quant_fp8_hip(g, u, D.q8_sw, D.qs_sw, dim, b_nb_, limit, D.stream);
+    D.q8_act = D.q8_sw; D.qs_act = D.qs_sw; D.q_active_dim = dim;
+    return true;
+  }
+  if (!q_slot(r, dim)) return false;
   batch_swiglu_quant_fp8_hip(g, u, D.q8, D.qs, dim, b_nb_, limit, D.stream);
   D.q8_src = nullptr;
+  norm_q8_invalidate(D.id, D.b_norm);
+  D.q8_act = D.q8; D.qs_act = D.qs; D.q_active_dim = dim;
   return true;
 }
 
@@ -3874,11 +3910,14 @@ void DenseGpu::batch_gemm_ent_q8(size_t r, int32_t h, float* y, uint64_t rows, u
                                  const char* aff_file, uint32_t aff_line) {
   const Entry& e = ent_[h];
   Impl::Dev& D = impl_->dev[r];
+  const uint8_t* const x8 = D.q8_act ? D.q8_act : D.q8;
+  const float* const xs = D.qs_act ? D.qs_act : D.qs;
+  const uint32_t xld = D.q_active_dim ? D.q_active_dim : D.q_dim;
   // w_row_off is nonzero only for the grouped output projection, whose eight groups share one
   // shard: the kernel needs it to reach both the weight rows and the right row of the scale plane.
-  batch_gemm_fp8_hip((const uint8_t*)e.sh[r].data, e.sh[r].scales, D.q8, D.qs, y, (uint32_t)rows,
+  batch_gemm_fp8_hip((const uint8_t*)e.sh[r].data, e.sh[r].scales, x8, xs, y, (uint32_t)rows,
                      (uint32_t)cols, b_nb_, x_off, w_row_off, D.stream, e.sh[r].ps,
-                     D.q_dim, D.q_dim / 128u, accum, 0u, aff_file, aff_line);
+                     xld, xld / 128u, accum, 0u, aff_file, aff_line);
 }
 
 // True when this entry can go through the W8A8 path at all: E4M3 weights, and a K that is a whole
@@ -3942,6 +3981,8 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
     batch_hc_seed_hip(D.b_emb, D.b_hc, n_embd, n_hc, nb, D.stream);
     // Every token in the chunk starts its stack with the reference's one-hot mix.
     if (shift_pre_) seed_pre_identity(D.b_pre_prev, n_hc, nb, D.stream);
+    D.q8_src = nullptr;
+    norm_q8_invalidate(D.id, D.b_norm);
   }
   return true;
 }
@@ -3982,11 +4023,19 @@ bool DenseGpu::batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint
                                 rms_eps, ctl ? 1 : 0, D.stream,
                                 shift_pre_ ? D.b_pre_prev : nullptr);
       D.q8_src = fold ? D.b_norm : nullptr;
+      if (fold) {
+        D.q8_act = D.q8; D.qs_act = D.qs; D.q_active_dim = n_embd;
+        norm_q8_publish(D.id, D.b_norm, D.q8, D.qs, n_embd, b_nb_);
+      } else {
+        norm_q8_invalidate(D.id, D.b_norm);
+      }
     } else {
       batch_hc_fused_hip(D.b_hc, D.b_mix, ctl ? D.vec[sv] : nullptr, ctl ? D.vec[bv] : nullptr,
                          nwp, D.b_pre, D.b_post, D.b_comb, D.b_cur, D.b_norm, n_embd, n_hc, b_nb_,
                          iters, hc_eps, rms_eps, ctl ? 1 : 0, D.stream,
                          shift_pre_ ? D.b_pre_prev : nullptr);
+      D.q8_src = nullptr;
+      norm_q8_invalidate(D.id, D.b_norm);
     }
     // Ping-pong b_pre and b_pre_prev on host instead of issuing D2D hipMemcpyAsync blits.
     if (shift_pre_ && ctl) std::swap(D.b_pre, D.b_pre_prev);
@@ -4070,11 +4119,14 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
       if (q8 && q_slot(d, (uint32_t)qr))
         qr_q8 = batch_rms_norm_q8_hip(D.b_g, D.vec[qnorm], nullptr, D.b_qr, D.q8, D.qs,
                                       (uint32_t)qr, b_nb_, eps, D.stream);
-      if (qr_q8)
+      if (qr_q8) {
         D.q8_src = D.b_qr;
-      else
+        D.q8_act = D.q8; D.qs_act = D.qs; D.q_active_dim = (uint32_t)qr;
+        norm_q8_invalidate(D.id, D.b_norm);
+      } else {
         batch_rms_norm_hip(D.b_g, D.vec[qnorm], nullptr, D.b_qr, (uint32_t)qr, b_nb_, eps,
                            D.stream);
+      }
       if (q8 && (qr_q8 || quant_act(d, D.b_qr, (uint32_t)qr)))
         batch_gemm_ent_q8(d, qb, D.b_q, nq, qr);
       else
@@ -5237,17 +5289,26 @@ bool DenseGpu::batch_attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_
     // kernel READ; b_htm aliases b_q and holds what it WROTE. See the alias note in batch_init.
     {
       AFF_TRACE(42);
-      batch_transpose_bf16_hip(D.b_htm, D.b_heads, (uint32_t)((uint64_t)a_hpr_ * width), b_nb_, 0,
-                               D.stream);
-      // V carried the rotated tail, so undo the rotation. Sine negated: this is the INVERSE.
-      batch_rope_tail_bf16_hip(D.b_heads, a_hpr_, width, n_rot, b_pos0_, rope, -1.0f, b_nb_,
-                               D.stream);
       static const bool o_qdq_on = [] {
         const char* v = std::getenv("AFF_O_FP8_QDQ");
         return !v || !*v || std::strcmp(v, "0") != 0;
       }();
-      if (o_qdq_on && ((a_hpr_ * width) % 32u) == 0u) {
-        batch_o_fp8_qdq_bf16_hip(D.b_heads, (a_hpr_ * width) / 32u, b_nb_, D.stream);
+      static const bool fused_prep_on = [] {
+        const char* v = std::getenv("AFF_FUSED_ATTN_OUT_PREP");
+        return !v || !*v || std::strcmp(v, "0") != 0;
+      }();
+      const bool do_qdq = o_qdq_on && ((a_hpr_ * width) % 32u) == 0u;
+      if (!fused_prep_on ||
+          !batch_attn_out_prep_hip(D.b_htm, D.b_heads, a_hpr_, width, n_rot, b_pos0_, rope,
+                                   -1.0f, b_nb_, do_qdq, D.stream)) {
+        batch_transpose_bf16_hip(D.b_htm, D.b_heads, (uint32_t)((uint64_t)a_hpr_ * width), b_nb_, 0,
+                                 D.stream);
+        // V carried the rotated tail, so undo the rotation. Sine negated: this is the INVERSE.
+        batch_rope_tail_bf16_hip(D.b_heads, a_hpr_, width, n_rot, b_pos0_, rope, -1.0f, b_nb_,
+                                 D.stream);
+        if (do_qdq) {
+          batch_o_fp8_qdq_bf16_hip(D.b_heads, (a_hpr_ * width) / 32u, b_nb_, D.stream);
+        }
       }
     }
     // wo_a stays on the bf16 kernel and only wo_b goes W8A8. The grouped projection is the one shape
@@ -6378,6 +6439,7 @@ bool DenseGpu::collapse_pre(int32_t nw, uint32_t n_embd, uint32_t n_hc, float hc
                              D.b_emb, D.b_hcp, n_embd, n_hc, b_nb_, hc_eps, rms_eps, D.stream,
                              pre_last);
     D.q8_src = nullptr;
+    norm_q8_invalidate(D.id, D.b_norm);
   }
   b_norm_rows_ = n_embd;
   ++st_.calls;
@@ -6405,6 +6467,7 @@ bool DenseGpu::draft_collapse(int32_t fn, int32_t sv, int32_t bv, int32_t nw, ui
                              D.b_emb, D.b_hcp, n_embd, n_hc, b_nb_, hc_eps, rms_eps, D.stream,
                              nullptr);
     D.q8_src = nullptr;                               // b_norm is a different vector now
+    norm_q8_invalidate(D.id, D.b_norm);
   }
   b_norm_rows_ = n_embd;
   ++st_.calls;
@@ -6419,7 +6482,8 @@ bool DenseGpu::draft_collapse(int32_t fn, int32_t sv, int32_t bv, int32_t nw, ui
 // the vocabulary is split across the cards and only the host sees both bands.
 bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint32_t n,
                           const float* x, int32_t h_w1, int32_t h_w2, uint32_t rank,
-                          uint32_t first_id, uint32_t* ids) {
+                          uint32_t first_id, uint32_t* ids, int32_t conf_cw, float* conf_out,
+                          bool* conf_ok) {
   // x == nullptr means draft_collapse has already left the activation in b_norm, transposed, and
   // there is nothing to stage. That is the live path; the host form is kept because the reference
   // epilogue is what this was checked against.
@@ -6555,16 +6619,27 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
       markov_combine_hip(D.b_mbest, D.b_mpeer, staged, D.b_ids, i, D.stream);
     }
   }
-  // ONE readback for the whole block, where there were ten. `b_ids[0]` is the input token, so the
-  // block's proposals are the n words after it.
+  // ONE readback for the whole block (ids + optional DSpark confidence together in 1 drain).
+  // `b_ids[0]` is the input token, so the block's proposals are the n words after it.
+  bool do_conf = conf_out != nullptr && conf_cw >= 0 && (size_t)conf_cw < n_vec_ &&
+                 W1.quant == AFF_BF16 && W1.cols == rank;
   {
     Impl::Dev& D = impl_->dev[0];
+    if (do_conf && (!D.b_conf || !D.b_cur || !D.b_ids || !D.h_conf)) do_conf = false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    if (do_conf) {
+      dspark_confidence_hip(D.vec[conf_cw], (const uint16_t*)W1.sh[0].data, D.b_cur, D.b_ids,
+                            D.b_conf, n, (uint32_t)n_embd, rank, kNarrowTok, D.stream);
+      AFF_HIP_CHECK(hipMemcpyAsync(D.h_conf, D.b_conf, (size_t)n * sizeof(float),
+                                   hipMemcpyDeviceToHost, D.stream));
+    }
     AFF_HIP_CHECK(hipMemcpyAsync(D.h_ids, D.b_ids + 1, (size_t)n * sizeof(uint32_t),
                                  hipMemcpyDeviceToHost, D.stream));
     AFF_DRAIN_AT(D, aff::BlockSite::DraftHead);
     std::memcpy(ids, D.h_ids, (size_t)n * sizeof(uint32_t));
+    if (do_conf) std::memcpy(conf_out, D.h_conf, (size_t)n * sizeof(float));
   }
+  if (conf_ok) *conf_ok = do_conf;
   ++st_.calls;
   return true;
 }
@@ -6658,6 +6733,12 @@ Model::BatchOps DenseGpu::batch_ops() {
   o.draft_head = [](void* c, int32_t h, uint64_t v, uint64_t ne, uint32_t n, const float* x,
                     int32_t w1, int32_t w2, uint32_t rk, uint32_t fid, uint32_t* ids) {
     return static_cast<DenseGpu*>(c)->draft_head(h, v, ne, n, x, w1, w2, rk, fid, ids);
+  };
+  o.draft_head_conf = [](void* c, int32_t h, uint64_t v, uint64_t ne, uint32_t n, const float* x,
+                         int32_t w1, int32_t w2, uint32_t rk, uint32_t fid, uint32_t* ids,
+                         int32_t ccw, float* cout, bool* cok) {
+    return static_cast<DenseGpu*>(c)->draft_head(h, v, ne, n, x, w1, w2, rk, fid, ids, ccw, cout,
+                                                 cok);
   };
   o.draft_confidence = [](void* c, int32_t cw, int32_t w1, uint32_t ne, uint32_t rk, uint32_t n,
                           float* out) {

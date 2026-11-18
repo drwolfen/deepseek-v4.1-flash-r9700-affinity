@@ -830,6 +830,7 @@ inline void ensure_size(std::vector<T>& v, size_t n) {
 }
 }  // namespace
 
+Model::Model() = default;
 Model::~Model() = default;
 
 // Nothing here is sized by the context window any more — see LayerState. The device allocators are
@@ -2801,20 +2802,31 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
       return false;
   }
   AFF_PH(draft_ep);
-  if (!bops_.draft_head(bops_.ctx, head_.gpu, cfg_.vocab, E, B, nullptr, D.markov_w1.gpu,
-                        D.markov_w2.gpu, cfg_.dspark_markov_rank, first_id, out))
-    return false;
-  AFF_PH(draft_head);
   // The confidence head, when bound. Advisory only: the accept rule never reads it, so a scoring
-  // failure drops the policy and cannot change the output. b_ids now holds [first_id, draft...] and
-  // b_cur still holds the un-normed collapsed hidden the head was built on.
-  if (dspark_conf_on_ && D.confidence_gpu >= 0 && bops_.draft_confidence) {
+  // failure drops the policy and cannot change the output. When batch ops provide draft_head_conf,
+  // run confidence scoring and copy both arrays back in one stream drain.
+  if (dspark_conf_on_ && D.confidence_gpu >= 0 && bops_.draft_head_conf) {
     dspark_conf_.assign(B, 0.0f);
-    if (!bops_.draft_confidence(bops_.ctx, D.confidence_gpu, D.markov_w1.gpu, E,
-                                cfg_.dspark_markov_rank, B, dspark_conf_.data()))
-      dspark_conf_.clear();
+    bool conf_ok = false;
+    if (!bops_.draft_head_conf(bops_.ctx, head_.gpu, cfg_.vocab, E, B, nullptr, D.markov_w1.gpu,
+                               D.markov_w2.gpu, cfg_.dspark_markov_rank, first_id, out,
+                               D.confidence_gpu, dspark_conf_.data(), &conf_ok))
+      return false;
+    if (!conf_ok) dspark_conf_.clear();
+    AFF_PH(draft_head);
   } else {
-    dspark_conf_.clear();
+    if (!bops_.draft_head(bops_.ctx, head_.gpu, cfg_.vocab, E, B, nullptr, D.markov_w1.gpu,
+                          D.markov_w2.gpu, cfg_.dspark_markov_rank, first_id, out))
+      return false;
+    AFF_PH(draft_head);
+    if (dspark_conf_on_ && D.confidence_gpu >= 0 && bops_.draft_confidence) {
+      dspark_conf_.assign(B, 0.0f);
+      if (!bops_.draft_confidence(bops_.ctx, D.confidence_gpu, D.markov_w1.gpu, E,
+                                  cfg_.dspark_markov_rank, B, dspark_conf_.data()))
+        dspark_conf_.clear();
+    } else {
+      dspark_conf_.clear();
+    }
   }
   return true;
 }
