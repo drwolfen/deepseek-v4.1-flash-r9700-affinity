@@ -2,8 +2,17 @@
 #include "server/server.h"
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
+
+#define CHECK(cond)                                                               \
+  do {                                                                            \
+    if (!(cond)) {                                                                \
+      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);       \
+      std::abort();                                                               \
+    }                                                                             \
+  } while (0)
 
 int main() {
   using namespace aff;
@@ -224,6 +233,111 @@ int main() {
     assert(json_escape("\xF0\x9F\x9A!") == rep + "!");
     assert(json_escape("a\n\t\"\\b") == "a\\n\\t\\\"\\\\b");
     assert(json_escape("北京" + bar + rocket) == "北京" + bar + rocket);
+  }
+
+  // 9. tool_block_close_end & ToolBlockScanState incremental streaming with embedded DSML closers
+  {
+    const std::string ds = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+    // (a) Open unclosed parameter containing literal </｜DSML｜ calls>, </｜DSML｜ invoke>, </｜DSML｜>
+    const std::string prefix =
+        "<" + ds + " calls>\n"
+        "<" + ds + " invoke name=\"bash\">\n"
+        "<" + ds + " parameter name=\"cmd\" string=\"true\">"
+        "grep '</" + ds + " calls>' a.cpp && echo '</" + ds + " invoke>' && echo '</" + ds + ">'\n"
+        "grep '</" + ds + " parameter>' b.cpp";
+    CHECK(tool_block_close_end(prefix, 0) == std::string::npos);
+
+    const std::string full =
+        prefix + "\n</" + ds + " parameter>\n</" + ds + " invoke>\n</" + ds + " calls>";
+    const std::string trailing = "\nsome trailing ramble";
+    const std::string full_with_ramble = full + trailing;
+
+    // Stream byte-by-byte (and 3-byte chunks) using ToolBlockScanState and stateless tool_block_close_end
+    ToolBlockScanState scan_st;
+    for (size_t len = 1; len < full.size(); ++len) {
+      const std::string sub = full_with_ramble.substr(0, len);
+      CHECK(tool_block_close_end(sub, 0) == std::string::npos);
+      CHECK(scan_st.scan(sub, 0) == std::string::npos);
+    }
+    CHECK(tool_block_close_end(full, 0) == full.size());
+    CHECK(scan_st.scan(full, 0) == full.size());
+    CHECK(tool_block_close_end(full_with_ramble, 0) == full.size());
+
+    // (b) Embedded complete DSML block inside parameter value
+    const std::string nested_full =
+        "<" + ds + " calls>\n"
+        "<" + ds + " invoke name=\"bash\">\n"
+        "<" + ds + " parameter name=\"cmd\" string=\"true\">cat <<'EOF'\n" +
+        literal_dsml +
+        "\nEOF\n</" + ds + " parameter>\n"
+        "</" + ds + " invoke>\n"
+        "</" + ds + " calls>";
+    ToolBlockScanState nested_scan;
+    for (size_t len = 1; len < nested_full.size(); ++len) {
+      CHECK(nested_scan.scan(nested_full.substr(0, len), 0) == std::string::npos);
+    }
+    CHECK(nested_scan.scan(nested_full, 0) == nested_full.size());
+
+    // (c) Bare <invoke> with embedded </invoke> inside open <parameter>
+    const std::string bare_full =
+        "<invoke name=\"write\">\n"
+        "<parameter name=\"body\">echo '</invoke>'</parameter>\n"
+        "</invoke>";
+    ToolBlockScanState bare_scan;
+    for (size_t len = 1; len < bare_full.size(); ++len) {
+      CHECK(bare_scan.scan(bare_full.substr(0, len), 0) == std::string::npos);
+    }
+    CHECK(bare_scan.scan(bare_full, 0) == bare_full.size());
+  }
+
+  // 10. Attribute '< gt' bounds checks, reordered string="false" before name=,
+  //     invalid JSON at EOF, and skipping repair_bare_dsml when </think> is missing.
+  {
+    const std::string ds = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+    // (a) Malformed invoke tag without name="..." followed by a second invoke tag with name="..."
+    const std::string bad_inv_gt =
+        "ok</think>\n\n<" + ds + " calls>\n"
+        "<" + ds + " invoke invalid>\n"
+        "<" + ds + " invoke name=\"foo\">\n"
+        "</" + ds + " invoke>\n"
+        "</" + ds + " calls>";
+    CHECK(!parse_completion(bad_inv_gt, ThinkingMode::Thinking).ok);
+
+    // (b) Malformed parameter tag without name="..." followed by a second parameter tag with name="..."
+    const std::string bad_param_gt =
+        "ok</think>\n\n<" + ds + " calls>\n"
+        "<" + ds + " invoke name=\"foo\">\n"
+        "<" + ds + " parameter invalid>\n"
+        "<" + ds + " parameter name=\"x\" string=\"true\">1</" + ds + " parameter>\n"
+        "</" + ds + " invoke>\n"
+        "</" + ds + " calls>";
+    CHECK(!parse_completion(bad_param_gt, ThinkingMode::Thinking).ok);
+
+    // (c) string="false" appearing BEFORE name="limit"
+    const std::string reordered =
+        "ok</think>\n\n<" + ds + " calls>\n"
+        "<" + ds + " invoke name=\"lookup\">\n"
+        "<" + ds + " parameter string=\"false\" name=\"limit\">42</" + ds + " parameter>\n"
+        "</" + ds + " invoke>\n"
+        "</" + ds + " calls>";
+    ParsedMessage pm_reord = parse_completion(reordered, ThinkingMode::Thinking);
+    CHECK(pm_reord.ok);
+    CHECK(pm_reord.tool_calls.size() == 1);
+    CHECK(pm_reord.tool_calls[0].arguments == R"({"limit": 42})");
+
+    // (d) string="false" with invalid JSON right before EOF (after == size) must fail
+    const std::string bad_eof_json =
+        "ok</think>\n\n<" + ds + " calls>\n"
+        "<" + ds + " invoke name=\"lookup\">\n"
+        "<" + ds + " parameter name=\"limit\" string=\"false\">not_json</" + ds + " parameter>";
+    CHECK(!parse_completion(bad_eof_json, ThinkingMode::Thinking).ok);
+
+    // (e) Thinking mode with NO </think> and bare <invoke name="x"> must skip repair_bare_dsml
+    const std::string no_think_close =
+        "reasoning mentions <invoke name=\"example\">foo</invoke> literally";
+    ParsedMessage pm_no_te = parse_completion(no_think_close, ThinkingMode::Thinking);
+    CHECK(!pm_no_te.ok);
+    CHECK(pm_no_te.content == no_think_close);
   }
 
   std::printf("PASS: test_tool_namespace\n");

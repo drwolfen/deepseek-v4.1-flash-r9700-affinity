@@ -12,6 +12,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define CHECK(cond)                                                               \
+  do {                                                                            \
+    if (!(cond)) {                                                                \
+      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);       \
+      std::abort();                                                               \
+    }                                                                             \
+  } while (0)
+
 namespace {
 
 void rm_rf(const std::string& path) {
@@ -114,6 +122,7 @@ void test_prefix_cache_delta() {
   opt.queue_depth = 2;
   opt.ranks = 1;
   opt.delta = true;
+  opt.persistent = true;
 
   const uint64_t fp = 0x123456789ABCDEF0ull;
   std::string err;
@@ -193,15 +202,11 @@ void test_prefix_cache_delta() {
     assert(sim.app[i] == expected);
   }
 
-  // Step 4: Index persistence test
-  assert(cache.save_index());
+  // Step 4: Index persistence test (close() persists index.bin; open() reloads it)
   cache.close();
 
-  // Reopen cache and load persisted index
   aff::PrefixCache cache2;
-  opt.persistent = true;
-  assert(cache2.open(opt, regions, io, fp, &err));
-  assert(cache2.load_index());
+  CHECK(cache2.open(opt, regions, io, fp, &err));
 
   std::fill(sim.ring.begin(), sim.ring.end(), 0);
   std::fill(sim.app.begin(), sim.app.end(), 0);
@@ -386,12 +391,190 @@ void test_prefix_cache_delta_multiregion_tp2() {
   std::printf("PASS: test_prefix_cache_delta_multiregion_tp2\n");
 }
 
+void test_prefix_cache_cross_branch_divergence() {
+  char temp_template[] = "/tmp/aff_pcache_div_XXXXXX";
+  char* temp_dir = ::mkdtemp(temp_template);
+  CHECK(temp_dir != nullptr);
+  std::string cache_dir(temp_dir);
+
+  SimContext sim;
+  sim.ring_row_bytes = 4096;
+  sim.app_row_bytes = 1024;
+  sim.ring.assign(4096, 0);
+  sim.app.assign(256 * 1024, 0);
+
+  std::vector<aff::KvRegion> regions = {
+      {/*part=*/0, /*layer=*/0, /*row_bytes=*/4096, /*rows=*/1,   /*ratio=*/0},
+      {/*part=*/1, /*layer=*/0, /*row_bytes=*/1024, /*rows=*/512, /*ratio=*/1},
+  };
+  aff::KvIo io{&sim_save, &sim_load, &sim};
+
+  aff::PrefixCache::Options opt;
+  opt.dir = cache_dir;
+  opt.block_tokens = 64;
+  // Tight budget (~8 blocks) so we can also test LRU eviction fallback cleanly
+  opt.budget_bytes = 2ull << 20;
+  opt.ckpt_percent = 25;
+  opt.queue_depth = 2;
+  opt.ranks = 1;
+  opt.delta = true;
+
+  const uint64_t fp = 0x733de762fee253e6ull;
+  std::string err;
+  aff::PrefixCache cache;
+  CHECK(cache.open(opt, regions, io, fp, &err));
+  const uint32_t n_blk_slots = cache.block_slots();
+
+  // Branch A and Branch B share block 0 (0..63), then diverge at token 64.
+  std::vector<uint32_t> branch_a(128), branch_b(128);
+  for (uint32_t i = 0; i < 64; ++i) branch_a[i] = branch_b[i] = 100 + i;
+  for (uint32_t i = 64; i < 128; ++i) {
+    branch_a[i] = 10000 + i;
+    branch_b[i] = 20000 + i;
+  }
+
+  // Fill sim with Branch A's state and publish checkpoint at pos = 74 (tail = 10).
+  std::fill(sim.ring.begin(), sim.ring.end(), 0xA1);
+  for (size_t i = 0; i < 74 * 1024; ++i) sim.app[i] = (uint8_t)((i + 0x11) & 0xFF);
+  CHECK(cache.publish(branch_a.data(), 74, &err));
+  cache.drain();
+
+  // Branch B publishes full block 1 (0..128) with DIFFERENT tokens after shared block 0!
+  std::fill(sim.ring.begin(), sim.ring.end(), 0xB2);
+  for (size_t i = 0; i < 128 * 1024; ++i) sim.app[i] = (uint8_t)((i + 0x77) & 0xFF);
+  CHECK(cache.publish(branch_b.data(), 128, &err));
+  cache.drain();
+
+  // Branch A's checkpoint at 74 must NOT have been marked state_only=true by Branch B,
+  // and MUST restore Branch A's exact bytes (0xA1 ring, +0x11 app), NOT Branch B's!
+  std::fill(sim.ring.begin(), sim.ring.end(), 0);
+  std::fill(sim.app.begin(), sim.app.end(), 0);
+  CHECK(cache.lookup(branch_a.data(), 74, nullptr) == 74);
+  CHECK(cache.restore(branch_a.data(), 74, &err));
+  CHECK(cache.stats().delta_ckpts_restored == 0);
+  for (size_t i = 0; i < 4096; ++i) CHECK(sim.ring[i] == 0xA1);
+  for (size_t i = 0; i < 74 * 1024; ++i) CHECK(sim.app[i] == (uint8_t)((i + 0x11) & 0xFF));
+
+  // Now publish Branch A's own block 1 (0..128), marking Branch A's checkpoint 74 state_only=true.
+  for (size_t i = 64 * 1024; i < 128 * 1024; ++i) sim.app[i] = (uint8_t)((i + 0x11) & 0xFF);
+  CHECK(cache.publish(branch_a.data(), 128, &err));
+  cache.drain();
+
+  // Evict Branch A's block 1 by filling the block pool with unrelated blocks (keep block 0 hot?
+  // Actually evicting > n_blk_slots blocks drops block 1; then re-publish block 0 so lookup reaches
+  // block 0 and finds checkpoint 74 whose base block 1 is gone!).
+  std::vector<uint32_t> junk(64);
+  for (uint32_t round = 0; round < n_blk_slots + 2; ++round) {
+    for (uint32_t i = 0; i < 64; ++i) junk[i] = 900000 + round * 100 + i;
+    CHECK(cache.publish(junk.data(), 64, &err));
+  }
+  cache.drain();
+  // Re-publish Branch A's block 0 (only 64 tokens, so block 1 is NOT present!)
+  std::fill(sim.ring.begin(), sim.ring.end(), 0xA1);
+  for (size_t i = 0; i < 64 * 1024; ++i) sim.app[i] = (uint8_t)((i + 0x11) & 0xFF);
+  CHECK(cache.publish(branch_a.data(), 64, &err));
+  cache.drain();
+
+  // Now restore Branch A at 74: checkpoint had state_only=true, base block 1 is gone,
+  // and flags==0 on disk -> must fall back to full-checkpoint restore seamlessly!
+  std::fill(sim.ring.begin(), sim.ring.end(), 0);
+  std::fill(sim.app.begin(), sim.app.end(), 0);
+  if (cache.lookup(branch_a.data(), 74, nullptr) == 74) {
+    CHECK(cache.restore(branch_a.data(), 74, &err));
+    for (size_t i = 0; i < 4096; ++i) CHECK(sim.ring[i] == 0xA1);
+    for (size_t i = 0; i < 74 * 1024; ++i) CHECK(sim.app[i] == (uint8_t)((i + 0x11) & 0xFF));
+  }
+
+  cache.close();
+  rm_rf(cache_dir);
+  std::printf("PASS: test_prefix_cache_cross_branch_divergence\n");
+}
+
+void test_prefix_cache_large_block_and_atomic_index() {
+  char temp_template[] = "/tmp/aff_pcache_big_XXXXXX";
+  char* temp_dir = ::mkdtemp(temp_template);
+  CHECK(temp_dir != nullptr);
+  std::string cache_dir(temp_dir);
+
+  const uint32_t B = 1536; // > 1000 tokens -> header > 4096 bytes
+  const uint32_t total = 3072;
+  SimContext sim;
+  sim.ring_row_bytes = 4096;
+  sim.app_row_bytes = 512;
+  sim.ring.assign(4096, 0x3C);
+  sim.app.resize((size_t)total * 512);
+  for (size_t i = 0; i < sim.app.size(); ++i) sim.app[i] = (uint8_t)((i * 17 + 3) & 0xFF);
+
+  std::vector<aff::KvRegion> regions = {
+      {/*part=*/0, /*layer=*/0, /*row_bytes=*/4096, /*rows=*/1,     /*ratio=*/0},
+      {/*part=*/1, /*layer=*/0, /*row_bytes=*/512,  /*rows=*/total, /*ratio=*/1},
+  };
+  aff::KvIo io{&sim_save, &sim_load, &sim};
+
+  aff::PrefixCache::Options opt;
+  opt.dir = cache_dir;
+  opt.block_tokens = B;
+  opt.budget_bytes = 64ull << 20;
+  opt.ckpt_percent = 25;
+  opt.queue_depth = 2;
+  opt.ranks = 1;
+  opt.delta = true;
+  opt.persistent = true;
+
+  // Live default V4.1 fingerprint compatibility check
+  const uint64_t fp = 0x733de762fee253e6ull;
+  std::string err;
+  aff::PrefixCache cache;
+  CHECK(cache.open(opt, regions, io, fp, &err));
+
+  std::vector<uint32_t> ids(total);
+  for (uint32_t i = 0; i < total; ++i) ids[i] = 42000 + i;
+
+  // Publish block 1 (0..3072) FIRST (do NOT drain manually: publish's find_base_block must handle it)
+  CHECK(cache.publish(ids.data(), 3072, &err));
+  // Immediately publish delta checkpoint at 1536 + 1200 (> 1000 tokens tail!)
+  const uint32_t pos = B + 1200;
+  CHECK(cache.publish(ids.data(), pos, &err));
+  CHECK(cache.stats().delta_ckpts_written == 1);
+  cache.drain();
+
+  std::fill(sim.ring.begin(), sim.ring.end(), 0);
+  std::fill(sim.app.begin(), sim.app.end(), 0);
+  CHECK(cache.lookup(ids.data(), pos, nullptr) == pos);
+  CHECK(cache.restore(ids.data(), pos, &err));
+  CHECK(cache.stats().delta_ckpts_restored == 1);
+  for (size_t i = 0; i < 4096; ++i) CHECK(sim.ring[i] == 0x3C);
+  for (size_t i = 0; i < (size_t)pos * 512; ++i) CHECK(sim.app[i] == (uint8_t)((i * 17 + 3) & 0xFF));
+
+  // Atomic save_index on close(): index.bin exists, index.bin.tmp does NOT exist
+  cache.close();
+  struct stat st{};
+  CHECK(::stat((cache_dir + "/index.bin").c_str(), &st) == 0);
+  CHECK(::stat((cache_dir + "/index.bin.tmp").c_str(), &st) != 0);
+
+  // Reopen and verify persistent reload with same fp
+  aff::PrefixCache cache2;
+  CHECK(cache2.open(opt, regions, io, fp, &err));
+  std::fill(sim.ring.begin(), sim.ring.end(), 0);
+  std::fill(sim.app.begin(), sim.app.end(), 0);
+  CHECK(cache2.lookup(ids.data(), pos, nullptr) == pos);
+  CHECK(cache2.restore(ids.data(), pos, &err));
+  for (size_t i = 0; i < 4096; ++i) CHECK(sim.ring[i] == 0x3C);
+  for (size_t i = 0; i < (size_t)pos * 512; ++i) CHECK(sim.app[i] == (uint8_t)((i * 17 + 3) & 0xFF));
+  cache2.close();
+
+  rm_rf(cache_dir);
+  std::printf("PASS: test_prefix_cache_large_block_and_atomic_index\n");
+}
+
 }  // namespace
 
 int main() {
   test_ignore_eos_parsing();
   test_prefix_cache_delta();
   test_prefix_cache_delta_multiregion_tp2();
+  test_prefix_cache_cross_branch_divergence();
+  test_prefix_cache_large_block_and_atomic_index();
   std::printf("PASS: all prefix cache and ignore_eos tests passed.\n");
   return 0;
 }
