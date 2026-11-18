@@ -358,7 +358,8 @@ float* splitk_buf(size_t need) {
 // SLOWER on all but the tallest shape, because halving the N grid halves the block count, and those
 // blocks are what generate the parallel misses that keep the memory system busy.
 constexpr uint32_t kFM = 128, kFN = 128, kFK = 64;    // kFK is BYTES per LDS row
-constexpr uint32_t kFKNarrow = 256;                   // one gfx1201 cacheline; see AFF_GEMM_F8
+constexpr uint32_t kFKNarrow = 128;                   // 128-wide decode tile (e.g. cols=1152 TP=2)
+constexpr uint32_t kFKNarrowWide = 256;               // one gfx1201 cacheline when cols % 256 == 0
 constexpr uint32_t kFWaves = 8;
 constexpr uint32_t kFThreads = kFWaves * kWave;
 // 1 M tile x 8 N tiles a wave, so the 8 waves cover 8 DISTINCT row tiles. With A coming straight
@@ -1326,16 +1327,9 @@ __global__ void batch_rope_tail_bf16_kernel(uint16_t* __restrict__ x, uint32_t n
 }
 
 // V4.1-1017: act_quant(o, 32, "ue8m0", scale_dtype, inplace=True) between inverse RoPE and wo_a.
-// One wave32 owns one (block_of_32_dims, token b) in dim-major [dim][nb] bf16 layout.
-__global__ void batch_o_fp8_qdq_bf16_kernel(uint16_t* __restrict__ x, uint32_t n_blocks32,
-                                            uint32_t nb) {
-  const uint32_t wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const uint32_t lane = threadIdx.x & 31u;
-  const uint32_t total = n_blocks32 * nb;
-  if (wid >= total) return;
-  const uint32_t b = wid % nb, blk = wid / nb;
-  const size_t idx = (size_t)(blk * 32u + lane) * nb + b;
-  const float f = wmma::bf16_to_f32(x[idx]);
+// Shared Wave32 block-32 E4M3 round-trip used by both standalone QDQ and fused attn_out_prep.
+__device__ __forceinline__ uint16_t o_fp8_qdq_wave32(uint16_t bits) {
+  const float f = wmma::bf16_to_f32(bits);
   float amax = fmaxf(fabsf(f), 1e-4f);
   #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1)
@@ -1345,16 +1339,25 @@ __global__ void batch_o_fp8_qdq_bf16_kernel(uint16_t* __restrict__ x, uint32_t n
   const float s = __uint_as_float((uint32_t)(e + 127) << 23);
   const float v = fminf(448.0f, fmaxf(-448.0f, f / s));
   const float a = fabsf(v);
-  if (a == 0.0f) {
-    x[idx] = wmma::f32_to_bf16(v);
-    return;
-  }
+  if (a == 0.0f) return wmma::f32_to_bf16(v);
   const int ea = max((int)((__float_as_uint(a) >> 23) & 0xFFu) - 127, -6);
   const float ulp = __uint_as_float((uint32_t)(ea - 3 + 127) << 23);
   const float r = (a / ulp + 12582912.0f) - 12582912.0f;
   const uint32_t qbits = __float_as_uint(r * ulp) | (__float_as_uint(v) & 0x80000000u);
   const float q = __uint_as_float(qbits) * s;
-  x[idx] = wmma::f32_to_bf16(q);
+  return wmma::f32_to_bf16(q);
+}
+
+// One wave32 owns one (block_of_32_dims, token b) in dim-major [dim][nb] bf16 layout.
+__global__ void batch_o_fp8_qdq_bf16_kernel(uint16_t* __restrict__ x, uint32_t n_blocks32,
+                                            uint32_t nb) {
+  const uint32_t wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t total = n_blocks32 * nb;
+  if (wid >= total) return;
+  const uint32_t b = wid % nb, blk = wid / nb;
+  const size_t idx = (size_t)(blk * 32u + lane) * nb + b;
+  x[idx] = o_fp8_qdq_wave32(x[idx]);
 }
 
 __global__ void o_fp8_qdq_f32_kernel(float* __restrict__ x, uint32_t n_blocks32) {
@@ -1427,6 +1430,73 @@ __global__ __launch_bounds__(kTrTile * kTrRows) void batch_transpose_kernel(
       if (dstb) dstb[(size_t)(bx + ty + k) * srow + by + tx] = wmma::f32_to_bf16(v);
       else      dst[(size_t)(bx + ty + k) * srow + by + tx] = v;
     }
+}
+
+// Fused attention-output preparation: coalesced [nb][n] f32 load -> bf16 in LDS, inverse RoPE
+// tail over [head_dim - n_rot, head_dim), optional Wave32 block-32 E4M3 QDQ, and coalesced
+// [n][nb] bf16 store. Produces bit-identical output to batch_transpose_bf16 + batch_rope_tail_bf16
+// + batch_o_fp8_qdq_bf16 while removing 2 kernel launches and 2 full global passes per layer.
+template <bool O_QDQ>
+__global__ __launch_bounds__(kTrTile * kTrRows) void batch_attn_out_prep_kernel(
+    const float* __restrict__ src, uint16_t* __restrict__ dst, uint32_t n_head, uint32_t head_dim,
+    uint32_t n_rot, uint32_t pos0, uint32_t nb, float freq_scale, float theta_scale,
+    float ext_factor, float lo, float hi, float sin_sign) {
+  __shared__ uint16_t tile[kTrTile][kTrTile + 2];
+  const uint32_t bx = blockIdx.x * kTrTile;
+  const uint32_t by = blockIdx.y * kTrTile;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  const uint32_t n = n_head * head_dim;
+
+  #pragma unroll
+  for (uint32_t k = 0; k < kTrTile; k += kTrRows) {
+    const uint32_t r = by + ty + k;
+    const uint32_t d = bx + tx;
+    if (r < nb && d < n)
+      tile[ty + k][tx] = wmma::f32_to_bf16(src[(size_t)r * n + d]);
+  }
+  __syncthreads();
+
+  const uint32_t dh = bx % head_dim;
+  if (dh >= head_dim - n_rot) {
+    const uint32_t k0 = (dh - (head_dim - n_rot)) >> 1;
+    const uint32_t p = tx & 31u;
+    const uint32_t r_base = (ty << 1) + (tx >> 5);
+    #pragma unroll
+    for (uint32_t m = 0; m < kTrTile; m += 16u) {
+      const uint32_t tr = r_base + m;
+      const uint32_t b = by + tr;
+      if (b < nb) {
+        float c, sn;
+        rope_cs(k0 + p, pos0 + b, freq_scale, theta_scale, ext_factor, lo, hi, sin_sign, &c, &sn);
+        const float x0 = wmma::bf16_to_f32(tile[tr][2u * p]);
+        const float x1 = wmma::bf16_to_f32(tile[tr][2u * p + 1u]);
+        tile[tr][2u * p]      = wmma::f32_to_bf16(x0 * c - x1 * sn);
+        tile[tr][2u * p + 1u] = wmma::f32_to_bf16(x0 * sn + x1 * c);
+      }
+    }
+    if (O_QDQ) __syncthreads();
+  }
+
+  if (O_QDQ) {
+    #pragma unroll
+    for (uint32_t k = 0; k < kTrTile; k += kTrRows) {
+      const uint32_t tr = ty + k;
+      const uint32_t b = by + tr;
+      const bool live = (b < nb) && (bx + tx < n);
+      const uint16_t bits = live ? tile[tr][tx] : 0u;
+      const uint16_t qbits = o_fp8_qdq_wave32(bits);
+      if (live) tile[tr][tx] = qbits;
+    }
+  }
+  __syncthreads();
+
+  #pragma unroll
+  for (uint32_t k = 0; k < kTrTile; k += kTrRows) {
+    const uint32_t b = by + tx;
+    const uint32_t d = bx + ty + k;
+    if (b < nb && d < n)
+      dst[(size_t)d * nb + b] = tile[tx][ty + k];
+  }
 }
 
 // Up to four dim-major -> token-major transposes in ONE launch, one per blockIdx.z. Same tile,
@@ -1506,6 +1576,7 @@ __global__ void batch_head_rms_inv_kernel(const float* __restrict__ x, float* __
 // order the three-pass version had — it stored the scaled value to global and the rope loaded it
 // back. So this is bit-identical, not merely equivalent.
 constexpr uint32_t kQTr = 64, kQTrRows = 8;
+template <bool QRMS>
 __global__ __launch_bounds__(kQTr * kQTrRows) void batch_head_scale_rope_tr_kernel(
     const float* __restrict__ src, uint16_t* __restrict__ dst, const float* __restrict__ inv,
     uint32_t n, uint32_t nb, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, float freq_scale,
@@ -1514,7 +1585,7 @@ __global__ __launch_bounds__(kQTr * kQTrRows) void batch_head_scale_rope_tr_kern
   const uint32_t bx = blockIdx.x * kQTr, by = blockIdx.y * kQTr;   // bx over tokens, by over dims
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t b = bx + tx;
-  const float sc = (b < nb) ? inv[(size_t)(by / head_dim) * nb + b] : 0.0f;
+  const float sc = QRMS ? ((b < nb) ? inv[(size_t)(by / head_dim) * nb + b] : 0.0f) : 1.0f;
   for (uint32_t k = 0; k < kQTr; k += kQTrRows)
     if (b < nb && by + ty + k < n)
       tile[ty + k][tx] = src[(size_t)(by + ty + k) * nb + b] * sc;
@@ -2811,6 +2882,8 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
                               uint32_t aff_line) {
   if (!n || n > kGemmJobsMax || nb > wmma::kN) return false;
   if ((cols % kFKNarrow) != 0) return false;
+  const bool use128 = (cols % kFKNarrowWide) != 0u;
+  const uint32_t k_unit = use128 ? kFKNarrow : kFKNarrowWide;
   if (gemm_profiling())
     for (uint32_t i = 0; i < n; ++i)
       gemm_tally(AFF_FP8_E4M3, jobs[i].rows, cols, nb, false, aff_file, aff_line);
@@ -2839,13 +2912,13 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
   float* ws = nullptr;
   if (tiles * gy * mw < kSplitTarget && cols >= 512u) {
     const uint32_t want = (kSplitTarget + tiles * gy * mw - 1) / (tiles * gy * mw);
-    uint32_t ckw = ((cols / want) + kFKNarrow - 1u) / kFKNarrow * kFKNarrow;
-    if (ckw < kFKNarrow) ckw = kFKNarrow;
+    uint32_t ckw = ((cols / want) + k_unit - 1u) / k_unit * k_unit;
+    if (ckw < k_unit) ckw = k_unit;
     uint32_t k2 = (cols + ckw - 1) / ckw;
     if (k2 > kSplitThinCap && (uint64_t)total * nb < 8192) k2 = kSplitThinCap;
     if (k2 > 1) { ws = splitk_buf((size_t)k2 * total * nb); if (ws) ksplit = k2; }
   }
-  uint32_t ck = ksplit > 1 ? ((cols + ksplit - 1) / ksplit + kFKNarrow - 1u) / kFKNarrow * kFKNarrow
+  uint32_t ck = ksplit > 1 ? ((cols + ksplit - 1) / ksplit + k_unit - 1u) / k_unit * k_unit
                            : 0u;
   if (ck) ksplit = (cols + ck - 1) / ck;
   if (ksplit < 2) { ck = 0; ksplit = 1; ws = nullptr; }
@@ -2858,19 +2931,25 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
   }
   const dim3 grid(tiles, gy, ksplit);
   const hipStream_t st = (hipStream_t)stream;
-#define AFF_F8M(f, ps, mw_)                                                                       \
-  AFF_BLAUNCH((batch_gemm_fp8_multi_kernel<f, ps, 1u, mw_, kFKNarrow>), grid, dim3(mw_ * kWave),   \
+#define AFF_F8M(f, ps, mw_, fk_)                                                                  \
+  AFF_BLAUNCH((batch_gemm_fp8_multi_kernel<f, ps, 1u, mw_, fk_>), grid, dim3(mw_ * kWave),        \
               0, st, J, X, Sx, cols, nb, sc_cols, x_ld, sx_ld, ck, total)
+#define AFF_F8M_FK(f, ps, mw_)                                                                    \
+  do {                                                                                            \
+    if (use128) AFF_F8M(f, ps, mw_, kFKNarrow);                                                   \
+    else        AFF_F8M(f, ps, mw_, kFKNarrowWide);                                               \
+  } while (0)
 #define AFF_F8M_MW(f, ps)                                                                         \
   do {                                                                                            \
-    if (mw == 1u)      AFF_F8M(f, ps, 1u);                                                        \
-    else if (mw == 2u) AFF_F8M(f, ps, 2u);                                                        \
-    else if (mw == 4u) AFF_F8M(f, ps, 4u);                                                        \
-    else               AFF_F8M(f, ps, 8u);                                                        \
+    if (mw == 1u)      AFF_F8M_FK(f, ps, 1u);                                                     \
+    else if (mw == 2u) AFF_F8M_FK(f, ps, 2u);                                                     \
+    else if (mw == 4u) AFF_F8M_FK(f, ps, 4u);                                                     \
+    else               AFF_F8M_FK(f, ps, 8u);                                                     \
   } while (0)
   if (preshuffled) { if (full) AFF_F8M_MW(true, true);  else AFF_F8M_MW(false, true); }
   else             { if (full) AFF_F8M_MW(true, false); else AFF_F8M_MW(false, false); }
 #undef AFF_F8M_MW
+#undef AFF_F8M_FK
 #undef AFF_F8M
   if (ksplit > 1) {
     const size_t nn = (size_t)total * nb;
@@ -2889,16 +2968,11 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
   const uint32_t sc_cols = (uint32_t)((cols + 127) / 128);
   if (!x_ld) x_ld = cols;
   if (!sx_ld) sx_ld = sc_cols;
-  // One 16-wide token tile once nb fits in one, eight otherwise. There is nothing between: the
-  // engine's two callers are a 1536-token prefill chunk and a <=8-token speculative batch, and
-  // every intermediate instantiation is another copy of the K loop in the binary for a shape
-  // nothing issues. See the NT comment on the kernel for what the narrow form is buying.
-  // The narrow tile stages 256 columns and would run past the end of a matrix that is not a
-  // multiple of that — the same hazard the split-K note below describes, and it decodes fluently
-  // while being wrong. V4.1 produces such a shape the moment a 2304-wide intermediate is split two
-  // ways (1152), so a K that does not fit the narrow tile takes the wide kernel, whose unit is 64.
-  // Slower at small `nb`, correct at every width.
+  // One 16-wide token tile once nb fits in one and cols is a multiple of kFKNarrow (128), eight
+  // otherwise. Keep kFKNarrowWide (256) when cols % 256 == 0 and specialize kFKNarrow (128) for
+  // shapes such as TP=2 shexp_down (cols = 1152).
   const bool narrow = nb <= wmma::kN && (cols % kFKNarrow) == 0;
+  const bool use128 = narrow && ((cols % kFKNarrowWide) != 0u);
   const uint32_t nt = narrow ? 1u : kFNTiles;
   const uint32_t fn = nt * 16u;
   // The M tile. Wide calls keep the 8-wave block they were tuned with; narrow ones want as many
@@ -2927,12 +3001,8 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
       if (ws) ksplit = k2;
     }
   }
-  // Rounded to the STAGED TILE, not to the 128-column scale block. A narrow tile is 256 wide, so a
-  // slice whose length is only a multiple of 128 runs one tile past its own end and accumulates the
-  // next slice's columns as well — a wrong answer that still decodes fluently.
-  // max, not the tile alone: a slice must be a whole number of 128-column SCALE blocks as well,
-  // or the UE8M0 fold reads the wrong exponent for part of it.
-  const uint32_t kq = narrow ? (kFKNarrow > 128u ? kFKNarrow : 128u) : 128u;
+  // Rounded to the staged tile (256 or 128) AND 128-col scale blocks.
+  const uint32_t kq = narrow ? (use128 ? kFKNarrow : kFKNarrowWide) : 128u;
   uint32_t ck = ksplit > 1 ? ((cols + ksplit - 1) / ksplit + kq - 1u) / kq * kq : 0u;
   if (ck) ksplit = (cols + ck - 1) / ck;                     // see gemm_launch
   if (ksplit < 2) { ck = 0; ksplit = 1; ws = nullptr; }
@@ -2941,28 +3011,30 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
   // `cols % 128` is required, not just preferred: the scale block is 128 wide and the fold at the
   // end of the K loop assumes a whole one.
   const bool full = (rows % fm == 0) && (nb % fn == 0) && (cols % 128 == 0);
-  // A narrow tile stages 256 columns; below that there is nothing to widen and the tail test
-  // inside the ks loop would be the only thing running. Every dense tensor here has cols a
-  // multiple of 1024, so this is a guard rather than a path.
   if (narrow && (cols % kFKNarrow) != 0) { aff::ui::fatal("batch_gemm_fp8: cols=%u is not a multiple of %u\n", cols, kFKNarrow); std::abort(); }
-// FK: a whole 256-byte cacheline a row for the narrow instantiation, 64 for the wide one. Wide is
-// prefill, where the LDS tile is 128 rows and 256 bytes of it would be 32 KiB of A alone -- half
-// the occupancy, on a path that is already at its roofline.
+// FK: a whole 256-byte cacheline a row when cols % 256 == 0, 128 for odd multiples of 128, and 64
+// for the wide prefill instantiation.
 #define AFF_GEMM_F8(f, ps, nt_, mw_, fk_)                                                         \
   AFF_BLAUNCH((batch_gemm_fp8_kernel<f, ps, nt_, mw_, fk_>), grid, dim3(mw_ * kWave), 0,          \
               (hipStream_t)stream, W, Sw, X, Sx, dst, rows, cols, nb, sc_cols, x_off, w_row_off,  \
               x_ld, sx_ld, accum ? 1 : 0, ck)
+#define AFF_GEMM_F8_FK(f, ps, nt_, mw_)                                                           \
+  do {                                                                                            \
+    if (use128) AFF_GEMM_F8(f, ps, nt_, mw_, kFKNarrow);                                          \
+    else        AFF_GEMM_F8(f, ps, nt_, mw_, kFKNarrowWide);                                      \
+  } while (0)
 #define AFF_GEMM_F8_MW(f, ps)                                                                     \
   do {                                                                                            \
     if (!narrow)        AFF_GEMM_F8(f, ps, kFNTiles, kFWaves, kFK);                               \
-    else if (mw == 1u)  AFF_GEMM_F8(f, ps, 1u, 1u, kFKNarrow);                                    \
-    else if (mw == 2u)  AFF_GEMM_F8(f, ps, 1u, 2u, kFKNarrow);                                    \
-    else if (mw == 4u)  AFF_GEMM_F8(f, ps, 1u, 4u, kFKNarrow);                                    \
-    else                AFF_GEMM_F8(f, ps, 1u, 8u, kFKNarrow);                                    \
+    else if (mw == 1u)  AFF_GEMM_F8_FK(f, ps, 1u, 1u);                                            \
+    else if (mw == 2u)  AFF_GEMM_F8_FK(f, ps, 1u, 2u);                                            \
+    else if (mw == 4u)  AFF_GEMM_F8_FK(f, ps, 1u, 4u);                                            \
+    else                AFF_GEMM_F8_FK(f, ps, 1u, 8u);                                            \
   } while (0)
   if (preshuffled) { if (full) AFF_GEMM_F8_MW(true, true);  else AFF_GEMM_F8_MW(false, true); }
   else             { if (full) AFF_GEMM_F8_MW(true, false); else AFF_GEMM_F8_MW(false, false); }
 #undef AFF_GEMM_F8_MW
+#undef AFF_GEMM_F8_FK
 #undef AFF_GEMM_F8
   if (ksplit > 1) {
     const size_t n = (size_t)rows * nb;
@@ -3029,23 +3101,27 @@ bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint3
   // rows that straddle. Refuse instead — the caller returns false and model.cpp aborts loudly,
   // which is what every other precondition on this path does.
   if (head_dim % kQTr || n_rot % kQTr || n_rot > head_dim) return false;
+  const uint32_t n = n_head * head_dim;
+  const dim3 grid((nb + kQTr - 1) / kQTr, (n + kQTr - 1) / kQTr), blk(kQTr, kQTrRows);
   if (!qrms) {
-    // V4.1: no per-head RMS. A scale of exactly 1.0 through the same transpose keeps one code path.
-    if (hipMemsetD32Async((hipDeviceptr_t)inv, 0x3f800000, (size_t)n_head * nb,
-                          (hipStream_t)stream) != hipSuccess)
-      return false;
-  } else if (nb == kNarrowTok) {
+    // V4.1: no per-head RMS — compile-time QRMS=false skips inv memset and global loads.
+    AFF_BLAUNCH((batch_head_scale_rope_tr_kernel<false>), grid, blk, 0, (hipStream_t)stream, x, dst,
+                nullptr, n, nb, head_dim, n_rot, pos0, r.freq_scale, r.theta_scale, r.ext_factor,
+                r.lo, r.hi);
+    return true;
+  }
+  if (!inv) return false;
+  if (nb == kNarrowTok) {
     AFF_BLAUNCH((hcn_head_rms_inv_kernel<kNarrowTok>), dim3(n_head), dim3(kHcnThreads), 0,
                 (hipStream_t)stream, x, inv, head_dim, eps);
   } else {
-    const uint32_t thr = 256, blk = (n_head * nb + thr - 1) / thr;
-    AFF_BLAUNCH(batch_head_rms_inv_kernel, dim3(blk), dim3(thr), 0, (hipStream_t)stream,
+    const uint32_t thr = 256, blk_inv = (n_head * nb + thr - 1) / thr;
+    AFF_BLAUNCH(batch_head_rms_inv_kernel, dim3(blk_inv), dim3(thr), 0, (hipStream_t)stream,
                 x, inv, n_head, head_dim, nb, eps);
   }
-  const uint32_t n = n_head * head_dim;
-  AFF_BLAUNCH(batch_head_scale_rope_tr_kernel, dim3((nb + kQTr - 1) / kQTr, (n + kQTr - 1) / kQTr),
-              dim3(kQTr, kQTrRows), 0, (hipStream_t)stream, x, dst, inv, n, nb, head_dim, n_rot,
-              pos0, r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi);
+  AFF_BLAUNCH((batch_head_scale_rope_tr_kernel<true>), grid, blk, 0, (hipStream_t)stream, x, dst,
+              inv, n, nb, head_dim, n_rot, pos0, r.freq_scale, r.theta_scale, r.ext_factor,
+              r.lo, r.hi);
   return true;
 }
 
@@ -3076,6 +3152,27 @@ void o_fp8_qdq_f32_hip(float* x, uint32_t n_blocks32, void* stream) {
   const uint32_t waves_per_blk = thr >> 5;
   const uint32_t blk = (n_blocks32 + waves_per_blk - 1) / waves_per_blk;
   AFF_BLAUNCH(o_fp8_qdq_f32_kernel, dim3(blk), dim3(thr), 0, (hipStream_t)stream, x, n_blocks32);
+}
+
+bool batch_attn_out_prep_hip(const float* src, uint16_t* dst, uint32_t n_head, uint32_t head_dim,
+                             uint32_t n_rot, uint32_t pos0, RopeDerived r, float sin_sign,
+                             uint32_t nb, bool o_qdq, void* stream) {
+  if (!nb || !n_head || !head_dim) return true;
+  if (head_dim % kTrTile != 0u || n_rot % kTrTile != 0u || n_rot > head_dim) return false;
+  if (o_qdq && (head_dim % 32u) != 0u) return false;
+  const uint32_t n = n_head * head_dim;
+  const dim3 grid((n + kTrTile - 1u) / kTrTile, (nb + kTrTile - 1u) / kTrTile);
+  const dim3 blk(kTrTile, kTrRows);
+  if (o_qdq) {
+    AFF_BLAUNCH((batch_attn_out_prep_kernel<true>), grid, blk, 0, (hipStream_t)stream, src, dst,
+                n_head, head_dim, n_rot, pos0, nb, r.freq_scale, r.theta_scale, r.ext_factor,
+                r.lo, r.hi, sin_sign);
+  } else {
+    AFF_BLAUNCH((batch_attn_out_prep_kernel<false>), grid, blk, 0, (hipStream_t)stream, src, dst,
+                n_head, head_dim, n_rot, pos0, nb, r.freq_scale, r.theta_scale, r.ext_factor,
+                r.lo, r.hi, sin_sign);
+  }
+  return true;
 }
 
 // dst[dim][nb] <- src[nb][dim], rounding to bf16. The heads path only: attn_out's transpose is the
@@ -3936,6 +4033,71 @@ void batch_hc_chained_decode_hip(const uint16_t* h, const float* w, const void* 
     AFF_BLAUNCH((hc_chained_decode_kernel<1>), dim3(grid), dim3(256), 0, (hipStream_t)stream,
                 h, w, downv, dld, upv, uld, dout, out_norm, rows, n, hc, lr, sync_counters);
   }
+}
+
+namespace {
+struct NormQ8Slot {
+  int dev_id = -1;
+  const float* src = nullptr;
+  const uint8_t* q8 = nullptr;
+  const float* qs = nullptr;
+  uint32_t dim = 0;
+  uint32_t nb = 0;
+};
+std::mutex g_norm_q8_mu;
+std::vector<NormQ8Slot> g_norm_q8;
+}  // namespace
+
+void norm_q8_publish(int dev_id, const float* src, const uint8_t* q8, const float* qs, uint32_t dim,
+                     uint32_t nb) {
+  if (!src || !q8 || !qs || !dim || !nb) return;
+  std::lock_guard<std::mutex> lk(g_norm_q8_mu);
+  for (NormQ8Slot& s : g_norm_q8) {
+    if (s.dev_id == dev_id && s.src == src) {
+      s.q8 = q8; s.qs = qs; s.dim = dim; s.nb = nb;
+      return;
+    }
+  }
+  g_norm_q8.push_back({dev_id, src, q8, qs, dim, nb});
+}
+
+void norm_q8_invalidate(int dev_id, const float* src) {
+  if (!src) return;
+  std::lock_guard<std::mutex> lk(g_norm_q8_mu);
+  for (size_t i = 0; i < g_norm_q8.size();) {
+    if (g_norm_q8[i].dev_id == dev_id && g_norm_q8[i].src == src) {
+      g_norm_q8[i] = g_norm_q8.back();
+      g_norm_q8.pop_back();
+    } else {
+      ++i;
+    }
+  }
+}
+
+void norm_q8_invalidate_dev(int dev_id) {
+  std::lock_guard<std::mutex> lk(g_norm_q8_mu);
+  for (size_t i = 0; i < g_norm_q8.size();) {
+    if (g_norm_q8[i].dev_id == dev_id) {
+      g_norm_q8[i] = g_norm_q8.back();
+      g_norm_q8.pop_back();
+    } else {
+      ++i;
+    }
+  }
+}
+
+bool norm_q8_lookup(int dev_id, const float* src, uint32_t dim, uint32_t nb, const uint8_t** q8,
+                    const float** qs) {
+  if (!src || !q8 || !qs) return false;
+  std::lock_guard<std::mutex> lk(g_norm_q8_mu);
+  for (const NormQ8Slot& s : g_norm_q8) {
+    if (s.dev_id == dev_id && s.src == src && s.dim == dim && s.nb == nb) {
+      *q8 = s.q8;
+      *qs = s.qs;
+      return true;
+    }
+  }
+  return false;
 }
 
 } // namespace aff

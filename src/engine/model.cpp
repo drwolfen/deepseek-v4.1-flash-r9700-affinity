@@ -25,10 +25,14 @@
 #include "ui/log.h"
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <limits>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 #if defined(__x86_64__)
@@ -740,6 +744,73 @@ bool Model::load_dspark(const std::string& path, std::string* err) {
   return true;
 }
 
+namespace {
+struct EngramBgWorker {
+  std::unique_ptr<aff::ThreadPool> pool;
+  std::mutex mu;
+  std::condition_variable cv;
+  std::function<void()> task;
+  bool busy = false;
+  bool stop = false;
+  std::thread th;
+
+  EngramBgWorker() {
+    const unsigned hc = std::thread::hardware_concurrency();
+    const unsigned nthr = std::min(8u, std::max(2u, hc ? hc / 2u : 4u));
+    pool = std::make_unique<aff::ThreadPool>(nthr);
+    th = std::thread([this] { run(); });
+  }
+  ~EngramBgWorker() {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      stop = true;
+    }
+    cv.notify_one();
+    if (th.joinable()) th.join();
+  }
+  void launch(std::function<void()> fn) {
+    wait();
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      task = std::move(fn);
+      busy = true;
+    }
+    cv.notify_one();
+  }
+  void wait() {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [this] { return !busy; });
+  }
+  void parallel_for_tail(uint64_t n, uint64_t min_par,
+                         const std::function<void(uint64_t, uint64_t)>& fn) {
+    if (n < min_par || pool->size() <= 1u) {
+      fn(0, n);
+    } else {
+      pool->parallel_for(n, fn);
+    }
+  }
+
+private:
+  void run() {
+    for (;;) {
+      std::function<void()> fn;
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [this] { return stop || busy; });
+        if (stop && !busy) return;
+        fn = std::move(task);
+      }
+      if (fn) fn();
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        busy = false;
+      }
+      cv.notify_all();
+    }
+  }
+};
+}  // namespace
+
 struct Model::PrefillScratch {
   std::vector<float> emb, normb, blockh, rlogb, iqb, swb, sw;
   std::vector<float> hg, hu, ha, embd, norm, flat, pre;
@@ -749,6 +820,7 @@ struct Model::PrefillScratch {
   std::vector<uint32_t> draft_selb, draft_nselb;
   std::vector<float> draft_swb;
   std::vector<uint8_t> draft_handled;
+  std::unique_ptr<EngramBgWorker> eng_bg;
 };
 
 namespace {
@@ -1801,11 +1873,12 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
     }
     AFF_PH(hyper);
 
-    // ---- Engram: this chunk's hash ids AND dequantised table rows, before any layer runs ------
-    // Gathering all Engram layers (1 and 14) upfront in one parallel_for sweep eliminates two
-    // mid-chunk barrier stalls between Layer 0->1 and Layer 13->14.
+    // ---- Engram: this chunk's hash ids AND dequantised table rows -----------------------------
+    // Gather Engram slot 0 (layer 1) upfront with parallel_for threshold 2 (also parallelizing
+    // DSpark verify blocks), and overlap later slots (layer 14) asynchronously on the background
+    // pool while GPUs execute layers 0..13.
     const uint32_t eng_in_dim = eng_c_.n_cols * eng_c_.head_dim;
-    if (eng_on_) {
+    if (eng_on_ && eng_c_.n_layer > 0) {
       if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
       eng_ids_.resize((size_t)live * eng_c_.n_layer * eng_c_.n_cols);
       eng_rows_.resize((size_t)eng_c_.n_layer * live * eng_in_dim);
@@ -1816,18 +1889,38 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         alive_ptr = sc.eng_alive.data();
       }
       eng_h_.push(ids + base, live, pos0, eng_ids_.data(), alive_ptr);
-      parallel_for((uint64_t)eng_c_.n_layer * live, 64, [&](uint64_t j0, uint64_t j1) {
-        for (uint64_t j = j0; j < j1; ++j) {
-          const uint32_t i = (uint32_t)(j / live);
-          const uint64_t t = j % live;
-          eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
-                        eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+      parallel_for((uint64_t)live, 2, [&](uint64_t t0, uint64_t t1) {
+        for (uint64_t t = t0; t < t1; ++t) {
+          eng_t_.gather(0, eng_ids_.data() + (size_t)t * eng_c_.n_layer * eng_c_.n_cols,
+                        eng_rows_.data() + (size_t)t * eng_in_dim);
         }
       });
+      if (eng_c_.n_layer > 1u) {
+        if (!sc.eng_bg) sc.eng_bg = std::make_unique<EngramBgWorker>();
+        EngramBgWorker* const bg = sc.eng_bg.get();
+        const uint32_t tail_layers = eng_c_.n_layer - 1u;
+        const uint64_t tail_jobs = (uint64_t)tail_layers * live;
+        bg->launch([this, bg, live, eng_in_dim, tail_jobs] {
+          bg->parallel_for_tail(tail_jobs, 2, [&](uint64_t j0, uint64_t j1) {
+            for (uint64_t j = j0; j < j1; ++j) {
+              const uint32_t i = 1u + (uint32_t)(j / live);
+              const uint64_t t = j % live;
+              eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
+                            eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+            }
+          });
+        });
+      }
     }
 
     const bool early_replay_chunk = (replay_cut < cfg_.n_layer && base + live <= replay_from);
     const uint32_t layer_limit = early_replay_chunk ? (replay_cut + 1u) : cfg_.n_layer;
+
+    struct EngramWaitGuard {
+      EngramBgWorker* w = nullptr;
+      void sync() { if (w) { w->wait(); w = nullptr; } }
+      ~EngramWaitGuard() { sync(); }
+    } eng_wait{eng_on_ && eng_c_.n_layer > 1u ? sc.eng_bg.get() : nullptr};
 
     for (uint32_t l = 0; l < layer_limit; ++l) {
       const LayerWeights& w = layers_[l];
@@ -1839,6 +1932,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // that genuinely costs -- `live * n_cols` random rows of a 91.6 GiB mmap.
       if (eng_on_ && eng_slot_[l] >= 0 && bops_.engram) {
         const uint32_t i = (uint32_t)eng_slot_[l];
+        if (i > 0u) eng_wait.sync();
         const float* layer_rows = eng_rows_.data() + (size_t)i * live * eng_in_dim;
         // Fatal, not a refusal: a `false` here would fall through to the per-token prefill, which
         // does not run engram at all, and the run would silently become the model without it.
@@ -2708,20 +2802,31 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
       return false;
   }
   AFF_PH(draft_ep);
-  if (!bops_.draft_head(bops_.ctx, head_.gpu, cfg_.vocab, E, B, nullptr, D.markov_w1.gpu,
-                        D.markov_w2.gpu, cfg_.dspark_markov_rank, first_id, out))
-    return false;
-  AFF_PH(draft_head);
   // The confidence head, when bound. Advisory only: the accept rule never reads it, so a scoring
-  // failure drops the policy and cannot change the output. b_ids now holds [first_id, draft...] and
-  // b_cur still holds the un-normed collapsed hidden the head was built on.
-  if (dspark_conf_on_ && D.confidence_gpu >= 0 && bops_.draft_confidence) {
+  // failure drops the policy and cannot change the output. When batch ops provide draft_head_conf,
+  // run confidence scoring and copy both arrays back in one stream drain.
+  if (dspark_conf_on_ && D.confidence_gpu >= 0 && bops_.draft_head_conf) {
     dspark_conf_.assign(B, 0.0f);
-    if (!bops_.draft_confidence(bops_.ctx, D.confidence_gpu, D.markov_w1.gpu, E,
-                                cfg_.dspark_markov_rank, B, dspark_conf_.data()))
-      dspark_conf_.clear();
+    bool conf_ok = false;
+    if (!bops_.draft_head_conf(bops_.ctx, head_.gpu, cfg_.vocab, E, B, nullptr, D.markov_w1.gpu,
+                               D.markov_w2.gpu, cfg_.dspark_markov_rank, first_id, out,
+                               D.confidence_gpu, dspark_conf_.data(), &conf_ok))
+      return false;
+    if (!conf_ok) dspark_conf_.clear();
+    AFF_PH(draft_head);
   } else {
-    dspark_conf_.clear();
+    if (!bops_.draft_head(bops_.ctx, head_.gpu, cfg_.vocab, E, B, nullptr, D.markov_w1.gpu,
+                          D.markov_w2.gpu, cfg_.dspark_markov_rank, first_id, out))
+      return false;
+    AFF_PH(draft_head);
+    if (dspark_conf_on_ && D.confidence_gpu >= 0 && bops_.draft_confidence) {
+      dspark_conf_.assign(B, 0.0f);
+      if (!bops_.draft_confidence(bops_.ctx, D.confidence_gpu, D.markov_w1.gpu, E,
+                                  cfg_.dspark_markov_rank, B, dspark_conf_.data()))
+        dspark_conf_.clear();
+    } else {
+      dspark_conf_.clear();
+    }
   }
   return true;
 }

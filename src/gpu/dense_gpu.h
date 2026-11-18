@@ -718,7 +718,8 @@ private:
   bool     draft_collapse(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,
                           uint32_t n_hc, float hc_eps, float rms_eps);
   bool     draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
-                      int32_t h_w1, int32_t h_w2, uint32_t rank, uint32_t first_id, uint32_t* ids);
+                      int32_t h_w1, int32_t h_w2, uint32_t rank, uint32_t first_id, uint32_t* ids,
+                      int32_t conf_cw = -1, float* conf_out = nullptr, bool* conf_ok = nullptr);
   // The DSpark confidence head: score the block's drafted tokens from the un-normed collapsed hidden
   // `collapse_pre`/`draft_collapse` left in b_cur and the Markov embedding of each step's input
   // token (b_ids). `cw` is the fp32 [n_embd + rank] projection (registered via reg_vec), `h_w1` the
@@ -745,6 +746,7 @@ private:
   // quantisation reads.
   bool     quant_act_swiglu(size_t r, const float* g, const float* u, uint32_t dim, float limit);
   bool     q_slot(size_t r, uint32_t dim);      // the destination the three of them share
+  bool     q_slot_sw(size_t r, uint32_t dim);   // dedicated narrow SwiGLU FP8 buffer preserving norm q8
   // `accum` makes the epilogue add rather than store — the shared expert's down projection writing
   // straight into the sublayer block instead of through a scratch.
   void     batch_gemm_ent_q8(size_t r, int32_t h, float* y, uint64_t rows, uint64_t cols,
@@ -753,7 +755,11 @@ private:
                              uint32_t aff_line = __builtin_LINE());
   bool     q8_ok(int32_t h, uint64_t cols) const;
 
+  bool     ensure_by(uint32_t need_rows, std::string* err = nullptr);
+  bool     ensure_btm(uint32_t need_rows, std::string* err = nullptr);
+
   uint32_t b_cap_ = 0, b_nb_ = 0, b_live_ = 0, b_pos0_ = 0, b_mid_ = 0;
+  uint32_t b_qr_cap_ = 0, b_g_cap_ = 0, b_u_cap_ = 0, b_y_cap_ = 0, b_tm_cap_ = 0;
   uint32_t b_vocab_ = 0;                        // 0 until batch_init
   uint32_t b_tapin_ = 0;                        // 0 until draft_init
 };

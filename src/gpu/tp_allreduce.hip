@@ -608,8 +608,11 @@ void tp_free(TpContext* ctx) {
 namespace {
 
 static inline bool tp_nrank_sync_enabled() {
-  const char* v = std::getenv("AFF_TP_NRANK_SYNC");
-  return v && *v && std::strcmp(v, "0") != 0;
+  static const bool enabled = [] {
+    const char* v = std::getenv("AFF_TP_NRANK_SYNC");
+    return v && *v && std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
 }
 
 // One launch per rank, with that rank's peer table filled in. NPEER is a template argument so the

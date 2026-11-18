@@ -740,6 +740,11 @@ public:
     bool (*draft_head)(void* ctx, int32_t h_head, uint64_t vocab, uint64_t n_embd, uint32_t n,
                        const float* x, int32_t w1, int32_t w2, uint32_t rank, uint32_t first_id,
                        uint32_t* ids) = nullptr;
+    // Fused draft head + confidence scoring in one stream drain when confidence gating is active.
+    bool (*draft_head_conf)(void* ctx, int32_t h_head, uint64_t vocab, uint64_t n_embd, uint32_t n,
+                            const float* x, int32_t w1, int32_t w2, uint32_t rank,
+                            uint32_t first_id, uint32_t* ids, int32_t conf_cw,
+                            float* conf_out, bool* conf_ok) = nullptr;
     // The confidence head, scored on the card after draft_head. Optional: null leaves the draft's
     // confidence unused, which is the default (the accept rule needs no score).
     bool (*draft_confidence)(void* ctx, int32_t cw, int32_t w1, uint32_t n_embd, uint32_t rank,

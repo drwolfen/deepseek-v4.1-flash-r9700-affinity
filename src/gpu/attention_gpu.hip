@@ -440,16 +440,22 @@ __device__ __forceinline__ void attend_body(
 }
 
 static inline bool draft_skip_masked_enabled() {
-  const char* v = std::getenv("AFF_DRAFT_SKIP_MASKED");
-  if (!v || !*v) v = std::getenv("AFF_DRAFT_RING_MASK_SKIP");
-  if (v && (*v == '0' || std::strcmp(v, "false") == 0)) return false;
-  return true; // default 1 for A/B candidate testing
+  static const bool enabled = [] {
+    const char* v = std::getenv("AFF_DRAFT_SKIP_MASKED");
+    if (!v || !*v) v = std::getenv("AFF_DRAFT_RING_MASK_SKIP");
+    if (v && (*v == '0' || std::strcmp(v, "false") == 0)) return false;
+    return true; // default 1 for A/B candidate testing
+  }();
+  return enabled;
 }
 
 static inline bool attn_lookahead_enabled() {
-  const char* v = std::getenv("AFF_ATTN_LOOKAHEAD");
-  if (v && (*v == '1' || std::strcmp(v, "true") == 0)) return true;
-  return false;
+  static const bool enabled = [] {
+    const char* v = std::getenv("AFF_ATTN_LOOKAHEAD");
+    if (v && (*v == '1' || std::strcmp(v, "true") == 0)) return true;
+    return false;
+  }();
+  return enabled;
 }
 
 template <int DT, bool DRAFT_SKIP = false, bool LOOKAHEAD = false>

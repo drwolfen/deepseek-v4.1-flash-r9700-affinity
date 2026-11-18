@@ -221,6 +221,21 @@ void batch_rope_tail_bf16_hip(uint16_t* x, uint32_t n_head, uint32_t head_dim, u
 void batch_o_fp8_qdq_bf16_hip(uint16_t* x, uint32_t n_blocks32, uint32_t nb, void* stream);
 void o_fp8_qdq_f32_hip(float* x, uint32_t n_blocks32, void* stream);
 
+// Fused attn_out prep: transpose [nb][n] f32 -> [n][nb] bf16, inverse RoPE tail in LDS, and
+// optional Wave32 E4M3 block-32 QDQ. Returns false when alignment preconditions are not met.
+bool batch_attn_out_prep_hip(const float* src, uint16_t* dst, uint32_t n_head, uint32_t head_dim,
+                             uint32_t n_rot, uint32_t pos0, RopeDerived rope, float sin_sign,
+                             uint32_t nb, bool o_qdq, void* stream);
+
+// Cross-module registry allowing StaticPlacement to reuse D.q8/D.qs when batch_hc_pre already
+// quantised D.b_norm with matching geometry and AFF_HADAMARD_ROT == 0.
+void norm_q8_publish(int dev_id, const float* src, const uint8_t* q8, const float* qs, uint32_t dim,
+                     uint32_t nb);
+void norm_q8_invalidate(int dev_id, const float* src);
+void norm_q8_invalidate_dev(int dev_id);
+bool norm_q8_lookup(int dev_id, const float* src, uint32_t dim, uint32_t nb, const uint8_t** q8,
+                    const float** qs);
+
 void batch_swiglu_hip(const float* g, const float* u, float* out, uint32_t n, uint32_t nb,
                       float limit, void* stream);
 
