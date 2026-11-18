@@ -519,9 +519,9 @@ __device__ __forceinline__ void gemm_fp8_body(
   constexpr uint32_t kFolds = (FK + 127u) / 128u;        // 128-col scale blocks touched per K tile
   static_assert(kFolds <= MW * kWave, "kFolds exceeds block threads");
   static_assert(kFolds * FN <= MW * kWave, "kFolds*FN exceeds block threads");
-  __shared__ uint8_t s_b[FN * FK];
+  alignas(16) __shared__ uint8_t s_b[FN * FK];
   // Only instantiated for PS == false; an empty array is not legal, so it is one byte otherwise.
-  __shared__ uint8_t s_a[PS ? 1 : FM * FK];
+  alignas(16) __shared__ uint8_t s_a[PS ? 1 : FM * FK];
   __shared__ uint32_t s_ws[kFolds];
   __shared__ float s_sx[kFolds * FN];
 
@@ -621,8 +621,14 @@ __device__ __forceinline__ void gemm_fp8_body(
 #pragma unroll
       for (uint32_t t = 0; t < kKT; ++t)
 #pragma unroll
-        for (uint32_t i = 0; i < kFMTiles; ++i)
-          apf[i][t] = load_frag8_ps(Wp, rt0 + i, (c0 + t * wmma::kK) >> 4, ktiles, lane);
+        for (uint32_t i = 0; i < kFMTiles; ++i) {
+          if (Full || (m0 + wm + i * 16u) < rows) {
+            apf[i][t] = load_frag8_ps(Wp, rt0 + i, (c0 + t * wmma::kK) >> 4, ktiles, lane);
+          } else {
+            apf[i][t][0] = 0;
+            apf[i][t][1] = 0;
+          }
+        }
     }
 #pragma unroll
     for (uint32_t ks = 0; ks < FK; ks += wmma::kK) {

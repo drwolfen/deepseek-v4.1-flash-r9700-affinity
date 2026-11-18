@@ -702,29 +702,18 @@ int main() {
       (void)hipFree(p);
   }
 
-  // 9. Test kFKNarrow=128 decode WMMA specialization (cols=1152, nb=6) vs reference BF16 matmul
+  // 9. Test kFKNarrow=128 / kFKNarrowWide=256 decode WMMA specializations vs reference BF16 matmul
   {
-    const uint32_t cols = 1152, nb = 6;
-    const uint32_t sc_cols = (cols + 127u) / 128u;
+    const uint32_t nb = 6;
     const float kWVals[] = {0.0f, 0.5f, -0.5f, 1.0f, -1.0f, 1.5f, -1.5f};
     const uint8_t kWCode[] = {0x00u, 0x30u, 0xb0u, 0x38u, 0xb8u, 0x3cu, 0xbcu};
-    const float kXVals[] = {-2.0f, -1.0f, 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f};
+    // Max 3.5f gives dynamic FP8 scale 3.5/448 = 1/128, so every element in kXVals maps exactly to E4M3.
+    const float kXVals[] = {-2.0f, -1.0f, 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.5f};
+    const uint8_t kSwCode[] = {0x7eu, 0x7fu, 0x80u}; // UE8M0 scales: 0.5, 1.0, 2.0
+    const float kSwVal[] = {0.5f, 1.0f, 2.0f};
 
-    for (uint32_t rows : {256u, 512u}) {
-      std::vector<uint8_t> h_w8((size_t)rows * cols);
-      std::vector<uint16_t> h_w16((size_t)rows * cols);
-      std::vector<float> h_wf32((size_t)rows * cols);
-      for (uint32_t r = 0; r < rows; ++r) {
-        for (uint32_t c = 0; c < cols; ++c) {
-          const uint32_t idx = (r * 17u + c * 31u + 5u) % 7u;
-          h_w8[(size_t)r * cols + c] = kWCode[idx];
-          h_w16[(size_t)r * cols + c] = f32_to_bf16_cpu(kWVals[idx]);
-          h_wf32[(size_t)r * cols + c] = kWVals[idx];
-        }
-      }
-      const uint32_t sw_rows = (rows + 127u) / 128u;
-      std::vector<uint8_t> h_sw((size_t)sw_rows * sc_cols, 0x7fu); // UE8M0 scale = 1.0
-
+    for (uint32_t cols : {1152u, 1280u}) {
+      const uint32_t sc_cols = (cols + 127u) / 128u;
       std::vector<float> h_x_dm((size_t)cols * nb); // dim-major [cols][nb]
       for (uint32_t c = 0; c < cols; ++c) {
         for (uint32_t b = 0; b < nb; ++b) {
@@ -732,55 +721,105 @@ int main() {
         }
       }
 
-      uint8_t *d_w8 = nullptr, *d_w8_ps = nullptr, *d_sw = nullptr, *d_x8 = nullptr;
-      uint16_t* d_w16 = nullptr;
-      float *d_x = nullptr, *d_xs = nullptr, *d_y_bf16 = nullptr, *d_y_rm = nullptr, *d_y_ps = nullptr;
-      assert(hipMalloc(&d_w8, h_w8.size()) == hipSuccess);
-      assert(hipMalloc(&d_w8_ps, h_w8.size()) == hipSuccess);
-      assert(hipMalloc(&d_sw, h_sw.size()) == hipSuccess);
-      assert(hipMalloc(&d_w16, h_w16.size() * sizeof(uint16_t)) == hipSuccess);
+      uint8_t* d_x8 = nullptr;
+      float *d_x = nullptr, *d_xs = nullptr;
       assert(hipMalloc(&d_x, h_x_dm.size() * sizeof(float)) == hipSuccess);
       assert(hipMalloc(&d_x8, (size_t)nb * cols) == hipSuccess);
       assert(hipMalloc(&d_xs, (size_t)nb * sc_cols * sizeof(float)) == hipSuccess);
-      assert(hipMalloc(&d_y_bf16, (size_t)rows * nb * sizeof(float)) == hipSuccess);
-      assert(hipMalloc(&d_y_rm, (size_t)rows * nb * sizeof(float)) == hipSuccess);
-      assert(hipMalloc(&d_y_ps, (size_t)rows * nb * sizeof(float)) == hipSuccess);
-
-      assert(hipMemcpy(d_w8, h_w8.data(), h_w8.size(), hipMemcpyHostToDevice) == hipSuccess);
-      assert(hipMemcpy(d_sw, h_sw.data(), h_sw.size(), hipMemcpyHostToDevice) == hipSuccess);
-      assert(hipMemcpy(d_w16, h_w16.data(), h_w16.size() * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
       assert(hipMemcpy(d_x, h_x_dm.data(), h_x_dm.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
-
-      preshuffle_fp8_hip(d_w8, d_w8_ps, rows, cols, nullptr);
       batch_quant_fp8_hip(d_x, d_x8, d_xs, cols, nb, 0u, nullptr);
-      batch_gemm_hip(AFF_BF16, d_w16, nullptr, d_x, d_y_bf16, rows, cols, nb, nullptr);
-      batch_gemm_fp8_hip(d_w8, d_sw, d_x8, d_xs, d_y_rm, rows, cols, nb, 0u, 0u, nullptr,
-                         /*preshuffled=*/false, 0u, 0u, /*accum=*/false, 0u);
-      batch_gemm_fp8_hip(d_w8_ps, d_sw, d_x8, d_xs, d_y_ps, rows, cols, nb, 0u, 0u, nullptr,
-                         /*preshuffled=*/true, 0u, 0u, /*accum=*/false, 0u);
-      assert(hipDeviceSynchronize() == hipSuccess);
 
-      std::vector<float> h_bf16((size_t)rows * nb), h_rm((size_t)rows * nb), h_ps((size_t)rows * nb);
-      assert(hipMemcpy(h_bf16.data(), d_y_bf16, h_bf16.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
-      assert(hipMemcpy(h_rm.data(), d_y_rm, h_rm.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
-      assert(hipMemcpy(h_ps.data(), d_y_ps, h_ps.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
-
-      for (uint32_t r = 0; r < rows; ++r) {
-        for (uint32_t b = 0; b < nb; ++b) {
-          float cpu_acc = 0.0f;
-          for (uint32_t c = 0; c < cols; ++c)
-            cpu_acc += h_wf32[(size_t)r * cols + c] * h_x_dm[(size_t)c * nb + b];
-          const size_t idx = (size_t)r * nb + b;
-          assert(!std::isnan(h_rm[idx]) && !std::isnan(h_ps[idx]));
-          assert(std::fabs(h_rm[idx] - cpu_acc) < 1e-3f);
-          assert(std::fabs(h_ps[idx] - cpu_acc) < 1e-3f);
-          assert(std::fabs(h_rm[idx] - h_bf16[idx]) < 1e-3f);
-          assert(std::fabs(h_ps[idx] - h_bf16[idx]) < 1e-3f);
+      for (uint32_t rows : {80u, 256u, 512u}) {
+        const uint32_t sw_rows = (rows + 127u) / 128u;
+        std::vector<uint8_t> h_sw((size_t)sw_rows * sc_cols);
+        for (uint32_t sr = 0; sr < sw_rows; ++sr) {
+          for (uint32_t sc = 0; sc < sc_cols; ++sc) {
+            h_sw[(size_t)sr * sc_cols + sc] = kSwCode[(sr * 3u + sc) % 3u];
+          }
         }
+
+        std::vector<uint8_t> h_w8((size_t)rows * cols);
+        std::vector<uint16_t> h_w16((size_t)rows * cols);
+        std::vector<float> h_wf32((size_t)rows * cols);
+        for (uint32_t r = 0; r < rows; ++r) {
+          for (uint32_t c = 0; c < cols; ++c) {
+            const uint32_t idx = (r * 17u + c * 31u + 5u) % 7u;
+            const uint32_t sidx = ((r >> 7) * 3u + (c >> 7)) % 3u;
+            const float w_scaled = kWVals[idx] * kSwVal[sidx];
+            h_w8[(size_t)r * cols + c] = kWCode[idx];
+            h_w16[(size_t)r * cols + c] = f32_to_bf16_cpu(w_scaled);
+            h_wf32[(size_t)r * cols + c] = w_scaled;
+          }
+        }
+
+        uint8_t *d_w8 = nullptr, *d_w8_ps = nullptr, *d_sw = nullptr;
+        uint16_t* d_w16 = nullptr;
+        float *d_y_bf16 = nullptr, *d_y_rm = nullptr, *d_y_ps = nullptr;
+        assert(hipMalloc(&d_w8, h_w8.size()) == hipSuccess);
+        assert(hipMalloc(&d_w8_ps, h_w8.size()) == hipSuccess);
+        assert(hipMalloc(&d_sw, h_sw.size()) == hipSuccess);
+        assert(hipMalloc(&d_w16, h_w16.size() * sizeof(uint16_t)) == hipSuccess);
+        assert(hipMalloc(&d_y_bf16, (size_t)rows * nb * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_y_rm, (size_t)rows * nb * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_y_ps, (size_t)rows * nb * sizeof(float)) == hipSuccess);
+
+        assert(hipMemcpy(d_w8, h_w8.data(), h_w8.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sw, h_sw.data(), h_sw.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_w16, h_w16.data(), h_w16.size() * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+
+        preshuffle_fp8_hip(d_w8, d_w8_ps, rows, cols, nullptr);
+        batch_gemm_hip(AFF_BF16, d_w16, nullptr, d_x, d_y_bf16, rows, cols, nb, nullptr);
+        batch_gemm_fp8_hip(d_w8, d_sw, d_x8, d_xs, d_y_rm, rows, cols, nb, 0u, 0u, nullptr,
+                           /*preshuffled=*/false, 0u, 0u, /*accum=*/false, 0u);
+        batch_gemm_fp8_hip(d_w8_ps, d_sw, d_x8, d_xs, d_y_ps, rows, cols, nb, 0u, 0u, nullptr,
+                           /*preshuffled=*/true, 0u, 0u, /*accum=*/false, 0u);
+        assert(hipDeviceSynchronize() == hipSuccess);
+
+        std::vector<float> h_bf16((size_t)rows * nb), h_rm((size_t)rows * nb), h_ps((size_t)rows * nb);
+        assert(hipMemcpy(h_bf16.data(), d_y_bf16, h_bf16.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(h_rm.data(), d_y_rm, h_rm.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(h_ps.data(), d_y_ps, h_ps.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+
+        std::vector<float> h_init((size_t)rows * nb);
+        for (uint32_t r = 0; r < rows; ++r) {
+          for (uint32_t b = 0; b < nb; ++b) {
+            h_init[(size_t)r * nb + b] = 0.25f * (float)((r + b) % 5u + 1u);
+          }
+        }
+        assert(hipMemcpy(d_y_rm, h_init.data(), h_init.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_y_ps, h_init.data(), h_init.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+        batch_gemm_fp8_hip(d_w8, d_sw, d_x8, d_xs, d_y_rm, rows, cols, nb, 0u, 0u, nullptr,
+                           /*preshuffled=*/false, 0u, 0u, /*accum=*/true, 0u);
+        batch_gemm_fp8_hip(d_w8_ps, d_sw, d_x8, d_xs, d_y_ps, rows, cols, nb, 0u, 0u, nullptr,
+                           /*preshuffled=*/true, 0u, 0u, /*accum=*/true, 0u);
+        assert(hipDeviceSynchronize() == hipSuccess);
+
+        std::vector<float> h_rm_acc((size_t)rows * nb), h_ps_acc((size_t)rows * nb);
+        assert(hipMemcpy(h_rm_acc.data(), d_y_rm, h_rm_acc.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(h_ps_acc.data(), d_y_ps, h_ps_acc.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+
+        for (uint32_t r = 0; r < rows; ++r) {
+          for (uint32_t b = 0; b < nb; ++b) {
+            float cpu_acc = 0.0f;
+            for (uint32_t c = 0; c < cols; ++c)
+              cpu_acc += h_wf32[(size_t)r * cols + c] * h_x_dm[(size_t)c * nb + b];
+            const size_t idx = (size_t)r * nb + b;
+            assert(!std::isnan(h_rm[idx]) && !std::isnan(h_ps[idx]));
+            assert(std::fabs(h_rm[idx] - cpu_acc) < 1e-3f);
+            assert(std::fabs(h_ps[idx] - cpu_acc) < 1e-3f);
+            assert(std::fabs(h_rm[idx] - h_bf16[idx]) < 1e-3f);
+            assert(std::fabs(h_ps[idx] - h_bf16[idx]) < 1e-3f);
+            assert(std::fabs(h_rm_acc[idx] - (h_init[idx] + cpu_acc)) < 1e-3f);
+            assert(std::fabs(h_ps_acc[idx] - (h_init[idx] + cpu_acc)) < 1e-3f);
+          }
+        }
+
+        for (void* p : {(void*)d_w8, (void*)d_w8_ps, (void*)d_sw, (void*)d_w16, (void*)d_y_bf16,
+                        (void*)d_y_rm, (void*)d_y_ps})
+          (void)hipFree(p);
       }
 
-      for (void* p : {(void*)d_w8, (void*)d_w8_ps, (void*)d_sw, (void*)d_w16, (void*)d_x,
-                      (void*)d_x8, (void*)d_xs, (void*)d_y_bf16, (void*)d_y_rm, (void*)d_y_ps})
+      for (void* p : {(void*)d_x, (void*)d_x8, (void*)d_xs})
         (void)hipFree(p);
     }
   }
