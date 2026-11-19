@@ -9,7 +9,7 @@ quantisation recipe, and the measurements, all captured on one machine. It exist
 combination that produced the numbers below can be rebuilt.
 
 The affinity engine was transformed into this **R9700-tweaked version with the help of
-DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, and Gemini 3.8 Flash**
+DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, and Gemini 4 Hydrogen**
 (used to port, patch and tune the engine — see *Rework and patches*).
 
 > **Tested on exactly two R9700s.** Every number here was measured on a two-card box. The engine
@@ -19,9 +19,10 @@ DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, and Gem
 **Model files (1017 revision):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)  
 **Model files (legacy 0925):** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)  
 
-**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v5.1.2`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v5.1.2) | **Bake-Off Reports:** [**`v5.1.0 & MoonMath-1017`**](docs/benchmarks/2026-11-16-v5.1-and-moonmath-1017-bakeoff.md) · [**`v5.0.0 & Radiance v2.1`**](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md)
+**Changelog & Benchmarks:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v5.2.0`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v5.2.0) | **Benchmark & Bake-Off Reports:** [**`v5.2.0 Optimization`**](docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md) · [**`v5.1.0 & MoonMath-1017`**](docs/benchmarks/2026-11-16-v5.1-and-moonmath-1017-bakeoff.md) · [**`v5.0.0 & Radiance v2.1`**](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md)
 
-**Release Highlights (Waves 0–4 Progression):**
+**Release Highlights (Waves 0–5 Progression):**
+- **v5.2.0** (`44e81ee`): Reclaimed dead V4.1 Q-RMS/compressor VRAM and tiled Engram H2D/gather (`-616 MiB/card`), expanding GPU-resident MoE capacity by **+101 experts (`3,416 -> 3,517`)** at `[355, 354] MiB` free VRAM (`0` OOM/`0` spill). Fused `attn_out` prep (`AFF_FUSED_ATTN_OUT_PREP`), specialized `kFKNarrow=128` FP8 multi-GEMM (`AFF_FP8_NARROW128`), reused norm Q8 (`AFF_REUSE_NORM_Q8`), skipped decode Engram threadpool overhead (`live < 64`), and synchronized prefill before decode -> **41.00–41.72 tok/s** warm Pass-2 decode (`+30.2%` to `+56.1%` over `v5.1.2`), **`+6.8%` to `+42.0%`** cold Pass-1 decode (`21.33–38.74 tok/s`), **`+5.2%` to `+12.6%`** prefill, **`+14.4%` to `+17.3%`** 4-prompt `temp=0` DSpark decode, and **`-47.0%` / `-55.9%`** cached multi-turn TTFT (`64K -> 100K`). Hardened OpenAI SSE serving with `fd_alive` disconnect probing (`<=1.13 s` FIFO drop, `0` wasted tokens), 15 s empty-delta SSE keepalives, `PrefillAlive` abort hook, O(1) tokenizer decode + BPE/LCP caching, and hardened delta prefix-cache lookup. **4/4 GPU kernel suites + 9/9 CPU `ctest` suites PASS**. See [`docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md`](docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md).
 - **v5.1.2** (`c52e95e`): Ported Lucebox `ThinkingBudget` (default `--thinking-reply-reserve 4096` / `AFF_THINK_REPLY_RESERVE`, `--thinking-loop-repeats 3` / `AFF_THINK_LOOP_REPEATS` over `loop_span=64`), added the Executive-Freeze Churn Breaker (`--thinking-freeze-breaker 1` / `AFF_THINK_FREEZE_BREAKER`, triggers `force_close` after 512 thinking tokens when trailing 256 tokens contain >=64 newline-group tokens and <=36 distinct IDs), synchronized `spec_decode` DSpark seeding/rollback across forced `</think>` injection (`\n</think>\n\n`), and added cache-preserving `reasoning_effort: "none"` (`"off"`/`"0"`) override (`suppress_final_think`) that preserves `idx == 0` effort prompts and historical `<think>...</think>` byte-identical across all `n_pre` tokens while closing only the final `<think>` (`128821` -> `128822`). 7/7 CPU unit tests PASS.
 - **v5.1.1** (`63cd104`): Hotfix for multi-region/multi-rank (`TP=2`) delta prefix-cache restore offsets (`PrefixCache::restore()` now indexes `impl_->rbuf[0]` via the full `B`-token `region_span` layout and per-rank stride across heterogeneous `app_` regions; on-disk `pcache` remains intact without wiping) and strict UTF-8 streaming holdback (`utf8_safe_end`), EOS/final-flush sanitization (`sanitize_utf8`), and validating `json_escape` (`U+FFFD` replacement for truncated/malformed sequences). 6/6 CPU unit tests PASS (including 6-region `TP=2` `pos=1805` delta restore and UTF-8/JSON edge cases).
 - **v5.1.0** (`839665f`): DSpark ring-attention tile skip (`AFF_DRAFT_SKIP_MASKED=1`, **+22.2%** decode speedup: 16.93 -> 20.69 tok/s), paired `temp=0` DSpark acceptance **`73.33%`** on `MoonMath-1017` (vs 67.52% on v5.0.0, **+5.81 pp**; **80.0%** on code, **+9.0%** paired mean gen), compact state-only delta prefix cache (`AFF_PCACHE_DELTA=1`, 1.42× multi-turn TTFT speedup), `ignore_eos=true` raw streaming, GPU `gridDim.y > 65535` overflow guard (#1006) for deep contexts, DSML nested XML tool-argument protection and multi-call invoke splitting (#1020), MoE stream RAW barrier validation (#983, #984). Retained `AFF_ATTN_LOOKAHEAD=0` default (regressed median decode by -11.4%). Verified 3,416 resident experts, [314, 302] MiB active free VRAM, 0 OOM / 0 spill. 6/6 CPU unit tests PASS.
@@ -42,7 +43,7 @@ DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, and Gem
 | RAM | 754 GiB DDR4 (2 NUMA nodes) |
 | PCIe | GPUs link at **Gen5 ×16**, but the switch **uplink runs Gen3 ×16 (8.0 GT/s)** — the host Xeon is a PCIe-3.0 CPU. |
 | Host OS | **Ubuntu 24.04.5 LTS** (Noble Numbat), kernel 7.0.0, ROCm 10.1.0 |
-| Engine build | Docker image `deepseek-affinity:v5.1.2` (ROCm 10.1.0-full, `gfx1201`) |
+| Engine build | Docker image `deepseek-affinity:v5.2.0` (ROCm 10.1.0-full, `gfx1201`) |
 | Serving ports | Dual active: `:8000` (Docker container) and `:8080` (local port-8080 TCP proxy for agent pipeline) |
 
 ### Minimum RAM
@@ -77,6 +78,7 @@ Full methodology, telemetry charts, and raw outputs are documented in [`docs/ben
 | **Wave 4A (v5.1.0)** | `839665f` | **20.69 tok/s** (22.63 peak) | **22.4 tok/s** | **21,448 tok/s (14.4×)** | **3,416** | **0/20 (0%)** | **6/6 PASS** |
 | **Wave 4B (v5.1.1 Hotfix)** | `63cd104` | **20.69 tok/s** (22.63 peak) | **22.4 tok/s** | **21,448 tok/s (14.4×)** | **3,416** | **0/20 (0%)** | **6/6 PASS** |
 | **Wave 4C (v5.1.2 ThinkingBudget)** | `c52e95e` | **20.69 tok/s** (22.63 peak) | **22.4 tok/s** | **21,448 tok/s (14.4×)** | **3,416** | **0/20 (0%)** | **7/7 PASS** |
+| **Wave 5 (v5.2.0 DeepSeek Opt)** | `44e81ee` | **41.00–41.72 tok/s** warm (`tg2`) | **22.4 tok/s** | **1,325.8 tok/s** cold (`+5.2%`) | **3,517 (+101)** | **0/20 (0%)** | **9/9 CPU + 4/4 GPU PASS** |
 
 ### Wave 3 / Wave 4 Long-Context Prefill Acceleration (`v5.0.0`)
 
@@ -134,9 +136,9 @@ In November 2026, upstream Radiance published version `v2.1.0` (`2a2b756`). We c
 
 All historical lines (`v1.0.0`, `v1.1.0`, `v41-tools-fix`, `merge/v41-tools-fix-v4.3.0`, and Waves 0–4 through `v5.0.0`) are unified in `main`.
 
-### ⭐ Local work & engine updates (`v1.0.0` → `v5.0.0`)
+### ⭐ Local work & engine updates (`v1.0.0` → `v5.2.0`)
 
-These are the local changes and backports published in this repository's history, ordered chronologically from initial bring-up through `v5.0.0`:
+These are the local changes and backports published in this repository's history, ordered chronologically from initial bring-up through `v5.2.0`:
 
 | diff | change | measured effect |
 |---|---|---|
@@ -170,6 +172,8 @@ These are the local changes and backports published in this repository's history
 | [`70b3aba`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/70b3aba), [`839665f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/839665f) | **Wave 4A (`v5.1.0`) release**: tools (`aff-cfgcheck`, `aff-fp8check`, `aff-exphash`, `aff-bench`), defaults (`AFF_ATTN_LOOKAHEAD=0`, `AFF_DRAFT_SKIP_MASKED=1`, `AFF_PCACHE_DELTA=1`), version bump `v5.1.0` | 6/6 CPU unit tests PASS; MoonMath-1017 paired DSpark acceptance **73.33%** (+5.81 pp over v5.0.0; +9.0% paired mean gen); 3,416 resident experts, [314, 302] MiB free VRAM |
 | [`63cd104`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/63cd104) | **`v5.1.1` hotfix**: fix `PrefixCache::restore()` multi-region/multi-rank (`TP=2`) delta base-block offset + per-rank striding; strict UTF-8 streaming holdback (`utf8_safe_end`), EOS `sanitize_utf8`, and validating `json_escape` (`U+FFFD` replacement) | prevents delta prefix-cache multi-region offset mismatch & malformed UTF-8 JSON chunks on early EOS; 6/6 CPU unit tests PASS (including `pos=1805` 6-region `TP=2` delta restore) |
 | [`c52e95e`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/c52e95e) | **`v5.1.2` ThinkingBudget & zero-miss `effort=none`**: port `ThinkingBudget` (`--thinking-reply-reserve 4096`, `--thinking-loop-repeats 3` over 64-tok span) + Executive-Freeze Churn Breaker (`--thinking-freeze-breaker 1`), wire DSpark-synced forced `</think>` injection into `spec_decode`, and add cache-preserving `suppress_final_think` for `reasoning_effort:"none"` with `enable_thinking:true` | prevents runaway `<think>` exhaustion & low-diversity newline churn loops while keeping 100% `n_pre` prefix-cache invariance (`128821` -> `128822` only on `ids.back()`); 7/7 CPU unit tests PASS |
+| [`45ea4eb`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/45ea4eb), [`f424cfd`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/f424cfd), [`54c5d78`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/54c5d78), [`d24e31d`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/d24e31d), [`60676eb`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/60676eb) | **`v5.2.0` host/server/tokenizer/pcache optimizations**: add `fd_alive` disconnect polling, strict FIFO slot queue, 15 s empty-delta SSE keepalives, depth-tracked DSML close scan, lock-free `/health` VRAM, skip prefill logits, O(1) `decode_one` + BPE memoization + turn-boundary LCP cache, delta ckpt verification + O(1) base lookup + atomic index, and expanded CPU test suite | concurrent queued disconnect drops in **`1.12 s–1.125 s`** (`0` wasted tokens); cached multi-turn TTFT **-47.0% @64K** (`2.049 -> 1.086 s`) & **-55.9% @100K** (`2.386 -> 1.052 s`); 9/9 CPU `ctest` PASS |
+| [`79e8ac7`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/79e8ac7), [`edba510`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/edba510), [`b13cbf2`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/b13cbf2), [`34deb71`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/34deb71), [`3f24d07`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/3f24d07), [`e626921`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e626921), [`44e81ee`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/44e81ee) | **`v5.2.0` HIP/VRAM/decode optimizations**: reclaim dead V4.1 Q-RMS & non-KV-source compressor buffers, tile Engram H2D/gather (`kEngramTileMax`), wire `PrefillAlive` abort hook, fuse `attn_out` prep (`AFF_FUSED_ATTN_OUT_PREP`), specialize `kFKNarrow=128` (`AFF_FP8_NARROW128`), reuse norm Q8 (`AFF_REUSE_NORM_Q8`), skip threadpool on decode Engram (`live < 64`), clamp `EngramBgWorker` cpuset, sync prefill before decode, and fix indexer stride + Test 9 E4M3 bounds | **`+101` resident experts** (`3,416 -> 3,517`, `-616 MiB/card` arena/Engram); warm Pass-2 decode **`41.00–41.72 tok/s`** (**`+30.2%` to `+56.1%`**); cold Pass-1 decode **`+6.8%` to `+42.0%`**; prefill **`+5.2%` to `+12.6%`**; 4-prompt DSpark **`+14.4%` to `+17.3%`**; 4/4 GPU kernel suites PASS (`0` HIP errors) |
 
 ### V4.1 / multimodal port (fork `v41` branch, also in this history)
 
@@ -227,7 +231,7 @@ AFF_PCACHE_DELTA=1
 ### Building the Docker Container (ROCm 10.1)
 
 ```sh
-docker build -f Dockerfile -t deepseek-affinity:v5.1.2 .
+docker build -f Dockerfile -t deepseek-affinity:v5.2.0 .
 ```
 
 ### Serving DeepSeek-V4.1-Flash (Production Topology)
@@ -248,7 +252,7 @@ docker run --name deepseek-affinity \
   -e AFF_DRAFT_SKIP_MASKED=1 -e AFF_ATTN_LOOKAHEAD=0 -e AFF_PCACHE_DELTA=1 \
   -p 8000:8000 \
   -v /models:/models \
-  deepseek-affinity:v5.1.2 \
+  deepseek-affinity:v5.2.0 \
     -m /models/DeepSeek-V4.1-Flash-1017-MoonMath-aff/model-moonmath-1017.aff \
     --tokenizer /models/LLM-Models/DeepSeek-V4.1-Flash-1017-MoonMath-FP8/tokenizer.json \
     --host 0.0.0.0 --port 8000 \
@@ -276,7 +280,7 @@ docker run --name deepseek-affinity \
 Health endpoint check:
 ```sh
 curl -sS http://127.0.0.1:8000/health
-# {"status":"ok","version":"v5.1.2","git_sha":"...","resident_experts":3416,"free_vram_mib":[204,300]}
+# {"status":"ok","version":"v5.2.0","git_sha":"...","resident_experts":3517,"free_vram_mib":[355,354]}
 ```
 
 ---
@@ -288,4 +292,4 @@ curl -sS http://127.0.0.1:8000/health
 - Lucebox AI ([Luce-Org/lucebox](https://github.com/Luce-Org/lucebox)) for bounded replay, adaptive verify width, and evaluation corpus.
 - 05yuki ([05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)) for INT4 LM head and tool namespace specs.
 - `dealignai` and `pqhaz` for the uncensored and abliterated weights.
-- Transformation of affinity into this R9700-tweaked engine was executed with DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, and Gemini 3.8 Flash.
+- Transformation of affinity into this R9700-tweaked engine was executed with DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, and Gemini 4 Hydrogen.
