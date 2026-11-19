@@ -6,6 +6,19 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [5.3.0] — 2026-11-19 — "RDNA 4 Wave32 HIP kernel optimizations"
+
+Wave 6 production release. Optimizes `gfx1201` Wave32 HIP kernels across Wave A (`dfb34cb`), Wave B (`c20ed32`), and multi-GEMM band / WGP fence fixes (`e1f6be3`), retaining ROCm `10.1.0-full` (`+3.55%` composite over ROCm `10.2.0-full`).
+
+### Added
+- **Wave A RDNA4 Primitives (`src/gpu/hip_common.h`, `dfb34cb`)**: `lds_barrier()`, `dpp_xor_lane<Lane>()` (`DPP16 row_xmask` + `v_permlanex16_b32`), and `AFF_WAVES(n)` occupancy hints across GPU kernels.
+- **Wave B Kernel Tuning (`c20ed32`)**: FP8 4×2 prefill (`AFF_FP8_PREFILL_4X2`), inline split-K (`AFF_FP8_SPLIT_INLINE`), staged TP2 all-reduce (`AFF_TP_AR_STAGED`), `AFF_FLASH_MIN_TILES`, and VGPR/LDS tightening (`flash_kernel<2>` `235` VGPR / `21,392` B LDS / `occ=6`, `idx_quant_kernel` `scratch=0`, `tp_ar_fp8_staged_kernel` `scratch=0`, `0` new spills across `497` `gfx1201` kernels).
+- **Multi-GEMM & WGP Fence Fix (`e1f6be3`)**: Contiguous output bands relative to `jobs[0].y` when `jobs[i].y == nullptr` (`batch_gemm_multi_hip`, `batch_gemm_fp8_multi_hip`), and `__builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent")` in `gemm_fp8_body`.
+
+### Performance & Verification
+- **Paired 3-Arm Benchmark (`NGEN=192`)**: `+24.9%` to `+43.8%` `tg` (`41.47–42.23 tok/s` @16K–64K), `+37.05%` slot `blocks/s`, `+34.9%` 4-prompt DSpark (`21.33 tok/s`), `-34.0%` `dense-gpu`, `-85.2%` `x_gu+x_down`, `resident_experts=3,517`, `free_vram_mib=[353, 355]`, `kfd_release_s=2.800 s`.
+- **Tests**: 13/13 filtered CPU `ctest` + 5/5 GPU binaries (ROCm 10.1 & 10.2) + 2/2 fallback-toggle GPU runs PASS (`0` `hipError`).
+
 ## [5.0.0] — 2026-11-16 — "RDNA 4 sparse indexer & 3,416 resident experts"
 
 Wave 3 production release. Implements hardware-specialized sparse indexer on RDNA 4 (`gfx1201`),

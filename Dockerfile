@@ -2,7 +2,7 @@ ARG BASE_IMAGE=docker.io/rocm/dev-ubuntu-24.04:10.1.0-full
 FROM ${BASE_IMAGE}
 ARG JOBS=16
 ARG AFF_GIT_SHA=unknown
-ARG AFF_VERSION=v5.2.0
+ARG AFF_VERSION=v5.3.0
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build git bash sudo passwd python3 procps iproute2 curl ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY . /opt/affinity-src
 RUN ln -s /opt/affinity-src /opt/affinity
