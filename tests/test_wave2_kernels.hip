@@ -563,6 +563,177 @@ int main() {
       }
 
       std::printf("PASS: FP8 prefill 4x2 (B1) + inline split-K parity (B2)\n");
+
+      // Regression: contiguous-band multi-GEMM with jobs[1].y == nullptr (dense_gpu.hip pattern)
+      // Covers (a) batch_gemm_fp8_multi_hip ksplit==1 (Layer 0 attn_qkv "hi" shape: 1536+576, 5120, 16)
+      // and (b) batch_gemm_fp8_multi_hip ksplit>1 (256+256, 5120, 16) with inline split-K fence.
+      auto run_fp8_multi_null_band = [&](uint32_t r0, uint32_t r1, uint32_t cols, uint32_t nb,
+                                         bool preshuffled) {
+        const uint32_t jrows[2] = {r0, r1};
+        const uint32_t total = r0 + r1;
+        const uint32_t sc_cols = cols / 128u;
+        std::vector<uint8_t> h_w0((size_t)r0 * cols), h_w1((size_t)r1 * cols);
+        std::vector<uint8_t> h_sw0((size_t)((r0 + 127u) / 128u) * sc_cols),
+            h_sw1((size_t)((r1 + 127u) / 128u) * sc_cols);
+        std::vector<uint8_t> h_x((size_t)nb * cols);
+        std::vector<float> h_sx((size_t)nb * sc_cols);
+        std::vector<float> h_y_gpu((size_t)total * nb, 0.0f);
+
+        for (size_t i = 0; i < h_w0.size(); ++i) h_w0[i] = make_e4m3(i + 41u);
+        for (size_t i = 0; i < h_w1.size(); ++i) h_w1[i] = make_e4m3(i + 131071u);
+        for (size_t i = 0; i < h_sw0.size(); ++i) h_sw0[i] = make_ue8m0(i + 3u);
+        for (size_t i = 0; i < h_sw1.size(); ++i) h_sw1[i] = make_ue8m0(i + 11u);
+        for (size_t i = 0; i < h_x.size(); ++i) h_x[i] = make_e4m3(i + 700001u);
+        for (uint32_t b = 0; b < nb; ++b)
+          for (uint32_t kb = 0; kb < sc_cols; ++kb)
+            h_sx[(size_t)b * sc_cols + kb] = 0.5f * (float)(1u + ((b * 3u + kb) % 3u));
+
+        uint8_t *d_w0 = nullptr, *d_w1 = nullptr, *d_ps0 = nullptr, *d_ps1 = nullptr;
+        uint8_t *d_sw0 = nullptr, *d_sw1 = nullptr, *d_x = nullptr;
+        float *d_sx = nullptr, *d_y = nullptr;
+        assert(hipMalloc(&d_w0, h_w0.size()) == hipSuccess);
+        assert(hipMalloc(&d_w1, h_w1.size()) == hipSuccess);
+        assert(hipMalloc(&d_sw0, h_sw0.size()) == hipSuccess);
+        assert(hipMalloc(&d_sw1, h_sw1.size()) == hipSuccess);
+        assert(hipMalloc(&d_x, h_x.size()) == hipSuccess);
+        assert(hipMalloc(&d_sx, h_sx.size() * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_y, h_y_gpu.size() * sizeof(float)) == hipSuccess);
+        assert(hipMemcpy(d_w0, h_w0.data(), h_w0.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_w1, h_w1.data(), h_w1.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sw0, h_sw0.data(), h_sw0.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sw1, h_sw1.data(), h_sw1.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_x, h_x.data(), h_x.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sx, h_sx.data(), h_sx.size() * sizeof(float), hipMemcpyHostToDevice) ==
+               hipSuccess);
+        assert(hipMemset(d_y, 0, h_y_gpu.size() * sizeof(float)) == hipSuccess);
+        if (preshuffled) {
+          assert(hipMalloc(&d_ps0, h_w0.size()) == hipSuccess);
+          assert(hipMalloc(&d_ps1, h_w1.size()) == hipSuccess);
+          aff::preshuffle_fp8_hip(d_w0, d_ps0, r0, cols, nullptr);
+          aff::preshuffle_fp8_hip(d_w1, d_ps1, r1, cols, nullptr);
+        }
+
+        aff::BatchGemmJob jobs[2] = {
+            {preshuffled ? d_ps0 : d_w0, d_sw0, d_y, r0, 0u, 0u},
+            {preshuffled ? d_ps1 : d_w1, d_sw1, nullptr, r1, 0u, 0u},
+        };
+        assert(aff::batch_gemm_fp8_multi_hip(jobs, 2u, d_x, d_sx, cols, nb, 0u, 0u, nullptr,
+                                             preshuffled));
+        assert(hipGetLastError() == hipSuccess);
+        assert(hipDeviceSynchronize() == hipSuccess);
+        assert(hipMemcpy(h_y_gpu.data(), d_y, h_y_gpu.size() * sizeof(float),
+                         hipMemcpyDeviceToHost) == hipSuccess);
+
+        double max_abs_err = 0.0;
+        for (uint32_t ji = 0; ji < 2u; ++ji) {
+          const auto& hw = (ji == 0u) ? h_w0 : h_w1;
+          const auto& hsw = (ji == 0u) ? h_sw0 : h_sw1;
+          const size_t y_off = (ji == 0u) ? 0u : (size_t)r0 * nb;
+          for (uint32_t r = 0; r < jrows[ji]; ++r) {
+            const uint32_t sr = r >> 7;
+            for (uint32_t b = 0; b < nb; ++b) {
+              float ref = 0.0f;
+              for (uint32_t kb = 0; kb < sc_cols; ++kb) {
+                float blk = 0.0f;
+                for (uint32_t k = 0; k < 128u; ++k) {
+                  blk += e4m3_to_f32_cpu(hw[(size_t)r * cols + kb * 128u + k]) *
+                         e4m3_to_f32_cpu(h_x[(size_t)b * cols + kb * 128u + k]);
+                }
+                ref += blk * (ue8m0_to_f32_cpu(hsw[(size_t)sr * sc_cols + kb]) *
+                              h_sx[(size_t)b * sc_cols + kb]);
+              }
+              const double err =
+                  std::fabs((double)h_y_gpu[y_off + (size_t)r * nb + b] - (double)ref);
+              if (err > max_abs_err) max_abs_err = err;
+            }
+          }
+        }
+        std::printf("  fp8_multi_null_band(%u+%u, %u, %u, ps=%d): max_abs_err=%.6e\n", r0, r1,
+                    cols, nb, (int)preshuffled, max_abs_err);
+        assert(max_abs_err <= 2e-3);
+
+        (void)hipFree(d_w0);
+        (void)hipFree(d_w1);
+        if (d_ps0) (void)hipFree(d_ps0);
+        if (d_ps1) (void)hipFree(d_ps1);
+        (void)hipFree(d_sw0);
+        (void)hipFree(d_sw1);
+        (void)hipFree(d_x);
+        (void)hipFree(d_sx);
+        (void)hipFree(d_y);
+      };
+
+      for (int ps_mode = 0; ps_mode <= 1; ++ps_mode) {
+        const bool ps = (ps_mode != 0);
+        run_fp8_multi_null_band(1536u, 576u, 5120u, 16u, ps); // ksplit == 1
+        run_fp8_multi_null_band(256u, 256u, 5120u, 16u, ps);  // ksplit > 1
+      }
+
+      // (c) batch_gemm_multi_hip (BF16, non-inline split-K, ksplit == 1, jobs[1].y == nullptr).
+      {
+        const uint32_t jrows[2] = {256u, 128u};
+        const uint32_t cols = 256u, nb = 16u, total = jrows[0] + jrows[1];
+        std::vector<uint16_t> h_w0((size_t)jrows[0] * cols), h_w1((size_t)jrows[1] * cols);
+        std::vector<uint16_t> h_x((size_t)cols * nb); // dim-major [cols][nb]
+        std::vector<float> h_y_gpu((size_t)total * nb, 0.0f);
+        for (size_t i = 0; i < h_w0.size(); ++i)
+          h_w0[i] = f32_to_bf16_cpu(0.125f * (float)((int)(i % 13u) - 6));
+        for (size_t i = 0; i < h_w1.size(); ++i)
+          h_w1[i] = f32_to_bf16_cpu(0.125f * (float)((int)((i * 3u) % 11u) - 5));
+        for (size_t i = 0; i < h_x.size(); ++i)
+          h_x[i] = f32_to_bf16_cpu(0.25f * (float)((int)((i * 7u) % 9u) - 4));
+
+        uint16_t *d_w0 = nullptr, *d_w1 = nullptr, *d_x = nullptr;
+        float* d_y = nullptr;
+        assert(hipMalloc(&d_w0, h_w0.size() * sizeof(uint16_t)) == hipSuccess);
+        assert(hipMalloc(&d_w1, h_w1.size() * sizeof(uint16_t)) == hipSuccess);
+        assert(hipMalloc(&d_x, h_x.size() * sizeof(uint16_t)) == hipSuccess);
+        assert(hipMalloc(&d_y, h_y_gpu.size() * sizeof(float)) == hipSuccess);
+        assert(hipMemcpy(d_w0, h_w0.data(), h_w0.size() * sizeof(uint16_t),
+                         hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_w1, h_w1.data(), h_w1.size() * sizeof(uint16_t),
+                         hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_x, h_x.data(), h_x.size() * sizeof(uint16_t),
+                         hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemset(d_y, 0, h_y_gpu.size() * sizeof(float)) == hipSuccess);
+
+        aff::BatchGemmJob jobs[2] = {
+            {d_w0, nullptr, d_y, jrows[0], 0u, 0u},
+            {d_w1, nullptr, nullptr, jrows[1], 0u, 0u},
+        };
+        assert(aff::batch_gemm_multi_hip(AFF_BF16, jobs, 2u, d_x, cols, nb, true, nullptr));
+        assert(hipGetLastError() == hipSuccess);
+        assert(hipDeviceSynchronize() == hipSuccess);
+        assert(hipMemcpy(h_y_gpu.data(), d_y, h_y_gpu.size() * sizeof(float),
+                         hipMemcpyDeviceToHost) == hipSuccess);
+
+        double max_abs_err = 0.0;
+        for (uint32_t ji = 0; ji < 2u; ++ji) {
+          const auto& hw = (ji == 0u) ? h_w0 : h_w1;
+          const size_t y_off = (ji == 0u) ? 0u : (size_t)jrows[0] * nb;
+          for (uint32_t r = 0; r < jrows[ji]; ++r) {
+            for (uint32_t b = 0; b < nb; ++b) {
+              float ref = 0.0f;
+              for (uint32_t c = 0; c < cols; ++c) {
+                ref += bf16_to_f32_cpu(hw[(size_t)r * cols + c]) *
+                       bf16_to_f32_cpu(h_x[(size_t)c * nb + b]);
+              }
+              const double err =
+                  std::fabs((double)h_y_gpu[y_off + (size_t)r * nb + b] - (double)ref);
+              if (err > max_abs_err) max_abs_err = err;
+            }
+          }
+        }
+        std::printf("  bf16_multi_null_band(256+128, 256, 16): max_abs_err=%.6e\n", max_abs_err);
+        assert(max_abs_err <= 2e-3);
+
+        (void)hipFree(d_w0);
+        (void)hipFree(d_w1);
+        (void)hipFree(d_x);
+        (void)hipFree(d_y);
+      }
+
+      std::printf("PASS: Multi-GEMM contiguous null-band regressions\n");
   }
 
   std::printf("ALL WAVE 2 PHASE 2B KERNEL TESTS PASSED.\n");

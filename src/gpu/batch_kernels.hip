@@ -752,7 +752,11 @@ __device__ __forceinline__ void gemm_fp8_body(
         if (tid == 0u) {
           __hip_atomic_store(&Ctr[tile_id], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         }
+#ifdef __HIP_DEVICE_COMPILE__
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
         __threadfence();
+#endif
         const uint32_t rlo = m0, rhi = min(m0 + FM, rows);
         const uint32_t clo = n0, chi = min(n0 + FN, nb);
         const uint32_t ncols = chi - clo;
@@ -3111,7 +3115,7 @@ bool batch_gemm_multi_hip(uint32_t quant, const BatchGemmJob* jobs, uint32_t n, 
   for (uint32_t i = 0; i < n; ++i) {
     J.w[i] = jobs[i].w; J.s[i] = jobs[i].s;
     J.xoff[i] = jobs[i].x_off; J.woff[i] = jobs[i].w_row_off;
-    J.y[i] = ws ? (ws + (size_t)off * nb) : jobs[i].y;
+    J.y[i] = (ws ? ws : jobs[0].y) + (size_t)off * nb;
     off += jobs[i].rows;
   }
   const dim3 grid(tiles, gy, ksplit);
@@ -3289,7 +3293,7 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
   for (uint32_t i = 0; i < n; ++i) {
     J.w[i] = jobs[i].w; J.s[i] = jobs[i].s;
     J.xoff[i] = jobs[i].x_off; J.woff[i] = jobs[i].w_row_off;
-    J.y[i] = ws ? (ws + (size_t)off * nb) : jobs[i].y;
+    J.y[i] = (ws ? ws : jobs[0].y) + (size_t)off * nb;
     off += jobs[i].rows;
   }
   const dim3 grid(tiles, gy, ksplit);
