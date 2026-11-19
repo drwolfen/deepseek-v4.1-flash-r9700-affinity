@@ -166,6 +166,17 @@ struct StaticPlacement::Impl {
   std::vector<uint32_t> stage_claimed;        // slots claimed by the dispatch being built
   std::vector<uint8_t> stage_raw;             // container bytes, reused across fetches
 
+  // Per-card count of pooled experts in each layer (`dev * n_layer + layer`).
+  std::vector<uint32_t> pooled_layer_cnt;
+  std::vector<uint8_t> pooled_mark;
+
+  // Non-blocking async pinned readback state for periodic MoePlanStatus verification.
+  MoePlanStatus* plan_h_st[8] = {};
+  hipEvent_t plan_ev[8] = {};
+  bool plan_inflight[8] = {};
+  uint32_t plan_expect_total[8] = {};
+  bool plan_any_inflight = false;
+
 };
 
 StaticPlacement::~StaticPlacement() {
@@ -191,6 +202,15 @@ StaticPlacement::~StaticPlacement() {
   plc_.clear();
   for (size_t i = 0; i < devs_.size() && i < 8; ++i) {
     (void)hipSetDevice(devs_[i]);
+    if (impl_->plan_ev[i]) {
+      if (impl_->plan_inflight[i]) (void)hipEventSynchronize(impl_->plan_ev[i]);
+      (void)hipEventDestroy(impl_->plan_ev[i]);
+      impl_->plan_ev[i] = nullptr;
+    }
+    if (impl_->plan_h_st[i]) {
+      (void)hipHostFree(impl_->plan_h_st[i]);
+      impl_->plan_h_st[i] = nullptr;
+    }
     for (void* p : {(void*)plan_col_[i], (void*)plan_cnt_[i], (void*)plan_st_[i],
                     (void*)d_imat_w2_[i], (void*)d_pref_slab_[i], (void*)d_pref_src_[i]})
       if (p) (void)hipFree(p);
@@ -356,6 +376,22 @@ void StaticPlacement::publish_base(size_t idx, PlcPatch* sink) {
     }
     plc_host_[dv * n + idx] = a;           // and the copy the host reads, from the same value
   }
+  if (impl_ && layer < n_layer_) {
+    const size_t n_cards = plc_.size();
+    if (impl_->pooled_mark.size() != n_cards * n)
+      impl_->pooled_mark.assign(n_cards * n, 0u);
+    if (impl_->pooled_layer_cnt.size() != n_cards * n_layer_)
+      impl_->pooled_layer_cnt.assign(n_cards * n_layer_, 0u);
+    for (size_t dv = 0; dv < n_cards; ++dv) {
+      const uint64_t a = plc_[dv] ? plc_host_[dv * n + idx] : 0ull;
+      const uint8_t is_pooled = (a != 0ull && (a & kPlcResident) == 0ull) ? 1u : 0u;
+      uint8_t& prev = impl_->pooled_mark[dv * n + idx];
+      if (prev != is_pooled) {
+        impl_->pooled_layer_cnt[dv * n_layer_ + layer] += is_pooled ? 1u : (uint32_t)-1;
+        prev = is_pooled;
+      }
+    }
+  }
   // And the layer's addressless count, maintained here because here is the only place an address
   // appears or disappears. Recomputed across the cards rather than incremented: a promote and a
   // demote both pass through this function and a delta would have to know which it was.
@@ -439,6 +475,27 @@ void StaticPlacement::lead_gate(void* const* streams, uint32_t nb_tok, size_t R)
   // nothing. The same nb_tok test the route trace uses to tell the two apart.
   if (nb_tok > 64) return;
   Impl& I = *impl_;
+  static const bool kLeadGateIdle = [] {
+    const char* s = std::getenv("AFF_LEAD_GATE_IDLE");
+    return s && *s && std::strcmp(s, "0") != 0;
+  }();
+  if (!kLeadGateIdle) {
+    if (!engine_on_) {
+      I.lead_blk = 0;
+      return;
+    }
+    bool any_active_move = false;
+    for (const auto& m : I.moves) {
+      if (m.state != Impl::Move::State::Free) {
+        any_active_move = true;
+        break;
+      }
+    }
+    if (!any_active_move) {
+      I.lead_blk = 0;
+      return;
+    }
+  }
   if (I.lead_ev.empty()) {
     I.lead_ev.assign(kLeadRing * R, nullptr);
     for (size_t i = 0; i < I.lead_ev.size(); ++i) {
@@ -1847,7 +1904,12 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         // the layer costs the same six launches it does today. Launching all four unconditionally
         // would take that to twenty-four.
         const uint32_t last = moe_plan_last_group(nb_tok);
-        for (uint32_t cls = 0; cls < 2u; ++cls)
+        const bool has_pooled =
+            I.pooled_layer_cnt.empty() ||
+            ((dv * n_layer_ + layer) < I.pooled_layer_cnt.size() &&
+             I.pooled_layer_cnt[dv * n_layer_ + layer] > 0u);
+        const uint32_t n_cls = has_pooled ? 2u : 1u;
+        for (uint32_t cls = 0; cls < n_cls; ++cls)
           for (uint32_t b = 0; b <= last; ++b) {
             const uint32_t g = cls * 4u + b;
             GRP.n[g] = cap;
@@ -1855,10 +1917,10 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
             for (uint32_t pl = 0; pl < 3u; ++pl)
               GRP.base[g][pl] = Tg + (size_t)(pl * 8u + g) * cap;
           }
-        n_miss_tiles = cap;
+        n_miss_tiles = has_pooled ? cap : 0u;
         _xbucket.stop();
         trace::g_xt.taken[dv] += taken;
-        trace::g_xt.tiles[dv] += (uint64_t)(last + 1u) * 2u * cap;
+        trace::g_xt.tiles[dv] += (uint64_t)(last + 1u) * (uint64_t)n_cls * cap;
       } else {
       // Tiles, split at the kernel's widest token block and ordered by the NT template they need.
       // A tile of 8 tokens launched under NT=8 would stage and multiply 128 columns to use 8, so
@@ -2178,12 +2240,16 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
   // and one stale read costs at most another 512 layers before the next. The point is that the
   // process stops rather than emitting wrong text for a whole run — not that it stops on the exact
   // layer. Checking per layer is what the drain was for.
-  if (plan_on && (++plan_calls_ & 511u) == 0u) {
-    for (size_t dv = 0; dv < R; ++dv) {
-      if (!plan_st_[dv]) continue;
-      if (hipSetDevice(devs_[dv]) != hipSuccess) continue;
-      MoePlanStatus S{};
-      if (hipMemcpy(&S, plan_st_[dv], sizeof S, hipMemcpyDeviceToHost) != hipSuccess) continue;
+  if (plan_on && impl_->plan_any_inflight) {
+    bool still = false;
+    for (size_t dv = 0; dv < R && dv < 8; ++dv) {
+      if (!impl_->plan_inflight[dv]) continue;
+      if (hipSetDevice(devs_[dv]) != hipSuccess) { still = true; continue; }
+      const hipError_t q = hipEventQuery(impl_->plan_ev[dv]);
+      if (q == hipErrorNotReady) { still = true; continue; }
+      impl_->plan_inflight[dv] = false;
+      if (q != hipSuccess) continue;
+      const MoePlanStatus S = *impl_->plan_h_st[dv];
       if (S.bad > plan_bad_ || S.over > plan_over_) {
         aff::ui::err("fatal: the device dispatch could not place %u routed (token, expert) slots "
                      "on card %zu (%u tile overflows). A slot with no address is on the SSD tier "
@@ -2195,10 +2261,33 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
                                        : "--host-pool-mib");
         std::abort();
       }
-      if (S.taken != (uint32_t)total) {
-        aff::ui::fatal("fatal: the device dispatch took %u of %zu slots on card %zu; the "
-                     "arena width the host launched with is wrong.\n", S.taken, total, dv);
+      if (S.taken != impl_->plan_expect_total[dv]) {
+        aff::ui::fatal("fatal: the device dispatch took %u of %u slots on card %zu; the "
+                     "arena width the host launched with is wrong.\n", S.taken,
+                     impl_->plan_expect_total[dv], dv);
         std::abort();
+      }
+    }
+    impl_->plan_any_inflight = still;
+  }
+  if (plan_on && (++plan_calls_ & 511u) == 0u) {
+    for (size_t dv = 0; dv < R && dv < 8; ++dv) {
+      if (impl_->plan_inflight[dv] || !plan_st_[dv]) continue;
+      if (hipSetDevice(devs_[dv]) != hipSuccess) continue;
+      if (!impl_->plan_h_st[dv] &&
+          hipHostMalloc((void**)&impl_->plan_h_st[dv], sizeof(MoePlanStatus),
+                        hipHostMallocDefault) != hipSuccess)
+        continue;
+      if (!impl_->plan_ev[dv] &&
+          hipEventCreateWithFlags(&impl_->plan_ev[dv], hipEventDisableTiming) != hipSuccess)
+        continue;
+      hipStream_t st = (hipStream_t)streams[dv];
+      impl_->plan_expect_total[dv] = (uint32_t)total;
+      if (hipMemcpyAsync(impl_->plan_h_st[dv], plan_st_[dv], sizeof(MoePlanStatus),
+                         hipMemcpyDeviceToHost, st) == hipSuccess &&
+          hipEventRecord(impl_->plan_ev[dv], st) == hipSuccess) {
+        impl_->plan_inflight[dv] = true;
+        impl_->plan_any_inflight = true;
       }
     }
   }
@@ -2570,9 +2659,7 @@ void StaticPlacement::engine_retire(void* const* streams) {
                            first, (unsigned long long)ss_v, (unsigned long long)mv_verified_);
             }
           }
-        }
-        // owner map: no OTHER resident expert may already point at this slot (double allocation = permanent poison)
-        {
+          // owner map: no OTHER resident expert may already point at this slot (double allocation = permanent poison)
           const uint64_t off_new = M.slab_slot * slot_stride();
           for (size_t j = 0; j < device_of_.size(); ++j)
             if (j != M.idx && device_of_[j] >= 0 && offset_of_[j] == off_new)

@@ -14,6 +14,7 @@
 #include "gpu/hip_common.h"
 #include "gpu/device_math.h"
 #include "gpu/tp_allreduce.h"
+#include "gpu/keepalive.h"
 #include "gpu/trace.h"
 #include "engine/instrument.h"
 #include "engine/route_trace.h"
@@ -502,6 +503,7 @@ struct DenseGpu::Impl {
     float* b_rbias = nullptr;                    // [n_router][n_expert], one slice a layer
     std::vector<const float*> rbias_src;         // tracks which bias pointer is currently on device
     size_t r_back = 0, r_woff = 0, r_noff = 0;   // the sel/wt/n block and its interior offsets
+    uint32_t r_k = 0;
     uint8_t* b_rres = nullptr;
     // ---- THE SELECTION, ON EVERY CARD ------------------------------------------------------------
     //
@@ -531,6 +533,8 @@ struct DenseGpu::Impl {
     uint32_t* b_rsel_m = nullptr;  float* b_rwt_m = nullptr;   // rank 0: its own block, unringed
     void* m_ring = nullptr;                      // rank > 0: kRouteSlots blocks
     void* ev_route[kRouteSlots] = {};            // rank 0: one per slot
+    size_t route_woff_slot[kRouteSlots] = {};    // per-slot byte offset to wt inside m_ring[slot]
+    size_t b_q_floats = 0;                       // float capacity of b_q (nq * b_cap_)
     uint32_t* h_rsel = nullptr;  float* h_rwt = nullptr;  uint32_t* h_rn = nullptr;
     // Pinned staging for the host side of every transfer. A hipMemcpyAsync out of pageable memory is
     // neither async nor a DMA — the runtime pins and copies through its own bounce buffer, which
@@ -1904,8 +1908,18 @@ __global__ void hc_add_kernel(float* __restrict__ hc, float* __restrict__ block,
 __device__ inline void hc_ar_store_rel(unsigned int* p, unsigned int v) {
   __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
-__device__ inline unsigned int hc_ar_load_acq(const unsigned int* p) {
-  return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+__device__ inline void hc_ar_store_relaxed(unsigned int* p, unsigned int v) {
+  __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ inline unsigned int hc_ar_load_relaxed(const unsigned int* p) {
+  return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ inline void hc_ar_fence_acq() {
+#ifdef __HIP_DEVICE_COMPILE__
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#else
+  std::atomic_thread_fence(std::memory_order_acquire);
+#endif
 }
 
 // Push this block's chunk, release it, wait for the peer's, and return mine + the peer's for `d`.
@@ -1919,6 +1933,7 @@ __device__ inline float hc_ar_exchange(const float* __restrict__ block, uint32_t
   if (threadIdx.x == 0) s_seq = atomicAdd(&seq[blockIdx.x], 1u) + 1u;
   __syncthreads();
   const unsigned int s = s_seq;
+  if (blockIdx.x == 0 && threadIdx.x == 0) hc_ar_store_relaxed(&peer_flags[kTpMaxBlocks], 1u);
   float* ps = peer_scratch + (size_t)(s & 1u) * slot_stride;
   const float* ms = my_scratch + (size_t)(s & 1u) * slot_stride;
   const float mine = live ? block[d] : 0.0f;
@@ -1932,9 +1947,15 @@ __device__ inline float hc_ar_exchange(const float* __restrict__ block, uint32_t
     hc_ar_store_rel(&peer_flags[blockIdx.x], s);
     unsigned long long z = 0;
     // Same generous bound as tp_ar_kernel: a lost peer degrades to a wrong answer, not a hung GPU.
-    while (hc_ar_load_acq(&my_flags[blockIdx.x]) < s) { if (++z > (1ull << 32)) break; }
+    do {
+#ifdef __HIP_DEVICE_COMPILE__
+      __builtin_amdgcn_s_sleep(1);
+#endif
+      if (hc_ar_load_relaxed(&my_flags[blockIdx.x]) >= s) break;
+    } while (++z <= kTpSpinMax);
   }
   __syncthreads();
+  hc_ar_fence_acq();
   return live ? mine + ms[d] : 0.0f;
 }
 
@@ -1966,6 +1987,209 @@ __global__ void hc_add_ar_kernel(float* __restrict__ hc, float* __restrict__ blo
   const float b = hc_ar_exchange(block, d, live, peer_scratch, my_scratch, peer_flags, my_flags,
                                  seq, slot_stride);
   if (live) { hc[d] += b; block[d] = 0.0f; }
+}
+
+template <uint32_t NH>
+__global__ void hc_expand_ar_vec_kernel(float* __restrict__ out_hc, float* __restrict__ block,
+                                        const float* __restrict__ hc, const float* __restrict__ post,
+                                        const float* __restrict__ comb, uint32_t n_embd,
+                                        float* peer_scratch, const float* __restrict__ my_scratch,
+                                        unsigned int* peer_flags, unsigned int* my_flags,
+                                        unsigned int* seq, uint32_t slot_stride,
+                                        uint32_t per_blk4) {
+  __shared__ unsigned int s_seq;
+  if (threadIdx.x == 0u) s_seq = atomicAdd(&seq[blockIdx.x], 1u) + 1u;
+  __syncthreads();
+  const unsigned int s = s_seq;
+  if (blockIdx.x == 0u && threadIdx.x == 0u) hc_ar_store_relaxed(&peer_flags[kTpMaxBlocks], 1u);
+
+  const uint32_t n4 = n_embd >> 2;
+  const uint32_t b_start = blockIdx.x * per_blk4;
+  const uint32_t b_end = min(n4, b_start + per_blk4);
+  const float4* __restrict__ blk4 = reinterpret_cast<const float4*>(block);
+  float4* __restrict__ ps4 = reinterpret_cast<float4*>(peer_scratch + (size_t)(s & 1u) * slot_stride);
+  const float4* __restrict__ ms4 =
+      reinterpret_cast<const float4*>(my_scratch + (size_t)(s & 1u) * slot_stride);
+
+  // per_blk4 <= kTpWordsPerBlock (1400) and blockDim.x up to 1024 -> at most 2 vec4s/thread.
+  const uint32_t idx0 = b_start + threadIdx.x;
+  const uint32_t idx1 = idx0 + blockDim.x;
+  const bool has0 = idx0 < b_end;
+  const bool has1 = idx1 < b_end;
+  const float4 m0 = has0 ? blk4[idx0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  const float4 m1 = has1 ? blk4[idx1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  if (has0) ps4[idx0] = m0;
+  if (has1) ps4[idx1] = m1;
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  __syncthreads();
+
+  if (threadIdx.x == 0u) hc_ar_store_rel(&peer_flags[blockIdx.x], s);
+
+  float p[NH], c[NH * NH];
+#pragma unroll
+  for (uint32_t i = 0u; i < NH; ++i) p[i] = post[i];
+#pragma unroll
+  for (uint32_t i = 0u; i < NH * NH; ++i) c[i] = comb[i];
+  float4 hv0[NH];
+  if (has0) {
+#pragma unroll
+    for (uint32_t src = 0u; src < NH; ++src)
+      hv0[src] = reinterpret_cast<const float4*>(hc + (size_t)src * n_embd)[idx0];
+  }
+
+  if (threadIdx.x == 0u) {
+    unsigned long long z = 0;
+    do {
+#ifdef __HIP_DEVICE_COMPILE__
+      __builtin_amdgcn_s_sleep(1);
+#endif
+      if (hc_ar_load_relaxed(&my_flags[blockIdx.x]) >= s) break;
+    } while (++z <= kTpSpinMax);
+  }
+  __syncthreads();
+  hc_ar_fence_acq();
+
+  float4* __restrict__ blk_out4 = reinterpret_cast<float4*>(block);
+  auto finish = [&](uint32_t idx4, const float4& m4, const float4* pre_hv) {
+    const float4 peer = ms4[idx4];
+    const float4 b = make_float4(m4.x + peer.x, m4.y + peer.y, m4.z + peer.z, m4.w + peer.w);
+    float4 hv[NH];
+#pragma unroll
+    for (uint32_t src = 0u; src < NH; ++src) {
+      hv[src] = pre_hv ? pre_hv[src]
+                       : reinterpret_cast<const float4*>(hc + (size_t)src * n_embd)[idx4];
+    }
+#pragma unroll
+    for (uint32_t dst = 0u; dst < NH; ++dst) {
+      const float pd = p[dst];
+      float4 acc = make_float4(b.x * pd, b.y * pd, b.z * pd, b.w * pd);
+#pragma unroll
+      for (uint32_t src = 0u; src < NH; ++src) {
+        const float cs = c[dst + src * NH];
+        acc.x += cs * hv[src].x;
+        acc.y += cs * hv[src].y;
+        acc.z += cs * hv[src].z;
+        acc.w += cs * hv[src].w;
+      }
+      reinterpret_cast<float4*>(out_hc + (size_t)dst * n_embd)[idx4] = acc;
+    }
+    blk_out4[idx4] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  };
+  if (has0) finish(idx0, m0, hv0);
+  if (has1) finish(idx1, m1, nullptr);
+}
+
+__global__ void hc_add_ar_vec_kernel(float* __restrict__ hc, float* __restrict__ block,
+                                     uint32_t n_embd, float* peer_scratch,
+                                     const float* __restrict__ my_scratch,
+                                     unsigned int* peer_flags, unsigned int* my_flags,
+                                     unsigned int* seq, uint32_t slot_stride,
+                                     uint32_t per_blk4) {
+  __shared__ unsigned int s_seq;
+  if (threadIdx.x == 0u) s_seq = atomicAdd(&seq[blockIdx.x], 1u) + 1u;
+  __syncthreads();
+  const unsigned int s = s_seq;
+  if (blockIdx.x == 0u && threadIdx.x == 0u) hc_ar_store_relaxed(&peer_flags[kTpMaxBlocks], 1u);
+
+  const uint32_t n4 = n_embd >> 2;
+  const uint32_t b_start = blockIdx.x * per_blk4;
+  const uint32_t b_end = min(n4, b_start + per_blk4);
+  float4* __restrict__ blk4 = reinterpret_cast<float4*>(block);
+  float4* __restrict__ ps4 = reinterpret_cast<float4*>(peer_scratch + (size_t)(s & 1u) * slot_stride);
+  const float4* __restrict__ ms4 =
+      reinterpret_cast<const float4*>(my_scratch + (size_t)(s & 1u) * slot_stride);
+  float4* __restrict__ hc4 = reinterpret_cast<float4*>(hc);
+
+  const uint32_t idx0 = b_start + threadIdx.x;
+  const uint32_t idx1 = idx0 + blockDim.x;
+  const bool has0 = idx0 < b_end;
+  const bool has1 = idx1 < b_end;
+  const float4 m0 = has0 ? blk4[idx0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  const float4 m1 = has1 ? blk4[idx1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  if (has0) ps4[idx0] = m0;
+  if (has1) ps4[idx1] = m1;
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  __syncthreads();
+
+  if (threadIdx.x == 0u) hc_ar_store_rel(&peer_flags[blockIdx.x], s);
+  const float4 hv0 = has0 ? hc4[idx0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+  if (threadIdx.x == 0u) {
+    unsigned long long z = 0;
+    do {
+#ifdef __HIP_DEVICE_COMPILE__
+      __builtin_amdgcn_s_sleep(1);
+#endif
+      if (hc_ar_load_relaxed(&my_flags[blockIdx.x]) >= s) break;
+    } while (++z <= kTpSpinMax);
+  }
+  __syncthreads();
+  hc_ar_fence_acq();
+
+  if (has0) {
+    const float4 p = ms4[idx0];
+    hc4[idx0] = make_float4(hv0.x + m0.x + p.x, hv0.y + m0.y + p.y,
+                            hv0.z + m0.z + p.z, hv0.w + m0.w + p.w);
+    blk4[idx0] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  if (has1) {
+    const float4 h = hc4[idx1];
+    const float4 p = ms4[idx1];
+    hc4[idx1] = make_float4(h.x + m1.x + p.x, h.y + m1.y + p.y,
+                            h.z + m1.z + p.z, h.w + m1.w + p.w);
+    blk4[idx1] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+}
+
+__global__ __launch_bounds__(256) void pack_route_wt_kernel(uint32_t* __restrict__ sel,
+                                                            const float* __restrict__ wt,
+                                                            uint32_t nk) {
+  const uint32_t i = blockIdx.x * 256u + threadIdx.x;
+  if (i < nk) reinterpret_cast<float*>(sel + nk)[i] = wt[i];
+}
+
+__global__ __launch_bounds__(256) void head_pack_tm_kernel(const float* __restrict__ src,
+                                                           float* __restrict__ dst, uint32_t nr,
+                                                           uint32_t ld_src) {
+  const uint32_t r = blockIdx.x * 256u + threadIdx.x;
+  const uint32_t pos = blockIdx.y;
+  if (r < nr) dst[(size_t)pos * nr + r] = src[(size_t)r * ld_src + pos];
+}
+
+__global__ __launch_bounds__(256) void head_unpack_tm_kernel(const float* __restrict__ src,
+                                                             float* __restrict__ dst, uint32_t nr,
+                                                             uint32_t ld_src, uint32_t r0,
+                                                             uint32_t vocab) {
+  const uint32_t r = blockIdx.x * 256u + threadIdx.x;
+  const uint32_t pos = blockIdx.y;
+  if (r >= nr) return;
+  const float v = (ld_src == 1u) ? src[(size_t)pos * nr + r] : src[(size_t)r * ld_src + pos];
+  dst[(size_t)pos * vocab + (r0 + r)] = v;
+}
+
+__global__ __launch_bounds__(256) void draft_transpose_pad_kernel(const float* __restrict__ src,
+                                                                  float* __restrict__ dst,
+                                                                  uint32_t n_live,
+                                                                  uint32_t nb_out, uint32_t cols) {
+  __shared__ float tile[32][33];
+  const uint32_t tid = threadIdx.x;
+  const uint32_t tx = tid & 31u, ty = tid >> 5;
+  const uint32_t c0 = blockIdx.x * 32u, r0 = blockIdx.y * 32u;
+  const uint32_t c = c0 + tx;
+#pragma unroll
+  for (uint32_t k = 0u; k < 32u; k += 8u) {
+    const uint32_t r = r0 + ty + k;
+    tile[ty + k][tx] = (r < n_live && c < cols) ? src[(size_t)r * cols + c] : 0.0f;
+  }
+  lds_barrier();
+  const uint32_t r_out = r0 + tx;
+  if (r_out < nb_out) {
+#pragma unroll
+    for (uint32_t k = 0u; k < 32u; k += 8u) {
+      const uint32_t c_out = c0 + ty + k;
+      if (c_out < cols) dst[(size_t)c_out * nb_out + r_out] = tile[tx][ty + k];
+    }
+  }
 }
 
 // The norm weight ships f32 for these tensors, so this takes it as f32 and keeps the inner loop free
@@ -2648,6 +2872,7 @@ bool DenseGpu::hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    keepalive_notify_active(D.id);
     // The peer's index. `ar` is only ever set at TWO ranks — block_reduce checks the count before
     // arming it and tp_fold_prepare refuses otherwise — so `1 - d` is in range exactly when it is
     // read. The fold's buffers are per rank as tp_all_reduce's are, and the kernel writes the PEER's
@@ -2659,7 +2884,35 @@ bool DenseGpu::hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
     unsigned* const fl_mine = ar ? impl_->tp.fflags[d] : nullptr;
     unsigned* const f_seq = ar ? impl_->tp.fseq[d] : nullptr;
     const uint32_t f_stride = ar ? (uint32_t)impl_->tp.fold_floats : 0;
-    if (has_control && ar) {
+    const bool vec4 = ar && ((n_embd & 3u) == 0u) && ((f_stride & 3u) == 0u) &&
+                      (((reinterpret_cast<uintptr_t>(D.d_block) |
+                         reinterpret_cast<uintptr_t>(f_peer) |
+                         reinterpret_cast<uintptr_t>(f_mine) |
+                         reinterpret_cast<uintptr_t>(D.d_hc)) & 15u) == 0u) &&
+                      (!has_control || (reinterpret_cast<uintptr_t>(D.d_hc_next) & 15u) == 0u);
+    if (has_control && ar && vec4) {
+      const uint32_t n4 = n_embd >> 2;
+      const uint32_t blk4 = std::max<uint32_t>(
+          1u, std::min<uint32_t>(kTpMaxBlocks, (n4 + kTpWordsPerBlock - 1u) / kTpWordsPerBlock));
+      const uint32_t per_blk4 = (n4 + blk4 - 1u) / blk4;
+      const uint32_t thr4 = std::min<uint32_t>(1024u, ((per_blk4 + 31u) & ~31u));
+      switch (n_hc) {
+        case 1: hipLaunchKernelGGL(HIP_KERNEL_NAME(hc_expand_ar_vec_kernel<1>), dim3(blk4), dim3(thr4),
+                  0, D.stream, D.d_hc_next, D.d_block, D.d_hc, D.d_post, D.d_comb, n_embd, f_peer,
+                  f_mine, fl_peer, fl_mine, f_seq, f_stride, per_blk4); break;
+        case 2: hipLaunchKernelGGL(HIP_KERNEL_NAME(hc_expand_ar_vec_kernel<2>), dim3(blk4), dim3(thr4),
+                  0, D.stream, D.d_hc_next, D.d_block, D.d_hc, D.d_post, D.d_comb, n_embd, f_peer,
+                  f_mine, fl_peer, fl_mine, f_seq, f_stride, per_blk4); break;
+        case 8: hipLaunchKernelGGL(HIP_KERNEL_NAME(hc_expand_ar_vec_kernel<8>), dim3(blk4), dim3(thr4),
+                  0, D.stream, D.d_hc_next, D.d_block, D.d_hc, D.d_post, D.d_comb, n_embd, f_peer,
+                  f_mine, fl_peer, fl_mine, f_seq, f_stride, per_blk4); break;
+        default: hipLaunchKernelGGL(HIP_KERNEL_NAME(hc_expand_ar_vec_kernel<4>), dim3(blk4), dim3(thr4),
+                  0, D.stream, D.d_hc_next, D.d_block, D.d_hc, D.d_post, D.d_comb, n_embd, f_peer,
+                  f_mine, fl_peer, fl_mine, f_seq, f_stride, per_blk4); break;
+      }
+      AFF_HIP_CHECK(hipGetLastError());
+      std::swap(D.d_hc, D.d_hc_next);
+    } else if (has_control && ar) {
       // Bit-identical to the reduce-then-expand pair below.
       switch (n_hc) {
         case 1: hipLaunchKernelGGL(HIP_KERNEL_NAME(hc_expand_ar_kernel<1>), dim3(blk), dim3(thr), 0,
@@ -2677,6 +2930,15 @@ bool DenseGpu::hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
       }
       AFF_HIP_CHECK(hipGetLastError());
       std::swap(D.d_hc, D.d_hc_next);
+    } else if (ar && vec4) {
+      const uint32_t n4 = n_embd >> 2;
+      const uint32_t blk4 = std::max<uint32_t>(
+          1u, std::min<uint32_t>(kTpMaxBlocks, (n4 + kTpWordsPerBlock - 1u) / kTpWordsPerBlock));
+      const uint32_t per_blk4 = (n4 + blk4 - 1u) / blk4;
+      const uint32_t thr4 = std::min<uint32_t>(1024u, ((per_blk4 + 31u) & ~31u));
+      hipLaunchKernelGGL(hc_add_ar_vec_kernel, dim3(blk4), dim3(thr4), 0, D.stream, D.d_hc, D.d_block,
+                         n_embd, f_peer, f_mine, fl_peer, fl_mine, f_seq, f_stride, per_blk4);
+      AFF_HIP_CHECK(hipGetLastError());
     } else if (ar) {
       hipLaunchKernelGGL(hc_add_ar_kernel, dim3(blk), dim3(thr), 0, D.stream, D.d_hc, D.d_block,
                          n_embd, f_peer, f_mine, fl_peer, fl_mine, f_seq, f_stride);
@@ -3465,6 +3727,7 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       AFF_HIP_CHECK(hipMemset(*a.p, 0, a.rows * nb * sizeof(float)));
       arena_rows += a.rows;
     }
+    D.b_q_floats = (size_t)nq * nb;
     // The hyper-connection lanes, in bf16 and therefore not in the f32 list above. Two of them,
     // hcd = n_embd * n_hc rows each. Holding them in bf16 rather than f32 takes a quarter off the
     // arena, for a buffer whose only GEMM consumer already reads it as bf16.
@@ -3895,6 +4158,18 @@ bool DenseGpu::quant_act_swiglu(size_t r, const float* g, const float* u, uint32
     D.q8_act = D.q8_sw; D.qs_act = D.qs_sw; D.q_active_dim = dim;
     return true;
   }
+  if ((dim % 128u) == 0u && D.b_q && D.b_q_floats) {
+    const size_t q8_bytes = (size_t)b_nb_ * dim;
+    const size_t qs_off = (q8_bytes + 15u) & ~size_t(15);
+    const size_t need_bytes = qs_off + (size_t)b_nb_ * (dim / 128u) * sizeof(float);
+    if (D.b_q_floats * sizeof(float) >= need_bytes) {
+      uint8_t* const q8_ptr = reinterpret_cast<uint8_t*>(D.b_q);
+      float* const qs_ptr = reinterpret_cast<float*>(q8_ptr + qs_off);
+      batch_swiglu_quant_fp8_hip(g, u, q8_ptr, qs_ptr, dim, b_nb_, limit, D.stream);
+      D.q8_act = q8_ptr; D.qs_act = qs_ptr; D.q_active_dim = dim;
+      return true;
+    }
+  }
   if (!q_slot(r, dim)) return false;
   batch_swiglu_quant_fp8_hip(g, u, D.q8, D.qs, dim, b_nb_, limit, D.stream);
   D.q8_src = nullptr;
@@ -3961,6 +4236,7 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    keepalive_notify_active(D.id);
     // ---- through the ring, which is what deleted the drain that used to be here ------------------
     //
     // `emb` belongs to the caller. For the draft it is `dspark_emb_`, a member — but one whose row 0
@@ -3973,10 +4249,12 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
     uint8_t* const pin = D.emb.claim(&es);
     AFF_BLOCK_AT(aff::BlockSite::Begin, AFF_HIP_CHECK(D.emb.wait(es)));
     std::memcpy(pin, emb, live_bytes);
-    // The padding columns run through every kernel; zeroing the seed is what keeps them finite, and
-    // a NaN there would be invisible until it reached a reduction that crosses tokens.
-    AFF_HIP_CHECK(hipMemsetAsync(D.b_emb, 0, (size_t)nb * n_embd * sizeof(float), D.stream));
+    // The padding columns run through every kernel; zeroing the [n_live, nb) tail is what keeps
+    // them finite without re-zeroing [0, n_live) before the H2D overwrite.
     AFF_HIP_CHECK(hipMemcpyAsync(D.b_emb, pin, live_bytes, hipMemcpyHostToDevice, D.stream));
+    if (nb > n_live)
+      AFF_HIP_CHECK(hipMemsetAsync(D.b_emb + (size_t)n_live * n_embd, 0,
+                                   (size_t)(nb - n_live) * n_embd * sizeof(float), D.stream));
     AFF_HIP_CHECK(D.emb.done(es, D.stream));
     batch_hc_seed_hip(D.b_emb, D.b_hc, n_embd, n_hc, nb, D.stream);
     // Every token in the chunk starts its stack with the reference's one-hot mix.
@@ -3997,6 +4275,7 @@ bool DenseGpu::batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    keepalive_notify_active(D.id);
     if (ctl) {
       AFF_TRACE(37);
       // b_hc is bf16, so this is the bf16-activation entry rather than batch_gemm_ent: the same
@@ -5053,8 +5332,9 @@ bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
     // attention's own row count for this token, and NOT over the plane's pitch: the pitch comes
     // from the cache's capacity, so at a 1M cache it is 262146 bytes however short the context is.
     const bool gather = topk <= kAdmCap;
-    idx_topk_mask_hip(D.i_sc, D.a_allow, nullptr, 1, a.n_keys, a_maxcomp_,
-                      a.n_mask > a_maxcomp_ ? a_maxcomp_ : a.n_mask, topk, st, &D.topk,
+    const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
+    idx_topk_mask_hip(D.i_sc, (gather && flash_ok) ? nullptr : D.a_allow, nullptr, 1, a.n_keys,
+                      a_maxcomp_, a.n_mask > a_maxcomp_ ? a_maxcomp_ : a.n_mask, topk, st, &D.topk,
                       gather ? D.a_adm : nullptr, gather ? D.a_admn : nullptr, kAdmCap);
   }
   if (cand_block_ && a.cand_source >= 0 && layer == (uint32_t)a.cand_source) a_cand_src_[slot_] = (int64_t)a.cand_source;
@@ -5160,12 +5440,14 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
       // Straight into b_allow at the CHUNK's own token indexing; batch_attend then offsets by its
       // sub-batch. The mask never leaves the card.
       const bool gather = topk <= kAdmCap;
-      // The byte mask is consumed by compact_row inside this launch; when the gather list is what
-      // attention reads it is a tile-local scratch (`i_tile_` rows, reused every tile), otherwise it
-      // is the chunk-indexed full plane. See batch_init.
-      uint8_t* const mrow = D.b_allow ? (b_allow_dense_ ? D.b_allow + (size_t)t0 * a_maxcomp_
-                                                        : D.b_allow)
-                                      : nullptr;
+      const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
+      // The byte mask is consumed by compact_row inside this launch unless attention gathers from
+      // b_adm/b_admn on the flash path, in which case mask writes are skipped completely.
+      uint8_t* const mrow = (gather && flash_ok)
+                                ? nullptr
+                                : (D.b_allow ? (b_allow_dense_ ? D.b_allow + (size_t)t0 * a_maxcomp_
+                                                               : D.b_allow)
+                                             : nullptr);
       idx_topk_mask_hip(D.i_sc, mrow, D.i_nc + t0, nt, n_keys,
                         a_maxcomp_, n_mask, topk, st, nullptr,
                         gather ? D.b_adm + (size_t)t0 * kAdmCap : nullptr,
@@ -5445,6 +5727,7 @@ bool DenseGpu::router_scratch(size_t rank, uint32_t n_expert, uint32_t k) {
   D.b_rbias = (float*)p[1]; D.b_rres = (uint8_t*)p[2];
   D.rbias_src.assign(n_router_, nullptr);
   D.r_back = back; D.r_woff = o_wt; D.r_noff = o_n;
+  D.r_k = k;
   D.h_rsel = (uint32_t*)hb; D.h_rwt = (float*)(hb + o_wt);
   D.b_rsel_m = D.b_rsel; D.b_rwt_m = D.b_rwt;        // rank 0 reads its own block
   D.h_rn = (uint32_t*)(hb + o_n);                    // last: it is the guard above
@@ -5495,6 +5778,20 @@ void DenseGpu::route_publish() {
   if (route_seq_ >= Impl::Dev::kRouteSlots)
     AFF_BLOCK_AT(aff::BlockSite::RouteRing,
                  AFF_HIP_CHECK(hipEventSynchronize((hipEvent_t)D.ev_route[slot])));
+  const size_t live_nk = (size_t)b_live_ * D.r_k;
+  const bool pack_live = b_live_ > 0 && D.r_k > 0 && (2u * (size_t)b_live_ <= b_cap_) &&
+                         (live_nk <= UINT32_MAX);
+  size_t copy_bytes = D.r_back;
+  size_t peer_woff = D.r_woff;
+  if (pack_live) {
+    const uint32_t nk = (uint32_t)live_nk;
+    hipLaunchKernelGGL(pack_route_wt_kernel, dim3((nk + 255u) / 256u), dim3(256), 0, D.stream,
+                       D.b_rsel, D.b_rwt, nk);
+    AFF_HIP_CHECK(hipGetLastError());
+    peer_woff = live_nk * sizeof(uint32_t);
+    copy_bytes = live_nk * (sizeof(uint32_t) + sizeof(float));
+  }
+  D.route_woff_slot[slot] = peer_woff;
   for (size_t r = 1; r < impl_->dev.size(); ++r) {
     Impl::Dev& Dr = impl_->dev[r];
     if (!Dr.m_ring) continue;
@@ -5506,7 +5803,7 @@ void DenseGpu::route_publish() {
     // business of deciding something independently — the failure mode the FP8 all-reduce asymmetry
     // already cost a long hunt to find.
     AFF_HIP_CHECK(hipMemcpyPeerAsync((uint8_t*)Dr.m_ring + (size_t)slot * D.r_back, Dr.id,
-                                     D.b_rsel, D.id, D.r_back, D.stream));
+                                     D.b_rsel, D.id, copy_bytes, D.stream));
   }
   AFF_HIP_CHECK(hipEventRecord((hipEvent_t)D.ev_route[slot], D.stream));
   ++route_seq_;
@@ -5529,7 +5826,7 @@ DenseGpu::RouteDev DenseGpu::route_dev(size_t r) const {
   } else {
     uint8_t* const base = (uint8_t*)D.m_ring + (size_t)slot * impl_->dev[0].r_back;
     R.sel = (const uint32_t*)base;
-    R.wt = (const float*)(base + impl_->dev[0].r_woff);
+    R.wt = (const float*)(base + impl_->dev[0].route_woff_slot[slot]);
   }
   // The event is rank 0's whatever rank is asking: it marks the instant the selection exists AND
   // has been pushed, which is the one thing every rank waits for.
@@ -5560,6 +5857,7 @@ bool DenseGpu::batch_router_hash(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   if (!D.router[h]) return false;
   AFF_HIP_CHECK(hipSetDevice(D.id));
   if (!router_scratch(0, n_expert, k)) return false;
+  D.r_k = k;
   // The mirror is latched by whichever router path runs first, and on this model that is a HASH
   // layer — layer 0. Latching it only in the top-k path left the first routed layers pushing
   // nothing at all.
@@ -5630,6 +5928,7 @@ bool DenseGpu::batch_router_topk(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   AFF_HIP_CHECK(hipSetDevice(D.id));
 
   if (!router_scratch(0, n_expert, k)) return false;
+  D.r_k = k;
   if (!route_ready_) route_ready_ = route_mirror(n_expert, k) ? 1 : 2;
   if (b_live_ > b_cap_) return false;
   // ---- the bias is per LAYER and never changes; the residency mask is per CALL -------------------
@@ -6009,6 +6308,21 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     }
     return true;
   };
+  Impl::Dev& D0 = impl_->dev[0];
+  bool pack_tm = (R > 1u) && (n < b_nb_) && D0.b_q && (D0.b_q_floats >= (size_t)vocab * n);
+  uint64_t r0_band[kMaxRanks] = {};
+  uint64_t nr_band[kMaxRanks] = {};
+  float* peer_src[kMaxRanks] = {};
+  for (size_t d = 0; d < R; ++d) {
+    row_band(e.sh[d], vocab, &r0_band[d], &nr_band[d]);
+    if (d > 0 && nr_band[d]) {
+      Impl::Dev& D = impl_->dev[d];
+      const size_t packed_elems = (size_t)nr_band[d] * n;
+      if (D.b_q && D.b_q_floats >= packed_elems) peer_src[d] = D.b_q;
+      else if ((size_t)r0_band[d] * b_nb_ >= packed_elems) peer_src[d] = D.b_head;
+      else pack_tm = false;
+    }
+  }
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     if (!D.b_head) return false;
@@ -6026,8 +6340,7 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
                                    hipMemcpyHostToDevice, D.stream));
       if (!use_w4) batch_transpose_hip(D.b_emb, D.b_norm, (uint32_t)n_embd, b_nb_, 0, D.stream);
     }
-    uint64_t r0 = 0, nr = 0;
-    row_band(e.sh[d], vocab, &r0, &nr);
+    const uint64_t r0 = r0_band[d], nr = nr_band[d];
     covered += nr;
     if (!nr) continue;
     // Into the band's own place in the full plane, so the gather below is a copy and not a shuffle.
@@ -6044,24 +6357,47 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
                      D.b_head + (size_t)r0 * b_nb_, (uint32_t)nr, (uint32_t)n_embd, b_nb_,
                      D.stream);
     }
+    if (pack_tm && d > 0) {
+      hipLaunchKernelGGL(head_pack_tm_kernel,
+                         dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D.stream,
+                         D.b_head + (size_t)r0 * b_nb_, peer_src[d], (uint32_t)nr, b_nb_);
+      AFF_HIP_CHECK(hipGetLastError());
+    }
     if (d > 0 && D.ev_amx) AFF_HIP_CHECK(hipEventRecord(D.ev_amx, D.stream));
   }
   if (covered != vocab)
     return no("the cards' bands do not tile the vocabulary");
 
   // Gather every other card's band onto card 0 asynchronously, ordered by each peer's ev_amx.
-  Impl::Dev& D0 = impl_->dev[0];
   AFF_HIP_CHECK(hipSetDevice(D0.id));
+  if (pack_tm && nr_band[0]) {
+    hipLaunchKernelGGL(head_unpack_tm_kernel,
+                       dim3(((uint32_t)nr_band[0] + 255u) / 256u, n), dim3(256), 0, D0.stream,
+                       D0.b_head + (size_t)r0_band[0] * b_nb_, D0.b_q, (uint32_t)nr_band[0], b_nb_,
+                       (uint32_t)r0_band[0], (uint32_t)vocab);
+    AFF_HIP_CHECK(hipGetLastError());
+  }
   for (size_t d = 1; d < R; ++d) {
-    uint64_t r0 = 0, nr = 0;
-    row_band(ent_[h].sh[d], vocab, &r0, &nr);
+    const uint64_t r0 = r0_band[d], nr = nr_band[d];
     if (!nr) continue;
     Impl::Dev& Pd = impl_->dev[d];
     if (Pd.ev_amx) AFF_HIP_CHECK(hipStreamWaitEvent(D0.stream, Pd.ev_amx, 0));
-    AFF_HIP_CHECK(hipMemcpyPeerAsync(D0.b_head + (size_t)r0 * b_nb_, D0.id,
-                                     Pd.b_head + (size_t)r0 * b_nb_, Pd.id,
-                                     (size_t)nr * b_nb_ * sizeof(float), D0.stream));
+    const size_t c_bytes = pack_tm ? ((size_t)nr * n * sizeof(float))
+                                   : ((size_t)nr * b_nb_ * sizeof(float));
+    const float* c_src = pack_tm ? peer_src[d] : (Pd.b_head + (size_t)r0 * b_nb_);
+    AFF_HIP_CHECK(hipMemcpyPeerAsync(D0.b_head + (size_t)r0 * b_nb_, D0.id, c_src, Pd.id,
+                                     c_bytes, D0.stream));
+    if (pack_tm) {
+      hipLaunchKernelGGL(head_unpack_tm_kernel,
+                         dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D0.stream,
+                         D0.b_head + (size_t)r0 * b_nb_, D0.b_q, (uint32_t)nr, 1u,
+                         (uint32_t)r0, (uint32_t)vocab);
+      AFF_HIP_CHECK(hipGetLastError());
+    }
   }
+  float* const logits_plane = pack_tm ? D0.b_q : D0.b_head;
+  const uint32_t smp_row_stride = pack_tm ? 1u : b_nb_;
+  const uint32_t smp_col_stride = pack_tm ? (uint32_t)vocab : 1u;
 
   if (!smp_cap_ || smp_cap_ < n) {
     for (void** p : {(void**)&smp_q_, (void**)&smp_u_, (void**)&smp_out_})
@@ -6106,8 +6442,9 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     if (n_pen) {
       AFF_HIP_CHECK(hipMemcpyAsync(smp_hist_, smp_h_hist_, (size_t)n_pen * sizeof(uint32_t),
                                    hipMemcpyHostToDevice, D0.stream));
-      if (!apply_repeat_penalty_hip(D0.b_head, (uint32_t)vocab, n, b_nb_, 1,
-                                    (const uint32_t*)smp_hist_, n_pen, repeat_penalty, D0.stream))
+      if (!apply_repeat_penalty_hip(logits_plane, (uint32_t)vocab, n, smp_row_stride,
+                                    smp_col_stride, (const uint32_t*)smp_hist_, n_pen,
+                                    repeat_penalty, D0.stream))
         return no("the repetition penalty refused the plane");
     }
   }
@@ -6120,15 +6457,15 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     std::memcpy(smp_h_dry_, dry_ids, (size_t)n_dry * sizeof(uint32_t));
     AFF_HIP_CHECK(hipMemcpyAsync(smp_dry_, smp_h_dry_, (size_t)n_dry * sizeof(uint32_t),
                                  hipMemcpyHostToDevice, D0.stream));
-    if (!apply_dry_penalty_hip(D0.b_head, (uint32_t)vocab, n, b_nb_, 1,
+    if (!apply_dry_penalty_hip(logits_plane, (uint32_t)vocab, n, smp_row_stride, smp_col_stride,
                                (const uint32_t*)smp_dry_, n_dry, dry_delta, D0.stream))
       return no("the DRY penalty refused the plane");
   }
   SampleParams sp;
   sp.temperature = temperature; sp.top_p = top_p; sp.top_k = top_k; sp.min_p = min_p;
-  // [vocab][nb] dim-major, as the GEMM leaves it: row stride nb, column stride 1.
-  if (!batch_sample_hip(D0.b_head, (uint32_t)vocab, n, b_nb_, 1, (const uint32_t*)smp_q_,
-                        (const float*)smp_u_, sp, (SpecDraw*)smp_out_, D0.stream))
+  if (!batch_sample_hip(logits_plane, (uint32_t)vocab, n, smp_row_stride, smp_col_stride,
+                        (const uint32_t*)smp_q_, (const float*)smp_u_, sp, (SpecDraw*)smp_out_,
+                        D0.stream))
     return no("batch_sample_hip refused the plane");
   AFF_HIP_CHECK(hipMemcpyAsync(smp_h_out_, smp_out_, (size_t)n * sizeof(SpecDraw),
                                hipMemcpyDeviceToHost, D0.stream));
@@ -6310,17 +6647,11 @@ bool DenseGpu::draft_proj(int32_t h, int32_t norm_w, uint64_t rows, uint64_t col
     if (!D.b_dxt || !D.b_dx || !D.b_dm || !D.b_tap_s[slot_]) return false;
     if ((size_t)(tap_row0 + n) * cols * sizeof(float) > D.tap_bytes_s[slot_]) return false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    // The padding columns are transposed and multiplied like every other; zeroing the source is
-    // what keeps them finite.
-    AFF_HIP_CHECK(hipMemsetAsync(D.b_dxt, 0, cols * kNarrowTok * sizeof(float), D.stream));
-    // ON THE CARD. `b_tap` already holds exactly this layout — [row][taps * n_embd], token-major,
-    // written by batch_hc_tap as the target ran — so the tap's rows are a contiguous run and this is
-    // a device-to-device copy of one. It replaces an H2D of a host plane whose bytes this card had
-    // computed itself, and the drain that used to follow it.
-    AFF_HIP_CHECK(hipMemcpyAsync(D.b_dxt, D.b_tap_s[slot_] + (size_t)tap_row0 * cols,
-                                 (size_t)n * cols * sizeof(float), hipMemcpyDeviceToDevice,
-                                 D.stream));
-    batch_transpose_hip(D.b_dxt, D.b_dx, (uint32_t)cols, kNarrowTok, 0, D.stream);
+    hipLaunchKernelGGL(draft_transpose_pad_kernel,
+                       dim3(((uint32_t)cols + 31u) / 32u, (kNarrowTok + 31u) / 32u), dim3(256),
+                       0, D.stream, D.b_tap_s[slot_] + (size_t)tap_row0 * cols, D.b_dx, n,
+                       kNarrowTok, (uint32_t)cols);
+    AFF_HIP_CHECK(hipGetLastError());
     batch_gemm_ent(d, h, D.b_dx, D.b_dm, rows, cols);
     if (!D.vec[norm_w]) return false;
     batch_rms_norm_hip(D.b_dm, D.vec[norm_w], nullptr, D.b_dm, (uint32_t)rows, kNarrowTok, eps,

@@ -54,11 +54,24 @@ __device__ inline void note_timeout(unsigned int* t, unsigned int s) {
 // up in a profile is for the caller to state which device is current, not to guess again.
 inline void set_device(int d) { (void)hipSetDevice(d); }
 
-__device__ inline void store_sys_rel(unsigned int* p, unsigned int v) {
+constexpr size_t kTpWakeBytes = 64;
+constexpr int kTpFp8RegCacheGroups = 8;
+
+__device__ __forceinline__ void store_sys_rel(unsigned int* p, unsigned int v) {
   __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
-__device__ inline unsigned int load_sys_acq(const unsigned int* p) {
-  return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+__device__ __forceinline__ void store_sys_relaxed(unsigned int* p, unsigned int v) {
+  __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ unsigned int load_sys_relaxed(const unsigned int* p) {
+  return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ void fence_sys_acq() {
+#ifdef __HIP_DEVICE_COMPILE__
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#else
+  asm volatile("" ::: "memory");
+#endif
 }
 
 // The peers a rank pushes to, resolved on the host so the kernel does no index arithmetic over rank
@@ -68,6 +81,7 @@ template <int NPEER>
 struct TpPush {
   float4*       scratch[NPEER];
   unsigned int* flags[NPEER];
+  unsigned int* wake[NPEER];
 };
 
 __device__ __forceinline__ float4 f4add(float4 a, float4 b) {
@@ -92,6 +106,11 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
   __syncthreads();
   const unsigned int s = s_seq;
   const int slot = (int)(s % TpContext::kTpSlots);
+
+  if (b == 0 && tid == 0) {
+#pragma unroll
+    for (int j = 0; j < NPEER; ++j) store_sys_relaxed(push.wake[j], s);
+  }
 
   float4* ps[NPEER];
   const float4* ms[NPEER];
@@ -136,9 +155,13 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
     if (tid < NPEER) {
       const unsigned int* f = &my_flags[tid * kTpMaxBlocks + b];
       unsigned long long z = 0;
-      while ((int)(load_sys_acq(f) - s) < 0) {
-        __builtin_amdgcn_s_sleep(2);
-        if (++z > kTpSpinMax) { note_timeout(timeout, s); break; }
+      unsigned int v = load_sys_relaxed(f);
+      if ((int)(v - s) < 0) {
+        do {
+          __builtin_amdgcn_s_sleep(1);
+          v = load_sys_relaxed(f);
+        } while ((int)(v - s) < 0 && ++z <= kTpSpinMax);
+        if ((int)(v - s) < 0) note_timeout(timeout, s);
       }
     }
   } else {
@@ -148,13 +171,20 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
       unsigned long long z = 0;
 #pragma unroll
       for (int j = 0; j < NPEER; ++j) {
-        while (load_sys_acq(&my_flags[j * kTpMaxBlocks + b]) < s) {
-          if (++z > kTpSpinMax) { note_timeout(timeout, s); break; }
+        const unsigned int* f = &my_flags[j * kTpMaxBlocks + b];
+        unsigned int v = load_sys_relaxed(f);
+        if (v < s) {
+          do {
+            __builtin_amdgcn_s_sleep(1);
+            v = load_sys_relaxed(f);
+          } while (v < s && ++z <= kTpSpinMax);
+          if (v < s) note_timeout(timeout, s);
         }
       }
     }
   }
   __syncthreads();
+  fence_sys_acq();
 
   // out = the sum of every rank's input, mine from `in` and the rest from my scratch.
   //
@@ -218,9 +248,10 @@ template <int NPEER>
 struct TpPush8 {
   unsigned char* base[NPEER];
   unsigned int*  flags[NPEER];
+  unsigned int*  wake[NPEER];
 };
 
-template <int NPEER, bool NRANK_SYNC = false>
+template <int NPEER, bool NRANK_SYNC = false, bool CACHE_REGS = false>
 __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
                                  TpPush8<NPEER> push, const unsigned char* my_base,
                                  float* __restrict__ out,
@@ -235,6 +266,11 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
   const unsigned int s = s_seq;
   const int slot = (int)(s % TpContext::kTpSlots);
 
+  if (b == 0 && tid == 0) {
+#pragma unroll
+    for (int j = 0; j < NPEER; ++j) store_sys_relaxed(push.wake[j], s);
+  }
+
   unsigned char* pb[NPEER];
   float* p_scale[NPEER];
   const unsigned char* mb[NPEER];
@@ -247,10 +283,10 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
     m_scale[j] = (const float*)(mb[j] + scale_off_bytes);
   }
 
-  // ONE WAVE per group, not one thread. Giving each thread a whole group and looping it serially
-  // over amax, encode and decode leaves a handful of threads doing all the work while the rest of
-  // the block idles, which is far slower than not quantising at all. Each lane now owns a few
-  // elements and the amax is a wave reduction.
+  // ONE WAVE per group, not one thread. Each lane owns 4 contiguous elements, packs its 4
+  // quantized E4M3 bytes into a uint32_t for coalesced 4-byte P2P BAR writes/reads, and when the
+  // per-wave group count fits within kTpFp8RegCacheGroups keeps quantized codes + scales in
+  // registers across the handshake to avoid a second pass over `in`.
   const int n_groups = (n + kTpFp8Group - 1) / kTpFp8Group;
   const int waves = nt / kWave;
   const int lane = tid & (kWave - 1);
@@ -260,31 +296,54 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
   const int g1 = (g0 + gw < n_groups) ? (g0 + gw) : n_groups;
   constexpr int kPerLane = kTpFp8Group / kWave;      // 4
 
-  for (int g = g0 + wave; g < g1; g += waves) {
-    const int lo = g * kTpFp8Group;
-    float v[kPerLane];
-    float amax = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-      const int idx = lo + lane * kPerLane + i;
-      v[i] = (idx < n) ? in[idx] : 0.0f;
-      amax = fmaxf(amax, fabsf(v[i]));
-    }
-    #pragma unroll
-    for (int off = kWave / 2; off > 0; off >>= 1)
-      amax = fmaxf(amax, __shfl_xor(amax, off, kWave));
+  uint32_t reg_pk[CACHE_REGS ? kTpFp8RegCacheGroups : 1];
+  float reg_sc[CACHE_REGS ? kTpFp8RegCacheGroups : 1];
 
-    const float scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
-    const float inv = 1.0f / scale;
-    #pragma unroll
-    for (int j = 0; j < NPEER; ++j) if (lane == 0) p_scale[j][g] = scale;
-    #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-      const int idx = lo + lane * kPerLane + i;
-      if (idx < n) {
-        const unsigned char q = f2e4m3(v[i] * inv);
+  {
+    int gi = 0;
+    for (int g = g0 + wave; g < g1; g += waves, ++gi) {
+      const int lo = g * kTpFp8Group;
+      const int base_idx = lo + lane * kPerLane;
+      float v[kPerLane];
+      float amax = 0.0f;
+      #pragma unroll
+      for (int i = 0; i < kPerLane; ++i) {
+        const int idx = base_idx + i;
+        v[i] = (idx < n) ? in[idx] : 0.0f;
+        amax = fmaxf(amax, fabsf(v[i]));
+      }
+      amax = aff::wave_reduce_max_dpp(amax);
+
+      const float scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
+      const float inv = 1.0f / scale;
+      #pragma unroll
+      for (int j = 0; j < NPEER; ++j) if (lane == 0) p_scale[j][g] = scale;
+
+      uint32_t pk = 0u;
+      #pragma unroll
+      for (int i = 0; i < kPerLane; ++i) {
+        const unsigned char q = (base_idx + i < n) ? f2e4m3(v[i] * inv) : 0u;
+        pk |= (uint32_t)q << (8 * i);
+      }
+      if (base_idx + (kPerLane - 1) < n) {
         #pragma unroll
-        for (int j = 0; j < NPEER; ++j) pb[j][idx] = q;
+        for (int j = 0; j < NPEER; ++j) *(uint32_t*)(pb[j] + base_idx) = pk;
+      } else {
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const int idx = base_idx + i;
+          if (idx < n) {
+            const unsigned char q = (unsigned char)(pk >> (8 * i));
+            #pragma unroll
+            for (int j = 0; j < NPEER; ++j) pb[j][idx] = q;
+          }
+        }
+      }
+      if constexpr (CACHE_REGS) {
+        if (gi < kTpFp8RegCacheGroups) {
+          reg_pk[gi] = pk;
+          reg_sc[gi] = scale;
+        }
       }
     }
   }
@@ -299,9 +358,13 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
     if (tid < NPEER) {
       const unsigned int* f = &my_flags[tid * kTpMaxBlocks + b];
       unsigned long long z = 0;
-      while ((int)(load_sys_acq(f) - s) < 0) {
-        __builtin_amdgcn_s_sleep(2);
-        if (++z > kTpSpinMax) { note_timeout(timeout, s); break; }
+      unsigned int fv = load_sys_relaxed(f);
+      if ((int)(fv - s) < 0) {
+        do {
+          __builtin_amdgcn_s_sleep(1);
+          fv = load_sys_relaxed(f);
+        } while ((int)(fv - s) < 0 && ++z <= kTpSpinMax);
+        if ((int)(fv - s) < 0) note_timeout(timeout, s);
       }
     }
   } else {
@@ -311,65 +374,113 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
       unsigned long long z = 0;
       #pragma unroll
       for (int j = 0; j < NPEER; ++j) {
-        while (load_sys_acq(&my_flags[j * kTpMaxBlocks + b]) < s) {
-          if (++z > kTpSpinMax) { note_timeout(timeout, s); break; }
+        const unsigned int* f = &my_flags[j * kTpMaxBlocks + b];
+        unsigned int fv = load_sys_relaxed(f);
+        if (fv < s) {
+          do {
+            __builtin_amdgcn_s_sleep(1);
+            fv = load_sys_relaxed(f);
+          } while (fv < s && ++z <= kTpSpinMax);
+          if (fv < s) note_timeout(timeout, s);
         }
       }
     }
   }
   __syncthreads();
+  fence_sys_acq();
 
-  // Reduce against MY OWN QUANTISED value, not my exact one.
-  //
-  // An all-reduce leaves a REPLICATED tensor: both cards are supposed to hold the same number, and
-  // everything downstream assumes it — this card's attention heads read the same hidden state the
-  // other card's do, and each card writes its own copy of the KV rows from it. Keeping the local
-  // half exact and quantising only what crossed makes each rank's answer closer to the true sum,
-  // but it makes the two answers DIFFERENT, and a difference in a replicated tensor is not an
-  // approximation, it is two cards running slightly different models.
-  //
-  // So both ranks sum the same two quantised numbers. The peer already holds Q(mine) — it is what
-  // crossed — and this recovers the identical value locally from the identical bytes and scale, so
-  // Q(mine) + Q(peer) and Q(peer) + Q(mine) agree bit for bit by commutativity. The crossing does
-  // not move; what it costs is a second amax pass over data already in registers.
-  for (int g = g0 + wave; g < g1; g += waves) {
-    const int lo = g * kTpFp8Group;
-    float sc[NPEER];
-    #pragma unroll
-    for (int j = 0; j < NPEER; ++j) sc[j] = m_scale[j][g];
-    float v[kPerLane];
-    float amax = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-      const int idx = lo + lane * kPerLane + i;
-      v[i] = (idx < n) ? in[idx] : 0.0f;
-      amax = fmaxf(amax, fabsf(v[i]));
-    }
-    #pragma unroll
-    for (int off = kWave / 2; off > 0; off >>= 1)
-      amax = fmaxf(amax, __shfl_xor(amax, off, kWave));
-    // Recomputed rather than carried across the barrier: a wave owns far more groups than fit in
-    // registers, and staging them through the scratch would be uncached traffic to trade for ALU.
-    const float mine_scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
-    const float mine_inv = 1.0f / mine_scale;
-    #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-      const int idx = lo + lane * kPerLane + i;
-      if (idx < n) {
-        // Recovered from the identical bytes and scale the peers received, so every rank adds the
-        // same numbers — and, from three ranks up, in the same RANK order. See the exact kernel.
-        const float mine = e4m3_2f(f2e4m3(v[i] * mine_inv)) * mine_scale;
-        if constexpr (NPEER == 1) {
-          out[idx] = mine + e4m3_2f(mb[0][idx]) * sc[0];
+  // Reduce against MY OWN QUANTISED value, not my exact one — see the replication comment above.
+  {
+    int gi = 0;
+    for (int g = g0 + wave; g < g1; g += waves, ++gi) {
+      const int lo = g * kTpFp8Group;
+      const int base_idx = lo + lane * kPerLane;
+      float sc[NPEER];
+      #pragma unroll
+      for (int j = 0; j < NPEER; ++j) sc[j] = m_scale[j][g];
+
+      float mine_scale;
+      uint32_t pk = 0u;
+      if constexpr (CACHE_REGS) {
+        if (gi < kTpFp8RegCacheGroups) {
+          mine_scale = reg_sc[gi];
+          pk = reg_pk[gi];
         } else {
-          float acc = 0.0f;
+          float v[kPerLane];
+          float amax = 0.0f;
           #pragma unroll
-          for (int p = 0; p <= NPEER; ++p) {
-            if (p == own) { acc += mine; continue; }
-            const int j = p < own ? p : p - 1;
-            acc += e4m3_2f(mb[j][idx]) * sc[j];
+          for (int i = 0; i < kPerLane; ++i) {
+            const int idx = base_idx + i;
+            v[i] = (idx < n) ? in[idx] : 0.0f;
+            amax = fmaxf(amax, fabsf(v[i]));
           }
-          out[idx] = acc;
+          amax = aff::wave_reduce_max_dpp(amax);
+          mine_scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
+          const float mine_inv = 1.0f / mine_scale;
+          #pragma unroll
+          for (int i = 0; i < kPerLane; ++i) {
+            const unsigned char q = (base_idx + i < n) ? f2e4m3(v[i] * mine_inv) : 0u;
+            pk |= (uint32_t)q << (8 * i);
+          }
+        }
+      } else {
+        float v[kPerLane];
+        float amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const int idx = base_idx + i;
+          v[i] = (idx < n) ? in[idx] : 0.0f;
+          amax = fmaxf(amax, fabsf(v[i]));
+        }
+        amax = aff::wave_reduce_max_dpp(amax);
+        mine_scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
+        const float mine_inv = 1.0f / mine_scale;
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const unsigned char q = (base_idx + i < n) ? f2e4m3(v[i] * mine_inv) : 0u;
+          pk |= (uint32_t)q << (8 * i);
+        }
+      }
+
+      if (base_idx + (kPerLane - 1) < n) {
+        uint32_t peer_pk[NPEER];
+        #pragma unroll
+        for (int j = 0; j < NPEER; ++j) peer_pk[j] = *(const uint32_t*)(mb[j] + base_idx);
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const float mine = e4m3_2f((unsigned char)(pk >> (8 * i))) * mine_scale;
+          if constexpr (NPEER == 1) {
+            out[base_idx + i] = mine + e4m3_2f((unsigned char)(peer_pk[0] >> (8 * i))) * sc[0];
+          } else {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int p = 0; p <= NPEER; ++p) {
+              if (p == own) { acc += mine; continue; }
+              const int j = p < own ? p : p - 1;
+              acc += e4m3_2f((unsigned char)(peer_pk[j] >> (8 * i))) * sc[j];
+            }
+            out[base_idx + i] = acc;
+          }
+        }
+      } else {
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const int idx = base_idx + i;
+          if (idx < n) {
+            const float mine = e4m3_2f((unsigned char)(pk >> (8 * i))) * mine_scale;
+            if constexpr (NPEER == 1) {
+              out[idx] = mine + e4m3_2f(mb[0][idx]) * sc[0];
+            } else {
+              float acc = 0.0f;
+              #pragma unroll
+              for (int p = 0; p <= NPEER; ++p) {
+                if (p == own) { acc += mine; continue; }
+                const int j = p < own ? p : p - 1;
+                acc += e4m3_2f(mb[j][idx]) * sc[j];
+              }
+              out[idx] = acc;
+            }
+          }
         }
       }
     }
@@ -439,12 +550,12 @@ bool tp_fold_prepare(TpContext* ctx, size_t floats, std::string* err) {
     ctx->fscratch[r] = (float*)sc;
     if (!ctx->fflags[r]) {
       void* fl = nullptr;
-      if (!hip_try(hipExtMallocWithFlags(&fl, kTpMaxBlocks * sizeof(unsigned),
+      if (!hip_try(hipExtMallocWithFlags(&fl, kTpMaxBlocks * sizeof(unsigned) + kTpWakeBytes,
                                          hipDeviceMallocFinegrained), "fold flags alloc", err))
         return false;
       ctx->fflags[r] = (unsigned*)fl;
-      if (!hip_try(hipMemset(ctx->fflags[r], 0, kTpMaxBlocks * sizeof(unsigned)), "memset fold flags",
-                   err))
+      if (!hip_try(hipMemset(ctx->fflags[r], 0, kTpMaxBlocks * sizeof(unsigned) + kTpWakeBytes),
+                   "memset fold flags", err))
         return false;
       if (!hip_try(hipMalloc(&ctx->fseq[r], kTpMaxBlocks * sizeof(unsigned)), "fold seq alloc", err))
         return false;
@@ -516,12 +627,12 @@ bool tp_init(TpContext* ctx, size_t max_floats, std::string* err, ihipStream_t* 
     ctx->scratch[r] = (float*)sc;
 
     void* fl = nullptr;
-    if (!hip_try(hipExtMallocWithFlags(&fl, np * kTpMaxBlocks * sizeof(unsigned),
+    if (!hip_try(hipExtMallocWithFlags(&fl, np * kTpMaxBlocks * sizeof(unsigned) + kTpWakeBytes,
                                        hipDeviceMallocFinegrained), "flags alloc", err))
       return false;
     ctx->flags[r] = (unsigned*)fl;
-    if (!hip_try(hipMemset(ctx->flags[r], 0, np * kTpMaxBlocks * sizeof(unsigned)), "memset flags",
-                 err))
+    if (!hip_try(hipMemset(ctx->flags[r], 0, np * kTpMaxBlocks * sizeof(unsigned) + kTpWakeBytes),
+                 "memset flags", err))
       return false;
 
     if (!hip_try(hipMalloc(&ctx->seq[r], kTpMaxBlocks * sizeof(unsigned)), "seq alloc", err))
@@ -622,6 +733,7 @@ template <int NPEER>
 void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4, int nb, int nt,
                      int slot4, int peer4) {
   const bool tp_nrank_sync = tp_nrank_sync_enabled();
+  const size_t np = ctx.ranks - 1;
   for (size_t r = 0; r < ctx.ranks; ++r) {
     TpPush<NPEER> push{};
     for (size_t q = 0, j = 0; q < ctx.ranks; ++q) {
@@ -629,6 +741,7 @@ void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4
       const size_t mine = tp_peer_slot(r, q);      // where rank r sits in rank q's tables
       push.scratch[j] = (float4*)(ctx.scratch[q] + mine * ctx.max_floats);
       push.flags[j] = ctx.flags[q] + mine * kTpMaxBlocks;
+      push.wake[j] = ctx.flags[q] + np * kTpMaxBlocks;
       ++j;
     }
     set_device(ctx.dev[r]);
@@ -651,6 +764,10 @@ template <int NPEER>
 void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, int nb,
                    int slot_bytes, int peer_bytes, int scale_off) {
   const bool tp_nrank_sync = tp_nrank_sync_enabled();
+  const size_t np = ctx.ranks - 1;
+  const int n_groups = (n + kTpFp8Group - 1) / kTpFp8Group;
+  const int gw = (n_groups + nb - 1) / nb;
+  const bool cache_regs = (gw <= 8 * kTpFp8RegCacheGroups);
   for (size_t r = 0; r < ctx.ranks; ++r) {
     TpPush8<NPEER> push{};
     for (size_t q = 0, j = 0; q < ctx.ranks; ++q) {
@@ -658,19 +775,32 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
       const size_t mine = tp_peer_slot(r, q);
       push.base[j] = (unsigned char*)(ctx.scratch[q] + mine * ctx.max_floats);
       push.flags[j] = ctx.flags[q] + mine * kTpMaxBlocks;
+      push.wake[j] = ctx.flags[q] + np * kTpMaxBlocks;
       ++j;
     }
     set_device(ctx.dev[r]);
     if (tp_nrank_sync && NPEER > 1) {
-      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, true>), dim3(nb), dim3(256), 0,
-                         (hipStream_t)ctx.stream[r], in[r], push,
-                         (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
-                         ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+      if (cache_regs)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, true, true>), dim3(nb),
+                           dim3(256), 0, (hipStream_t)ctx.stream[r], in[r], push,
+                           (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+      else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, true, false>), dim3(nb),
+                           dim3(256), 0, (hipStream_t)ctx.stream[r], in[r], push,
+                           (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
     } else {
-      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, false>), dim3(nb), dim3(256), 0,
-                         (hipStream_t)ctx.stream[r], in[r], push,
-                         (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
-                         ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+      if (cache_regs)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, false, true>), dim3(nb),
+                           dim3(256), 0, (hipStream_t)ctx.stream[r], in[r], push,
+                           (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+      else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, false, false>), dim3(nb),
+                           dim3(256), 0, (hipStream_t)ctx.stream[r], in[r], push,
+                           (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
     }
     AFF_HIP_CHECK(hipGetLastError());
   }

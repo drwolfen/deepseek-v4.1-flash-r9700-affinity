@@ -103,9 +103,7 @@ __device__ inline float bf16_to_f32_dev(uint16_t h) {
 // Sums `v` across a wave32. Explicit width — a width-less shuffle silently means "whatever the
 // wave is", and this kernel is only correct at 32.
 __device__ inline float wave_reduce_add(float v) {
-  #pragma unroll
-  for (int off = kWave / 2; off > 0; off >>= 1) v += __shfl_xor(v, off, kWave);
-  return v;
+  return aff::wave_reduce_add_dpp(v);
 }
 
 // SwiGLU over EVERY expert's intermediate in one launch. The scratch layout is
@@ -182,7 +180,7 @@ __global__ __launch_bounds__(kThreads) void expert_gemm_tokens_kernel(
   const int wave = tid / kWave;
 
   for (int i = tid; i < 4 * 32 * 2; i += kThreads) s_cb[i] = cb[i];
-  __syncthreads();
+  aff::lds_barrier();
 
   const uint32_t nblk = cols / 16;
   const uint32_t bpl  = nblk / kWave;
@@ -315,6 +313,7 @@ constexpr bool     fmt_has_sign(uint32_t f) { return f == kFmtQuad4S || f == kFm
 constexpr bool     fmt_has_rot2(uint32_t f) { return f == kFmtQuad2S; }
 constexpr uint32_t kEWaves = 4, kEThreads = kEWaves * kWave;
 constexpr uint32_t kEK = 64;           // columns staged per iteration = bytes per LDS row
+constexpr uint32_t kEPitch = kEK + 8u; // padded LDS stride avoids 32-bank conflicts on 8B load_efrag
 
 // Single-buffer the A stage to cross an occupancy step. Compile-time so the two arms differ in the
 // kernel and nowhere else; see the note at the LDS declarations for why it is legal and what it
@@ -344,7 +343,7 @@ __device__ __forceinline__ wmma::i2v load_efrag(const uint8_t* lds, uint32_t row
                                                 uint32_t k0, uint32_t lane) {
   const uint32_t row = row0 + wmma::frag_c(lane);
   const uint32_t k = k0 + wmma::frag_k0(lane);
-  const uint2 v = *(const uint2*)(lds + row * kEK + ((((k >> 3) ^ (row & 7u))) << 3));
+  const uint2 v = *(const uint2*)(lds + row * kEPitch + k);
   wmma::i2v f;
   f[0] = (int)v.x;
   f[1] = (int)v.y;
@@ -361,7 +360,25 @@ __device__ __forceinline__ wmma::i2v load_efrag(const uint8_t* lds, uint32_t row
 // fraction of streaming bandwidth. Colgroup-major makes those spans adjacent, and the read then
 // lands on the plain-stream ceiling. Widening the scattered read instead does not close the gap:
 // the request size was never the problem, the addressing was.
+template <uint32_t NT, uint32_t MT, uint32_t FMT, bool TR>
+constexpr int expert_gemm_min_waves() {
+  if constexpr (NT == 2u && MT == 2u && FMT == kFmtQuad2S) return 5;
+  if constexpr (NT == 4u && MT == 2u && FMT == kFmtQuad2S && !TR) return 4;
+  return 1;
+}
+
+template <uint32_t NT, uint32_t MT, uint32_t FMT, bool TR>
+constexpr int expert_gemm_max_waves() {
+  if constexpr (NT == 2u && MT == 2u && FMT == kFmtQuad2S) return 5;
+  if constexpr (NT == 4u && MT == 2u && FMT == kFmtQuad2S && !TR) return 4;
+  return 16;
+}
+
 template <uint32_t NT, uint32_t MT, uint32_t FMT = kFmtPair16, bool TR = false>
+#ifdef __HIP_DEVICE_COMPILE__
+__attribute__((amdgpu_waves_per_eu((expert_gemm_min_waves<NT, MT, FMT, TR>()),
+                                   (expert_gemm_max_waves<NT, MT, FMT, TR>()))))
+#endif
 __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     const ExpertTile* __restrict__ tiles, const uint8_t* __restrict__ x8,
     const float* __restrict__ xs, const float* __restrict__ cb,
@@ -416,7 +433,7 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   // the allocation never moves. Verify with `.group_segment_fixed_size`, not the -Rpass remark,
   // which interleaves across instantiations.
   constexpr uint32_t kEPad = 0;
-  constexpr uint32_t kASz = kEM * kEK, kBSz = NT * 16 * kEK;
+  constexpr uint32_t kASz = kEM * kEPitch, kBSz = NT * 16 * kEPitch;
   // kSingleA. Overwriting s_a is a write-after-read against this wave's own reads, so it needs only
   // the lgkmcnt the compiler already emits between may-aliasing LDS ops, not a barrier. It costs
   // ordering: stage_a for the next half moves after the mma_half that reads the current one, so that
@@ -428,8 +445,8 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   constexpr uint32_t kLdsRest = kLutW * 4u + 2u * kBSz + kEPad;
   constexpr bool kSingleA = kSingleAWanted &&
       kWgpLds / (kLdsRest + kASz) > kWgpLds / (kLdsRest + 2 * kASz);
-  __shared__ uint8_t s_a_all[(kSingleA ? 1 : 2) * kASz];
-  __shared__ uint8_t s_b_all[2 * kBSz + kEPad];
+  alignas(16) __shared__ uint8_t s_a_all[(kSingleA ? 1 : 2) * kASz];
+  alignas(16) __shared__ uint8_t s_b_all[2 * kBSz + kEPad];
 
   const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
   const uint32_t m0 = blockIdx.x * kEM;
@@ -526,8 +543,6 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
           fp0 = as_global(fields + (size_t)row * field_bytes_row) + (size_t)b0 * 6 / 8;
           fsh0 = 0;
         }
-        const auto* crow = as_global(data + (size_t)row * code_bytes_row);
-        const auto* frow = as_global(fields + (size_t)row * field_bytes_row);
 
         // The two loads, widened. A thread's kEBPT blocks are consecutive and both planes are packed
         // with no per-block padding, so its share of each is one contiguous span rather than kEBPT
@@ -565,9 +580,17 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
         }
         // Row-major reaches this only when kWide made 6*b0 a multiple of 24; TR always can, because
         // the group's three bytes are a unit by construction.
-        if (kWide || TR)
+        if constexpr (kHalfTR) {
+          if (sblk == 0u) {
+            f24 = (uint32_t)ld_nt(&fp0[0]) | ((uint32_t)ld_nt(&fp0[1]) << 8) |
+                  ((uint32_t)ld_nt(&fp0[2]) << 16);
+          }
+          const uint32_t f24_partner = aff::dpp_xor_lane<1u>(f24);
+          if (sblk != 0u) f24 = f24_partner;
+        } else if constexpr (kWide || TR) {
           f24 = (uint32_t)ld_nt(&fp0[0]) | ((uint32_t)ld_nt(&fp0[1]) << 8) |
                 ((uint32_t)ld_nt(&fp0[2]) << 16);
+        }
 
 #pragma unroll
         for (uint32_t bb = 0; bb < kEBPT; ++bb) {
@@ -600,6 +623,8 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
 #pragma unroll
             for (uint32_t i = 0; i < 5; ++i) win |= (uint64_t)ld_nt(&cp[i]) << (8 * i);
           } else {
+            const auto* crow = as_global(data + (size_t)row * code_bytes_row);
+            const auto* frow = as_global(fields + (size_t)row * field_bytes_row);
             const uint32_t fb = b * 6;
             // The second byte is only needed when the 6-bit field straddles a byte, and reading it
             // unconditionally overruns the plane by one on the final block of the final row.
@@ -631,11 +656,11 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
             const uint32_t neg = fmt_has_sign(FMT) ? (field & 8u) * 0x10101010u : 0u;
             // A 2-byte rotate is a funnel shift of the dword with itself, and it commutes with both
             // the exponent add and the sign xor because all three act on whole bytes.
-            const uint32_t rot = fmt_has_rot2(FMT) ? (field & 16u) : 0u;
+            const uint32_t rsh = (fmt_has_rot2(FMT) && (field & 16u)) ? 16u : 0u;
 #pragma unroll
             for (uint32_t i = 0; i < 4; ++i) {
               uint32_t q = (tab[(uint32_t)((win >> (10 * i)) & 1023u)] + add) ^ neg;
-              if (fmt_has_rot2(FMT) && rot) q = (q >> 16) | (q << 16);
+              if constexpr (fmt_has_rot2(FMT)) q = __builtin_amdgcn_alignbit(q, q, rsh);
               d[bb * 2 + (i >> 1)][i & 1] = q;
             }
           } else {
@@ -655,7 +680,7 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
 #pragma unroll
       for (uint32_t g = 0; g < kEBPT * 2; ++g) {
         const uint32_t k = sblk * 16 + g * 8;
-        *(uint2*)(s_a + sm * kEK + ((((k >> 3) ^ (sm & 7u))) << 3)) =
+        *(uint2*)(s_a + sm * kEPitch + k) =
             make_uint2(d[g][0], d[g][1]);
       }
     }
@@ -680,14 +705,14 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
 #pragma unroll
       for (uint32_t g = 0; g < 4; ++g) {
         const uint32_t k = sk + g * 8;
-        *(uint2*)(s_b + sn * kEK + ((((k >> 3) ^ (sn & 7u))) << 3)) = gr[g];
+        *(uint2*)(s_b + sn * kEPitch + k) = gr[g];
       }
     }
   };
 
   // The LUT is read by `stage`, so it has to be complete before the first call; the loop's own
   // barrier comes too late to cover it.
-  __syncthreads();
+  aff::lds_barrier();
   stage_a(0, 0);
   stage_b(0, 0);
 
@@ -717,7 +742,7 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   // is a legitimate f32 reassociation, and it moves the output hash. The double-buffered body is
   // kept verbatim so arm 0 stays a fixed numeric reference.
   constexpr uint32_t kJG = (NT >= 2) ? 2u : 1u;
-  auto mma_half = [&](uint32_t buf, bool init, uint32_t kb) {
+  auto mma_half = [&](uint32_t buf, bool init, const float (&xs_cur)[NT]) {
     // The same fold as stage_a's, and it has to be: with one A buffer, `s_a_all + buf * kASz` at
     // buf=1 walks off the end of the array and into s_b_all. Half 1 would then read activations as
     // weights — a wrong answer, and a faster one, since the LDS really is smaller. Only the
@@ -726,36 +751,69 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     const uint8_t* const s_b = s_b_all + (size_t)buf * kBSz;
     if constexpr (kSingleA) {
       (void)init;
+      if constexpr (NT == 4u && kJG == 2u) {
+        wmma::i2v af_all[MT][kEK / wmma::kK];
 #pragma unroll
-      for (uint32_t j0 = 0; j0 < NT; j0 += kJG) {
-        wmma::f8v acc[MT][kJG];
-#pragma unroll
-        for (uint32_t ks = 0; ks < kEK; ks += wmma::kK) {
-          wmma::i2v af[MT];
+        for (uint32_t ksi = 0; ksi < kEK / wmma::kK; ++ksi) {
 #pragma unroll
           for (uint32_t i = 0; i < MT; ++i)
-            af[i] = load_efrag(s_a, (wave * MT + i) * 16, ks, lane);
+            af_all[i][ksi] = load_efrag(s_a, (wave * MT + i) * 16, ksi * wmma::kK, lane);
+        }
+#pragma unroll
+        for (uint32_t j0 = 0; j0 < NT; j0 += kJG) {
+          wmma::f8v acc[MT][kJG];
+#pragma unroll
+          for (uint32_t ksi = 0; ksi < kEK / wmma::kK; ++ksi) {
+            const uint32_t ks = ksi * wmma::kK;
+#pragma unroll
+            for (uint32_t jj = 0; jj < kJG; ++jj) {
+              const wmma::i2v bf = load_efrag(s_b, (j0 + jj) * 16, ks, lane);
+#pragma unroll
+              for (uint32_t i = 0; i < MT; ++i)
+                acc[i][jj] = wmma::mma_fp8(af_all[i][ksi], bf, ksi == 0 ? zero8 : acc[i][jj]);
+            }
+          }
 #pragma unroll
           for (uint32_t jj = 0; jj < kJG; ++jj) {
-            const wmma::i2v bf = load_efrag(s_b, (j0 + jj) * 16, ks, lane);
+            const float s = xs_cur[j0 + jj];
 #pragma unroll
             for (uint32_t i = 0; i < MT; ++i)
-              acc[i][jj] = wmma::mma_fp8(af[i], bf, ks == 0 ? zero8 : acc[i][jj]);
+#pragma unroll
+              for (uint32_t q = 0; q < 8; ++q)
+                out[i][j0 + jj][q] = __builtin_fmaf(acc[i][jj][q], s, out[i][j0 + jj][q]);
           }
         }
-        // Folded HERE, while this group's accumulators are still the only ones live.
+      } else {
 #pragma unroll
-        for (uint32_t jj = 0; jj < kJG; ++jj) {
-          const float s = xrow[j0 + jj][kb];
+        for (uint32_t j0 = 0; j0 < NT; j0 += kJG) {
+          wmma::f8v acc[MT][kJG];
 #pragma unroll
-          for (uint32_t i = 0; i < MT; ++i)
+          for (uint32_t ks = 0; ks < kEK; ks += wmma::kK) {
+            wmma::i2v af[MT];
 #pragma unroll
-            for (uint32_t q = 0; q < 8; ++q)
-              out[i][j0 + jj][q] = __builtin_fmaf(acc[i][jj][q], s, out[i][j0 + jj][q]);
+            for (uint32_t i = 0; i < MT; ++i)
+              af[i] = load_efrag(s_a, (wave * MT + i) * 16, ks, lane);
+#pragma unroll
+            for (uint32_t jj = 0; jj < kJG; ++jj) {
+              const wmma::i2v bf = load_efrag(s_b, (j0 + jj) * 16, ks, lane);
+#pragma unroll
+              for (uint32_t i = 0; i < MT; ++i)
+                acc[i][jj] = wmma::mma_fp8(af[i], bf, ks == 0 ? zero8 : acc[i][jj]);
+            }
+          }
+          // Folded HERE, while this group's accumulators are still the only ones live.
+#pragma unroll
+          for (uint32_t jj = 0; jj < kJG; ++jj) {
+            const float s = xs_cur[j0 + jj];
+#pragma unroll
+            for (uint32_t i = 0; i < MT; ++i)
+#pragma unroll
+              for (uint32_t q = 0; q < 8; ++q)
+                out[i][j0 + jj][q] = __builtin_fmaf(acc[i][jj][q], s, out[i][j0 + jj][q]);
+          }
         }
       }
     } else {
-      (void)kb;
 #pragma unroll
       for (uint32_t ks = 0; ks < kEK; ks += wmma::kK) {
         wmma::i2v af[MT];
@@ -782,32 +840,35 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   // keeps the store below the loads — which is why `load_efrag` does not take its LDS pointer
   // `__restrict__`.
   for (uint32_t c0 = 0; c0 < cols; c0 += 128) {
-    __syncthreads();
+    aff::lds_barrier();
+    const uint32_t kb = c0 >> 7;
+    float xs_cur[NT];
+#pragma unroll
+    for (uint32_t j = 0; j < NT; ++j) xs_cur[j] = xrow[j][kb];
     if (c0 + kEK < cols) {
       if constexpr (!kSingleA) stage_a(1, c0 + kEK);
       stage_b(1, c0 + kEK);
     }
-    mma_half(0, /*init=*/true, c0 >> 7);
+    mma_half(0, /*init=*/true, xs_cur);
     // A tail half-block only happens if `cols` is not a multiple of 128, which no shipped shape is
     // — `sc_cols = cols >> 7` above already assumes it. The guard is a guard, not a path.
     if (c0 + kEK < cols) {
       if constexpr (kSingleA) stage_a(1, c0 + kEK);
-      __syncthreads();
+      aff::lds_barrier();
       if (c0 + 128 < cols) {
         if constexpr (!kSingleA) stage_a(0, c0 + 128);
         stage_b(0, c0 + 128);
       }
-      mma_half(1, /*init=*/false, c0 >> 7);
+      mma_half(1, /*init=*/false, xs_cur);
       if constexpr (kSingleA) {
         if (c0 + 128 < cols) stage_a(0, c0 + 128);
       }
     }
 
     if constexpr (!kSingleA) {
-      const uint32_t kb = c0 >> 7;
 #pragma unroll
       for (uint32_t j = 0; j < NT; ++j) {
-        const float s = xrow[j][kb];
+        const float s = xs_cur[j];
 #pragma unroll
         for (uint32_t i = 0; i < MT; ++i)
 #pragma unroll
@@ -902,7 +963,7 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
   // chunk `total` alone makes the grid wide enough that it does not matter; at a speculative block
   // it is only a couple of slots, and serialising the bands would leave the card nearly idle.
   for (uint32_t kb = blockIdx.y; kb < nkb; kb += gridDim.y) {
-    __syncthreads();
+    aff::lds_barrier();
     float m = 0.0f;
 #pragma unroll
     for (uint32_t i = 0; i < 16; ++i) {
@@ -922,7 +983,7 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
       if constexpr (!Hadamard32) m = fmaxf(m, fabsf(v));
     }
     if constexpr (Hadamard32) {
-      __syncthreads();
+      aff::lds_barrier();
       for (uint32_t stride = 1; stride < 32u; stride <<= 1) {
 #pragma unroll
         for (uint32_t b32 = 0; b32 < 4u; ++b32) {
@@ -933,7 +994,7 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
             tile[base + stride][tt] = a - b;
           }
         }
-        __syncthreads();
+        aff::lds_barrier();
       }
 #pragma unroll
       for (uint32_t i = 0; i < 16; ++i) {
@@ -944,7 +1005,7 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
       }
     }
     part[kk][tt] = m;
-    __syncthreads();
+    aff::lds_barrier();
     if (kk == 0) {
       float mm = part[0][tt];
 #pragma unroll
@@ -952,7 +1013,7 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
       smax[tt] = mm > 0.0f ? mm * (1.0f / 448.0f) : 1.0f;
       if (sl < total) scales[(size_t)sl * nkb + kb] = smax[tt];
     }
-    __syncthreads();
+    aff::lds_barrier();
 
     const uint32_t wt = tid >> 3, wk = (tid & 7u) * 16;
     if (t0 + wt < total) {
@@ -1069,7 +1130,7 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_multix_kernel(
   const int lane = tid & (kWave - 1);
   const int wave = tid / kWave;
   for (int i = tid; i < 4 * 32 * 2; i += kThreads) s_cb[i] = cb[i];
-  __syncthreads();
+  aff::lds_barrier();
 
   const uint32_t nblk = cols / 16;
   const uint32_t bpl  = nblk / kWave;
@@ -1092,12 +1153,7 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_multix_kernel(
       __builtin_amdgcn_wave_barrier();
 
       const uint32_t nwords = bpl * 5 / 4;
-      uint32_t cw[kMaxCodeWords + 1];
       const uint32_t base_w = lane * bpl * 5 / 4;
-      #pragma unroll
-      for (int i = 0; i < kMaxCodeWords; ++i)
-        cw[i] = (i < (int)nwords) ? s_code[wave][base_w + i] : 0u;
-      cw[kMaxCodeWords] = 0u;
       const uint32_t fbyte = lane * field_bytes_lane;
       const uint32_t fa = fbyte & ~3u;
       const uint64_t fwin =
@@ -1109,7 +1165,9 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_multix_kernel(
         const float* lut = s_cb + (size_t)(field >> 4) * 64;
         const uint32_t cbit = b * 40;
         const uint32_t w = cbit >> 5;
-        const uint64_t win = (((uint64_t)cw[w + 1] << 32) | cw[w]) >> (cbit & 31);
+        const uint32_t lo = s_code[wave][base_w + w];
+        const uint32_t hi = (w + 1u < nwords) ? s_code[wave][base_w + w + 1u] : 0u;
+        const uint64_t win = (((uint64_t)hi << 32) | lo) >> (cbit & 31);
         const float* xb = xm + (size_t)(lane * bpl + b) * 16;
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         #pragma unroll
@@ -1285,7 +1343,7 @@ __device__ __forceinline__ float tr_mat_dot(const BatchPtrs& p, uint32_t m, uint
 }
 
 // Factored out of the kernel so the accumulating form and the split-output one cannot drift.
-template <uint32_t FMT>
+template <uint32_t FMT, uint32_t NW = (uint32_t)kWavesPerBlock>
 __device__ __forceinline__ void expert_gemv_tr_body(
     const BatchPtrs& p,
     const float* __restrict__ weights,
@@ -1294,22 +1352,23 @@ __device__ __forceinline__ void expert_gemv_tr_body(
     float* __restrict__ y,
     uint32_t rows, uint32_t cols) {
 
+  constexpr uint32_t kNWThreads = NW * kWave;
   constexpr uint32_t kLutW = fmt_is_quad(FMT) ? fmt_variants(FMT) * 1024u : 4u * 32u * 2u;
   __shared__ uint32_t s_lut[kLutW];
-  __shared__ float s_part[kWavesPerBlock][kWave];
+  __shared__ float s_part[NW][kWave];
   const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = wave_uniform(tid / kWave);
   float* const s_cb = (float*)s_lut;
-  for (uint32_t i = tid; i < kLutW; i += kThreads) s_lut[i] = ((const uint32_t*)cb)[i];
-  __syncthreads();
+  for (uint32_t i = tid; i < kLutW; i += kNWThreads) s_lut[i] = ((const uint32_t*)cb)[i];
+  aff::lds_barrier();
 
   const uint32_t ng = cols / kEK;              // column groups: 4 blocks, 20 code bytes, 3 field
   // THE WAVES OF A BLOCK SPLIT THE COLUMNS, NOT THE ROWS. Giving each wave its own 32 rows is the
   // obvious reading of lane-per-row and starves the grid — the whole matvec becomes rows/32 waves.
-  // Instead a block owns 32 rows and all of the columns, and its eight waves take an eighth of the
-  // column groups each. The eight partial sums per row then reduce through LDS in a FIXED order, so
+  // Instead a block owns 32 rows and all of the columns, and its NW waves take 1/NW of the
+  // column groups each. The NW partial sums per row then reduce through LDS in a FIXED order, so
   // the result is deterministic; an atomicAdd would be simpler and would make decode irreproducible
   // run to run.
-  const uint32_t gpw = (ng + kWavesPerBlock - 1) / kWavesPerBlock;
+  const uint32_t gpw = (ng + NW - 1) / NW;
   const uint32_t g_lo = wave * gpw, g_hi = g_lo + gpw < ng ? g_lo + gpw : ng;
   for (uint32_t r0 = blockIdx.x * kWave; r0 < rows; r0 += gridDim.x * kWave) {
     const uint32_t row = r0 + lane;
@@ -1319,29 +1378,29 @@ __device__ __forceinline__ void expert_gemv_tr_body(
       const float rs = live ? bf16_to_f32_dev(p.rscales[m][row]) * weights[m] : 0.0f;
       acc = fmaf(rs, tr_mat_dot<FMT>(p, m, row, live, g_lo, g_hi, rows, s_lut), acc);
     }
-    // The block's eight column-partials for this row, summed in wave order and stored once.
-    __syncthreads();
+    // The block's column-partials for this row, summed in wave order and stored once.
+    aff::lds_barrier();
     s_part[wave][lane] = acc;
-    __syncthreads();
+    aff::lds_barrier();
     if (wave == 0) {
       float t = 0.0f;
 #pragma unroll
-      for (uint32_t w = 0; w < kWavesPerBlock; ++w) t += s_part[w][lane];
+      for (uint32_t w = 0; w < NW; ++w) t += s_part[w][lane];
       if (live) y[row] += t;      // 32 lanes, 32 consecutive floats — the store coalesces too
     }
   }
   (void)s_cb;
 }
 
-template <uint32_t FMT>
-__global__ __launch_bounds__(kThreads) void expert_gemv_kernel_tr(
+template <uint32_t FMT, uint32_t NW = (uint32_t)kWavesPerBlock>
+__global__ __launch_bounds__(NW * kWave) void expert_gemv_kernel_tr(
     BatchPtrs p,
     const float* __restrict__ weights,
     uint32_t n_mats,
     const float* __restrict__ cb,
     float* __restrict__ y,
     uint32_t rows, uint32_t cols) {
-  expert_gemv_tr_body<FMT>(p, weights, n_mats, cb, y, rows, cols);
+  expert_gemv_tr_body<FMT, NW>(p, weights, n_mats, cb, y, rows, cols);
 }
 
 // Split output: n_mats matrices of identical shape, each writing its own vector.
@@ -1354,7 +1413,7 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_kernel_tr(
 // multiple of kWave for every expert shape here, so a 32-row block never straddles two matrices and
 // the LDS reduction is unchanged. The store is a store rather than an accumulate, which also retires
 // the memset that had to zero the scratch buffer first.
-template <uint32_t FMT, uint32_t RB>
+template <uint32_t FMT, uint32_t RB, uint32_t NW = (uint32_t)kWavesPerBlock>
 __device__ __forceinline__ void expert_gemv_tr_split_body(
     const BatchPtrs& p,
     const float* __restrict__ weights,
@@ -1362,15 +1421,16 @@ __device__ __forceinline__ void expert_gemv_tr_split_body(
     const float* __restrict__ cb,
     uint32_t rows, uint32_t cols) {
 
+  constexpr uint32_t kNWThreads = NW * kWave;
   constexpr uint32_t kLutW = fmt_is_quad(FMT) ? fmt_variants(FMT) * 1024u : 4u * 32u * 2u;
   __shared__ uint32_t s_lut[kLutW];
-  __shared__ float s_part[kWavesPerBlock][RB * kWave];
+  __shared__ float s_part[NW][RB * kWave];
   const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = wave_uniform(tid / kWave);
-  for (uint32_t i = tid; i < kLutW; i += kThreads) s_lut[i] = ((const uint32_t*)cb)[i];
-  __syncthreads();
+  for (uint32_t i = tid; i < kLutW; i += kNWThreads) s_lut[i] = ((const uint32_t*)cb)[i];
+  aff::lds_barrier();
 
   const uint32_t ng = cols / kEK;
-  const uint32_t gpw = (ng + kWavesPerBlock - 1) / kWavesPerBlock;
+  const uint32_t gpw = (ng + NW - 1) / NW;
   const uint32_t g_lo = wave * gpw, g_hi = g_lo + gpw < ng ? g_lo + gpw : ng;
   const uint32_t nb = (rows + RB * kWave - 1) / (RB * kWave);   // row-blocks a matrix
   for (uint32_t b = blockIdx.x; b < n_mats * nb; b += gridDim.x) {
@@ -1386,30 +1446,30 @@ __device__ __forceinline__ void expert_gemv_tr_split_body(
       rs[r] = live[r] ? bf16_to_f32_dev(p.rscales[m][row[r]]) * weights[m] : 0.0f;
     }
     tr_mat_dot_rb<FMT, RB>(p, m, row, live, g_lo, g_hi, rows, s_lut, sacc);
-    __syncthreads();
+    aff::lds_barrier();
 #pragma unroll
     for (uint32_t r = 0; r < RB; ++r) s_part[wave][r * kWave + lane] = rs[r] * sacc[r];
-    __syncthreads();
+    aff::lds_barrier();
     if (wave == 0) {
 #pragma unroll
       for (uint32_t r = 0; r < RB; ++r) {
         float t = 0.0f;
 #pragma unroll
-        for (uint32_t w = 0; w < kWavesPerBlock; ++w) t += s_part[w][r * kWave + lane];
+        for (uint32_t w = 0; w < NW; ++w) t += s_part[w][r * kWave + lane];
         if (live[r]) p.ys[m][row[r]] = t;
       }
     }
   }
 }
 
-template <uint32_t FMT, uint32_t RB>
-__global__ __launch_bounds__(kThreads) void expert_gemv_kernel_tr_split(
+template <uint32_t FMT, uint32_t RB, uint32_t NW = (uint32_t)kWavesPerBlock>
+__global__ __launch_bounds__(NW * kWave) void expert_gemv_kernel_tr_split(
     BatchPtrs p,
     const float* __restrict__ weights,
     uint32_t n_mats,
     const float* __restrict__ cb,
     uint32_t rows, uint32_t cols) {
-  expert_gemv_tr_split_body<FMT, RB>(p, weights, n_mats, cb, rows, cols);
+  expert_gemv_tr_split_body<FMT, RB, NW>(p, weights, n_mats, cb, rows, cols);
 }
 
 // The row-major decode gemv. Only a test or a bench that builds its own planes reaches it — the
@@ -1431,7 +1491,7 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_kernel_v8(
   const int wave = tid / kWave;
 
   for (int i = tid; i < 4 * 32 * 2; i += kThreads) s_cb[i] = cb[i];
-  __syncthreads();
+  aff::lds_barrier();
 
   const uint32_t nblk = cols / 16;
   const uint32_t bpl  = nblk / kWave;
@@ -1453,13 +1513,8 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_kernel_v8(
       __builtin_amdgcn_wave_barrier();
       if (rs == 0.0f) continue;
 
-      // Ten dword reads, then everything else happens in registers.
-      uint32_t cw[kMaxCodeWords + 1];
+      // Direct LDS reads keep codes out of stack scratch (`cw[]` spill).
       const uint32_t base_w = lane * bpl * 5 / 4;
-      #pragma unroll
-      for (int i = 0; i < kMaxCodeWords; ++i)
-        cw[i] = (i < (int)nwords) ? s_code[wave][base_w + i] : 0u;
-      cw[kMaxCodeWords] = 0u;
       // Fields: bpl*6 bits per lane, starting at a 2-byte boundary, so two dwords always cover it.
       const uint32_t fbyte = lane * bpl * 6 / 8;
       const uint32_t fa = fbyte & ~3u;
@@ -1475,7 +1530,9 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_kernel_v8(
         // b*40 mod 32 is always in {0,8,16,24}, so two dwords always hold the 40-bit window.
         const uint32_t cbit = b * 40;
         const uint32_t w = cbit >> 5;
-        const uint64_t win = (((uint64_t)cw[w + 1] << 32) | cw[w]) >> (cbit & 31);
+        const uint32_t lo = s_code[wave][base_w + w];
+        const uint32_t hi = (w + 1u < nwords) ? s_code[wave][base_w + w + 1u] : 0u;
+        const uint64_t win = (((uint64_t)hi << 32) | lo) >> (cbit & 31);
 
         const float* xb = p.xs[m] + (size_t)(lane * bpl + b) * 16;
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
@@ -1537,13 +1594,9 @@ __device__ inline float gemv_row_staged(
   __builtin_amdgcn_wave_barrier();
   if (rs == 0.0f) return 0.0f;
 
-  // Bulk-read this lane's slice into registers: ten dword reads instead of ~80 byte reads.
+  // Direct LDS reads keep codes out of stack scratch (`cw[]` spill).
   const uint32_t nwords = bpl * 5 / 4;
-  uint32_t cw[kMaxCodeWords + 1];
   const uint32_t base_w = lane * bpl * 5 / 4;
-  #pragma unroll
-  for (int i = 0; i < kMaxCodeWords; ++i) cw[i] = (i < (int)nwords) ? s_code[base_w + i] : 0u;
-  cw[kMaxCodeWords] = 0u;
   const uint32_t fbyte = lane * bpl * 6 / 8;
   const uint32_t fa = fbyte & ~3u;
   const uint32_t fsh = (fbyte - fa) * 8;
@@ -1557,7 +1610,9 @@ __device__ inline float gemv_row_staged(
     const float* lut = s_cb + (size_t)(field >> 4) * 64;
     const uint32_t cbit = b * 40;
     const uint32_t w = cbit >> 5;
-    const uint64_t win = (((uint64_t)cw[w + 1] << 32) | cw[w]) >> (cbit & 31);
+    const uint32_t lo = s_code[base_w + w];
+    const uint32_t hi = (w + 1u < nwords) ? s_code[base_w + w + 1u] : 0u;
+    const uint64_t win = (((uint64_t)hi << 32) | lo) >> (cbit & 31);
     const float* xb = xv + (size_t)(lane * bpl + b) * 16;
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     #pragma unroll
@@ -1612,7 +1667,7 @@ __global__ __launch_bounds__(kThreads) void expert_ffn_mono_kernel(MonoArgs a) {
   const uint32_t gwave = blockIdx.x * kWavesPerBlock + wave;
 
   for (int i = tid; i < 4 * 32 * 2; i += kThreads) s_cb[i] = a.cb[i];
-  __syncthreads();
+  aff::lds_barrier();
 
   // --- phase 1: gate and up for every expert, straight into scratch ---------------------------
   // One flat work list over (expert, gate|up, row) so the whole grid stays busy regardless of how
@@ -1724,7 +1779,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_bf16_tall_kernel(
 
   const float v = wave_reduce_add((a0 + a1) + (a2 + a3));
   if (lane == 0) red[wave] = v;
-  __syncthreads();
+  aff::lds_barrier();
   if (tid == 0) {
     float t = 0.0f;
     for (int k = 0; k < kDenseWaves; ++k) t += red[k];
@@ -1743,7 +1798,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_bf16_kernel(
 
   if (stage_x) {
     for (uint32_t i = tid; i < cols; i += kDenseThreads) s_x[i] = x[i];
-    __syncthreads();
+    aff::lds_barrier();
   }
   const float* xv = stage_x ? s_x : x;
 
@@ -1790,7 +1845,8 @@ bool expert_gemm_tokens_pair_hip(const DeviceMatrix& a, float* ya, const DeviceM
   // read their fields half a byte early and the result is uncorrelated rather than merely imprecise.
   // Both real expert shapes satisfy it.
   if (!nt || m.cols % 2048 != 0) return false;
-  const uint32_t blocks = std::min<uint32_t>(2048u, (m.rows + kWavesPerBlock - 1) / kWavesPerBlock);
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (m.rows + kWavesPerBlock - 1) / kWavesPerBlock), kWavesPerBlock);
   // T is a template parameter because it sizes a REGISTER array; spilling the accumulators to
   // scratch would give back exactly the reuse the kernel exists to get. Sizes between the tiers are
   // padded up by the caller: a few wasted columns, no correctness cost.
@@ -1861,7 +1917,8 @@ void matvec_bf16_hip(const uint16_t* W, const float* x, uint32_t rows, uint32_t 
   // at half the factor here — 8 floats a lane rather than 16 — and at that width the conflicts cost
   // nothing measurable, so this keeps the staging and the L1 pressure it relieves.
   const int stage = lds <= 32768 ? 1 : 0;      // 32 KiB ceiling keeps two blocks resident per CU
-  const uint32_t blocks = std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves);
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
   // A row per wave leaves the card idle when the matrix is short, so below the crossover each row
   // gets a whole block instead — same bytes, 8x the threads, still one launch. `cols` has to be wide
   // enough that a block-wide sweep is worth its cross-wave reduction.
@@ -2025,6 +2082,9 @@ __device__ __forceinline__ void fp8_rows_dot(const uint8_t* __restrict__ W,
 }
 
 template <uint32_t RB>
+#ifdef __HIP_DEVICE_COMPILE__
+__attribute__((amdgpu_waves_per_eu((RB == 8u ? 12 : 1), (RB == 8u ? 12 : 16))))
+#endif
 __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_rb_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, const float* __restrict__ x,
     float* __restrict__ out, uint32_t rows, uint32_t cols, uint32_t sc_cols) {
@@ -2070,17 +2130,20 @@ __device__ __forceinline__ float rms_inv_256(const float* __restrict__ x, uint32
   const uint32_t lane = tid & 31, warp = tid >> 5;
   for (int o = 16; o; o >>= 1) acc += __shfl_down(acc, o);
   if (lane == 0) red[warp] = acc;
-  __syncthreads();
+  aff::lds_barrier();
   if (tid == 0) {
     float t = 0.0f;
     for (uint32_t k = 0; k < (nt + 31) / 32; ++k) t += red[k];
     red[0] = rsqrtf(t / (float)n + eps);
   }
-  __syncthreads();
+  aff::lds_barrier();
   return red[0];
 }
 
 template <uint32_t RB>
+#ifdef __HIP_DEVICE_COMPILE__
+__attribute__((amdgpu_waves_per_eu((RB == 8u ? 12 : 1), (RB == 8u ? 12 : 16))))
+#endif
 __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_rn_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, const float* __restrict__ x,
     const float* __restrict__ nw, float* __restrict__ out, float* __restrict__ xn, uint32_t rows,
@@ -2120,7 +2183,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_kernel(
 
   if (stage_x) {
     for (uint32_t i = tid; i < cols; i += kDenseThreads) s_x[i] = x[i];
-    __syncthreads();
+    aff::lds_barrier();
   }
   const float* xv = stage_x ? s_x : x;
 
@@ -2183,7 +2246,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_grouped_kernel(
       d[2 * k] = x0 * c - x1 * sn;
       d[2 * k + 1] = x0 * sn + x1 * c;
     }
-    __syncthreads();
+    aff::lds_barrier();
   }
 
   for (uint32_t row = blockIdx.x * kDenseWaves + wave; row < rows;
@@ -2236,6 +2299,9 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_grouped_kernel(
 // the same group, which holds exactly when `rank % RB == 0` — r0 is RB-aligned, so the group index
 // r0/rank cannot change inside the block. The launcher checks it rather than assuming.
 template <uint32_t RB>
+#ifdef __HIP_DEVICE_COMPILE__
+__attribute__((amdgpu_waves_per_eu((RB == 8u ? 12 : 1), (RB == 8u ? 12 : 16))))
+#endif
 __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_grouped_rb_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, const float* __restrict__ x,
     float* __restrict__ out, uint32_t rows, uint32_t cols, uint32_t sc_cols, uint32_t rank) {
@@ -2262,7 +2328,8 @@ void matvec_fp8_grouped_hip(const uint8_t* W, const uint8_t* S, const float* x, 
   const uint32_t rb = mv_rb(rows, group_dim);       // group_dim IS this kernel's row width
   if (rb > 1u && rank % rb == 0u) {
     const uint32_t per = kDenseWaves * rb;
-    const uint32_t blocks = std::min<uint32_t>(2048u, (rows + per - 1) / per);
+    const uint32_t blocks = aff::safe_grid_blocks(
+        std::min<uint32_t>(2048u, (rows + per - 1) / per), kDenseWaves);
     const uint32_t sc = (group_dim + 127) / 128;
 #define AFF_MVGRB(N)                                                                          \
   hipLaunchKernelGGL((matvec_fp8_grouped_rb_kernel<N>), dim3(blocks), dim3(kDenseThreads), 0,  \
@@ -2272,7 +2339,8 @@ void matvec_fp8_grouped_hip(const uint8_t* W, const uint8_t* S, const float* x, 
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }
-  const uint32_t blocks = std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves);
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
   hipLaunchKernelGGL(HIP_KERNEL_NAME(matvec_fp8_grouped_kernel<false>), dim3(blocks),
                      dim3(kDenseThreads), 0, (hipStream_t)stream, W, S, x, out, rows, group_dim,
                      (group_dim + 127) / 128, rank, RopeTail{});
@@ -2474,7 +2542,8 @@ bool matvec_multix_hip(const MvJob* jobs, uint32_t n_jobs, const float* x, uint3
   a.cols = cols;
   a.sc_cols = (cols + 127) / 128;
   a.total_rows = acc;
-  const uint32_t blocks = std::min<uint32_t>(2048u, (acc + kDenseWaves - 1) / kDenseWaves);
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (acc + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
 #define AFF_MULTIX(T)                                                                             \
   case T:                                                                                         \
     hipLaunchKernelGGL((matvec_multix_kernel<T>), dim3(blocks), dim3(kDenseThreads), 0,            \
@@ -2528,7 +2597,8 @@ void mv_gate_up_swiglu_hip(const void* wg, const uint8_t* sg, uint32_t quant_g, 
   a.out = out; a.rows = rows; a.cols = cols;
   a.sc_cols = (cols + 127) / 128;
   a.limit = limit;
-  const uint32_t blocks = std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves);
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
   hipLaunchKernelGGL(mv_gate_up_swiglu_kernel, dim3(blocks), dim3(kDenseThreads), 0,
                      (hipStream_t)stream, a, x);
   AFF_HIP_CHECK(hipGetLastError());
@@ -2559,7 +2629,8 @@ void matvec_batch_hip(const MvJob* jobs, uint32_t n_jobs, const float* x, uint32
   a.cols = cols;
   a.sc_cols = (cols + 127) / 128;
   a.total_rows = acc;
-  const uint32_t blocks = std::min<uint32_t>(2048u, (acc + kDenseWaves - 1) / kDenseWaves);
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (acc + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
   hipLaunchKernelGGL(matvec_batch_kernel, dim3(blocks), dim3(kDenseThreads), 0,
                      (hipStream_t)stream, a, x);
   AFF_HIP_CHECK(hipGetLastError());
@@ -2574,7 +2645,8 @@ void matvec_fp8_hip(const uint8_t* W, const uint8_t* S, const float* x, uint32_t
   const uint32_t rb = mv_rb(rows, cols);
   if (rb > 1u) {
     const uint32_t per = kDenseWaves * rb;
-    const uint32_t blocks = std::min<uint32_t>(2048u, (rows + per - 1) / per);
+    const uint32_t blocks = aff::safe_grid_blocks(
+        std::min<uint32_t>(2048u, (rows + per - 1) / per), kDenseWaves);
     const uint32_t sc = (cols + 127) / 128;
 #define AFF_MVRB(N)                                                                          \
   hipLaunchKernelGGL((matvec_fp8_rb_kernel<N>), dim3(blocks), dim3(kDenseThreads), 0,         \
@@ -2584,7 +2656,8 @@ void matvec_fp8_hip(const uint8_t* W, const uint8_t* S, const float* x, uint32_t
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }
-  const uint32_t blocks = std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves);
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
   hipLaunchKernelGGL(matvec_fp8_kernel, dim3(blocks), dim3(kDenseThreads),
                      0, (hipStream_t)stream, W, S, x, out, rows, cols,
                      (cols + 127) / 128, 0);
@@ -2601,7 +2674,8 @@ void matvec_fp8_rmsnorm_hip(const uint8_t* W, const uint8_t* S, const float* x, 
                             void* stream) {
   const uint32_t rb = mv_rb(rows, cols);
   const uint32_t per = kDenseWaves * rb;
-  const uint32_t blocks = std::min<uint32_t>(2048u, (rows + per - 1) / per);
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (rows + per - 1) / per), kDenseWaves);
   const uint32_t sc = (cols + 127) / 128;
 #define AFF_MVRN(N)                                                                          \
   hipLaunchKernelGGL((matvec_fp8_rn_kernel<N>), dim3(blocks), dim3(kDenseThreads), 0,         \
@@ -2673,6 +2747,10 @@ void expert_gemv_multix_hip(const DeviceMatrix* mats, const float* const* xs, co
   const bool tr = expert_planes_are_colgroup_major();
   const uint32_t rows_per_block = tr ? kWave : kWavesPerBlock;
   const uint32_t blocks = (rows + rows_per_block - 1) / rows_per_block;
+  const uint32_t ng = cols / kEK;
+  const bool use6 = tr && (ng % (uint32_t)kWavesPerBlock != 0u) && (ng % 6u == 0u);
+  const uint32_t tr_blocks = aff::safe_grid_blocks(blocks, use6 ? 6u : (uint32_t)kWavesPerBlock);
+  const uint32_t v8_blocks = aff::safe_grid_blocks(blocks, (uint32_t)kWavesPerBlock);
   for (uint32_t off = 0; off < n_mats; off += kMaxBatch) {
     const uint32_t n = std::min<uint32_t>(kMaxBatch, n_mats - off);
     BatchPtrs p{};
@@ -2686,8 +2764,16 @@ void expert_gemv_multix_hip(const DeviceMatrix* mats, const float* const* xs, co
       // Same wire-format switch as expert_gemv_batch_hip; see the comment there.
       const uint32_t fmt = expert_wire_format();
 #define AFF_GTRX(FV)                                                                              \
-  hipLaunchKernelGGL((expert_gemv_kernel_tr<FV>), dim3(blocks), dim3(kThreads), 0,                 \
-                     (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols); AFF_HIP_CHECK(hipGetLastError())
+  do {                                                                                             \
+    if (use6) {                                                                                    \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV, 6u>), dim3(tr_blocks), dim3(6u * kWave), 0,   \
+                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);             \
+    } else {                                                                                       \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV>), dim3(tr_blocks), dim3(kThreads), 0,          \
+                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);             \
+    }                                                                                              \
+    AFF_HIP_CHECK(hipGetLastError());                                                              \
+  } while (0)
       if (fmt == kFmtQuad2S) { AFF_GTRX(kFmtQuad2S); }
       else if (fmt == kFmtQuad4S) { AFF_GTRX(kFmtQuad4S); }
       else if (fmt == kFmtQuad4) { AFF_GTRX(kFmtQuad4); }
@@ -2695,7 +2781,7 @@ void expert_gemv_multix_hip(const DeviceMatrix* mats, const float* const* xs, co
       else { AFF_GTRX(kFmtPair16); }
 #undef AFF_GTRX
     } else
-      hipLaunchKernelGGL(expert_gemv_multix_kernel, dim3(blocks), dim3(kThreads), 0,
+      hipLaunchKernelGGL(expert_gemv_multix_kernel, dim3(v8_blocks), dim3(kThreads), 0,
                          (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);
     AFF_HIP_CHECK(hipGetLastError());
   }
@@ -2734,10 +2820,24 @@ bool expert_gemv_split_hip(const DeviceMatrix* mats, const float* const* xs, flo
       p.ys[i] = ys[off + i];
     }
     const uint32_t blocks = n * nb;
+    const uint32_t ng = cols / kEK;
+    const bool use6 = (ng % (uint32_t)kWavesPerBlock != 0u) && (ng % 6u == 0u);
+    const uint32_t launch_blocks =
+        aff::safe_grid_blocks(blocks, use6 ? 6u : (uint32_t)kWavesPerBlock);
     const uint32_t fmt = expert_wire_format();
 #define AFF_GSPL(FV, RV)                                                                          \
-  hipLaunchKernelGGL((expert_gemv_kernel_tr_split<FV, RV>), dim3(blocks), dim3(kThreads), 0,       \
-                     (hipStream_t)stream, p, weights + off, n, cb, rows, cols); AFF_HIP_CHECK(hipGetLastError())
+  do {                                                                                             \
+    if (use6) {                                                                                    \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr_split<FV, RV, 6u>), dim3(launch_blocks),           \
+                         dim3(6u * kWave), 0, (hipStream_t)stream, p, weights + off, n, cb, rows,  \
+                         cols);                                                                    \
+    } else {                                                                                       \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr_split<FV, RV>), dim3(launch_blocks),               \
+                         dim3(kThreads), 0, (hipStream_t)stream, p, weights + off, n, cb, rows,    \
+                         cols);                                                                    \
+    }                                                                                              \
+    AFF_HIP_CHECK(hipGetLastError());                                                              \
+  } while (0)
 #define AFF_GSPR(FV)                                                                              \
   do { if (use_rb == 4u) { AFF_GSPL(FV, 4); }                                                     \
        else if (use_rb == 2u) { AFF_GSPL(FV, 2); }                                                \
@@ -2787,6 +2887,10 @@ void expert_gemv_batch_hip(const DeviceMatrix* mats, const float* weights, uint3
   // fraction of the matrix.
   const uint32_t rows_per_block = tr ? kWave : kWavesPerBlock;
   const uint32_t blocks = (rows + rows_per_block - 1) / rows_per_block;
+  const uint32_t ng = cols / kEK;
+  const bool use6 = tr && (ng % (uint32_t)kWavesPerBlock != 0u) && (ng % 6u == 0u);
+  const uint32_t tr_blocks = aff::safe_grid_blocks(blocks, use6 ? 6u : (uint32_t)kWavesPerBlock);
+  const uint32_t v8_blocks = aff::safe_grid_blocks(blocks, (uint32_t)kWavesPerBlock);
 
   for (uint32_t off = 0; off < n_mats; off += kMaxBatch) {
     const uint32_t n = std::min<uint32_t>(kMaxBatch, n_mats - off);
@@ -2807,8 +2911,16 @@ void expert_gemv_batch_hip(const DeviceMatrix* mats, const float* weights, uint3
       // not is silently wrong output rather than a failure.
       const uint32_t fmt = expert_wire_format();
 #define AFF_GTR(FV)                                                                               \
-  hipLaunchKernelGGL((expert_gemv_kernel_tr<FV>), dim3(blocks), dim3(kThreads), 0,                 \
-                     (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols); AFF_HIP_CHECK(hipGetLastError())
+  do {                                                                                             \
+    if (use6) {                                                                                    \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV, 6u>), dim3(tr_blocks), dim3(6u * kWave), 0,   \
+                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);             \
+    } else {                                                                                       \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV>), dim3(tr_blocks), dim3(kThreads), 0,          \
+                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);             \
+    }                                                                                              \
+    AFF_HIP_CHECK(hipGetLastError());                                                              \
+  } while (0)
       if (fmt == kFmtQuad2S) { AFF_GTR(kFmtQuad2S); }
       else if (fmt == kFmtQuad4S) { AFF_GTR(kFmtQuad4S); }
       else if (fmt == kFmtQuad4) { AFF_GTR(kFmtQuad4); }
@@ -2819,8 +2931,8 @@ void expert_gemv_batch_hip(const DeviceMatrix* mats, const float* weights, uint3
       continue;
     }
     // Row-major, which only a test or a bench that builds its own planes ever asks for.
-    hipLaunchKernelGGL(expert_gemv_kernel_v8, dim3(blocks), dim3(kThreads), 0, (hipStream_t)stream,
-                       p, weights + off, n, cb, y, rows, cols);
+    hipLaunchKernelGGL(expert_gemv_kernel_v8, dim3(v8_blocks), dim3(kThreads), 0,
+                       (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);
     AFF_HIP_CHECK(hipGetLastError());
   }
   // No synchronise here. Work is ordered on the stream, and the caller's download (or explicit

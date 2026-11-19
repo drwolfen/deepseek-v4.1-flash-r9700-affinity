@@ -52,6 +52,14 @@ namespace {
 constexpr uint32_t kW = kFlashWidth;         // 512
 constexpr uint32_t kRowB = kFlashRowBytes;   // 528
 
+__device__ __forceinline__ float flash_rcpf(float x) {
+#ifdef __HIP_DEVICE_COMPILE__
+  return __builtin_amdgcn_rcpf(x);
+#else
+  return 1.0f / x;
+#endif
+}
+
 // FOUR waves. LDS caps occupancy, so eight waves a block would buy one more wave a SIMD — and that
 // does not pay: the key tile has to grow with the wave count (QK gives one 16-key M-tile to each
 // wave, so kKT = 16 * kWaves), which halves the output dims a wave owns, and the dims a wave owns
@@ -161,6 +169,9 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
   __shared__ float s_m[NH], s_l[NH], s_af[NH];       // running max, denominator, rescale factor
   __shared__ float s_red[kWaves * NH];               // cross-wave max / sum scratch
   __shared__ float s_amax[kThreads];
+  // `s_amax` is dead after Q quantisation in the prologue, so `s_ps` aliases it at zero extra
+  // LDS cost to avoid an occupancy drop from 3 to 2 blocks/CU while keeping `s_red` disjoint.
+  float* const s_ps = s_amax;
   __shared__ float s_scur, s_sprev;
   __shared__ int s_skip;
 
@@ -370,10 +381,9 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       }
       ps[nt] = psum + __shfl_xor(psum, 16);
     }
-    __syncthreads();                                  // s_red is reused for the denominator
 #pragma unroll
     for (uint32_t nt = 0; nt < NT; ++nt)
-      if (lane < 16) s_red[wave * NH + nt * 16u + c] = ps[nt];
+      if (lane < 16) s_ps[wave * NH + nt * 16u + c] = ps[nt];
     __syncthreads();
 
     // ---- P -> E4M3, with the key's row scale folded in.
@@ -383,8 +393,8 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     // multiplying it by a raw 2^-7 would push most of it into E4M3 subnormals. Dividing by S_cur
     // holds the ratio at or below 1, and the unit change is absorbed by the rescale the online
     // softmax already applies each tile: alpha * (S_prev / S_cur).
-    const float sratio = s_sprev / s_scur;
-    const float inv_scur = 1.0f / s_scur;
+    const float inv_scur = flash_rcpf(s_scur);
+    const float sratio = s_sprev * inv_scur;
     int skip = 1;
 #pragma unroll
     for (uint32_t nt = 0; nt < NT; ++nt) {
@@ -396,9 +406,9 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       if (wave == 0) {
         if (__ballot(fac == 1.0f) != 0xFFFFFFFFull) skip = 0;
         if (lane < 16) {
-          float ltile = s_red[hd];
+          float ltile = s_ps[hd];
 #pragma unroll
-          for (uint32_t w = 1; w < kWaves; ++w) ltile += s_red[w * NH + hd];
+          for (uint32_t w = 1; w < kWaves; ++w) ltile += s_ps[w * NH + hd];
           s_m[hd] = mnew[nt];
           s_l[hd] = s_l[hd] * alpha[nt] + ltile;
           s_af[hd] = fac;
@@ -408,8 +418,8 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
 #pragma unroll
       for (int j = 0; j < 8; ++j) pw[j] = sv[nt][j] * (rw[j] * inv_scur);
       uint8_t* pdst = s_p + (size_t)hd * kPLd + 16u * wave + hlf * 8u;
-      *(uint32_t*)(pdst) = pack4(pw[0], pw[1], pw[2], pw[3]);
-      *(uint32_t*)(pdst + 4) = pack4(pw[4], pw[5], pw[6], pw[7]);
+      *(uint2*)(pdst) = make_uint2(pack4(pw[0], pw[1], pw[2], pw[3]),
+                                   pack4(pw[4], pw[5], pw[6], pw[7]));
     }
     if (wave == 0 && lane == 0) s_skip = skip;
     __syncthreads();
@@ -613,13 +623,19 @@ static uint32_t flash_split_slices(uint32_t n_tok, uint32_t head_tiles, uint32_t
                                    const FlashSplit* sp) {
   if (!sp || !sp->o || !sp->ml || !sp->slots || n_tok > sp->tok_cap) return 1u;
   constexpr uint32_t kTargetBlocks = 128u;
-  constexpr uint32_t kMinTiles = 4u;                 // keys a slice, in units of kKT = 64
+  static const uint32_t env_min_tiles = [] {
+    const char* s = std::getenv("AFF_FLASH_MIN_TILES");
+    if (!s || !*s) return 0u;
+    const long v = std::strtol(s, nullptr, 10);
+    return v > 0 ? (uint32_t)v : 1u;
+  }();
+  const uint32_t min_tiles = env_min_tiles ? env_min_tiles : (n_tok <= 16u ? 1u : 4u);
   const uint32_t nat = n_tok * head_tiles;
   if (!nat || nat >= kTargetBlocks) return 1u;
   const uint32_t tiles = (n_keys + kKT - 1u) / kKT;
   uint32_t s = std::min(kTargetBlocks / nat, sp->slots);
   s = std::min(s, kMaxSlices);
-  s = std::min(s, tiles / kMinTiles);
+  s = std::min(s, tiles / min_tiles);
   return s ? s : 1u;
 }
 

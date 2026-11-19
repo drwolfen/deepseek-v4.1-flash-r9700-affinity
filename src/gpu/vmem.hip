@@ -116,12 +116,15 @@ bool VirtualSpan::commit_to(size_t bytes, hipStream_t zero_on, std::string* err)
   // own non-blocking stream: the blocking form synchronises the device, and 86 of those a growth
   // from the grower thread is a stall on the dispatch. Waited for here, so the memory is zero
   // before commit_to returns and the caller can publish it.
-  e = hipMemsetD8Async(reinterpret_cast<hipDeviceptr_t>(base_ + off), 0, add, zero_on);
+  if (((reinterpret_cast<uintptr_t>(base_ + off) & 3u) == 0u) && ((add & 3u) == 0u))
+    e = hipMemsetAsync(base_ + off, 0, add, zero_on);
+  else
+    e = hipMemsetD8Async(reinterpret_cast<hipDeviceptr_t>(base_ + off), 0, add, zero_on);
   if (e == hipSuccess) e = hipStreamSynchronize(zero_on);
   if (e != hipSuccess) {
     (void)hipMemUnmap(base_ + off, add);
     (void)hipMemRelease(h);
-    if (err) *err = hip_err("hipMemsetD8Async", e);
+    if (err) *err = hip_err("hipMemsetAsync", e);
     return false;
   }
   chunks_.push_back({h, add});

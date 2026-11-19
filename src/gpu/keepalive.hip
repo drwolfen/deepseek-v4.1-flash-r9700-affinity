@@ -22,6 +22,9 @@ __global__ void keepalive_kernel(float* __restrict__ sink, uint32_t iters) {
 
 constexpr uint32_t kIters = 8000;
 
+std::atomic<uint32_t> g_keepalive_active{0};
+std::atomic<int64_t> g_last_active_ns[kMaxGpuDevices]{};
+
 // nanosleep rather than a spin: the CPU is doing expert arithmetic on every core during exactly the
 // window this covers, and taking a core from it to save a few microseconds of GPU dispatch would be
 // a straight loss. Overshoot is fine: the interval is set below the threshold with margin.
@@ -39,13 +42,25 @@ struct GpuKeepalive::Impl {
   std::vector<std::thread> th;
 };
 
+void keepalive_notify_active(int dev) {
+  if (!g_keepalive_active.load(std::memory_order_relaxed)) return;
+  if (dev < 0 && hipGetDevice(&dev) != hipSuccess) return;
+  if (dev < 0 || dev >= (int)kMaxGpuDevices) return;
+  const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+  g_last_active_ns[dev].store(now_ns, std::memory_order_relaxed);
+}
+
+void GpuKeepalive::notify_active(int dev) { keepalive_notify_active(dev); }
+
 GpuKeepalive::~GpuKeepalive() { stop(); }
 
 bool GpuKeepalive::start(const std::vector<int>& devices, double interval_us) {
   if (running_ || devices.empty()) return false;
+  g_keepalive_active.fetch_add(1u, std::memory_order_relaxed);
   impl_ = new Impl();
+  const int64_t interval_ns = interval_us > 0.0 ? (int64_t)(interval_us * 1000.0) : 0;
   for (int dev : devices) {
-    impl_->th.emplace_back([this, dev, interval_us] {
+    impl_->th.emplace_back([this, dev, interval_us, interval_ns] {
       if (hipSetDevice(dev) != hipSuccess) return;
       // Lowest priority the driver offers, so the heartbeat can never take a turn ahead of real
       // work. It exists to fill idle time, not to compete for the device.
@@ -60,6 +75,14 @@ bool GpuKeepalive::start(const std::vector<int>& devices, double interval_us) {
       // which is the one failure mode that makes this useless.
       while (!impl_->stop.load(std::memory_order_relaxed)) {
         const auto t0 = std::chrono::steady_clock::now();
+        if (interval_ns > 0 && dev >= 0 && dev < (int)kMaxGpuDevices) {
+          const int64_t now_ns = t0.time_since_epoch().count();
+          const int64_t last_ns = g_last_active_ns[dev].load(std::memory_order_relaxed);
+          if (last_ns > 0 && (now_ns - last_ns) < interval_ns) {
+            sleep_us((double)(interval_ns - (now_ns - last_ns)) * 1e-3);
+            continue;
+          }
+        }
         hipLaunchKernelGGL(keepalive_kernel, dim3(1), dim3(256), 0, st, sink, kIters);
         if (hipStreamSynchronize(st) != hipSuccess) break;
         const double spent =
@@ -81,6 +104,7 @@ void GpuKeepalive::stop() {
   delete impl_;
   impl_ = nullptr;
   running_ = false;
+  g_keepalive_active.fetch_sub(1u, std::memory_order_relaxed);
 }
 
 } // namespace aff

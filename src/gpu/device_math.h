@@ -141,11 +141,11 @@ __device__ __forceinline__ float yarn_ramp_d(float low, float high, int i) {
 // writes the rotated pair SOMEWHERE ELSE — the inverse RoPE folded into attn_out's matvec writes
 // LDS, not back over its input — computes it from the same body. Two call sites that agree by
 // inspection stay agreeing only until one is edited.
-__device__ __forceinline__ void rope_cs(uint32_t k, uint32_t pos, float freq_scale,
-                                        float theta_scale, float ext_factor, float lo, float hi,
-                                        float sin_sign, float* c, float* sn) {
+__device__ __forceinline__ void rope_cs_pre(uint32_t k, float theta_pow, uint32_t pos,
+                                            float freq_scale, float ext_factor, float lo, float hi,
+                                            float sin_sign, float* c, float* sn) {
   const uint32_t i = k * 2;
-  const float theta_extrap = (float)pos * __powf(theta_scale, (float)k);
+  const float theta_extrap = (float)pos * theta_pow;
   float theta = freq_scale * theta_extrap;
   if (ext_factor != 0.0f) {
     const float mix = yarn_ramp_d(lo, hi, (int)i) * ext_factor;
@@ -153,6 +153,13 @@ __device__ __forceinline__ void rope_cs(uint32_t k, uint32_t pos, float freq_sca
   }
   *c = __cosf(theta);
   *sn = sin_sign * __sinf(theta);
+}
+
+__device__ __forceinline__ void rope_cs(uint32_t k, uint32_t pos, float freq_scale,
+                                        float theta_scale, float ext_factor, float lo, float hi,
+                                        float sin_sign, float* c, float* sn) {
+  rope_cs_pre(k, __powf(theta_scale, (float)k), pos, freq_scale, ext_factor, lo, hi, sin_sign, c,
+              sn);
 }
 
 // One rotated PAIR, `stride` floats apart. `stride` exists for the batched prefill path, where

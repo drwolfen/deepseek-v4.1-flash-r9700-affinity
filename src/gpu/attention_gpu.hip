@@ -163,12 +163,11 @@ struct KvRow {
     if (DT == 3 && i >= n_nope) return __half2float(h[i - n_nope]);
     return e4m3_decode(p[i]) * sc[i >> 6];
   }
+  __device__ __forceinline__ float row_scale() const { return sc[0]; }
+  __device__ __forceinline__ bool is_aligned4() const {
+    return (reinterpret_cast<uintptr_t>(p) & 3u) == 0u;
+  }
 };
-
-__device__ __forceinline__ float wave_sum(float v) {
-  for (int o = kWave / 2; o; o >>= 1) v += __shfl_down(v, o);
-  return __shfl(v, 0);
-}
 
 // One block per (query head, token). The body is a __device__ function and not a kernel because
 // there are now two entry points into it — decode's one token and prefill's sub-batch — and a
@@ -214,56 +213,17 @@ __device__ __forceinline__ float bf16_to_f32_att(uint16_t h) {
   return __uint_as_float((uint32_t)h << 16);
 }
 
-#if defined(__HIP_PLATFORM_AMD__)
-static __device__ __forceinline__ float wave32_dpp_reduce_sum(float v) {
-  const int vi = __float_as_int(v);
-  int t = __builtin_amdgcn_update_dpp(vi, vi, 0x160 | 1, 0xF, 0xF, true);
-  v += __int_as_float(t);
-  const int vi2 = __float_as_int(v);
-  t = __builtin_amdgcn_update_dpp(vi2, vi2, 0x160 | 2, 0xF, 0xF, true);
-  v += __int_as_float(t);
-  const int vi4 = __float_as_int(v);
-  t = __builtin_amdgcn_update_dpp(vi4, vi4, 0x160 | 4, 0xF, 0xF, true);
-  v += __int_as_float(t);
-  const int vi8 = __float_as_int(v);
-  t = __builtin_amdgcn_update_dpp(vi8, vi8, 0x160 | 8, 0xF, 0xF, true);
-  v += __int_as_float(t);
-  const int vi16 = __float_as_int(v);
-  t = __builtin_amdgcn_permlanex16(vi16, vi16, 0x76543210u, 0xfedcba98u, false, false);
-  v += __int_as_float(t);
-  return v;
-}
-
-static __device__ __forceinline__ float wave32_dpp_reduce_max(float v) {
-  const int vi = __float_as_int(v);
-  int t = __builtin_amdgcn_update_dpp(vi, vi, 0x160 | 1, 0xF, 0xF, true);
-  v = fmaxf(v, __int_as_float(t));
-  const int vi2 = __float_as_int(v);
-  t = __builtin_amdgcn_update_dpp(vi2, vi2, 0x160 | 2, 0xF, 0xF, true);
-  v = fmaxf(v, __int_as_float(t));
-  const int vi4 = __float_as_int(v);
-  t = __builtin_amdgcn_update_dpp(vi4, vi4, 0x160 | 4, 0xF, 0xF, true);
-  v = fmaxf(v, __int_as_float(t));
-  const int vi8 = __float_as_int(v);
-  t = __builtin_amdgcn_update_dpp(vi8, vi8, 0x160 | 8, 0xF, 0xF, true);
-  v = fmaxf(v, __int_as_float(t));
-  const int vi16 = __float_as_int(v);
-  t = __builtin_amdgcn_permlanex16(vi16, vi16, 0x76543210u, 0xfedcba98u, false, false);
-  v = fmaxf(v, __int_as_float(t));
-  return v;
-}
-#endif
-
 // QB: the query buffer is bf16 rather than f32. The batched prefill path feeds it from the arena,
 // where the heads buffer is bf16 and the flash kernel beside it reads the same thing; the
 // single-token path still passes f32.
-template <int DT, bool QB = false, bool DRAFT_SKIP = false, bool LOOKAHEAD = false>
+template <int DT, bool QB = false, bool DRAFT_SKIP = false, bool LOOKAHEAD = false,
+          bool HAS_ALLOWED = true>
 __device__ __forceinline__ void attend_body(
     const void* __restrict__ qbase, const void* __restrict__ raw, const void* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const float* __restrict__ sinks, bool has_sink,
-    float* __restrict__ obase, float* __restrict__ s_score, uint32_t raw0, uint32_t n_raw,
-    uint32_t ring, uint32_t n_comp, uint32_t width, uint32_t nope, uint32_t stride, float scale,
-    uint32_t nh) {
+    float* __restrict__ obase, float* __restrict__ s_score, float* __restrict__ s_q,
+    uint32_t raw0, uint32_t n_raw, uint32_t ring, uint32_t n_comp, uint32_t width, uint32_t nope,
+    uint32_t stride, float scale, uint32_t nh) {
 
   const uint32_t tid = threadIdx.x;
   const uint32_t lane = tid & (kWave - 1), wave = tid / kWave;
@@ -277,11 +237,20 @@ __device__ __forceinline__ void attend_body(
   const float NEG = -3.0e38f;
   const uint32_t per_lane = width / kWave;                  // 16 at width 512
 
+  if (s_q) {
+    const uint32_t tot_q = nh * width;
+    for (uint32_t i = tid; i < tot_q; i += kAttnThreads) {
+      s_q[i] = QB ? bf16_to_f32_att(static_cast<const uint16_t*>(qbase)[i])
+                  : static_cast<const float*>(qbase)[i];
+    }
+    lds_barrier();
+  }
+
   // ---- scores. One K row per wave iteration, reused across every head in the block.
   if constexpr (LOOKAHEAD) {
     uint32_t j = wave;
     if (j < n_keys) {
-      bool cur_skip = (j >= n_raw) && allowed && !allowed[j - n_raw];
+      bool cur_skip = HAS_ALLOWED && (j >= n_raw) && allowed && !allowed[j - n_raw];
       float cur_kv[kQPerLane];
       if (!cur_skip) {
         uint32_t rs = raw0 + j; if (rs >= ring) rs -= ring;
@@ -294,7 +263,7 @@ __device__ __forceinline__ void attend_body(
         bool next_skip = false;
         float next_kv[kQPerLane];
         if (j_next < n_keys) {
-          next_skip = (j_next >= n_raw) && allowed && !allowed[j_next - n_raw];
+          next_skip = HAS_ALLOWED && (j_next >= n_raw) && allowed && !allowed[j_next - n_raw];
           if (!next_skip) {
             uint32_t rs_next = raw0 + j_next; if (rs_next >= ring) rs_next -= ring;
             const KvRow<DT> k_next = (j_next < n_raw) ? KvRow<DT>(raw, rs_next, stride, width, nope)
@@ -307,16 +276,15 @@ __device__ __forceinline__ void attend_body(
             for (uint32_t h = 0; h < nh; ++h) s_score[(size_t)h * n_keys + j] = NEG;
         } else {
           for (uint32_t h = 0; h < nh; ++h) {
-            const float* qh = QB ? nullptr : (const float*)qbase + (size_t)h * width;
-            const uint16_t* qhb = QB ? (const uint16_t*)qbase + (size_t)h * width : nullptr;
+            const float* qhs = s_q ? (s_q + (size_t)h * width) : nullptr;
+            const float* qh = (s_q || QB) ? qhs : (const float*)qbase + (size_t)h * width;
+            const uint16_t* qhb = (!s_q && QB) ? (const uint16_t*)qbase + (size_t)h * width : nullptr;
             float d = 0.0f;
-            for (uint32_t t = 0; t < per_lane; ++t)
-              d = fmaf(QB ? bf16_to_f32_att(qhb[lane + t * kWave]) : qh[lane + t * kWave], cur_kv[t], d);
-#if defined(__HIP_PLATFORM_AMD__)
-            d = wave32_dpp_reduce_sum(d);
-#else
-            d = wave_sum(d);
-#endif
+            for (uint32_t t = 0; t < per_lane; ++t) {
+              const float qv = qhb ? bf16_to_f32_att(qhb[lane + t * kWave]) : qh[lane + t * kWave];
+              d = fmaf(qv, cur_kv[t], d);
+            }
+            d = wave_reduce_add_dpp(d);
             if (lane == 0) s_score[(size_t)h * n_keys + j] = d * scale;
           }
         }
@@ -327,7 +295,7 @@ __device__ __forceinline__ void attend_body(
     }
   } else {
     for (uint32_t j = wave; j < n_keys; j += kAttnWaves) {
-      const bool skip = (j >= n_raw) && allowed && !allowed[j - n_raw];
+      const bool skip = HAS_ALLOWED && (j >= n_raw) && allowed && !allowed[j - n_raw];
       if (skip) {
         if (lane == 0)
           for (uint32_t h = 0; h < nh; ++h) s_score[(size_t)h * n_keys + j] = NEG;
@@ -336,20 +304,45 @@ __device__ __forceinline__ void attend_body(
       uint32_t rs = raw0 + j; if (rs >= ring) rs -= ring;
       const KvRow<DT> k = (j < n_raw) ? KvRow<DT>(raw, rs, stride, width, nope)
                                       : KvRow<DT>(comp, j - n_raw, stride, width, nope);
-      float kv[kQPerLane];
-      for (uint32_t t = 0; t < per_lane; ++t) kv[t] = k[lane + t * kWave];
-      for (uint32_t h = 0; h < nh; ++h) {
-        const float* qh = QB ? nullptr : (const float*)qbase + (size_t)h * width;
-        const uint16_t* qhb = QB ? (const uint16_t*)qbase + (size_t)h * width : nullptr;
-        float d = 0.0f;
-        for (uint32_t t = 0; t < per_lane; ++t)
-          d = fmaf(QB ? bf16_to_f32_att(qhb[lane + t * kWave]) : qh[lane + t * kWave], kv[t], d);
-        d = wave_sum(d);
-        if (lane == 0) s_score[(size_t)h * n_keys + j] = d * scale;
+      if (DT == 4 && s_q && (width % 128u) == 0u && k.is_aligned4()) {
+        const float ksc = k.row_scale();
+        const uint32_t v_iters = per_lane >> 2;
+        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(k.p);
+        uint32_t kv_pk[kQPerLane / 4u];
+        for (uint32_t t = 0; t < v_iters; ++t) kv_pk[t] = p32[t * kWave + lane];
+        for (uint32_t h = 0; h < nh; ++h) {
+          const float4* q4 = reinterpret_cast<const float4*>(s_q + (size_t)h * width);
+          float d = 0.0f;
+          for (uint32_t t = 0; t < v_iters; ++t) {
+            const uint32_t u = kv_pk[t];
+            const float4 qv = q4[t * kWave + lane];
+            d = fmaf(qv.x, e4m3_decode(static_cast<uint8_t>(u)), d);
+            d = fmaf(qv.y, e4m3_decode(static_cast<uint8_t>(u >> 8)), d);
+            d = fmaf(qv.z, e4m3_decode(static_cast<uint8_t>(u >> 16)), d);
+            d = fmaf(qv.w, e4m3_decode(static_cast<uint8_t>(u >> 24)), d);
+          }
+          d = wave_reduce_add_dpp(d);
+          if (lane == 0) s_score[(size_t)h * n_keys + j] = d * (ksc * scale);
+        }
+      } else {
+        float kv[kQPerLane];
+        for (uint32_t t = 0; t < per_lane; ++t) kv[t] = k[lane + t * kWave];
+        for (uint32_t h = 0; h < nh; ++h) {
+          const float* qhs = s_q ? (s_q + (size_t)h * width) : nullptr;
+          const float* qh = (s_q || QB) ? qhs : (const float*)qbase + (size_t)h * width;
+          const uint16_t* qhb = (!s_q && QB) ? (const uint16_t*)qbase + (size_t)h * width : nullptr;
+          float d = 0.0f;
+          for (uint32_t t = 0; t < per_lane; ++t) {
+            const float qv = qhb ? bf16_to_f32_att(qhb[lane + t * kWave]) : qh[lane + t * kWave];
+            d = fmaf(qv, kv[t], d);
+          }
+          d = wave_reduce_add_dpp(d);
+          if (lane == 0) s_score[(size_t)h * n_keys + j] = d * scale;
+        }
       }
     }
   }
-  __syncthreads();
+  lds_barrier();
 
   // ---- softmax, one head per wave. Purely wave-level, so no barrier until the scores are needed
   // by every thread again.
@@ -358,15 +351,7 @@ __device__ __forceinline__ void attend_body(
     const float sink = sinks ? sinks[wave] : 0.0f;
     float m = has_sink ? sink : NEG;
     for (uint32_t j = lane; j < n_keys; j += kWave) m = fmaxf(m, row[j]);
-#if defined(__HIP_PLATFORM_AMD__)
-    if constexpr (LOOKAHEAD) {
-      m = wave32_dpp_reduce_max(m);
-    } else {
-      for (int o = kWave / 2; o; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
-    }
-#else
-    for (int o = kWave / 2; o; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
-#endif
+    m = wave_reduce_max_dpp(m);
     float den = 0.0f;
     for (uint32_t j = lane; j < n_keys; j += kWave) {
       const float sj = row[j];
@@ -374,19 +359,11 @@ __device__ __forceinline__ void attend_body(
       row[j] = e;
       den += e;
     }
-#if defined(__HIP_PLATFORM_AMD__)
-    if constexpr (LOOKAHEAD) {
-      den = wave32_dpp_reduce_sum(den);
-    } else {
-      for (int o = kWave / 2; o; o >>= 1) den += __shfl_xor(den, o);
-    }
-#else
-    for (int o = kWave / 2; o; o >>= 1) den += __shfl_xor(den, o);
-#endif
+    den = wave_reduce_add_dpp(den);
     if (has_sink) den += __expf(sink - m);
     if (lane == 0) s_inv[wave] = (den > 0.0f) ? 1.0f / den : 0.0f;
   }
-  __syncthreads();
+  lds_barrier();
 
   // ---- weighted sum. k[d] is loaded once and feeds every head, which is the other half of the
   // per-head re-read this kernel used to pay.
@@ -458,18 +435,22 @@ static inline bool attn_lookahead_enabled() {
   return enabled;
 }
 
-template <int DT, bool DRAFT_SKIP = false, bool LOOKAHEAD = false>
+template <int DT, bool DRAFT_SKIP = false, bool LOOKAHEAD = false, bool HAS_ALLOWED = true>
 __global__ __launch_bounds__(kAttnThreads) void mqa_attend_kernel(
     const float* __restrict__ q, const void* __restrict__ raw, const void* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const float* __restrict__ sinks,
     float* __restrict__ out, uint32_t raw0, uint32_t n_raw, uint32_t ring, uint32_t n_comp,
-    uint32_t width, uint32_t nope, uint32_t stride, float scale, uint32_t n_head, uint32_t nhb) {
-  extern __shared__ float s_score[];              // nhb * n_keys, then nhb
+    uint32_t width, uint32_t nope, uint32_t stride, float scale, uint32_t n_head, uint32_t nhb,
+    bool use_sq) {
+  extern __shared__ __align__(16) float s_score[];              // nhb * n_keys, then nhb[, then s_q]
   const uint32_t h0 = blockIdx.x * nhb;
-  attend_body<DT, false, DRAFT_SKIP, LOOKAHEAD>((const void*)(q + (size_t)h0 * width), raw, comp, allowed,
-                                                sinks ? sinks + h0 : nullptr,
-                                                sinks != nullptr, out + (size_t)h0 * width, s_score, raw0, n_raw, ring, n_comp,
-                                                width, nope, stride, scale, min(nhb, n_head - h0));
+  const uint32_t nh = min(nhb, n_head - h0);
+  const size_t q_off = (((size_t)nh * (n_raw + n_comp) + nh) + 3u) & ~size_t(3);
+  float* const s_q = use_sq ? (s_score + q_off) : nullptr;
+  attend_body<DT, false, DRAFT_SKIP, LOOKAHEAD, HAS_ALLOWED>(
+      (const void*)(q + (size_t)h0 * width), raw, comp, allowed,
+      sinks ? sinks + h0 : nullptr, sinks != nullptr, out + (size_t)h0 * width, s_score, s_q,
+      raw0, n_raw, ring, n_comp, width, nope, stride, scale, nh);
 }
 
 // grid(n_head, n). blockIdx.y names the token; everything else is the same attention.
@@ -479,16 +460,16 @@ __global__ __launch_bounds__(kAttnThreads) void mqa_attend_kernel(
 // the compressor emits a row every `ratio` positions, so tokens inside one sub-batch legitimately
 // see different numbers of compressed rows; taking the batch's max here would let an early token
 // attend to a row derived from a later one.
-template <int DT, bool QB, bool DRAFT_SKIP = false, bool LOOKAHEAD = false>
+template <int DT, bool QB, bool DRAFT_SKIP = false, bool LOOKAHEAD = false, bool HAS_ALLOWED = true>
 __global__ __launch_bounds__(kAttnThreads) void mqa_attend_batch_kernel(
     const void* __restrict__ q, const void* __restrict__ raw, const void* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const uint32_t* __restrict__ n_comp_v,
     const float* __restrict__ sinks, float* __restrict__ out, uint32_t b0, uint32_t pos0,
     uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head, uint32_t width,
     uint32_t nope, uint32_t stride, float scale, uint32_t nhb, uint32_t flat_n,
-    uint32_t flat_raw0, uint32_t raw_floor) {
+    uint32_t flat_raw0, uint32_t raw_floor, bool use_sq) {
 
-  extern __shared__ float s_score[];
+  extern __shared__ __align__(16) float s_score[];
   const uint32_t h0 = blockIdx.x * nhb, t = blockIdx.y;
   const uint32_t pos = pos0 + t;
   // Causal by construction: the window IS [pos-sliding+1, pos], so there is no mask to apply. The
@@ -497,12 +478,16 @@ __global__ __launch_bounds__(kAttnThreads) void mqa_attend_batch_kernel(
   const uint32_t n_raw = flat_n ? flat_n : ((raw_avail < sliding) ? raw_avail : sliding);
   const uint32_t raw0 = flat_n ? flat_raw0 : ((pos + 1u - n_raw) % ring);
   const uint32_t n_comp = n_comp_v ? n_comp_v[t] : 0u;
+  const uint32_t nh = min(nhb, n_head - h0);
+  const size_t q_off = (((size_t)nh * (n_raw + n_comp) + nh) + 3u) & ~size_t(3);
+  float* const s_q = use_sq ? (s_score + q_off) : nullptr;
   const size_t tok = (size_t)(b0 + t) * n_head * width + (size_t)h0 * width;
   const void* qp = QB ? (const void*)((const uint16_t*)q + tok)
                       : (const void*)((const float*)q + tok);
-  attend_body<DT, QB, DRAFT_SKIP, LOOKAHEAD>(qp, raw, comp, allowed ? allowed + (size_t)t * max_comp : nullptr,
-                                             sinks ? sinks + h0 : nullptr, sinks != nullptr, out + tok, s_score, raw0,
-                                             n_raw, ring, n_comp, width, nope, stride, scale, min(nhb, n_head - h0));
+  attend_body<DT, QB, DRAFT_SKIP, LOOKAHEAD, HAS_ALLOWED>(
+      qp, raw, comp, allowed ? allowed + (size_t)t * max_comp : nullptr,
+      sinks ? sinks + h0 : nullptr, sinks != nullptr, out + tok, s_score, s_q, raw0,
+      n_raw, ring, n_comp, width, nope, stride, scale, nh);
 }
 
 
@@ -798,36 +783,37 @@ void mqa_attend_hip(KvDtype dt, const float* q, const void* raw, const void* com
   // while making the batched one more than twice as fast. The reuse is worth nothing when there is
   // only one token's window to reuse and most of the card is left idle to get it.
   const uint32_t nhb = 1;
-  const size_t lds = ((size_t)nhb * n_keys + nhb) * sizeof(float);
+  const size_t base_lds = ((((size_t)nhb * n_keys + nhb) + 3u) & ~size_t(3)) * sizeof(float);
+  const size_t q_lds = (size_t)nhb * width * sizeof(float);
+  const bool use_sq = (base_lds + q_lds) <= (48u * 1024u);
+  const size_t lds = use_sq ? (base_lds + q_lds) : ((size_t)nhb * n_keys + nhb) * sizeof(float);
   const dim3 g((n_head + nhb - 1) / nhb), b(kAttnThreads);
   hipStream_t st = (hipStream_t)stream;
   const uint32_t sd = (uint32_t)kv_row_bytes(dt, width, n_rot);
   const uint32_t nope = width - n_rot;
-  const bool draft_mask_skip = draft_skip_masked_enabled();
+  const bool has_allowed = (allowed != nullptr);
+  const bool draft_mask_skip = has_allowed && draft_skip_masked_enabled();
   const bool lookahead = attn_lookahead_enabled();
+#define AFF_ATT_S_LA(DTV, LA)                                                                      \
+  do {                                                                                             \
+    if (!has_allowed) {                                                                            \
+      hipLaunchKernelGGL((mqa_attend_kernel<DTV, false, LA, false>), g, b, lds, st, q, raw, comp,  \
+                         allowed, sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale,   \
+                         n_head, nhb, use_sq);                                                     \
+    } else if (draft_mask_skip) {                                                                  \
+      hipLaunchKernelGGL((mqa_attend_kernel<DTV, true, LA, true>), g, b, lds, st, q, raw, comp,    \
+                         allowed, sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale,   \
+                         n_head, nhb, use_sq);                                                     \
+    } else {                                                                                       \
+      hipLaunchKernelGGL((mqa_attend_kernel<DTV, false, LA, true>), g, b, lds, st, q, raw, comp,   \
+                         allowed, sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale,   \
+                         n_head, nhb, use_sq);                                                     \
+    }                                                                                              \
+  } while (0)
 #define AFF_ATT_S(DTV)                                                                             \
   do {                                                                                             \
-    if (lookahead) {                                                                               \
-      if (draft_mask_skip) {                                                                       \
-        hipLaunchKernelGGL((mqa_attend_kernel<DTV, true, true>), g, b, lds, st, q, raw, comp,      \
-                           allowed, sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale,\
-                           n_head, nhb);                                                           \
-      } else {                                                                                     \
-        hipLaunchKernelGGL((mqa_attend_kernel<DTV, false, true>), g, b, lds, st, q, raw, comp,     \
-                           allowed, sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale,\
-                           n_head, nhb);                                                           \
-      }                                                                                            \
-    } else {                                                                                       \
-      if (draft_mask_skip) {                                                                       \
-        hipLaunchKernelGGL((mqa_attend_kernel<DTV, true, false>), g, b, lds, st, q, raw, comp,     \
-                           allowed, sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale,\
-                           n_head, nhb);                                                           \
-      } else {                                                                                     \
-        hipLaunchKernelGGL((mqa_attend_kernel<DTV, false, false>), g, b, lds, st, q, raw, comp,    \
-                           allowed, sinks, out, raw0, n_raw, ring, n_comp, width, nope, sd, scale,\
-                           n_head, nhb);                                                           \
-      }                                                                                            \
-    }                                                                                              \
+    if (lookahead) AFF_ATT_S_LA(DTV, true);                                                        \
+    else AFF_ATT_S_LA(DTV, false);                                                                 \
   } while (0)
   switch (dt) {
     case KvDtype::F32:   AFF_ATT_S(0); break;
@@ -836,6 +822,7 @@ void mqa_attend_hip(KvDtype dt, const float* q, const void* raw, const void* com
     case KvDtype::FP8R:  AFF_ATT_S(4); break;
   }
 #undef AFF_ATT_S
+#undef AFF_ATT_S_LA
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -855,11 +842,16 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
   const uint32_t n_raw_max = flat_n ? flat_n : ((last_avail < sliding) ? last_avail : sliding);
   // Batched: n tokens already give the grid its width, so spend head-grouping on K/V reuse.
   const uint32_t nhb = kHeadsPerBlk;
-  const size_t lds = ((size_t)nhb * (n_raw_max + n_comp_max) + nhb) * sizeof(float);
+  const size_t n_keys_max = (size_t)n_raw_max + n_comp_max;
+  const size_t base_lds = ((((size_t)nhb * n_keys_max + nhb) + 3u) & ~size_t(3)) * sizeof(float);
+  const size_t q_lds = (size_t)nhb * width * sizeof(float);
+  const bool use_sq = (base_lds + q_lds) <= (48u * 1024u);
+  const size_t lds = use_sq ? (base_lds + q_lds) : ((size_t)nhb * n_keys_max + nhb) * sizeof(float);
   hipStream_t st = (hipStream_t)stream;
   const uint32_t sd = (uint32_t)kv_row_bytes(dt, width, n_rot);
   const uint32_t nope = width - n_rot;
-  const bool draft_mask_skip = draft_skip_masked_enabled();
+  const bool has_allowed = (allowed != nullptr);
+  const bool draft_mask_skip = has_allowed && draft_skip_masked_enabled();
   const bool lookahead = attn_lookahead_enabled();
   // Hardware gridDim.y max is 65535 on RDNA. Chunking n into slices <= 65535 guards against
   // hardware overflow for long prefill (>65535 rows up to 262144 context).
@@ -871,33 +863,29 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
     const uint32_t pos0_chunk = pos0 + t_off;
     const uint32_t* n_comp_v_chunk = n_comp_v ? (n_comp_v + t_off) : nullptr;
     const uint8_t* allowed_chunk = allowed ? (allowed + (size_t)t_off * max_comp) : nullptr;
+#define AFF_ATTB_LA(DTV, QBV, LA)                                                                  \
+    do {                                                                                           \
+      if (!has_allowed) {                                                                          \
+        hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, false, LA, false>), g, b, lds, st,   \
+                           q, raw, comp, allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk,      \
+                           pos0_chunk, sliding, ring, max_comp, n_head, width, nope, sd, scale,    \
+                           nhb, flat_n, flat_raw0, raw_floor, use_sq);                             \
+      } else if (draft_mask_skip) {                                                                \
+        hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, true, LA, true>), g, b, lds, st, q,  \
+                           raw, comp, allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk,         \
+                           pos0_chunk, sliding, ring, max_comp, n_head, width, nope, sd, scale,    \
+                           nhb, flat_n, flat_raw0, raw_floor, use_sq);                             \
+      } else {                                                                                     \
+        hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, false, LA, true>), g, b, lds, st, q, \
+                           raw, comp, allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk,         \
+                           pos0_chunk, sliding, ring, max_comp, n_head, width, nope, sd, scale,    \
+                           nhb, flat_n, flat_raw0, raw_floor, use_sq);                             \
+      }                                                                                            \
+    } while (0)
 #define AFF_ATTB(DTV, QBV)                                                                         \
     do {                                                                                           \
-      if (lookahead) {                                                                             \
-        if (draft_mask_skip) {                                                                     \
-          hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, true, true>), g, b, lds, st, q,    \
-                             raw, comp, allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk,       \
-                             pos0_chunk, sliding, ring, max_comp, n_head, width, nope, sd, scale,  \
-                             nhb, flat_n, flat_raw0, raw_floor);                                  \
-        } else {                                                                                   \
-          hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, false, true>), g, b, lds, st, q,   \
-                             raw, comp, allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk,       \
-                             pos0_chunk, sliding, ring, max_comp, n_head, width, nope, sd, scale,  \
-                             nhb, flat_n, flat_raw0, raw_floor);                                  \
-        }                                                                                          \
-      } else {                                                                                     \
-        if (draft_mask_skip) {                                                                     \
-          hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, true, false>), g, b, lds, st, q,   \
-                             raw, comp, allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk,       \
-                             pos0_chunk, sliding, ring, max_comp, n_head, width, nope, sd, scale,  \
-                             nhb, flat_n, flat_raw0, raw_floor);                                  \
-        } else {                                                                                   \
-          hipLaunchKernelGGL((mqa_attend_batch_kernel<DTV, QBV, false, false>), g, b, lds, st, q,  \
-                             raw, comp, allowed_chunk, n_comp_v_chunk, sinks, out, b0_chunk,       \
-                             pos0_chunk, sliding, ring, max_comp, n_head, width, nope, sd, scale,  \
-                             nhb, flat_n, flat_raw0, raw_floor);                                  \
-        }                                                                                          \
-      }                                                                                            \
+      if (lookahead) AFF_ATTB_LA(DTV, QBV, true);                                                  \
+      else AFF_ATTB_LA(DTV, QBV, false);                                                           \
     } while (0)
 #define AFF_ATTQ(DTV) do { if (q_bf16) AFF_ATTB(DTV, true); else AFF_ATTB(DTV, false); } while (0)
     switch (dt) {
@@ -908,6 +896,7 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
     }
 #undef AFF_ATTQ
 #undef AFF_ATTB
+#undef AFF_ATTB_LA
   }
   AFF_HIP_CHECK(hipGetLastError());
 }

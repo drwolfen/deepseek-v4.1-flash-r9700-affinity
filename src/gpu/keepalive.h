@@ -41,10 +41,14 @@ public:
 
   bool running() const { return running_; }
 
+  static void notify_active(int dev = -1);
+
 private:
   struct Impl;
   Impl* impl_ = nullptr;
   bool running_ = false;
 };
+
+void keepalive_notify_active(int dev = -1);
 
 } // namespace aff

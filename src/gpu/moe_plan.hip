@@ -61,21 +61,67 @@ __device__ inline uint32_t plan_bucket(uint32_t nt) {
 // tree with twice the barriers. `tmp` must hold nrow*n.
 __device__ void wg_excl_scan(uint32_t* __restrict__ a, uint32_t* __restrict__ tmp, uint32_t n,
                              uint32_t nrow) {
-  const uint32_t tot = n * nrow;
-  for (uint32_t off = 1; off < n; off <<= 1) {
-    for (uint32_t i = threadIdx.x; i < tot; i += kPlanThreads) {
-      const uint32_t c = i % n;
-      tmp[i] = a[i] + (c >= off ? a[i - off] : 0u);
+  const uint32_t w = threadIdx.x >> 5;
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t nw_row = (n + 31u) >> 5;
+  if (nw_row == 1u) {
+    for (uint32_t r = w; r < nrow; r += 32u) {
+      const uint32_t val = (lane < n) ? a[r * n + lane] : 0u;
+      uint32_t inc = val;
+      #pragma unroll
+      for (uint32_t d = 1u; d < 32u; d <<= 1) {
+        const uint32_t up = __shfl_up(inc, d, 32);
+        if (lane >= d) inc += up;
+      }
+      if (lane < n) a[r * n + lane] = inc - val;
     }
-    __syncthreads();
-    for (uint32_t i = threadIdx.x; i < tot; i += kPlanThreads) a[i] = tmp[i];
-    __syncthreads();
+    lds_barrier();
+    return;
   }
-  for (uint32_t i = threadIdx.x; i < tot; i += kPlanThreads)
-    tmp[i] = (i % n) ? a[i - 1] : 0u;                      // inclusive -> exclusive
-  __syncthreads();
-  for (uint32_t i = threadIdx.x; i < tot; i += kPlanThreads) a[i] = tmp[i];
-  __syncthreads();
+
+  const uint32_t n_chunks = nrow * nw_row;
+  for (uint32_t chunk = w; chunk < n_chunks; chunk += 32u) {
+    const uint32_t r = chunk / nw_row;
+    const uint32_t blk = chunk - r * nw_row;
+    const uint32_t c = (blk << 5) + lane;
+    const uint32_t val = (c < n) ? a[r * n + c] : 0u;
+    uint32_t inc = val;
+    #pragma unroll
+    for (uint32_t d = 1u; d < 32u; d <<= 1) {
+      const uint32_t up = __shfl_up(inc, d, 32);
+      if (lane >= d) inc += up;
+    }
+    if (c < n) a[r * n + c] = inc - val;
+    if (lane == 31u) tmp[chunk] = inc;
+  }
+  lds_barrier();
+
+  for (uint32_t r = w; r < nrow; r += 32u) {
+    uint32_t base = 0u;
+    for (uint32_t b0 = 0u; b0 < nw_row; b0 += 32u) {
+      const uint32_t idx = b0 + lane;
+      const uint32_t cv = (idx < nw_row) ? tmp[r * nw_row + idx] : 0u;
+      uint32_t ci = cv;
+      #pragma unroll
+      for (uint32_t d = 1u; d < 32u; d <<= 1) {
+        const uint32_t up = __shfl_up(ci, d, 32);
+        if (lane >= d) ci += up;
+      }
+      if (idx < nw_row) tmp[r * nw_row + idx] = base + (ci - cv);
+      base += __shfl(ci, 31, 32);
+    }
+  }
+  lds_barrier();
+
+  for (uint32_t chunk = w; chunk < n_chunks; chunk += 32u) {
+    const uint32_t r = chunk / nw_row;
+    const uint32_t blk = chunk - r * nw_row;
+    if (blk > 0u) {
+      const uint32_t c = (blk << 5) + lane;
+      if (c < n) a[r * n + c] += tmp[r * nw_row + blk];
+    }
+  }
+  lds_barrier();
 }
 
 // The dynamic LDS block, carved in one place so the host's size calculation and the kernel's
@@ -113,7 +159,7 @@ __device__ inline PlanLds plan_lds(char* raw, uint32_t n_expert, uint32_t nb_tok
 
 constexpr uint32_t kNone = 0xffffffffu;
 
-__global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a) {
+__global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a, uint32_t last_group) {
   extern __shared__ char raw[];
   const uint32_t NE = a.n_expert, NB = a.nb_tok, K = a.k, TOTAL = NB * K;
   PlanLds L = plan_lds(raw, NE, NB);
@@ -342,6 +388,7 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a) {
   // The host sizes the grid from `tile_cap`, which it can compute without the routing, and the
   // surplus is `nt = 0` — a tile the GEMM returns on before it builds its codebook.
   for (uint32_t g = 0; g < 8u; ++g) {
+    if ((g & 3u) > last_group) continue;
     for (uint32_t i = s_gtot[g] + threadIdx.x; i < cap; i += kPlanThreads)
       for (uint32_t pl = 0; pl < 3u; ++pl)
         a.tiles[(size_t)pl * 8u * cap + g * cap + i].nt = 0u;
@@ -420,7 +467,8 @@ bool moe_plan_hip(const MoePlanArgs& a, void* stream) {
   // this is on the dispatch path and hipGetDeviceProperties is a driver call.
   const size_t lds = moe_plan_lds_bytes(a.n_expert, a.nb_tok);
   if (lds > device_lds_per_block()) return false;
-  hipLaunchKernelGGL(moe_plan_kernel, dim3(1), dim3(kPlanThreads), lds, (hipStream_t)stream, a);
+  hipLaunchKernelGGL(moe_plan_kernel, dim3(1), dim3(kPlanThreads), lds, (hipStream_t)stream, a,
+                     moe_plan_last_group(a.nb_tok));
   return hipGetLastError() == hipSuccess;   // amdnas-fixes: an unbuilt plan must not be dispatched
 }
 

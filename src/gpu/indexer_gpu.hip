@@ -46,12 +46,30 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
 
   // ---- B: the keys. Loaded once, held for the whole head loop.
   wmma::i2v bf[kKT][kD / 16u];
+  const bool k8_aligned16 = (reinterpret_cast<uintptr_t>(k8) & 15u) == 0u;
 #pragma unroll
   for (uint32_t n = 0; n < kKT; ++n) {
     const uint32_t key = kb + n * 16u + c;
-    const uint8_t* kp = k8 + (size_t)(key < n_keys ? key : 0u) * kD + hlf * 8u;
+    const uint8_t* row_kp = k8 + (size_t)(key < n_keys ? key : 0u) * kD;
+    if (k8_aligned16) {
+      const uint4* ku4 = reinterpret_cast<const uint4*>(row_kp);
 #pragma unroll
-    for (uint32_t d = 0; d < kD / 16u; ++d) bf[n][d] = *(const wmma::i2v*)(kp + d * 16u);
+      for (uint32_t d2 = 0; d2 < kD / 32u; ++d2) {
+        const uint4 u = ku4[2u * d2 + hlf];
+        const uint32_t ex0 = dpp_xor_lane<16>(hlf == 0u ? u.z : u.x);
+        const uint32_t ex1 = dpp_xor_lane<16>(hlf == 0u ? u.w : u.y);
+        bf[n][2u * d2 + 0u] = wmma::i2v{
+            static_cast<int>(hlf == 0u ? u.x : ex0),
+            static_cast<int>(hlf == 0u ? u.y : ex1)};
+        bf[n][2u * d2 + 1u] = wmma::i2v{
+            static_cast<int>(hlf == 0u ? ex0 : u.z),
+            static_cast<int>(hlf == 0u ? ex1 : u.w)};
+      }
+    } else {
+      const uint8_t* kp = row_kp + hlf * 8u;
+#pragma unroll
+      for (uint32_t d = 0; d < kD / 16u; ++d) bf[n][d] = *(const wmma::i2v*)(kp + d * 16u);
+    }
   }
 
   wmma::f8v acc_out[kKT];
@@ -61,7 +79,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
   for (uint32_t hg = 0; hg < n_head; hg += kHG) {
     // Stage kHG heads of this token tile. 128 threads, kHG*16 rows of kD bytes: each thread copies
     // one 32-byte run, using 8-byte vectorized stores (uint64_t) eliminating RDNA4 32-bank LDS conflicts.
-    __syncthreads();
+    if (hg > 0u) lds_barrier();
 #pragma unroll
     for (uint32_t i = 0; i < kHG * 16u * (kD / 32u) / kThreads; ++i) {
       const uint32_t idx = tid + i * kThreads;
@@ -81,7 +99,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
       const uint32_t hh = tid / 16u, tt = tid % 16u, t = t0 + tt;
       s_w[hh * 16u + tt] = (t < nb) ? hw[(size_t)t * n_head + hg + hh] : 0.0f;
     }
-    __syncthreads();
+    lds_barrier();
 
 #pragma unroll
     for (uint32_t hh = 0; hh < kHG; ++hh) {
@@ -107,7 +125,6 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
 
   // ---- both scales ride out here: ReLU commutes with a positive factor, so neither had to be
   // inside the head loop. Results staged through K_VECS_PADDED shared memory and coalesced to VRAM.
-  __syncthreads();
 #pragma unroll
   for (uint32_t n = 0; n < kKT; ++n) {
     const uint32_t key_in_block = wave * (kKT * 16u) + n * 16u + c;
@@ -122,7 +139,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
       }
     }
   }
-  __syncthreads();
+  lds_barrier();
   for (uint32_t i = tid; i < kIdxTokTile * kIdxKeys; i += kThreads) {
     const uint32_t tt = i / kIdxKeys, kk = i % kIdxKeys;
     const uint32_t t = t0 + tt;
@@ -179,15 +196,32 @@ __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
     *(uint64_t*)(dst + 8) = *(const uint64_t*)&qv.z;
   }
   if (tid < n_head) s_w[tid] = hw[tid];
-  __syncthreads();
+  lds_barrier();
 
   const uint32_t key = blockIdx.x * (kWaves * 16u) + wave * 16u + c;
   // An out-of-range key reads row 0 and is dropped on store rather than branched around: every lane
   // of the wave has to supply a defined operand for the fragment to be well formed.
-  const uint8_t* kp = k8 + (size_t)(key < n_keys ? key : 0u) * kD + hlf * 8u;
+  const uint8_t* row_kp = k8 + (size_t)(key < n_keys ? key : 0u) * kD;
   wmma::i2v bf[kD / 16u];
+  if ((reinterpret_cast<uintptr_t>(k8) & 15u) == 0u) {
+    const uint4* ku4 = reinterpret_cast<const uint4*>(row_kp);
 #pragma unroll
-  for (uint32_t d = 0; d < kD / 16u; ++d) bf[d] = *(const wmma::i2v*)(kp + d * 16u);
+    for (uint32_t d2 = 0; d2 < kD / 32u; ++d2) {
+      const uint4 u = ku4[2u * d2 + hlf];
+      const uint32_t ex0 = dpp_xor_lane<16>(hlf == 0u ? u.z : u.x);
+      const uint32_t ex1 = dpp_xor_lane<16>(hlf == 0u ? u.w : u.y);
+      bf[2u * d2 + 0u] = wmma::i2v{
+          static_cast<int>(hlf == 0u ? u.x : ex0),
+          static_cast<int>(hlf == 0u ? u.y : ex1)};
+      bf[2u * d2 + 1u] = wmma::i2v{
+          static_cast<int>(hlf == 0u ? ex0 : u.z),
+          static_cast<int>(hlf == 0u ? ex1 : u.w)};
+    }
+  } else {
+    const uint8_t* kp = row_kp + hlf * 8u;
+#pragma unroll
+    for (uint32_t d = 0; d < kD / 16u; ++d) bf[d] = *(const wmma::i2v*)(kp + d * 16u);
+  }
 
   float sum = 0.0f;
   for (uint32_t mt = 0; mt < n_head; mt += 16u) {
@@ -208,33 +242,86 @@ __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
 // ---- f32 rows -> E4M3 + one scale a row, on device ----------------------------------------------
 //
 // One block a row. `dim` is 8192 for a query token (64 heads x 128) and 128 for a key.
-__global__ void idx_quant_kernel(const float* __restrict__ src, uint8_t* __restrict__ dst,
-                                 float* __restrict__ scale, uint32_t dim) {
-  __shared__ float s_part[256];
+__global__ __launch_bounds__(32) void idx_quant128_kernel(const float* __restrict__ src,
+                                                          uint8_t* __restrict__ dst,
+                                                          float* __restrict__ scale) {
   const uint32_t r = blockIdx.x, tid = threadIdx.x;
-  const float* p = src + (size_t)r * dim;
-  float m = 0.0f;
-  for (uint32_t i = tid; i < dim; i += 256u) m = fmaxf(m, fabsf(p[i]));
-  s_part[tid] = m;
-  __syncthreads();
-  for (uint32_t o = 128; o; o >>= 1) {
-    if (tid < o) s_part[tid] = fmaxf(s_part[tid], s_part[tid + o]);
-    __syncthreads();
-  }
-  const float sc = s_part[0] > 0.0f ? s_part[0] * (1.0f / 448.0f) : 1.0f;
-  if (tid == 0) scale[r] = sc;
+  const float4 v = reinterpret_cast<const float4*>(src + (size_t)r * 128u)[tid];
+  float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+  m = wave_reduce_max_dpp(m);
+  const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+  if (tid == 0u) scale[r] = sc;
   const float inv = 1.0f / sc;
+  const float c0 = fminf(448.0f, fmaxf(-448.0f, v.x * inv));
+  const float c1 = fminf(448.0f, fmaxf(-448.0f, v.y * inv));
+  const float c2 = fminf(448.0f, fmaxf(-448.0f, v.z * inv));
+  const float c3 = fminf(448.0f, fmaxf(-448.0f, v.w * inv));
+  int pk = 0;
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, pk, false);
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, pk, true);
+  reinterpret_cast<uint32_t*>(dst + (size_t)r * 128u)[tid] = static_cast<uint32_t>(pk);
+}
+
+__global__ __launch_bounds__(256) void idx_quant_kernel(const float* __restrict__ src,
+                                                        uint8_t* __restrict__ dst,
+                                                        float* __restrict__ scale, uint32_t dim) {
+  __shared__ float s_wave[8];
+  const uint32_t r = blockIdx.x, tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
+  const float* p = src + (size_t)r * dim;
   uint8_t* d = dst + (size_t)r * dim;
-  for (uint32_t i = tid * 4u; i < dim; i += 256u * 4u) {
-    // Clamp before the convert: v_cvt_pk_fp8_f32 answers an out-of-range input with NaN rather than
-    // saturating, and max*(1/(max/448)) can land an ulp above 448.
-    float v[4];
+  const bool vec_ok = ((dim & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(p) & 15u) == 0u) &&
+                      ((reinterpret_cast<uintptr_t>(d) & 3u) == 0u);
+  constexpr uint32_t kRegMaxVec = 8u;
+  float4 reg_v[kRegMaxVec];
+  uint32_t n_reg = 0u;
+  float m = 0.0f;
+  if (vec_ok) {
+    const uint32_t n4 = dim >> 2;
+    const float4* p4 = reinterpret_cast<const float4*>(p);
+    for (uint32_t i4 = tid; i4 < n4; i4 += 256u) {
+      const float4 fv = p4[i4];
+      if (n_reg < kRegMaxVec) reg_v[n_reg++] = fv;
+      m = fmaxf(m, fmaxf(fmaxf(fabsf(fv.x), fabsf(fv.y)), fmaxf(fabsf(fv.z), fabsf(fv.w))));
+    }
+  } else {
+    for (uint32_t i = tid; i < dim; i += 256u) m = fmaxf(m, fabsf(p[i]));
+  }
+  m = wave_reduce_max_dpp(m);
+  if (lane == 0u) s_wave[wave] = m;
+  lds_barrier();
+  float amax = s_wave[0];
 #pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) v[j] = fminf(448.0f, fmaxf(-448.0f, p[i + j] * inv));
-    int pk = 0;
-    pk = __builtin_amdgcn_cvt_pk_fp8_f32(v[0], v[1], pk, false);
-    pk = __builtin_amdgcn_cvt_pk_fp8_f32(v[2], v[3], pk, true);
-    *(uint32_t*)(d + i) = (uint32_t)pk;
+  for (uint32_t w = 1u; w < 8u; ++w) amax = fmaxf(amax, s_wave[w]);
+  const float sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+  if (tid == 0u) scale[r] = sc;
+  const float inv = 1.0f / sc;
+  if (vec_ok && dim <= kRegMaxVec * 256u * 4u) {
+    const uint32_t n4 = dim >> 2;
+    uint32_t* d4 = reinterpret_cast<uint32_t*>(d);
+    uint32_t ri = 0u;
+    for (uint32_t i4 = tid; i4 < n4; i4 += 256u, ++ri) {
+      const float4 fv = reg_v[ri];
+      const float c0 = fminf(448.0f, fmaxf(-448.0f, fv.x * inv));
+      const float c1 = fminf(448.0f, fmaxf(-448.0f, fv.y * inv));
+      const float c2 = fminf(448.0f, fmaxf(-448.0f, fv.z * inv));
+      const float c3 = fminf(448.0f, fmaxf(-448.0f, fv.w * inv));
+      int pk = 0;
+      pk = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, pk, false);
+      pk = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, pk, true);
+      d4[i4] = static_cast<uint32_t>(pk);
+    }
+  } else {
+    for (uint32_t i = tid * 4u; i < dim; i += 256u * 4u) {
+      // Clamp before the convert: v_cvt_pk_fp8_f32 answers an out-of-range input with NaN rather than
+      // saturating, and max*(1/(max/448)) can land an ulp above 448.
+      float v[4];
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) v[j] = fminf(448.0f, fmaxf(-448.0f, p[i + j] * inv));
+      int pk = 0;
+      pk = __builtin_amdgcn_cvt_pk_fp8_f32(v[0], v[1], pk, false);
+      pk = __builtin_amdgcn_cvt_pk_fp8_f32(v[2], v[3], pk, true);
+      *(uint32_t*)(d + i) = (uint32_t)pk;
+    }
   }
 }
 
@@ -371,6 +458,83 @@ __device__ __forceinline__ void compact_row(const uint8_t* __restrict__ row, uin
   }
 }
 
+__device__ __forceinline__ void compact_admitted(const float* __restrict__ sc, uint32_t n,
+                                                 uint32_t T, uint32_t tie_excl_end,
+                                                 uint32_t tid, uint32_t* __restrict__ adm,
+                                                 uint32_t cap, uint32_t* s_wc,
+                                                 uint32_t* s_base) {
+  const uint32_t lane = tid & 31u, wave = tid >> 5;
+  if (tid == 0) *s_base = 0;
+  __syncthreads();
+  for (uint32_t i0 = 0; i0 < n; i0 += kTopkThr) {
+    const uint32_t i = i0 + tid;
+    bool a = false;
+    if (i < n) {
+      const uint32_t key = mono(sc[i]);
+      a = (key > KEY_NEG_INF) && ((key > T) || (key == T && i < tie_excl_end));
+    }
+    const uint32_t bm = (uint32_t)__ballot(a);
+    const uint32_t mask_lt = (lane == 0) ? 0u : ((1u << lane) - 1u);
+    const uint32_t wr = (uint32_t)__popc(bm & mask_lt);
+    if (lane == 0) s_wc[wave] = (uint32_t)__popc(bm);
+    __syncthreads();
+    uint32_t off = 0;
+    for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
+    const uint32_t p = *s_base + off + wr;
+    if (a && p < cap) adm[p] = i;
+    __syncthreads();
+    if (tid == 0) {
+      uint32_t s = 0;
+      for (uint32_t w = 0; w < kTopkWaves; ++w) s += s_wc[w];
+      *s_base += s;
+    }
+    __syncthreads();
+  }
+}
+
+__device__ __forceinline__ void tie_cutoff_excl(const uint32_t* tie, uint32_t nt, uint32_t need,
+                                                uint32_t tid, const float* sc, uint32_t n_keys,
+                                                uint32_t T, uint32_t* s_tie_end) {
+  if (need == 0u || nt == 0u) {
+    if (tid == 0u) *s_tie_end = 0u;
+    return;
+  }
+  if (nt <= kTieCap) {
+    if (need >= nt) {
+      if (tid == 0u) *s_tie_end = UINT32_MAX;
+      return;
+    }
+    for (uint32_t a = tid; a < nt; a += kTopkThr) {
+      const uint32_t v = tie[a];
+      uint32_t rank = 0;
+      for (uint32_t b = 0; b < nt; ++b) rank += (tie[b] < v) ? 1u : 0u;
+      if (rank == need - 1u) *s_tie_end = v + 1u;
+    }
+    return;
+  }
+  if (tid < 32u) {
+    uint32_t quota = need;
+    uint32_t cut = 0u;
+    for (uint32_t i0 = 0; i0 < n_keys && quota; i0 += 32u) {
+      const uint32_t i = i0 + tid;
+      const uint32_t kv = (i < n_keys) ? mono(sc[i]) : KEY_NEG_INF;
+      const bool eq = (i < n_keys) && (kv == T) && (kv > KEY_NEG_INF);
+      const uint32_t bm = (uint32_t)__ballot(eq);
+      const uint32_t cnt = (uint32_t)__popc(bm);
+      const uint32_t mask_lt = (tid == 0) ? 0u : ((1u << tid) - 1u);
+      const uint32_t before = (uint32_t)__popc(bm & mask_lt);
+      if (eq && before + 1u == quota) cut = i + 1u;
+      if (cnt < quota) {
+        quota -= cnt;
+      } else {
+        for (int o = 16; o; o >>= 1) cut |= static_cast<uint32_t>(__shfl_xor(static_cast<int>(cut), o, 32));
+        quota = 0u;
+      }
+    }
+    if (tid == 0u) *s_tie_end = cut ? cut : UINT32_MAX;
+  }
+}
+
 __device__ __forceinline__ void tie_admit(const uint32_t* tie, uint32_t nt, uint32_t need,
                                           uint32_t tid, const float* sc, uint8_t* row,
                                           uint32_t n_keys, uint32_t T) {
@@ -407,10 +571,10 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   __shared__ uint32_t s_hist[256];
   __shared__ uint32_t s_tie[kTieCap];
   __shared__ uint32_t s_wc[kTopkWaves];
-  __shared__ uint32_t s_prefix, s_need, s_gt, s_b, s_any, s_nt, s_base;
+  __shared__ uint32_t s_prefix, s_need, s_gt, s_b, s_any, s_nt, s_base, s_tie_end;
   const uint32_t t = blockIdx.x, tid = threadIdx.x;
   const float* sc = scores + (size_t)t * stride;
-  uint8_t* row = mask + (size_t)t * mstride;
+  uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
   // The compressed cache GROWS inside a chunk — the compressor emits a row every `ratio` positions
   // — so each token sees its own prefix of it. Scoring past that is scoring against rows derived
   // from tokens that come later. Clamped to `stride` because that is how many scores exist: the two
@@ -425,8 +589,8 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   // call at every context however short. [0, n_keys) is written unconditionally by the marking pass
   // below, so all that is left here is the gap between the indexer's key count and the attention's,
   // which is normally empty — and it is cleared 16 bytes a lane rather than one.
-  const uint32_t clr = mlen > n_keys ? mlen : n_keys;
-  {
+  if (row) {
+    const uint32_t clr = mlen > n_keys ? mlen : n_keys;
     uint32_t b = n_keys;
     const uint32_t head = (uint32_t)((16u - ((uintptr_t)(row + b) & 15u)) & 15u);
     const uint32_t hb = b + (head < clr - b ? head : clr - b);
@@ -439,13 +603,19 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   }
   // Fewer keys than the budget: admit all finite ones, skipping the radix passes completely.
   if (n_keys <= k) {
-    for (uint32_t i = tid; i < n_keys; i += kTopkThr) {
-      const bool valid = mono(sc[i]) > KEY_NEG_INF;
-      row[i] = valid ? 1u : 0u;
-    }
-    if (adm) {
-      __syncthreads();
-      compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+    if (row) {
+      for (uint32_t i = tid; i < n_keys; i += kTopkThr) {
+        const bool valid = mono(sc[i]) > KEY_NEG_INF;
+        row[i] = valid ? 1u : 0u;
+      }
+      if (adm) {
+        __syncthreads();
+        compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+        if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+      }
+    } else if (adm) {
+      compact_admitted(sc, n_keys, KEY_NEG_INF, 0u, tid, adm + (size_t)t * adm_stride, adm_stride,
+                       s_wc, &s_base);
       if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
     }
     return;
@@ -510,8 +680,10 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
     for (int j = 0; j < 8; ++j) {
       const uint32_t idx = i * 8u + (uint32_t)j;
       const uint32_t key = ks[j];
-      const bool gt = (key > T) && (key > KEY_NEG_INF);
-      row[idx] = gt ? 1u : 0u;
+      if (row) {
+        const bool gt = (key > T) && (key > KEY_NEG_INF);
+        row[idx] = gt ? 1u : 0u;
+      }
       if (key == T && key > KEY_NEG_INF) {
         const uint32_t p = atomicAdd(&s_nt, 1u);
         if (p < kTieCap) s_tie[p] = idx;
@@ -520,18 +692,28 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   }
   for (uint32_t i = T8 * 8u + tid; i < n_keys; i += kTopkThr) {
     const uint32_t key = mono(sc[i]);
-    const bool gt = (key > T) && (key > KEY_NEG_INF);
-    row[i] = gt ? 1u : 0u;
+    if (row) {
+      const bool gt = (key > T) && (key > KEY_NEG_INF);
+      row[i] = gt ? 1u : 0u;
+    }
     if (key == T && key > KEY_NEG_INF) {
       const uint32_t p = atomicAdd(&s_nt, 1u);
       if (p < kTieCap) s_tie[p] = i;
     }
   }
   __syncthreads();
-  tie_admit(s_tie, s_nt, need, tid, sc, row, n_keys, T);
-  if (adm) {
-    __syncthreads();                                 // the mask is only final after the ties
-    compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+  if (row) {
+    tie_admit(s_tie, s_nt, need, tid, sc, row, n_keys, T);
+    if (adm) {
+      __syncthreads();                                 // the mask is only final after the ties
+      compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    }
+  } else if (adm) {
+    tie_cutoff_excl(s_tie, s_nt, need, tid, sc, n_keys, T, &s_tie_end);
+    __syncthreads();
+    compact_admitted(sc, n_keys, T, s_tie_end, tid, adm + (size_t)t * adm_stride, adm_stride,
+                     s_wc, &s_base);
     if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
   }
 }
@@ -624,24 +806,28 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mark_kernel(
     uint32_t k, const uint32_t* __restrict__ state, uint32_t* __restrict__ tie) {
   const uint32_t t = blockIdx.y, tid = threadIdx.x;
   const float* sc = scores + (size_t)t * stride;
-  uint8_t* row = mask + (size_t)t * mstride;
+  uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
   const uint32_t nk0 = nkeys ? nkeys[t] : stride;
   const uint32_t n_keys = nk0 < stride ? nk0 : stride;
   const uint32_t clr = mlen > n_keys ? mlen : n_keys;
   const uint32_t str = kTopkThr * gridDim.x;
   const uint32_t g0 = blockIdx.x * kTopkThr + tid;
 
-  for (uint32_t i = n_keys + g0; i < clr; i += str) row[i] = 0;
+  if (row) {
+    for (uint32_t i = n_keys + g0; i < clr; i += str) row[i] = 0;
+  }
   if (n_keys <= k) {
-    for (uint32_t i = g0; i < n_keys; i += str)
-      row[i] = (mono(sc[i]) > KEY_NEG_INF) ? 1u : 0u;
+    if (row) {
+      for (uint32_t i = g0; i < n_keys; i += str)
+        row[i] = (mono(sc[i]) > KEY_NEG_INF) ? 1u : 0u;
+    }
     return;
   }
   const uint32_t T = state[(size_t)t * 4u];
   uint32_t* g_t = tie + (size_t)t * (kTieCap + 1u);
   for (uint32_t i = g0; i < n_keys; i += str) {
     const uint32_t key = mono(sc[i]);
-    row[i] = (key > T && key > KEY_NEG_INF) ? 1u : 0u;
+    if (row) row[i] = (key > T && key > KEY_NEG_INF) ? 1u : 0u;
     if (key == T && key > KEY_NEG_INF) {
       const uint32_t p = atomicAdd(&g_t[0], 1u);
       if (p < kTieCap) g_t[1u + p] = i;
@@ -658,15 +844,20 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
     uint32_t* __restrict__ admn, uint32_t adm_stride) {
   __shared__ uint32_t s_tie[kTieCap];
   __shared__ uint32_t s_wc[kTopkWaves];
-  __shared__ uint32_t s_base;
+  __shared__ uint32_t s_base, s_tie_end;
   const uint32_t t = blockIdx.x, tid = threadIdx.x;
   const float* sc = scores + (size_t)t * stride;
-  uint8_t* row = mask + (size_t)t * mstride;
+  uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
   const uint32_t nk0 = nkeys ? nkeys[t] : stride;
   const uint32_t n_keys = nk0 < stride ? nk0 : stride;
   if (n_keys <= k) {
     if (adm) {
-      compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      if (row) {
+        compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      } else {
+        compact_admitted(sc, n_keys, KEY_NEG_INF, 0u, tid, adm + (size_t)t * adm_stride,
+                         adm_stride, s_wc, &s_base);
+      }
       if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
     }
     return;
@@ -676,13 +867,25 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
   const uint32_t nc = nt < kTieCap ? nt : kTieCap;
   for (uint32_t i = tid; i < nc; i += kTopkThr) s_tie[i] = g_t[1u + i];
   __syncthreads();
-  tie_admit(s_tie, nt, state[(size_t)t * 4u + 1u], tid, sc, row, n_keys,
-            state[(size_t)t * 4u]);
-  __syncthreads();
-  if (tid == 0) g_t[0] = 0;                          // back to empty for the next call
-  if (adm) {
-    compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
-    if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+  const uint32_t T = state[(size_t)t * 4u];
+  const uint32_t need = state[(size_t)t * 4u + 1u];
+  if (row) {
+    tie_admit(s_tie, nt, need, tid, sc, row, n_keys, T);
+    __syncthreads();
+    if (tid == 0) g_t[0] = 0;                          // back to empty for the next call
+    if (adm) {
+      compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    }
+  } else {
+    if (adm) tie_cutoff_excl(s_tie, nt, need, tid, sc, n_keys, T, &s_tie_end);
+    __syncthreads();
+    if (tid == 0) g_t[0] = 0;                          // back to empty for the next call
+    if (adm) {
+      compact_admitted(sc, n_keys, T, s_tie_end, tid, adm + (size_t)t * adm_stride, adm_stride,
+                       s_wc, &s_base);
+      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    }
   }
 }
 
@@ -850,8 +1053,14 @@ void idx_rope_qat_hip(float* q, uint32_t n, uint32_t n_head, uint32_t n_rot, uin
 void idx_quant_rows_hip(const float* src, uint8_t* dst, float* scale, uint32_t n, uint32_t dim,
                         void* stream) {
   if (!n || !dim) return;
-  hipLaunchKernelGGL(idx_quant_kernel, dim3(n), dim3(256), 0, (hipStream_t)stream, src, dst, scale,
-                     dim);
+  if (dim == 128u && ((reinterpret_cast<uintptr_t>(src) & 15u) == 0u) &&
+      ((reinterpret_cast<uintptr_t>(dst) & 3u) == 0u)) {
+    hipLaunchKernelGGL(idx_quant128_kernel, dim3(n), dim3(32), 0, (hipStream_t)stream, src, dst,
+                       scale);
+  } else {
+    hipLaunchKernelGGL(idx_quant_kernel, dim3(n), dim3(256), 0, (hipStream_t)stream, src, dst,
+                       scale, dim);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -867,6 +1076,7 @@ void idx_topk_mask_hip(const float* scores, uint8_t* mask, const uint32_t* nkeys
                        uint32_t adm_stride) {
   if (!nb || !stride) return;
   if (adm && (!admn || adm_stride < k)) { adm = nullptr; admn = nullptr; }
+  if (!mask && !adm) return;
   hipStream_t st = (hipStream_t)stream;
   // One block a workgroup processor, which is what `multiProcessorCount` reports on RDNA and what
   // `device_cus` doubles. Queried once a device: this is on the dispatch path and
@@ -877,10 +1087,11 @@ void idx_topk_mask_hip(const float* scores, uint8_t* mask, const uint32_t* nkeys
   // which needs both a small grid and enough keys for the passes to dominate.
   if (sp && sp->hist && sp->tie && nb <= sp->tok_cap && nb < blocks && stride >= 4096u) {
     const dim3 g(blocks, nb), b(kTopkThr);
-    for (int sh = 24; sh >= 0; sh -= 8)
+    for (int sh = 24; sh >= 0; sh -= 8) {
       hipLaunchKernelGGL(idx_topk_hist_kernel, g, b, 0, st, scores, nkeys, stride, k, sh, sp->hist,
                          sp->state);
       AFF_HIP_CHECK(hipGetLastError());
+    }
     hipLaunchKernelGGL(idx_topk_mark_kernel, g, b, 0, st, scores, mask, nkeys, stride, mstride,
                        mlen, k, sp->state, sp->tie);
     hipLaunchKernelGGL(idx_topk_tie_kernel, dim3(nb), dim3(kTopkThr), 0, st, scores, mask, nkeys,

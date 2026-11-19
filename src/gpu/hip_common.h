@@ -259,6 +259,115 @@ private:
   size_t n_ = 0;
 };
 
+#ifdef __HIP_DEVICE_COMPILE__
+#define AFF_WAVES(n) __attribute__((amdgpu_waves_per_eu((n), (n))))
+#else
+#define AFF_WAVES(n)
+#endif
+
+#if defined(__HIPCC__) || defined(__HIP_DEVICE_COMPILE__)
+// Workgroup barrier for pure LDS producer/consumer synchronization: skips global memory
+// invalidation/drain implied by `__syncthreads()`, ordering only local address space.
+__device__ __forceinline__ void lds_barrier() {
+#ifdef __HIP_DEVICE_COMPILE__
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+  __syncthreads();
+#endif
+}
+
+// Wave32 lane-XOR exchange via DPP16 `row_xmask` (offsets 1, 2, 4, 8) and `v_permlanex16_b32`
+// (offset 16), avoiding the `ds_bpermute_b32` LDS crossbar queue. Bit-identical to
+// `__shfl_xor(v, Lane, kWave)` when all 32 lanes participate.
+template <uint32_t Lane>
+__device__ __forceinline__ uint32_t dpp_xor_lane(uint32_t v) {
+  static_assert(Lane == 1u || Lane == 2u || Lane == 4u || Lane == 8u || Lane == 16u,
+                "Lane must be a Wave32 power-of-two xor offset in {1,2,4,8,16}");
+#ifdef __HIP_DEVICE_COMPILE__
+  if constexpr (Lane < 16u) {
+    return (uint32_t)__builtin_amdgcn_update_dpp(0, (int)v, 0x160 | (int)Lane, 0xf, 0xf, true);
+  } else {
+    return (uint32_t)__builtin_amdgcn_permlanex16((int)v, (int)v, 0x76543210u, 0xFEDCBA98u,
+                                                  false, false);
+  }
+#else
+  return (uint32_t)__shfl_xor((int)v, (int)Lane, kWave);
+#endif
+}
+
+template <uint32_t Lane>
+__device__ __forceinline__ int dpp_xor_lane(int v) {
+  return (int)dpp_xor_lane<Lane>((uint32_t)v);
+}
+
+template <uint32_t Lane>
+__device__ __forceinline__ float dpp_xor_lane(float v) {
+  return __uint_as_float(dpp_xor_lane<Lane>(__float_as_uint(v)));
+}
+
+// Runtime-mask Wave32 xor shuffle using the same DPP16 lane mappings for {16, 8, 4, 2, 1}.
+__device__ __forceinline__ uint32_t wave32_shuffle_xor(uint32_t v, uint32_t mask) {
+  switch (mask) {
+    case 1u:  return dpp_xor_lane<1u>(v);
+    case 2u:  return dpp_xor_lane<2u>(v);
+    case 4u:  return dpp_xor_lane<4u>(v);
+    case 8u:  return dpp_xor_lane<8u>(v);
+    case 16u: return dpp_xor_lane<16u>(v);
+    default:  return (uint32_t)__shfl_xor((int)v, (int)mask, kWave);
+  }
+}
+
+__device__ __forceinline__ int wave32_shuffle_xor(int v, uint32_t mask) {
+  return (int)wave32_shuffle_xor((uint32_t)v, mask);
+}
+
+__device__ __forceinline__ float wave32_shuffle_xor(float v, uint32_t mask) {
+  return __uint_as_float(wave32_shuffle_xor(__float_as_uint(v), mask));
+}
+
+// Wave32 butterfly reductions in exact 16 -> 8 -> 4 -> 2 -> 1 xor-mask order so floating-point
+// accumulation order is bit-identical to `for (int o = 16; o > 0; o >>= 1) op(__shfl_xor(v, o, 32))`.
+__device__ __forceinline__ float wave_reduce_add_dpp(float v) {
+  v += dpp_xor_lane<16u>(v);
+  v += dpp_xor_lane<8u>(v);
+  v += dpp_xor_lane<4u>(v);
+  v += dpp_xor_lane<2u>(v);
+  v += dpp_xor_lane<1u>(v);
+  return v;
+}
+
+__device__ __forceinline__ float wave_reduce_max_dpp(float v) {
+  v = fmaxf(v, dpp_xor_lane<16u>(v));
+  v = fmaxf(v, dpp_xor_lane<8u>(v));
+  v = fmaxf(v, dpp_xor_lane<4u>(v));
+  v = fmaxf(v, dpp_xor_lane<2u>(v));
+  v = fmaxf(v, dpp_xor_lane<1u>(v));
+  return v;
+}
+#endif
+
+// Guards persistent / block-bounded launches against the gfx1201 full-card wave-slot cliff:
+// wavefront counts in `[2016..2047] mod 2048` (and exact non-zero multiples of 2048) incur heavy
+// tail scheduling stalls across the 64 CUs x 2 SIMDs x 16 slots = 2048 hardware wave slots.
+// Only use on grid-stride kernels or kernels whose blockIdx.x excess exits cleanly.
+inline constexpr uint32_t kGfx12CliffWaves  = 2048u;
+inline constexpr uint32_t kGfx12CliffWindow = 32u;
+
+__host__ __device__ __forceinline__ uint32_t safe_grid_blocks(uint32_t blocks,
+                                                              uint32_t waves_per_block) {
+  if (blocks == 0u || waves_per_block == 0u || (waves_per_block % kGfx12CliffWaves) == 0u) {
+    return blocks;
+  }
+  uint32_t b = blocks;
+  for (uint32_t i = 0u; i < 64u; ++i, ++b) {
+    const uint32_t w = (uint32_t)(((uint64_t)b * waves_per_block) % kGfx12CliffWaves);
+    if (w != 0u && w < kGfx12CliffWaves - kGfx12CliffWindow) return b;
+  }
+  return blocks;
+}
+
 } // namespace aff
 
 // ---- amdnas-fixes malloc-trace --------------------------------------------------------------------------------------

@@ -73,29 +73,22 @@ __device__ __forceinline__ void idx_key_store(float v, float* s, float* s_sc, ui
     __syncthreads();
   }
   // ---- an E2M1 round trip per 32, with an E8M0 scale ---------------------------------------------
-  s[j] = fabsf(v);
-  __syncthreads();
-  if (j < hd / 32u) {
-    float amax = 0.0f;
-    for (uint32_t i = 0; i < 32u; ++i) amax = fmaxf(amax, s[j * 32u + i]);
-    s_sc[j] = exp2f(ceilf(log2f(fmaxf(amax, 7.052966104933725e-38f) / 6.0f)));
-  }
-  __syncthreads();
   {
-    const float q = s_sc[j >> 5];
+    const float amax = wave_reduce_max_dpp(fabsf(v));
+    const float q = exp2f(ceilf(log2f(fmaxf(amax, 7.052966104933725e-38f) / 6.0f)));
     v = e2m1_round_d(fminf(6.0f, fmaxf(-6.0f, v / q))) * q;
   }
-  __syncthreads();
 
   // ---- the cache row: E4M3 with ONE scale, chosen the way idx_quant_kernel chooses it ------------
   v = __half2float(__float2half(v));
-  s[j] = fabsf(v);
-  __syncthreads();
-  for (uint32_t o = hd >> 1; o; o >>= 1) {
-    if (j < o) s[j] = fmaxf(s[j], s[j + o]);
-    __syncthreads();
+  {
+    const float w_amax = wave_reduce_max_dpp(fabsf(v));
+    if ((j & 31u) == 0u) s_sc[j >> 5] = w_amax;
   }
-  const float q = s[0] > 0.0f ? s[0] * (1.0f / 448.0f) : 1.0f;
+  lds_barrier();
+  float row_amax = s_sc[0];
+  for (uint32_t w = 1u; w < (hd >> 5); ++w) row_amax = fmaxf(row_amax, s_sc[w]);
+  const float q = row_amax > 0.0f ? row_amax * (1.0f / 448.0f) : 1.0f;
   if (j == 0) out_scale[row] = q;
   // The hardware convert, not e4m3_enc: this row is read by the same kernel that used to quantise
   // it, and two encoders for one format is how a cache silently changes meaning.
@@ -169,14 +162,14 @@ __global__ void compress_kernel(Window win, const float* __restrict__ ape,
   }
 
   // ---- rms_norm, then the layer's own weight --------------------------------------------------
-  s[j] = pooled * pooled;
-  __syncthreads();
-  for (uint32_t o = hd >> 1; o; o >>= 1) {
-    if (j < o) s[j] += s[j + o];
-    __syncthreads();
+  {
+    const float ws = wave_reduce_add_dpp(pooled * pooled);
+    if ((j & 31u) == 0u) s_sc[j >> 5] = ws;
   }
-  float v = pooled * (1.0f / sqrtf(s[0] / (float)hd + rms_eps)) * nrm[j];
-  __syncthreads();
+  lds_barrier();
+  float rms_sum = s_sc[0];
+  for (uint32_t w = 1u; w < (hd >> 5); ++w) rms_sum += s_sc[w];
+  float v = pooled * (1.0f / sqrtf(rms_sum / (float)hd + rms_eps)) * nrm[j];
 
   // The latent V4.1's indexer projects its keys from — published HERE, before the RoPE, because
   // that is where the reference reads it (`Attention._compress_kv` runs the indexer and only then
@@ -201,44 +194,34 @@ __global__ void compress_kernel(Window win, const float* __restrict__ ape,
   if (MODE == 0) {
     // ---- fp8_kv_qat: E4M3 round trip over the NOPE part, one power-of-two scale per 64 ----------
     const uint32_t n_qat = (n_nope / 64u) * 64u;
-    s[j] = (j < n_qat) ? fabsf(v) : 0.0f;
-    __syncthreads();
-    if (j < n_qat / 64u) {
-      float amax = 0.0f;
-      for (uint32_t i = 0; i < 64u; ++i) amax = fmaxf(amax, s[j * 64u + i]);
-      s_sc[j] = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
+    {
+      const float wm_qat = wave_reduce_max_dpp((j < n_qat) ? fabsf(v) : 0.0f);
+      if ((j & 31u) == 0u) s_sc[j >> 5] = wm_qat;
     }
-    __syncthreads();
+    lds_barrier();
     if (j < n_qat) {
-      const float q = s_sc[j >> 6];
+      const uint32_t g = j >> 6;
+      const float amax = fmaxf(s_sc[2u * g], s_sc[2u * g + 1u]);
+      const float q = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
       v = e4m3_decode(e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / q)))) * q;
     }
-    __syncthreads();
 
     // ---- the cache row: f16 first, because that is the value the model committed to -------------
     //
-    // The group reduction goes through LDS and not shuffles. Waves are 32 lanes here, so
-    // `__shfl_xor(v, 32)` returns v unchanged and an apparent 64-lane reduction would take each
-    // scale from its first 32 elements only — see kv_store_kernel, which had exactly that bug.
+    // Two Wave32 maxima per 64-group (or all hd/32 waves in s[] for row max) avoid RDNA4 Wave32
+    // `__shfl_xor(v, 32)` aliasing while keeping reductions in DPP + a single LDS wave combine.
     v = __half2float(__float2half(v));
     uint8_t* slot = out + (size_t)(slot0 + blockIdx.x) * out_stride;
-    s[j] = fabsf(v);
-    __syncthreads();
-    if (j < hd / 64u) {
-      float amax = 0.0f;
-      for (uint32_t i = 0; i < 64u; ++i) amax = fmaxf(amax, s[j * 64u + i]);
-      s_sc[j] = amax;
+    {
+      const float w_amax = wave_reduce_max_dpp(fabsf(v));
+      if ((j & 31u) == 0u) s[j >> 5] = w_amax;
     }
-    __syncthreads();
-    if (j == 0) {
-      float amax = 0.0f;
-      for (uint32_t g = 0; g < hd / 64u; ++g) amax = fmaxf(amax, s_sc[g]);
-      const float q = exp2f(ceilf(log2f(fmaxf(amax, 1e-6f) / 448.0f)));
-      s_sc[hd / 64u] = q;
-      *(float*)(slot + hd) = q;
-    }
-    __syncthreads();
-    slot[j] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / s_sc[hd / 64u])));
+    lds_barrier();
+    float amax = s[0];
+    for (uint32_t w = 1u; w < (hd >> 5); ++w) amax = fmaxf(amax, s[w]);
+    const float q = exp2f(ceilf(log2f(fmaxf(amax, 1e-6f) / 448.0f)));
+    if (j == 0) *(float*)(slot + hd) = q;
+    slot[j] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / q)));
     return;
   }
 
@@ -271,14 +254,14 @@ __global__ void idx_key_kernel(const float* __restrict__ src, const float* __res
   float v = src[(size_t)j * gridDim.x + blockIdx.x];
 
   // ---- k_norm: RMSNorm over the 128, then the layer's own weight ------------------------------
-  s[j] = v * v;
-  __syncthreads();
-  for (uint32_t o = hd >> 1; o; o >>= 1) {
-    if (j < o) s[j] += s[j + o];
-    __syncthreads();
+  {
+    const float ws = wave_reduce_add_dpp(v * v);
+    if ((j & 31u) == 0u) s_sc[j >> 5] = ws;
   }
-  v = v * (1.0f / sqrtf(s[0] / (float)hd + rms_eps)) * k_norm[j];
-  __syncthreads();
+  lds_barrier();
+  float rms_sum = s_sc[0];
+  for (uint32_t w = 1u; w < (hd >> 5); ++w) rms_sum += s_sc[w];
+  v = v * (1.0f / sqrtf(rms_sum / (float)hd + rms_eps)) * k_norm[j];
 
   // ---- rope_tail over the trailing n_rot, at the group's own position --------------------------
   s[j] = v;

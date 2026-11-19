@@ -1,4 +1,5 @@
-FROM docker.io/rocm/dev-ubuntu-24.04:10.1.0-full
+ARG BASE_IMAGE=docker.io/rocm/dev-ubuntu-24.04:10.1.0-full
+FROM ${BASE_IMAGE}
 ARG JOBS=16
 ARG AFF_GIT_SHA=unknown
 ARG AFF_VERSION=v5.2.0

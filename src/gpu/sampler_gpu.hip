@@ -38,27 +38,72 @@ struct Shared {
 };
 
 __device__ __forceinline__ float reduce_max(Shared& sh, float v) {
-  sh.red[threadIdx.x] = v;
-  __syncthreads();
-  for (uint32_t k = kThr / 2; k; k >>= 1) {
-    if (threadIdx.x < k) sh.red[threadIdx.x] = fmaxf(sh.red[threadIdx.x], sh.red[threadIdx.x + k]);
-    __syncthreads();
+  const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
+  float wm = wave_reduce_max_dpp(v);
+  if (lane == 0u) sh.red[wave] = wm;
+  lds_barrier();
+  if (wave == 0u) {
+    wm = wave_reduce_max_dpp(sh.red[lane]);
+    if (lane == 0u) sh.red[0] = wm;
   }
-  const float r = sh.red[0];
-  __syncthreads();
-  return r;
+  lds_barrier();
+  return sh.red[0];
 }
 
 __device__ __forceinline__ float reduce_sum(Shared& sh, float v) {
-  sh.red[threadIdx.x] = v;
-  __syncthreads();
-  for (uint32_t k = kThr / 2; k; k >>= 1) {
-    if (threadIdx.x < k) sh.red[threadIdx.x] += sh.red[threadIdx.x + k];
-    __syncthreads();
+  const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
+  float ws = wave_reduce_add_dpp(v);
+  if (lane == 0u) sh.red[wave] = ws;
+  lds_barrier();
+  if (wave == 0u) {
+    ws = wave_reduce_add_dpp(sh.red[lane]);
+    if (lane == 0u) sh.red[0] = ws;
   }
-  const float r = sh.red[0];
-  __syncthreads();
-  return r;
+  lds_barrier();
+  return sh.red[0];
+}
+
+__device__ __forceinline__ void cnt_wave_accum(bool match, uint32_t bin, uint32_t lane,
+                                               uint32_t* cnt) {
+  uint32_t rem = (uint32_t)__ballot(match);
+  while (rem) {
+    const int leader = __ffs(rem) - 1;
+    const uint32_t b_lead = __shfl(bin, leader, 32);
+    const uint32_t same = (uint32_t)__ballot(match && (bin == b_lead)) & rem;
+    if ((int)lane == leader) atomicAdd(&cnt[b_lead], (uint32_t)__popc(same));
+    rem &= ~same;
+  }
+}
+
+__device__ __forceinline__ void mass_wave_accum(bool match, uint32_t bin, float p, uint32_t lane,
+                                                float* mass) {
+  uint32_t rem = (uint32_t)__ballot(match);
+  while (rem) {
+    const int leader = __ffs(rem) - 1;
+    const uint32_t b_lead = __shfl(bin, leader, 32);
+    const uint32_t same = (uint32_t)__ballot(match && (bin == b_lead)) & rem;
+    const bool mine = ((same >> lane) & 1u) != 0u;
+    const float b_sum = wave_reduce_add_dpp(mine ? p : 0.0f);
+    if ((int)lane == leader) atomicAdd(&mass[b_lead], b_sum);
+    rem &= ~same;
+  }
+}
+
+__device__ __forceinline__ void wave_argmax_step(float& bv, uint32_t& bi, uint32_t off) {
+  const float ov = wave32_shuffle_xor(bv, off);
+  const uint32_t oi = wave32_shuffle_xor(bi, off);
+  if (ov > bv || (ov == bv && oi < bi)) {
+    bv = ov;
+    bi = oi;
+  }
+}
+
+__device__ __forceinline__ void wave_argmax_reduce(float& bv, uint32_t& bi) {
+  wave_argmax_step(bv, bi, 16u);
+  wave_argmax_step(bv, bi, 8u);
+  wave_argmax_step(bv, bi, 4u);
+  wave_argmax_step(bv, bi, 2u);
+  wave_argmax_step(bv, bi, 1u);
 }
 
 // ---- the kernel ---------------------------------------------------------------------------------
@@ -75,6 +120,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
   __shared__ Shared sh;
 
   const uint32_t pos = blockIdx.x, tid = threadIdx.x;
+  const uint32_t lane = tid & 31u, wave = tid >> 5;
   const float* const col = logits + (size_t)pos * col_stride;
   const uint32_t q = query ? query[pos] : 0xFFFFFFFFu;
 
@@ -98,23 +144,21 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       const float x = lg(v);
       if (x > bv || (x == bv && v < bi)) { bv = x; bi = v; }
     }
-    sh.red[tid] = bv;
-    sh.red_i[tid] = bi;
-    __syncthreads();
-    for (uint32_t k = kThr / 2; k; k >>= 1) {
-      if (tid < k) {
-        const float ov = sh.red[tid + k];
-        const uint32_t oi = sh.red_i[tid + k];
-        if (ov > sh.red[tid] || (ov == sh.red[tid] && oi < sh.red_i[tid])) {
-          sh.red[tid] = ov; sh.red_i[tid] = oi;
-        }
-      }
-      __syncthreads();
+    wave_argmax_reduce(bv, bi);
+    if (lane == 0u) {
+      sh.red[wave] = bv;
+      sh.red_i[wave] = bi;
     }
-    if (tid == 0) {
-      out[pos].tok = sh.red_i[0];
-      out[pos].tok_excl = sh.red_i[0];
-      out[pos].p_query = (q == sh.red_i[0]) ? 1.0f : 0.0f;
+    lds_barrier();
+    if (wave == 0u) {
+      bv = sh.red[lane];
+      bi = sh.red_i[lane];
+      wave_argmax_reduce(bv, bi);
+      if (lane == 0u) {
+        out[pos].tok = bi;
+        out[pos].tok_excl = bi;
+        out[pos].p_query = (q == bi) ? 1.0f : 0.0f;
+      }
     }
     return;
   }
@@ -139,9 +183,12 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       if (tid < 256) sh.cnt[tid] = 0u;
       __syncthreads();
       const uint32_t mask = (shift == 24) ? 0u : (0xFFFFFFFFu << (shift + 8));
-      for (uint32_t v = tid; v < vocab; v += kThr) {
-        const uint32_t key = mono(prob(v));
-        if ((key & mask) == (sh.prefix & mask)) atomicAdd(&sh.cnt[(key >> shift) & 0xFFu], 1u);
+      for (uint32_t v0 = 0; v0 < vocab; v0 += kThr) {
+        const uint32_t v = v0 + tid;
+        const bool in_r = (v < vocab);
+        const uint32_t key = in_r ? mono(prob(v)) : 0u;
+        const bool match = in_r && ((key & mask) == (sh.prefix & mask));
+        cnt_wave_accum(match, (key >> shift) & 0xFFu, lane, sh.cnt);
       }
       __syncthreads();
       if (tid == 0) {
@@ -177,11 +224,13 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
     if (tid < 256) sh.mass[tid] = 0.0f;
     __syncthreads();
     float target = top_p;
-    for (uint32_t v = tid; v < vocab; v += kThr) {
-      const float p = prob(v);
-      const uint32_t key = mono(p);
-      if (k_key == 0u || key >= k_key)
-        atomicAdd(&sh.mass[(key >> 24) & 0xFFu], p);
+    for (uint32_t v0 = 0; v0 < vocab; v0 += kThr) {
+      const uint32_t v = v0 + tid;
+      const bool in_r = (v < vocab);
+      const float p = in_r ? prob(v) : 0.0f;
+      const uint32_t key = in_r ? mono(p) : 0u;
+      const bool match = in_r && (k_key == 0u || key >= k_key);
+      mass_wave_accum(match, (key >> 24) & 0xFFu, p, lane, sh.mass);
     }
     __syncthreads();
     if (tid == 0) {
@@ -196,14 +245,24 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
     }
     __syncthreads();
     const uint32_t b24 = sh.prefix >> 24;
-    for (uint32_t v = tid; v < vocab; v += kThr) {
-      const float p = prob(v);
-      const uint32_t key = mono(p);
-      if ((k_key == 0u || key >= k_key) && (key >> 24) >= b24) {
-        const uint32_t idx = atomicAdd(&sh.n_cand, 1u);
-        if (idx < kCandCap) {
-          sh.cand_id[idx] = v;
-          sh.cand_p[idx] = p;
+    for (uint32_t v0 = 0; v0 < vocab; v0 += kThr) {
+      const uint32_t v = v0 + tid;
+      const bool in_r = (v < vocab);
+      const float p = in_r ? prob(v) : 0.0f;
+      const uint32_t key = in_r ? mono(p) : 0u;
+      const bool take = in_r && (k_key == 0u || key >= k_key) && ((key >> 24) >= b24);
+      const uint32_t bm = (uint32_t)__ballot(take);
+      if (bm) {
+        uint32_t base = 0u;
+        if (lane == 0u) base = atomicAdd(&sh.n_cand, (uint32_t)__popc(bm));
+        base = __shfl(base, 0, 32);
+        if (take) {
+          const uint32_t mask_lt = (lane == 0u) ? 0u : ((1u << lane) - 1u);
+          const uint32_t idx = base + (uint32_t)__popc(bm & mask_lt);
+          if (idx < kCandCap) {
+            sh.cand_id[idx] = v;
+            sh.cand_p[idx] = p;
+          }
         }
       }
     }
@@ -215,18 +274,23 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       __syncthreads();
       const uint32_t mask = 0xFFFFFFFFu << (shift + 8);
       if (compacted) {
-        for (uint32_t i = tid; i < nc; i += kThr) {
-          const float p = sh.cand_p[i];
-          const uint32_t key = mono(p);
-          if ((key & mask) == (sh.prefix & mask))
-            atomicAdd(&sh.mass[(key >> shift) & 0xFFu], p);
+        for (uint32_t i0 = 0; i0 < nc; i0 += kThr) {
+          const uint32_t i = i0 + tid;
+          const bool in_r = (i < nc);
+          const float p = in_r ? sh.cand_p[i] : 0.0f;
+          const uint32_t key = in_r ? mono(p) : 0u;
+          const bool match = in_r && ((key & mask) == (sh.prefix & mask));
+          mass_wave_accum(match, (key >> shift) & 0xFFu, p, lane, sh.mass);
         }
       } else {
-        for (uint32_t v = tid; v < vocab; v += kThr) {
-          const float p = prob(v);
-          const uint32_t key = mono(p);
-          if ((key & mask) == (sh.prefix & mask) && (k_key == 0u || key >= k_key))
-            atomicAdd(&sh.mass[(key >> shift) & 0xFFu], p);
+        for (uint32_t v0 = 0; v0 < vocab; v0 += kThr) {
+          const uint32_t v = v0 + tid;
+          const bool in_r = (v < vocab);
+          const float p = in_r ? prob(v) : 0.0f;
+          const uint32_t key = in_r ? mono(p) : 0u;
+          const bool match = in_r && ((key & mask) == (sh.prefix & mask)) &&
+                             (k_key == 0u || key >= k_key);
+          mass_wave_accum(match, (key >> shift) & 0xFFu, p, lane, sh.mass);
         }
       }
       __syncthreads();
@@ -385,14 +449,16 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
     // vocabulary, the special-token region that top_p filters out — which holds no kept token, `last` stays 0xFFFFFFFF
     // and the kernel returned an OUT-OF-RANGE token id. Fall back to the highest kept id anywhere in the block.
     if (sh.pick == 0xFFFFFFFFu) {
-      sh.red_i[tid] = (uint32_t)(my_last + 1);      // 0 = none, else id+1, so a plain max reduction works
-      __syncthreads();
-      for (uint32_t k = kThr / 2; k; k >>= 1) {
-        if (tid < k) sh.red_i[tid] = max(sh.red_i[tid], sh.red_i[tid + k]);
-        __syncthreads();
+      uint32_t mx = (uint32_t)(my_last + 1);      // 0 = none, else id+1, so a plain max reduction works
+      for (uint32_t o = 16u; o; o >>= 1) mx = max(mx, wave32_shuffle_xor(mx, o));
+      if (lane == 0u) sh.red_i[wave] = mx;
+      lds_barrier();
+      if (wave == 0u) {
+        mx = sh.red_i[lane];
+        for (uint32_t o = 16u; o; o >>= 1) mx = max(mx, wave32_shuffle_xor(mx, o));
+        if (lane == 0u) sh.pick = mx ? mx - 1u : 0u;
       }
-      if (tid == 0) sh.pick = sh.red_i[0] ? sh.red_i[0] - 1u : 0u;
-      __syncthreads();
+      lds_barrier();
     }
     const uint32_t r = sh.pick;
     __syncthreads();
