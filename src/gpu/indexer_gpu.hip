@@ -271,16 +271,12 @@ __global__ __launch_bounds__(256) void idx_quant_kernel(const float* __restrict_
   uint8_t* d = dst + (size_t)r * dim;
   const bool vec_ok = ((dim & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(p) & 15u) == 0u) &&
                       ((reinterpret_cast<uintptr_t>(d) & 3u) == 0u);
-  constexpr uint32_t kRegMaxVec = 8u;
-  float4 reg_v[kRegMaxVec];
-  uint32_t n_reg = 0u;
   float m = 0.0f;
   if (vec_ok) {
     const uint32_t n4 = dim >> 2;
     const float4* p4 = reinterpret_cast<const float4*>(p);
     for (uint32_t i4 = tid; i4 < n4; i4 += 256u) {
       const float4 fv = p4[i4];
-      if (n_reg < kRegMaxVec) reg_v[n_reg++] = fv;
       m = fmaxf(m, fmaxf(fmaxf(fabsf(fv.x), fabsf(fv.y)), fmaxf(fabsf(fv.z), fabsf(fv.w))));
     }
   } else {
@@ -295,12 +291,14 @@ __global__ __launch_bounds__(256) void idx_quant_kernel(const float* __restrict_
   const float sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
   if (tid == 0u) scale[r] = sc;
   const float inv = 1.0f / sc;
-  if (vec_ok && dim <= kRegMaxVec * 256u * 4u) {
+  if (vec_ok) {
     const uint32_t n4 = dim >> 2;
+    const float4* p4 = reinterpret_cast<const float4*>(p);
     uint32_t* d4 = reinterpret_cast<uint32_t*>(d);
-    uint32_t ri = 0u;
-    for (uint32_t i4 = tid; i4 < n4; i4 += 256u, ++ri) {
-      const float4 fv = reg_v[ri];
+    for (uint32_t i4 = tid; i4 < n4; i4 += 256u) {
+      // Clamp before the convert: v_cvt_pk_fp8_f32 answers an out-of-range input with NaN rather than
+      // saturating, and max*(1/(max/448)) can land an ulp above 448.
+      const float4 fv = p4[i4];
       const float c0 = fminf(448.0f, fmaxf(-448.0f, fv.x * inv));
       const float c1 = fminf(448.0f, fmaxf(-448.0f, fv.y * inv));
       const float c2 = fminf(448.0f, fmaxf(-448.0f, fv.z * inv));
@@ -311,16 +309,27 @@ __global__ __launch_bounds__(256) void idx_quant_kernel(const float* __restrict_
       d4[i4] = static_cast<uint32_t>(pk);
     }
   } else {
-    for (uint32_t i = tid * 4u; i < dim; i += 256u * 4u) {
+    for (uint32_t i = tid * 4u; i + 3u < dim; i += 256u * 4u) {
       // Clamp before the convert: v_cvt_pk_fp8_f32 answers an out-of-range input with NaN rather than
       // saturating, and max*(1/(max/448)) can land an ulp above 448.
-      float v[4];
-#pragma unroll
-      for (uint32_t j = 0; j < 4; ++j) v[j] = fminf(448.0f, fmaxf(-448.0f, p[i + j] * inv));
+      const float v0 = fminf(448.0f, fmaxf(-448.0f, p[i + 0u] * inv));
+      const float v1 = fminf(448.0f, fmaxf(-448.0f, p[i + 1u] * inv));
+      const float v2 = fminf(448.0f, fmaxf(-448.0f, p[i + 2u] * inv));
+      const float v3 = fminf(448.0f, fmaxf(-448.0f, p[i + 3u] * inv));
       int pk = 0;
-      pk = __builtin_amdgcn_cvt_pk_fp8_f32(v[0], v[1], pk, false);
-      pk = __builtin_amdgcn_cvt_pk_fp8_f32(v[2], v[3], pk, true);
-      *(uint32_t*)(d + i) = (uint32_t)pk;
+      pk = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, pk, false);
+      pk = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pk, true);
+      const uint32_t u = static_cast<uint32_t>(pk);
+      d[i + 0u] = static_cast<uint8_t>(u);
+      d[i + 1u] = static_cast<uint8_t>(u >> 8);
+      d[i + 2u] = static_cast<uint8_t>(u >> 16);
+      d[i + 3u] = static_cast<uint8_t>(u >> 24);
+    }
+    const uint32_t tail0 = dim & ~3u;
+    for (uint32_t i = tail0 + tid; i < dim; i += 256u) {
+      const float v = fminf(448.0f, fmaxf(-448.0f, p[i] * inv));
+      const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v, 0.0f, 0, false);
+      d[i] = static_cast<uint8_t>(pk & 0xff);
     }
   }
 }

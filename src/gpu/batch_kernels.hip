@@ -277,6 +277,9 @@ __global__ void splitk_reduce_kernel(const float* __restrict__ ws, float* __rest
 
 // One workspace a device, grown on demand. Only ever used by shapes too narrow to fill the card,
 // so it stays small: the hyper-connection control GEMM is 24 rows and 16 splits is 393 KB.
+// Reserve a fixed 4 KiB header at offset 0 for zeroed arrival counters (`splitk_buf_with_ctr`)
+// so counters stay at a fixed address across workspace size changes with zero per-call hipMemsetAsync.
+constexpr uint32_t kSplitCtrFloats = 1024u;
 struct SplitKWs { float* p = nullptr; size_t n = 0; };
 SplitKWs g_skws[kMaxGpuDevices];
 
@@ -312,17 +315,30 @@ constexpr uint32_t kSplitTarget = 128u;
 // decoding different sequences and cannot be compared on either.
 constexpr uint32_t kSplitThinCap = 64u;
 
-float* splitk_buf(size_t need) {
+float* splitk_buf_with_ctr(size_t need, unsigned int** ctr_out) {
   int dev = 0;
   if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxGpuDevices) return nullptr;
   SplitKWs& w = g_skws[dev];
-  if (w.n < need) {
+  const size_t total_need = (size_t)kSplitCtrFloats + need;
+  if (w.n < total_need) {
     if (w.p) (void)hipFree(w.p);
     w.p = nullptr;
-    if (hipMalloc(&w.p, need * sizeof(float)) != hipSuccess) { w.n = 0; return nullptr; }
-    w.n = need;
+    w.n = 0;
+    if (hipMalloc(&w.p, total_need * sizeof(float)) != hipSuccess) return nullptr;
+    if (hipMemset(w.p, 0, (size_t)kSplitCtrFloats * sizeof(uint32_t)) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess) {
+      (void)hipFree(w.p);
+      w.p = nullptr;
+      return nullptr;
+    }
+    w.n = total_need;
   }
-  return w.p;
+  if (ctr_out) *ctr_out = (unsigned int*)w.p;
+  return w.p + kSplitCtrFloats;
+}
+
+float* splitk_buf(size_t need) {
+  return splitk_buf_with_ctr(need, nullptr);
 }
 
 // ---- the W8A8 GEMM -------------------------------------------------------------------------------
@@ -504,14 +520,22 @@ struct GemmJobsArgs {
 // The body, with `m0` and the K range handed in — same split the WMMA kernel took, and for the
 // same reason: a grouped wrapper maps blockIdx.x through a job table so several weight matrices
 // sharing an activation are one launch, and this is far too much staging code to keep two of.
-template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK>
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u>
 __device__ __forceinline__ void gemm_fp8_body(
     const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Sw, const uint8_t* __restrict__ Xp,
-    const float* __restrict__ Sx, float* __restrict__ Y, uint32_t rows, uint32_t cols, uint32_t nb,
-    uint32_t sc_cols, uint32_t x_off, uint32_t w_row_off, uint32_t x_ld, uint32_t sx_ld,
-    int accum, uint32_t m0, uint32_t kbeg, uint32_t kend) {
-  constexpr uint32_t FN = NT * 16;                       // tokens a block, kFN when NT == kFNTiles
-  constexpr uint32_t FM = MW * kFMTiles * 16;            // rows a block, kFM when MW == kFWaves
+    const float* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
+    unsigned int* __restrict__ Ctr, uint32_t rows, uint32_t cols, uint32_t nb, uint32_t sc_cols,
+    uint32_t x_off, uint32_t w_row_off, uint32_t x_ld, uint32_t sx_ld, int accum, uint32_t bx,
+    uint32_t by, uint32_t kbeg, uint32_t kend, uint32_t ws_rows, uint32_t tile_id) {
+  static_assert(MTW == 1u || (NT == 8u && MW == 8u && FK == 64u),
+                "4x2 prefill wave layout applies only to 8x8x64");
+  constexpr uint32_t kMWaves = (MTW == 2u) ? 4u : MW;
+  constexpr uint32_t kNWaves = (MTW == 2u) ? 2u : 1u;
+  constexpr uint32_t kMWTiles = MTW;
+  constexpr uint32_t kNWTiles = (MTW == 2u) ? 4u : NT;
+  constexpr uint32_t FN = kNWaves * kNWTiles * 16u;      // tokens a block, kFN when NT == 8
+  constexpr uint32_t FM = kMWaves * kMWTiles * 16u;      // rows a block, kFM when MW == 8
+  const uint32_t m0 = bx * FM;
   // FK BYTES a row a K tile, and for the narrow instantiation that is a whole 256-byte cacheline
   // — this card's line size, not 128. At FK = 64 a thread reads a quarter of a line and the other
   // three quarters are only paid for if the line survives in L0 for three more K tiles.
@@ -525,16 +549,20 @@ __device__ __forceinline__ void gemm_fp8_body(
   __shared__ uint32_t s_ws[kFolds];
   __shared__ float s_sx[kFolds * FN];
 
-  const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
-  const uint32_t n0 = blockIdx.y * FN;
-  // Wave grid 8(M) x 1(N): a wave owns 16 rows and all FN tokens.
-  const uint32_t wm = wave * (kFMTiles * 16), wn = 0;
+  const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
+  const uint32_t wave =
+      __builtin_amdgcn_readfirstlane(tid / kWave);
+  const uint32_t n0 = by * FN;
+  // Wave grid: 4(M) x 2(N) for prefill 4x2 (each wave 2x4 tiles = 50% fewer s_b fragment reads),
+  // or MW(M) x 1(N) for 8x1 and narrow decode.
+  const uint32_t wm = (MTW == 2u) ? (wave % kMWaves) * (kMWTiles * 16u) : wave * (kMWTiles * 16u);
+  const uint32_t wn = (MTW == 2u) ? (wave / kMWaves) * (kNWTiles * 16u) : 0u;
 
-  wmma::f8v raw[kFMTiles][NT], out[kFMTiles][NT];
+  wmma::f8v raw[kMWTiles][kNWTiles], out[kMWTiles][kNWTiles];
 #pragma unroll
-  for (uint32_t i = 0; i < kFMTiles; ++i)
+  for (uint32_t i = 0; i < kMWTiles; ++i)
 #pragma unroll
-    for (uint32_t j = 0; j < NT; ++j) {
+    for (uint32_t j = 0; j < kNWTiles; ++j) {
       raw[i][j] = wmma::acc_zero();
       out[i][j] = wmma::acc_zero();
     }
@@ -590,24 +618,43 @@ __device__ __forceinline__ void gemm_fp8_body(
     if (tid < kFolds) s_ws[tid] = pws;
     if (tid < kFolds * FN) s_sx[tid] = psx;
     aff::lds_barrier();
-    const uint32_t c1 = c0 + FK;
-    if (c1 < kend) {
+    if constexpr (Full && MTW == 2u) {
+      // Unconditional clamped prefetch eliminates loop-tail branch merge stalls across k-tiles.
+      const uint32_t c1 = min(c0 + FK, kend - FK);
 #pragma unroll
       for (uint32_t g = 0; g < kNG; ++g) {
         const uint32_t o = c1 + g * 64;
-        const bool live = Full || (o + sk + 32 <= cols);
-        if (sn < FN) pb[g] = stage8_load(bsrc + o, b_row && live);
-        if (!PS) pa[g] = stage8_load(asrc + o, a_row && live);
+        pb[g] = stage8_load(bsrc + o, true);
+        if constexpr (!PS) pa[g] = stage8_load(asrc + o, true);
       }
       if (tid < kFolds) {
         const uint32_t kb1 = (c1 >> 7) + tid;
-        pws = (Full || kb1 < sc_cols) ? Sw[(size_t)srow * sc_cols + kb1] : 0u;
+        pws = Sw[(size_t)srow * sc_cols + kb1];
       }
       if (tid < kFolds * FN) {
         const uint32_t kb1 = (c1 >> 7) + sf;
-        psx = ((Full || sx_tok < nb) && (Full || kb1 < sc_cols))
-                  ? Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb1]
-                  : 0.0f;
+        psx = Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb1];
+      }
+    } else {
+      const uint32_t c1 = c0 + FK;
+      if (c1 < kend) {
+#pragma unroll
+        for (uint32_t g = 0; g < kNG; ++g) {
+          const uint32_t o = c1 + g * 64;
+          const bool live = Full || (o + sk + 32 <= cols);
+          if (sn < FN) pb[g] = stage8_load(bsrc + o, b_row && live);
+          if (!PS) pa[g] = stage8_load(asrc + o, a_row && live);
+        }
+        if (tid < kFolds) {
+          const uint32_t kb1 = (c1 >> 7) + tid;
+          pws = (Full || kb1 < sc_cols) ? Sw[(size_t)srow * sc_cols + kb1] : 0u;
+        }
+        if (tid < kFolds * FN) {
+          const uint32_t kb1 = (c1 >> 7) + sf;
+          psx = ((Full || sx_tok < nb) && (Full || kb1 < sc_cols))
+                    ? Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb1]
+                    : 0.0f;
+        }
       }
     }
 
@@ -616,12 +663,12 @@ __device__ __forceinline__ void gemm_fp8_body(
     // the compiler hoisting past it — which is enough to make the preshuffled path SLOWER than
     // row-major despite reading the same bytes with no LDS round trip and no barrier.
     constexpr uint32_t kKT = FK / wmma::kK;
-    wmma::i2v apf[PS ? kFMTiles : 1][PS ? kKT : 1];
+    wmma::i2v apf[PS ? kMWTiles : 1][PS ? kKT : 1];
     if (PS) {
 #pragma unroll
       for (uint32_t t = 0; t < kKT; ++t)
 #pragma unroll
-        for (uint32_t i = 0; i < kFMTiles; ++i) {
+        for (uint32_t i = 0; i < kMWTiles; ++i) {
           if (Full || (m0 + wm + i * 16u) < rows) {
             apf[i][t] = load_frag8_ps(Wp, rt0 + i, (c0 + t * wmma::kK) >> 4, ktiles, lane);
           } else {
@@ -632,16 +679,17 @@ __device__ __forceinline__ void gemm_fp8_body(
     }
 #pragma unroll
     for (uint32_t ks = 0; ks < FK; ks += wmma::kK) {
-      wmma::i2v af[kFMTiles], bf[NT];
+      wmma::i2v af[kMWTiles], bf[kNWTiles];
 #pragma unroll
-      for (uint32_t i = 0; i < kFMTiles; ++i)
+      for (uint32_t i = 0; i < kMWTiles; ++i)
         af[i] = PS ? apf[i][ks / wmma::kK] : load_frag8<FK>(s_a, wm + i * 16, ks, lane);
 #pragma unroll
-      for (uint32_t j = 0; j < NT; ++j) bf[j] = load_frag8<FK>(s_b, wn + j * 16, ks, lane);
+      for (uint32_t j = 0; j < kNWTiles; ++j)
+        bf[j] = load_frag8<FK>(s_b, wn + j * 16, ks, lane);
 #pragma unroll
-      for (uint32_t i = 0; i < kFMTiles; ++i)
+      for (uint32_t i = 0; i < kMWTiles; ++i)
 #pragma unroll
-        for (uint32_t j = 0; j < NT; ++j) raw[i][j] = wmma::mma_fp8(af[i], bf[j], raw[i][j]);
+        for (uint32_t j = 0; j < kNWTiles; ++j) raw[i][j] = wmma::mma_fp8(af[i], bf[j], raw[i][j]);
 
     // End of a 128-column scale block: fold both scales in from LDS and reset.
     if ((c0 + ks + wmma::kK) % 128u == 0 || c0 + ks + wmma::kK >= kend) {
@@ -649,10 +697,10 @@ __device__ __forceinline__ void gemm_fp8_body(
       const uint32_t e = s_ws[fold];
       const float ws = __uint_as_float(e ? (e << 23) : 0u);
 #pragma unroll
-      for (uint32_t j = 0; j < NT; ++j) {
+      for (uint32_t j = 0; j < kNWTiles; ++j) {
         const float s = ws * s_sx[fold * FN + wn + j * 16 + fc];
 #pragma unroll
-        for (uint32_t i = 0; i < kFMTiles; ++i)
+        for (uint32_t i = 0; i < kMWTiles; ++i)
 #pragma unroll
           for (uint32_t t = 0; t < 8; ++t) {
             out[i][j][t] += raw[i][j][t] * s;
@@ -663,12 +711,14 @@ __device__ __forceinline__ void gemm_fp8_body(
     }
   }
 
+  const bool split_active = (ws_rows != 0u);
+  float* const dst_y = split_active ? (Y + (size_t)blockIdx.z * ws_rows * nb) : Y;
   const uint32_t c = wmma::frag_c(lane);
   const auto emit_y = [&](auto store_fn) __attribute__((always_inline)) {
 #pragma unroll
-    for (uint32_t i = 0; i < kFMTiles; ++i)
+    for (uint32_t i = 0; i < kMWTiles; ++i)
 #pragma unroll
-      for (uint32_t j = 0; j < NT; ++j) {
+      for (uint32_t j = 0; j < kNWTiles; ++j) {
         const uint32_t col = n0 + wn + j * 16 + c;
         if (!Full && col >= nb) continue;
         const uint32_t rb = m0 + wm + i * 16;
@@ -680,46 +730,114 @@ __device__ __forceinline__ void gemm_fp8_body(
         }
       }
   };
-  if (accum) {
-    emit_y([&](size_t off, float v) { Y[off] += v; });
+  if (accum && !split_active) {
+    emit_y([&](size_t off, float v) { dst_y[off] += v; });
   } else {
-    emit_y([&](size_t off, float v) { Y[off] = v; });
+    emit_y([&](size_t off, float v) { dst_y[off] = v; });
+  }
+
+  // Inline split-K arrival counter finisher: only instantiated for NT == 1u narrow decode so
+  // prefill (NT == 8u) registers and occupancy are completely untouched.
+  if constexpr (NT == 1u) {
+    if (split_active && Ctr) {
+      __threadfence();
+      __syncthreads();
+      __shared__ unsigned int s_arrived;
+      if (tid == 0u) {
+        s_arrived = __hip_atomic_fetch_add(&Ctr[tile_id], 1u, __ATOMIC_ACQ_REL,
+                                           __HIP_MEMORY_SCOPE_AGENT);
+      }
+      __syncthreads();
+      if (s_arrived + 1u == gridDim.z) {
+        if (tid == 0u) {
+          __hip_atomic_store(&Ctr[tile_id], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        __threadfence();
+        const uint32_t rlo = m0, rhi = min(m0 + FM, rows);
+        const uint32_t clo = n0, chi = min(n0 + FN, nb);
+        const uint32_t ncols = chi - clo;
+        if (rlo < rhi && clo < chi) {
+          const size_t plane = (size_t)ws_rows * nb;
+          const uint32_t ksplit = gridDim.z;
+          const uint32_t total_el = (rhi - rlo) * ncols;
+          for (uint32_t idx = tid; idx < total_el; idx += MW * kWave) {
+            const uint32_t r = rlo + idx / ncols;
+            const uint32_t col = clo + idx % ncols;
+            const size_t o = (size_t)r * nb + col;
+            const float* __restrict__ p = Y + o;
+            constexpr uint32_t U = 8;
+            float acc = 0.0f;
+            uint32_t z = 0;
+            for (; z + U <= ksplit; z += U) {
+              float v[U];
+#pragma unroll
+              for (uint32_t u = 0; u < U; ++u) v[u] = p[(size_t)(z + u) * plane];
+#pragma unroll
+              for (uint32_t u = 0; u < U; ++u) acc += v[u];
+            }
+            for (; z < ksplit; ++z) acc += p[(size_t)z * plane];
+            if (accum) FinalY[o] += acc;
+            else       FinalY[o]  = acc;
+          }
+        }
+      }
+    }
   }
 }
 
-template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK>
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((NT == 8u && MW == 8u && FK == 64u) ? 8 : 1,
                                    (NT == 8u && MW == 8u && FK == 64u) ? 8 : 16)))
 #endif
 __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_kernel(
     const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Sw, const uint8_t* __restrict__ Xp,
-    const float* __restrict__ Sx, float* __restrict__ Y, uint32_t rows, uint32_t cols, uint32_t nb,
-    uint32_t sc_cols, uint32_t x_off, uint32_t w_row_off, uint32_t x_ld, uint32_t sx_ld,
-    int accum, uint32_t ck) {
+    const float* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
+    unsigned int* __restrict__ Ctr, uint32_t rows, uint32_t cols, uint32_t nb, uint32_t sc_cols,
+    uint32_t x_off, uint32_t w_row_off, uint32_t x_ld, uint32_t sx_ld, int accum, uint32_t ck) {
+  uint32_t bx = blockIdx.x, by = blockIdx.y;
+  if constexpr (MTW == 2u) {
+    // Group M-bands into slabs of kGroupM across the N sweep for MALL weight reuse.
+    constexpr uint32_t kGroupM = 8u;
+    if (gridDim.x > kGroupM && gridDim.y > 1u) {
+      const uint32_t per = kGroupM * gridDim.y;
+      const uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x;
+      const uint32_t first = (lin / per) * kGroupM, rem = lin % per;
+      const uint32_t gm = min(gridDim.x - first, kGroupM);
+      bx = first + (rem % gm);
+      by = rem / gm;
+    }
+  }
   // Split-K. `ck` is a multiple of both 128 (the scale block) and FK (the staged tile), and ksplit
   // is derived FROM it at the launcher, so every slice has work and starts on a scale boundary.
   const uint32_t kbeg = ck ? blockIdx.z * ck : 0u;
   const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
-  gemm_fp8_body<Full, PS, NT, MW, FK>(Wp, Sw, Xp, Sx, Y + (size_t)blockIdx.z * rows * nb, rows,
-                                      cols, nb, sc_cols, x_off, w_row_off, x_ld, sx_ld, accum,
-                                      blockIdx.x * (MW * kFMTiles * 16), kbeg, kend);
+  const uint32_t ws_rows = ck ? rows : 0u;
+  const uint32_t tile_id = by * gridDim.x + bx;
+  gemm_fp8_body<Full, PS, NT, MW, FK, MTW>(Wp, Sw, Xp, Sx, Y, FinalY, Ctr, rows, cols, nb, sc_cols,
+                                           x_off, w_row_off, x_ld, sx_ld, accum, bx, by, kbeg,
+                                           kend, ws_rows, tile_id);
 }
 
 // Several fp8 weight matrices against one activation, one launch. See batch_gemm_multi_kernel.
 template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK>
 __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_multi_kernel(
-    GemmJobsArgs J, const uint8_t* __restrict__ Xp, const float* __restrict__ Sx, uint32_t cols,
-    uint32_t nb, uint32_t sc_cols, uint32_t x_ld, uint32_t sx_ld, uint32_t ck, uint32_t total) {
+    GemmJobsArgs J, const uint8_t* __restrict__ Xp, const float* __restrict__ Sx,
+    float* __restrict__ FinalY0, unsigned int* __restrict__ Ctr, uint32_t cols, uint32_t nb,
+    uint32_t sc_cols, uint32_t x_ld, uint32_t sx_ld, uint32_t ck, uint32_t total) {
   uint32_t j = 0;
   while (j + 1u < J.n && blockIdx.x >= J.tile_end[j]) ++j;
   const uint32_t tbeg = j ? J.tile_end[j - 1] : 0u;
   const uint32_t kbeg = ck ? blockIdx.z * ck : 0u;
   const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
-  gemm_fp8_body<Full, PS, NT, MW, FK>(
-      (const uint8_t*)J.w[j], J.s[j], Xp, Sx, J.y[j] + (size_t)blockIdx.z * total * nb, J.rows[j],
-      cols, nb, sc_cols, J.xoff[j], J.woff[j], x_ld, sx_ld, 0,
-      (blockIdx.x - tbeg) * (MW * kFMTiles * 16), kbeg, kend);
+  float* const y_job = (float*)J.y[j];
+  const size_t band_off = (size_t)(y_job - (const float*)J.y[0]);
+  float* const final_job = (ck && FinalY0) ? (FinalY0 + band_off) : nullptr;
+  const uint32_t tile_id = blockIdx.y * gridDim.x + blockIdx.x;
+  gemm_fp8_body<Full, PS, NT, MW, FK, 1u>(
+      (const uint8_t*)J.w[j], J.s[j], Xp, Sx, y_job, final_job, Ctr, J.rows[j], cols, nb, sc_cols,
+      J.xoff[j], J.woff[j], x_ld, sx_ld, 0, blockIdx.x - tbeg, blockIdx.y, kbeg, kend,
+      ck ? total : 0u, tile_id);
 }
 
 // `Full` = every dimension is an exact multiple of its tile, which every dense tensor in this model
@@ -2993,7 +3111,7 @@ bool batch_gemm_multi_hip(uint32_t quant, const BatchGemmJob* jobs, uint32_t n, 
   for (uint32_t i = 0; i < n; ++i) {
     J.w[i] = jobs[i].w; J.s[i] = jobs[i].s;
     J.xoff[i] = jobs[i].x_off; J.woff[i] = jobs[i].w_row_off;
-    J.y[i] = (ws ? ws : jobs[0].y) + (size_t)off * nb;
+    J.y[i] = ws ? (ws + (size_t)off * nb) : jobs[i].y;
     off += jobs[i].rows;
   }
   const dim3 grid(tiles, gy, ksplit);
@@ -3093,6 +3211,22 @@ inline bool fp8_narrow128_enabled() {
   return on;
 }
 
+inline bool fp8_prefill_4x2_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_FP8_PREFILL_4X2");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool fp8_split_inline_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_FP8_SPLIT_INLINE");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
 bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_t* X,
                               const float* Sx, uint32_t cols, uint32_t nb, uint32_t x_ld,
                               uint32_t sx_ld, void* stream, bool preshuffled, const char* aff_file,
@@ -3127,32 +3261,43 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
   }
   J.n = n;
   const uint32_t gy = (nb + 15u) / 16u;
+  const bool inline_split = fp8_split_inline_enabled();
   uint32_t ksplit = 1;
   float* ws = nullptr;
+  unsigned int* ctr_buf = nullptr;
   if (tiles * gy * mw < kSplitTarget && cols >= 512u) {
     const uint32_t want = (kSplitTarget + tiles * gy * mw - 1) / (tiles * gy * mw);
     uint32_t ckw = ((cols / want) + k_unit - 1u) / k_unit * k_unit;
     if (ckw < k_unit) ckw = k_unit;
     uint32_t k2 = (cols + ckw - 1) / ckw;
     if (k2 > kSplitThinCap && (uint64_t)total * nb < 8192) k2 = kSplitThinCap;
-    if (k2 > 1) { ws = splitk_buf((size_t)k2 * total * nb); if (ws) ksplit = k2; }
+    if (k2 > 1) {
+      if (inline_split && tiles * gy <= kSplitCtrFloats) {
+        ws = splitk_buf_with_ctr((size_t)k2 * total * nb, &ctr_buf);
+        if (ws) ksplit = k2;
+      } else {
+        ws = splitk_buf((size_t)k2 * total * nb);
+        if (ws) ksplit = k2;
+      }
+    }
   }
   uint32_t ck = ksplit > 1 ? ((cols + ksplit - 1) / ksplit + k_unit - 1u) / k_unit * k_unit
                            : 0u;
   if (ck) ksplit = (cols + ck - 1) / ck;
-  if (ksplit < 2) { ck = 0; ksplit = 1; ws = nullptr; }
+  if (ksplit < 2) { ck = 0; ksplit = 1; ws = nullptr; ctr_buf = nullptr; }
   uint32_t off = 0;
   for (uint32_t i = 0; i < n; ++i) {
     J.w[i] = jobs[i].w; J.s[i] = jobs[i].s;
     J.xoff[i] = jobs[i].x_off; J.woff[i] = jobs[i].w_row_off;
-    J.y[i] = (ws ? ws : jobs[0].y) + (size_t)off * nb;
+    J.y[i] = ws ? (ws + (size_t)off * nb) : jobs[i].y;
     off += jobs[i].rows;
   }
   const dim3 grid(tiles, gy, ksplit);
   const hipStream_t st = (hipStream_t)stream;
+  float* const final_y0 = ksplit > 1 ? jobs[0].y : nullptr;
 #define AFF_F8M(f, ps, mw_, fk_)                                                                  \
   AFF_BLAUNCH((batch_gemm_fp8_multi_kernel<f, ps, 1u, mw_, fk_>), grid, dim3(mw_ * kWave),        \
-              0, st, J, X, Sx, cols, nb, sc_cols, x_ld, sx_ld, ck, total)
+              0, st, J, X, Sx, final_y0, ctr_buf, cols, nb, sc_cols, x_ld, sx_ld, ck, total)
 #define AFF_F8M_FK(f, ps, mw_)                                                                    \
   do {                                                                                            \
     if (use128) AFF_F8M(f, ps, mw_, kFKNarrow);                                                   \
@@ -3170,7 +3315,7 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
 #undef AFF_F8M_MW
 #undef AFF_F8M_FK
 #undef AFF_F8M
-  if (ksplit > 1) {
+  if (ksplit > 1 && !ctr_buf) {
     const size_t nn = (size_t)total * nb;
     AFF_BLAUNCH(splitk_reduce_kernel, dim3((uint32_t)((nn + 255) / 256)), dim3(256), 0, st, ws,
                 jobs[0].y, total, nb, ksplit);
@@ -3206,38 +3351,51 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
   if (!mw) mw = narrow ? fp8_narrow_mw(rows) : kFWaves;
   const uint32_t fm = mw * kFMTiles * 16u;
   const uint32_t gx = (rows + fm - 1) / fm, gy = (nb + fn - 1) / fn;
-  // Split K until the WAVE count can cover the machine's memory latency — see the note in the
-  // kernel. Not when `accum` is set: the epilogue would then add each K slice into Y separately.
+  // Split K until the WAVE count can cover the machine's memory latency. With inline atomic
+  // finisher (`AFF_FP8_SPLIT_INLINE=1`), `accum=true` also splits cleanly by applying `+=` in
+  // the finisher rather than on uninitialized split workspace slices.
+  const bool inline_split = fp8_split_inline_enabled();
   uint32_t ksplit = 1;
   float* ws = nullptr;
-  if (narrow && !accum && gx * gy * mw < kSplitTarget && cols >= 512u) {
+  unsigned int* ctr_buf = nullptr;
+  if (narrow && (inline_split || !accum) && gx * gy * mw < kSplitTarget && cols >= 512u) {
     const uint32_t want = (kSplitTarget + gx * gy * mw - 1) / (gx * gy * mw);
     uint32_t ckw = ((cols / want) + 127u) / 128u * 128u;
     if (ckw < 128u) ckw = 128u;
     uint32_t k2 = (cols + ckw - 1) / ckw;
     if (k2 > kSplitThinCap && (uint64_t)rows * nb < 8192) k2 = kSplitThinCap;      // see gemm_launch
     if (k2 > 1) {
-      ws = splitk_buf((size_t)k2 * rows * nb);
-      if (ws) ksplit = k2;
+      if (inline_split && gx * gy <= kSplitCtrFloats) {
+        ws = splitk_buf_with_ctr((size_t)k2 * rows * nb, &ctr_buf);
+        if (ws && ctr_buf) ksplit = k2;
+        else if (ws && !accum) { ctr_buf = nullptr; ksplit = k2; }
+        else { ws = nullptr; ctr_buf = nullptr; }
+      } else if (!accum) {
+        ws = splitk_buf((size_t)k2 * rows * nb);
+        if (ws) ksplit = k2;
+      }
     }
   }
   // Rounded to the staged tile (256 or 128) AND 128-col scale blocks.
   const uint32_t kq = narrow ? (use128 ? kFKNarrow : kFKNarrowWide) : 128u;
   uint32_t ck = ksplit > 1 ? ((cols + ksplit - 1) / ksplit + kq - 1u) / kq * kq : 0u;
   if (ck) ksplit = (cols + ck - 1) / ck;                     // see gemm_launch
-  if (ksplit < 2) { ck = 0; ksplit = 1; ws = nullptr; }
+  if (ksplit < 2) { ck = 0; ksplit = 1; ws = nullptr; ctr_buf = nullptr; }
   const dim3 grid(gx, gy, ksplit);
   float* const dst = ksplit > 1 ? ws : Y;
+  float* const final_y = ksplit > 1 ? Y : nullptr;
   // `cols % 128` is required, not just preferred: the scale block is 128 wide and the fold at the
   // end of the K loop assumes a whole one.
   const bool full = (rows % fm == 0) && (nb % fn == 0) && (cols % 128 == 0);
   if (narrow && (cols % kFKNarrow) != 0) { aff::ui::fatal("batch_gemm_fp8: cols=%u is not a multiple of %u\n", cols, kFKNarrow); std::abort(); }
+  const bool prefill_4x2 = !narrow && fp8_prefill_4x2_enabled();
 // FK: a whole 256-byte cacheline a row when cols % 256 == 0, 128 for odd multiples of 128, and 64
 // for the wide prefill instantiation.
-#define AFF_GEMM_F8(f, ps, nt_, mw_, fk_)                                                         \
-  AFF_BLAUNCH((batch_gemm_fp8_kernel<f, ps, nt_, mw_, fk_>), grid, dim3(mw_ * kWave), 0,          \
-              (hipStream_t)stream, W, Sw, X, Sx, dst, rows, cols, nb, sc_cols, x_off, w_row_off,  \
-              x_ld, sx_ld, accum ? 1 : 0, ck)
+#define AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, mtw_)                                               \
+  AFF_BLAUNCH((batch_gemm_fp8_kernel<f, ps, nt_, mw_, fk_, mtw_>), grid, dim3(mw_ * kWave), 0,    \
+              (hipStream_t)stream, W, Sw, X, Sx, dst, final_y, ctr_buf, rows, cols, nb, sc_cols,  \
+              x_off, w_row_off, x_ld, sx_ld, accum ? 1 : 0, ck)
+#define AFF_GEMM_F8(f, ps, nt_, mw_, fk_) AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, 1u)
 #define AFF_GEMM_F8_FK(f, ps, nt_, mw_)                                                           \
   do {                                                                                            \
     if (use128) AFF_GEMM_F8(f, ps, nt_, mw_, kFKNarrow);                                          \
@@ -3245,7 +3403,10 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
   } while (0)
 #define AFF_GEMM_F8_MW(f, ps)                                                                     \
   do {                                                                                            \
-    if (!narrow)        AFF_GEMM_F8(f, ps, kFNTiles, kFWaves, kFK);                               \
+    if (!narrow) {                                                                                \
+      if (prefill_4x2) AFF_GEMM_F8_MTW(f, ps, kFNTiles, kFWaves, kFK, 2u);                        \
+      else             AFF_GEMM_F8_MTW(f, ps, kFNTiles, kFWaves, kFK, 1u);                        \
+    }                                                                                             \
     else if (mw == 1u)  AFF_GEMM_F8_FK(f, ps, 1u, 1u);                                            \
     else if (mw == 2u)  AFF_GEMM_F8_FK(f, ps, 1u, 2u);                                            \
     else if (mw == 4u)  AFF_GEMM_F8_FK(f, ps, 1u, 4u);                                            \
@@ -3256,7 +3417,8 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
 #undef AFF_GEMM_F8_MW
 #undef AFF_GEMM_F8_FK
 #undef AFF_GEMM_F8
-  if (ksplit > 1) {
+#undef AFF_GEMM_F8_MTW
+  if (ksplit > 1 && !ctr_buf) {
     const size_t n = (size_t)rows * nb;
     AFF_BLAUNCH(splitk_reduce_kernel, dim3((uint32_t)((n + 255) / 256)), dim3(256), 0,
                 (hipStream_t)stream, ws, Y, rows, nb, ksplit);

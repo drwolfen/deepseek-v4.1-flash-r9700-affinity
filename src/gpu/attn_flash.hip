@@ -166,11 +166,14 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
   __shared__ const uint8_t* s_ptr[kKT];              // this tile's key rows, ring/comp resolved
   __shared__ float s_rs[kKT];                        // their row scales; 0 marks absent or masked
   __shared__ float s_qs[NH];                         // Q dequant scale a head
-  __shared__ float s_m[NH], s_l[NH], s_af[NH];       // running max, denominator, rescale factor
-  __shared__ float s_red[kWaves * NH];               // cross-wave max / sum scratch
+  __shared__ float s_m[NH], s_l[NH];               // running max and denominator
+  __shared__ float s_red[kWaves * NH];               // cross-wave max scratch; dead before s_af
+  // `s_red` is dead after the cross-wave max reduction until the next key tile, and `s_af` is
+  // written only after the P-sum barrier and consumed before that barrier repeats, so they alias.
+  float* const s_af = s_red;
   __shared__ float s_amax[kThreads];
   // `s_amax` is dead after Q quantisation in the prologue, so `s_ps` aliases it at zero extra
-  // LDS cost to avoid an occupancy drop from 3 to 2 blocks/CU while keeping `s_red` disjoint.
+  // LDS cost to keep `LDS <= 21504` (6 waves/SIMD) while keeping `s_red` disjoint.
   float* const s_ps = s_amax;
   __shared__ float s_scur, s_sprev;
   __shared__ int s_skip;
@@ -349,15 +352,15 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
 #pragma unroll
     for (int j = 0; j < 8; ++j) rw[j] = s_rs[16u * wave + hlf * 8u + (uint32_t)j];
 
-    float sv[NT][8], mnew[NT], alpha[NT], ps[NT];
+    float mnew[NT], alpha[NT];
 #pragma unroll
     for (uint32_t nt = 0; nt < NT; ++nt) {
       const float qs = s_qs[nt * 16u + c] * scale;
       float mt = kNeg;
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
-        sv[nt][j] = (rw[j] > 0.0f) ? acc[nt][j] * rw[j] * qs : kNeg;
-        mt = fmaxf(mt, sv[nt][j]);
+        acc[nt][j] = (rw[j] > 0.0f) ? acc[nt][j] * rw[j] * qs : kNeg;
+        mt = fmaxf(mt, acc[nt][j]);
       }
       mt = fmaxf(mt, __shfl_xor(mt, 16));
       if (lane < 16) s_red[wave * NH + nt * 16u + c] = mt;
@@ -375,15 +378,13 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       float psum = 0.0f;
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
-        const float e = (sv[nt][j] > kNeg) ? __expf(sv[nt][j] - mnew[nt]) : 0.0f;
-        sv[nt][j] = e;                                // sv becomes P in place
+        const float e = (acc[nt][j] > kNeg) ? __expf(acc[nt][j] - mnew[nt]) : 0.0f;
+        acc[nt][j] = e;                               // acc becomes P in place
         psum += e;
       }
-      ps[nt] = psum + __shfl_xor(psum, 16);
+      const float ps = psum + __shfl_xor(psum, 16);
+      if (lane < 16) s_ps[wave * NH + hd] = ps;
     }
-#pragma unroll
-    for (uint32_t nt = 0; nt < NT; ++nt)
-      if (lane < 16) s_ps[wave * NH + nt * 16u + c] = ps[nt];
     __syncthreads();
 
     // ---- P -> E4M3, with the key's row scale folded in.
@@ -414,12 +415,12 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
           s_af[hd] = fac;
         }
       }
-      float pw[8];
-#pragma unroll
-      for (int j = 0; j < 8; ++j) pw[j] = sv[nt][j] * (rw[j] * inv_scur);
       uint8_t* pdst = s_p + (size_t)hd * kPLd + 16u * wave + hlf * 8u;
-      *(uint2*)(pdst) = make_uint2(pack4(pw[0], pw[1], pw[2], pw[3]),
-                                   pack4(pw[4], pw[5], pw[6], pw[7]));
+      *(uint2*)(pdst) = make_uint2(
+          pack4(acc[nt][0] * (rw[0] * inv_scur), acc[nt][1] * (rw[1] * inv_scur),
+                acc[nt][2] * (rw[2] * inv_scur), acc[nt][3] * (rw[3] * inv_scur)),
+          pack4(acc[nt][4] * (rw[4] * inv_scur), acc[nt][5] * (rw[5] * inv_scur),
+                acc[nt][6] * (rw[6] * inv_scur), acc[nt][7] * (rw[7] * inv_scur)));
     }
     if (wave == 0 && lane == 0) s_skip = skip;
     __syncthreads();

@@ -56,6 +56,12 @@ inline void set_device(int d) { (void)hipSetDevice(d); }
 
 constexpr size_t kTpWakeBytes = 64;
 constexpr int kTpFp8RegCacheGroups = 8;
+constexpr size_t kTpStagedMinBytes = 4u << 20;  // 4 MiB floor for staged TP=2 FP8 overlap
+constexpr int kTpFp8DefaultStages = 8;
+constexpr int kTpFp8MaxStages = 8;
+// Per-peer flag stride: [0, kTpMaxBlocks) holds unstaged block flags;
+// [kTpMaxBlocks, (1 + kTpFp8MaxStages) * kTpMaxBlocks) holds per-(stage, block) flags.
+constexpr size_t kTpFlagStride = (size_t)kTpMaxBlocks * (1u + (size_t)kTpFp8MaxStages);
 
 __device__ __forceinline__ void store_sys_rel(unsigned int* p, unsigned int v) {
   __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -153,7 +159,7 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
       for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
     }
     if (tid < NPEER) {
-      const unsigned int* f = &my_flags[tid * kTpMaxBlocks + b];
+      const unsigned int* f = &my_flags[tid * kTpFlagStride + b];
       unsigned long long z = 0;
       unsigned int v = load_sys_relaxed(f);
       if ((int)(v - s) < 0) {
@@ -171,7 +177,7 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
       unsigned long long z = 0;
 #pragma unroll
       for (int j = 0; j < NPEER; ++j) {
-        const unsigned int* f = &my_flags[j * kTpMaxBlocks + b];
+        const unsigned int* f = &my_flags[j * kTpFlagStride + b];
         unsigned int v = load_sys_relaxed(f);
         if (v < s) {
           do {
@@ -356,7 +362,7 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
       for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
     }
     if (tid < NPEER) {
-      const unsigned int* f = &my_flags[tid * kTpMaxBlocks + b];
+      const unsigned int* f = &my_flags[tid * kTpFlagStride + b];
       unsigned long long z = 0;
       unsigned int fv = load_sys_relaxed(f);
       if ((int)(fv - s) < 0) {
@@ -374,7 +380,7 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
       unsigned long long z = 0;
       #pragma unroll
       for (int j = 0; j < NPEER; ++j) {
-        const unsigned int* f = &my_flags[j * kTpMaxBlocks + b];
+        const unsigned int* f = &my_flags[j * kTpFlagStride + b];
         unsigned int fv = load_sys_relaxed(f);
         if (fv < s) {
           do {
@@ -485,6 +491,148 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
       }
     }
   }
+}
+
+// Staged 2-rank FP8 all-reduce for large prefill payloads: splits each block's [g0, g1) range into
+// S contiguous stages on 128-element group boundaries and overlaps PCIe BAR push of stage j with
+// local wait + quant + HBM reduce of stage j - 1. Wire format and outputs are bit-identical to
+// tp_ar_fp8_kernel.
+__global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
+                                        TpPush8<1> push, const unsigned char* my_base,
+                                        float* __restrict__ out,
+                                        unsigned int* my_flags,
+                                        unsigned int* seq_ctrs, unsigned int* timeout,
+                                        int n, int slot_stride_bytes, int scale_off_bytes,
+                                        int stages) {
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seq;
+  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
+  __syncthreads();
+  const unsigned int s = s_seq;
+  const int slot = (int)(s % TpContext::kTpSlots);
+
+  if (b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
+
+  unsigned char* const pb0 = push.base[0] + (size_t)slot * slot_stride_bytes;
+  float* const p_scale0 = (float*)(pb0 + scale_off_bytes);
+  const unsigned char* const mb0 = my_base + (size_t)slot * slot_stride_bytes;
+  const float* const m_scale0 = (const float*)(mb0 + scale_off_bytes);
+
+  const int n_groups = (n + kTpFp8Group - 1) / kTpFp8Group;
+  const int waves = nt / kWave;
+  const int lane = tid & (kWave - 1);
+  const int wave = tid / kWave;
+  const int gw = (n_groups + nb - 1) / nb;
+  const int g0 = b * gw;
+  const int g1 = (g0 + gw < n_groups) ? (g0 + gw) : n_groups;
+  const int gw_blk = (g1 > g0) ? (g1 - g0) : 0;
+  constexpr int kPerLane = kTpFp8Group / kWave;  // 4
+
+  auto quant_group = [&](int g, float& mine_scale, uint32_t& pk, bool write_peer) {
+    const int lo = g * kTpFp8Group;
+    const int base_idx = lo + lane * kPerLane;
+    float v[kPerLane];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      const int idx = base_idx + i;
+      v[i] = (idx < n) ? in[idx] : 0.0f;
+      amax = fmaxf(amax, fabsf(v[i]));
+    }
+    amax = aff::wave_reduce_max_dpp(amax);
+    mine_scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
+    const float inv = 1.0f / mine_scale;
+    if (write_peer && lane == 0) p_scale0[g] = mine_scale;
+    pk = 0u;
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      const unsigned char q = (base_idx + i < n) ? f2e4m3(v[i] * inv) : 0u;
+      pk |= (uint32_t)q << (8 * i);
+    }
+    if (write_peer) {
+      if (base_idx + (kPerLane - 1) < n) {
+        *(uint32_t*)(pb0 + base_idx) = pk;
+      } else {
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const int idx = base_idx + i;
+          if (idx < n) pb0[idx] = (unsigned char)(pk >> (8 * i));
+        }
+      }
+    }
+  };
+
+  auto push_stage = [&](int st) {
+    const int sg0 = g0 + (gw_blk * st) / stages;
+    const int sg1 = g0 + (gw_blk * (st + 1)) / stages;
+    for (int g = sg0 + wave; g < sg1; g += waves) {
+      float sc_tmp;
+      uint32_t pk_tmp;
+      quant_group(g, sc_tmp, pk_tmp, true);
+    }
+  };
+
+  auto publish_stage = [&](int st) {
+    asm volatile("s_wait_storecnt 0x0" ::: "memory");
+    __syncthreads();
+    if (tid == 0) store_sys_rel(&push.flags[0][(size_t)(1 + st) * kTpMaxBlocks + b], s);
+  };
+
+  auto fold_stage = [&](int st) {
+    if (tid == 0) {
+      const unsigned int* const f = &my_flags[(size_t)(1 + st) * kTpMaxBlocks + b];
+      unsigned long long z = 0;
+      unsigned int fv = load_sys_relaxed(f);
+      if ((int)(fv - s) < 0) {
+        do {
+          __builtin_amdgcn_s_sleep(1);
+          fv = load_sys_relaxed(f);
+        } while ((int)(fv - s) < 0 && ++z <= kTpSpinMax);
+        if ((int)(fv - s) < 0) note_timeout(timeout, s);
+      }
+    }
+    __syncthreads();
+    fence_sys_acq();
+
+    const int sg0 = g0 + (gw_blk * st) / stages;
+    const int sg1 = g0 + (gw_blk * (st + 1)) / stages;
+    for (int g = sg0 + wave; g < sg1; g += waves) {
+      const int lo = g * kTpFp8Group;
+      const int base_idx = lo + lane * kPerLane;
+      const float peer_scale = m_scale0[g];
+      float mine_scale;
+      uint32_t pk;
+      quant_group(g, mine_scale, pk, false);
+
+      if (base_idx + (kPerLane - 1) < n) {
+        const uint32_t peer_pk = *(const uint32_t*)(mb0 + base_idx);
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const float mine = e4m3_2f((unsigned char)(pk >> (8 * i))) * mine_scale;
+          const float peer = e4m3_2f((unsigned char)(peer_pk >> (8 * i))) * peer_scale;
+          out[base_idx + i] = mine + peer;
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const int idx = base_idx + i;
+          if (idx < n) {
+            const float mine = e4m3_2f((unsigned char)(pk >> (8 * i))) * mine_scale;
+            out[idx] = mine + e4m3_2f(mb0[idx]) * peer_scale;
+          }
+        }
+      }
+    }
+  };
+
+  push_stage(0);
+  publish_stage(0);
+  for (int st = 1; st < stages; ++st) {
+    push_stage(st);
+    fold_stage(st - 1);
+    publish_stage(st);
+  }
+  fold_stage(stages - 1);
 }
 
 } // namespace
@@ -627,11 +775,11 @@ bool tp_init(TpContext* ctx, size_t max_floats, std::string* err, ihipStream_t* 
     ctx->scratch[r] = (float*)sc;
 
     void* fl = nullptr;
-    if (!hip_try(hipExtMallocWithFlags(&fl, np * kTpMaxBlocks * sizeof(unsigned) + kTpWakeBytes,
+    if (!hip_try(hipExtMallocWithFlags(&fl, np * kTpFlagStride * sizeof(unsigned) + kTpWakeBytes,
                                        hipDeviceMallocFinegrained), "flags alloc", err))
       return false;
     ctx->flags[r] = (unsigned*)fl;
-    if (!hip_try(hipMemset(ctx->flags[r], 0, np * kTpMaxBlocks * sizeof(unsigned) + kTpWakeBytes),
+    if (!hip_try(hipMemset(ctx->flags[r], 0, np * kTpFlagStride * sizeof(unsigned) + kTpWakeBytes),
                  "memset flags", err))
       return false;
 
@@ -662,7 +810,7 @@ void tp_reset_seq(TpContext& ctx) {
       // and a stale flag from a previous block could satisfy the wait prematurely.
       if (ctx.flags[r])
         AFF_HIP_CHECK(hipMemsetAsync(ctx.flags[r], 0,
-                     (size_t)(ctx.ranks - 1) * kTpMaxBlocks * sizeof(unsigned),
+                     (size_t)(ctx.ranks - 1) * kTpFlagStride * sizeof(unsigned),
                      (hipStream_t)ctx.stream[r]));
       set_device(ctx.dev[r]);
       AFF_HIP_CHECK(hipMemsetAsync(ctx.seq[r], 0, kTpMaxBlocks * sizeof(unsigned),
@@ -726,6 +874,25 @@ static inline bool tp_nrank_sync_enabled() {
   return enabled;
 }
 
+static inline bool tp_ar_staged_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("AFF_TP_AR_STAGED");
+    return !(v && *v && std::strcmp(v, "0") == 0);
+  }();
+  return enabled;
+}
+
+static inline int tp_ar_fp8_stages_cfg() {
+  static const int stages = [] {
+    const char* v = std::getenv("AFF_TP_AR_STAGES");
+    if (!v || !*v) return kTpFp8DefaultStages;
+    const int s = std::atoi(v);
+    if (s <= 1) return 1;
+    return s > kTpFp8MaxStages ? kTpFp8MaxStages : s;
+  }();
+  return stages;
+}
+
 // One launch per rank, with that rank's peer table filled in. NPEER is a template argument so the
 // two-rank path keeps the straight-line kernel it had; the switch below is the only place the live
 // rank count meets it.
@@ -740,8 +907,8 @@ void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4
       if (q == r) continue;
       const size_t mine = tp_peer_slot(r, q);      // where rank r sits in rank q's tables
       push.scratch[j] = (float4*)(ctx.scratch[q] + mine * ctx.max_floats);
-      push.flags[j] = ctx.flags[q] + mine * kTpMaxBlocks;
-      push.wake[j] = ctx.flags[q] + np * kTpMaxBlocks;
+      push.flags[j] = ctx.flags[q] + mine * kTpFlagStride;
+      push.wake[j] = ctx.flags[q] + np * kTpFlagStride;
       ++j;
     }
     set_device(ctx.dev[r]);
@@ -768,14 +935,35 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
   const int n_groups = (n + kTpFp8Group - 1) / kTpFp8Group;
   const int gw = (n_groups + nb - 1) / nb;
   const bool cache_regs = (gw <= 8 * kTpFp8RegCacheGroups);
+  if constexpr (NPEER == 1) {
+    if (tp_ar_staged_enabled() && (size_t)n * sizeof(float) >= kTpStagedMinBytes) {
+      const int stages = std::min(tp_ar_fp8_stages_cfg(), gw);
+      if (stages >= 2) {
+        for (size_t r = 0; r < ctx.ranks; ++r) {
+          TpPush8<1> push{};
+          const size_t q = 1u - r;
+          push.base[0] = (unsigned char*)ctx.scratch[q];
+          push.flags[0] = ctx.flags[q];
+          push.wake[0] = ctx.flags[q] + kTpFlagStride;
+          set_device(ctx.dev[r]);
+          hipLaunchKernelGGL(tp_ar_fp8_staged_kernel, dim3(nb), dim3(256), 0,
+                             (hipStream_t)ctx.stream[r], in[r], push,
+                             (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                             ctx.timeout_dev, n, slot_bytes, scale_off, stages);
+          AFF_HIP_CHECK(hipGetLastError());
+        }
+        return;
+      }
+    }
+  }
   for (size_t r = 0; r < ctx.ranks; ++r) {
     TpPush8<NPEER> push{};
     for (size_t q = 0, j = 0; q < ctx.ranks; ++q) {
       if (q == r) continue;
       const size_t mine = tp_peer_slot(r, q);
       push.base[j] = (unsigned char*)(ctx.scratch[q] + mine * ctx.max_floats);
-      push.flags[j] = ctx.flags[q] + mine * kTpMaxBlocks;
-      push.wake[j] = ctx.flags[q] + np * kTpMaxBlocks;
+      push.flags[j] = ctx.flags[q] + mine * kTpFlagStride;
+      push.wake[j] = ctx.flags[q] + np * kTpFlagStride;
       ++j;
     }
     set_device(ctx.dev[r]);

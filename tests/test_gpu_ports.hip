@@ -1027,7 +1027,7 @@ int main() {
     }
   }
 
-  // 13. Test tp_ar_fp8_kernel 1-pass vs 2-pass & tail at TP=2 (skip gracefully if <2 GPUs)
+  // 13. Test tp_ar_fp8_kernel (unstaged & >= 4 MiB staged, mixed Exact/Fp8, alias, reset) at TP=2
   {
     int ndev = 0, can01 = 0, can10 = 0;
     if (hipGetDeviceCount(&ndev) == hipSuccess && ndev >= 2 &&
@@ -1035,7 +1035,7 @@ int main() {
         hipDeviceCanAccessPeer(&can10, 1, 0) == hipSuccess && can10) {
       TpContext ctx;
       std::string err;
-      const size_t max_n = 262144u;
+      const size_t max_n = 2097152u;  // 8 MiB: exercises >= 4 MiB AFF_TP_AR_STAGED path
       assert(tp_init(&ctx, max_n, &err));
       float *d_in[2] = {}, *d_out[2] = {};
       for (int r = 0; r < 2; ++r) {
@@ -1043,45 +1043,67 @@ int main() {
         assert(hipMalloc(&d_in[r], max_n * sizeof(float)) == hipSuccess);
         assert(hipMalloc(&d_out[r], max_n * sizeof(float)) == hipSuccess);
       }
-      for (size_t n : {size_t(32768u), size_t(65536u), size_t(262144u), size_t(2563u)}) {
+      struct TpCase { size_t n; TpReduce mode; bool alias; bool reset_after; };
+      const TpCase cases[] = {
+          {32768u, TpReduce::Fp8, false, false},
+          {65536u, TpReduce::Fp8, false, false},
+          {262144u, TpReduce::Fp8, false, false},
+          {2563u, TpReduce::Fp8, false, false},
+          {1048576u, TpReduce::Fp8, false, false},  // 4 MiB staged boundary
+          {2048u, TpReduce::Exact, false, false},   // interleaved Exact on shared seq/flags
+          {2097152u, TpReduce::Fp8, false, false},  // 8 MiB staged
+          {1049003u, TpReduce::Fp8, true, true},    // > 4 MiB odd-tail staged in-place alias + reset
+          {1048576u, TpReduce::Fp8, false, false},  // post-tp_reset_seq staged verify
+      };
+      for (const TpCase& tc : cases) {
+        const size_t n = tc.n;
         std::vector<float> h0(n), h1(n), ref(n);
         for (size_t i = 0; i < n; ++i) {
           h0[i] = std::sin((float)(i % 331u) * 0.043f) * 3.0f;
           h1[i] = std::cos((float)(i % 277u) * 0.059f) * 2.5f;
         }
-        // CPU FP8 group-128 QDQ wire reference
-        for (size_t g0 = 0; g0 < n; g0 += 128u) {
-          const size_t ge = std::min(n, g0 + 128u);
-          float a0 = 0.0f, a1 = 0.0f;
-          for (size_t i = g0; i < ge; ++i) {
-            a0 = std::max(a0, std::fabs(h0[i]));
-            a1 = std::max(a1, std::fabs(h1[i]));
-          }
-          const float s0 = a0 > 0.0f ? a0 / 448.0f : 1.0f;
-          const float s1 = a1 > 0.0f ? a1 / 448.0f : 1.0f;
-          for (size_t i = g0; i < ge; ++i) {
-            const float q0 = e4m3_round_ref(std::min(448.0f, std::max(-448.0f, h0[i] / s0))) * s0;
-            const float q1 = e4m3_round_ref(std::min(448.0f, std::max(-448.0f, h1[i] / s1))) * s1;
-            ref[i] = q0 + q1;
+        if (tc.mode == TpReduce::Exact) {
+          for (size_t i = 0; i < n; ++i) ref[i] = h0[i] + h1[i];
+        } else {
+          // CPU FP8 group-128 QDQ wire reference
+          for (size_t g0 = 0; g0 < n; g0 += 128u) {
+            const size_t ge = std::min(n, g0 + 128u);
+            float a0 = 0.0f, a1 = 0.0f;
+            for (size_t i = g0; i < ge; ++i) {
+              a0 = std::max(a0, std::fabs(h0[i]));
+              a1 = std::max(a1, std::fabs(h1[i]));
+            }
+            const float s0 = a0 > 0.0f ? a0 / 448.0f : 1.0f;
+            const float s1 = a1 > 0.0f ? a1 / 448.0f : 1.0f;
+            for (size_t i = g0; i < ge; ++i) {
+              const float q0 = e4m3_round_ref(std::min(448.0f, std::max(-448.0f, h0[i] / s0))) * s0;
+              const float q1 = e4m3_round_ref(std::min(448.0f, std::max(-448.0f, h1[i] / s1))) * s1;
+              ref[i] = q0 + q1;
+            }
           }
         }
         assert(hipSetDevice(ctx.dev[0]) == hipSuccess);
         assert(hipMemcpy(d_in[0], h0.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
         assert(hipSetDevice(ctx.dev[1]) == hipSuccess);
         assert(hipMemcpy(d_in[1], h1.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
-        tp_all_reduce(ctx, d_in, d_out, n, TpReduce::Fp8);
+        float* const* dst_ptrs = tc.alias ? d_in : d_out;
+        tp_all_reduce(ctx, d_in, dst_ptrs, n, tc.mode);
         tp_sync(ctx);
         tp_check(ctx);
 
         std::vector<float> got0(n), got1(n);
         assert(hipSetDevice(ctx.dev[0]) == hipSuccess);
-        assert(hipMemcpy(got0.data(), d_out[0], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(got0.data(), dst_ptrs[0], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
         assert(hipSetDevice(ctx.dev[1]) == hipSuccess);
-        assert(hipMemcpy(got1.data(), d_out[1], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(got1.data(), dst_ptrs[1], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
         assert(std::memcmp(got0.data(), got1.data(), n * sizeof(float)) == 0);
         float max_diff = 0.0f;
         for (size_t i = 0; i < n; ++i) max_diff = std::max(max_diff, std::fabs(got0[i] - ref[i]));
-        assert(max_diff <= 1e-2f);
+        assert(max_diff <= (tc.mode == TpReduce::Exact ? 1e-5f : 1e-2f));
+        if (tc.reset_after) {
+          tp_reset_seq(ctx);
+          tp_sync(ctx);
+        }
       }
       for (int r = 0; r < 2; ++r) {
         assert(hipSetDevice(ctx.dev[r]) == hipSuccess);

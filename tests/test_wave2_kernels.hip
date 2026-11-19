@@ -26,6 +26,29 @@ static float bf16_to_f32_cpu(uint16_t h) {
   return f;
 }
 
+static float e4m3_to_f32_cpu(uint8_t b) {
+  const uint32_t sign = (uint32_t)(b & 0x80u) << 24;
+  const uint32_t ex = (b >> 3) & 0x0Fu;
+  const uint32_t mn = b & 0x07u;
+  if (ex == 15u && mn == 7u) return 0.0f;
+  if (ex == 0u) {
+    const float mag = (float)mn * (1.0f / 512.0f);
+    return (b & 0x80u) ? -mag : mag;
+  }
+  const uint32_t u = sign | ((ex + 120u) << 23) | (mn << 20);
+  float out = 0.0f;
+  std::memcpy(&out, &u, sizeof(out));
+  return out;
+}
+
+static float ue8m0_to_f32_cpu(uint8_t e) {
+  if (e == 0u) return 0.0f;
+  const uint32_t u = (uint32_t)e << 23;
+  float out = 0.0f;
+  std::memcpy(&out, &u, sizeof(out));
+  return out;
+}
+
 int main() {
   using namespace aff;
 
@@ -41,6 +64,20 @@ int main() {
       }
     }
     std::printf("PASS: moe_tail_skip_enabled bounds <=16 and >16\n");
+  }
+
+  // 1b. Offline FP8 reference codec + narrow wave selector checks (no GPU required).
+  {
+    assert(e4m3_to_f32_cpu(0x38u) == 1.0f);
+    assert(e4m3_to_f32_cpu(0xB8u) == -1.0f);
+    assert(e4m3_to_f32_cpu(0x01u) == 1.0f / 512.0f);
+    assert(e4m3_to_f32_cpu(0x7Eu) == 448.0f);
+    assert(ue8m0_to_f32_cpu(127u) == 1.0f);
+    assert(ue8m0_to_f32_cpu(128u) == 2.0f);
+    assert(ue8m0_to_f32_cpu(126u) == 0.5f);
+    assert(fp8_narrow_mw(5120u) >= 1u);
+    assert(fp8_narrow_mw(1024u) >= 1u);
+    std::printf("PASS: Offline FP8 E4M3/UE8M0 reference codec + fp8_narrow_mw check\n");
   }
 
   // Check GPU device count
@@ -280,6 +317,252 @@ int main() {
       (void)hipFree(d_run);
     }
     std::printf("PASS: Summed MoE Down GEMM across n_tokens = {1, 4, 16, 24, 64}\n");
+  }
+
+  // ---- Wave B1 + B2: FP8 prefill 4x2 + narrow inline split-K parity checks ------------------
+  {
+    assert(hipSetDevice(0) == hipSuccess);
+      auto make_e4m3 = [](uint64_t idx) -> uint8_t {
+        const uint32_t h = (uint32_t)(idx * 2654435761ull ^ (idx >> 13));
+        const uint32_t ex = 4u + ((h >> 3) & 3u);
+        const uint32_t mn = h & 7u;
+        const uint8_t sign = (uint8_t)(h & 0x80u);
+        return (uint8_t)(sign | (ex << 3) | mn);
+      };
+      auto make_ue8m0 = [](uint64_t idx) -> uint8_t {
+        return (uint8_t)(126u + ((idx * 17u + 3u) % 3u));
+      };
+      auto run_fp8_case = [&](uint32_t rows, uint32_t cols, uint32_t nb, bool preshuffled,
+                              bool accum, bool repeat_same_stream) {
+        const uint32_t sc_rows = (rows + 127u) / 128u;
+        const uint32_t sc_cols = cols / 128u;
+        std::vector<uint8_t> h_w((size_t)rows * cols);
+        std::vector<uint8_t> h_sw((size_t)sc_rows * sc_cols);
+        std::vector<uint8_t> h_x((size_t)nb * cols);
+        std::vector<float> h_sx((size_t)nb * sc_cols);
+        std::vector<float> h_y_init((size_t)rows * nb, 0.0f);
+        std::vector<float> h_y_gpu((size_t)rows * nb, 0.0f);
+
+        for (size_t i = 0; i < h_w.size(); ++i) h_w[i] = make_e4m3(i + 17u);
+        for (size_t i = 0; i < h_sw.size(); ++i) h_sw[i] = make_ue8m0(i + 5u);
+        for (size_t i = 0; i < h_x.size(); ++i) h_x[i] = make_e4m3(i + 1000003u);
+        for (uint32_t b = 0; b < nb; ++b) {
+          for (uint32_t kb = 0; kb < sc_cols; ++kb) {
+            h_sx[(size_t)b * sc_cols + kb] = 0.25f * (float)(1u + ((b * 7u + kb * 3u) % 5u));
+          }
+        }
+        if (accum) {
+          for (uint32_t r = 0; r < rows; ++r) {
+            for (uint32_t b = 0; b < nb; ++b) {
+              h_y_init[(size_t)r * nb + b] = 0.125f * (float)((int)((r * 13u + b * 5u) % 19u) - 9);
+            }
+          }
+        }
+
+        uint8_t* d_w = nullptr;
+        uint8_t* d_w_ps = nullptr;
+        uint8_t* d_sw = nullptr;
+        uint8_t* d_x = nullptr;
+        float* d_sx = nullptr;
+        float* d_y = nullptr;
+        assert(hipMalloc(&d_w, h_w.size()) == hipSuccess);
+        assert(hipMalloc(&d_sw, h_sw.size()) == hipSuccess);
+        assert(hipMalloc(&d_x, h_x.size()) == hipSuccess);
+        assert(hipMalloc(&d_sx, h_sx.size() * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_y, h_y_init.size() * sizeof(float)) == hipSuccess);
+        assert(hipMemcpy(d_w, h_w.data(), h_w.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sw, h_sw.data(), h_sw.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_x, h_x.data(), h_x.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sx, h_sx.data(), h_sx.size() * sizeof(float), hipMemcpyHostToDevice) ==
+               hipSuccess);
+        assert(hipMemcpy(d_y, h_y_init.data(), h_y_init.size() * sizeof(float),
+                         hipMemcpyHostToDevice) == hipSuccess);
+
+        const uint8_t* w_arg = d_w;
+        if (preshuffled) {
+          assert(hipMalloc(&d_w_ps, h_w.size()) == hipSuccess);
+          aff::preshuffle_fp8_hip(d_w, d_w_ps, rows, cols, nullptr);
+          w_arg = d_w_ps;
+        }
+
+        aff::batch_gemm_fp8_hip(w_arg, d_sw, d_x, d_sx, d_y, rows, cols, nb, 0u, 0u, nullptr,
+                                preshuffled, 0u, 0u, accum, 0u);
+        if (repeat_same_stream) {
+          assert(hipMemcpy(d_y, h_y_init.data(), h_y_init.size() * sizeof(float),
+                           hipMemcpyHostToDevice) == hipSuccess);
+          aff::batch_gemm_fp8_hip(w_arg, d_sw, d_x, d_sx, d_y, rows, cols, nb, 0u, 0u, nullptr,
+                                  preshuffled, 0u, 0u, accum, 0u);
+        }
+        assert(hipDeviceSynchronize() == hipSuccess);
+        assert(hipMemcpy(h_y_gpu.data(), d_y, h_y_gpu.size() * sizeof(float),
+                         hipMemcpyDeviceToHost) == hipSuccess);
+
+        std::vector<uint32_t> check_rows;
+        if (rows <= 1536u || nb <= 16u) {
+          check_rows.resize(rows);
+          for (uint32_t r = 0; r < rows; ++r) check_rows[r] = r;
+        } else {
+          for (uint32_t r = 0; r < rows; r += 17u) check_rows.push_back(r);
+          const uint32_t extra[] = {127u, 128u, 255u, 256u, rows - 1u};
+          for (uint32_t er : extra) {
+            if (er < rows) check_rows.push_back(er);
+          }
+        }
+
+        double max_abs_err = 0.0;
+        double dot = 0.0, norm_ref = 0.0, norm_gpu = 0.0;
+        for (uint32_t r : check_rows) {
+          const uint32_t sr = r >> 7;
+          for (uint32_t b = 0; b < nb; ++b) {
+            float ref = accum ? h_y_init[(size_t)r * nb + b] : 0.0f;
+            for (uint32_t kb = 0; kb < sc_cols; ++kb) {
+              float blk = 0.0f;
+              for (uint32_t k = 0; k < 128u; ++k) {
+                const float wf = e4m3_to_f32_cpu(h_w[(size_t)r * cols + kb * 128u + k]);
+                const float xf = e4m3_to_f32_cpu(h_x[(size_t)b * cols + kb * 128u + k]);
+                blk += wf * xf;
+              }
+              const float ws = ue8m0_to_f32_cpu(h_sw[(size_t)sr * sc_cols + kb]);
+              const float xs = h_sx[(size_t)b * sc_cols + kb];
+              ref += blk * (ws * xs);
+            }
+            const double g = (double)h_y_gpu[(size_t)r * nb + b];
+            const double rf = (double)ref;
+            const double err = std::fabs(g - rf);
+            if (err > max_abs_err) max_abs_err = err;
+            dot += g * rf;
+            norm_ref += rf * rf;
+            norm_gpu += g * g;
+          }
+        }
+        const double cos_sim = dot / (std::sqrt(norm_ref) * std::sqrt(norm_gpu) + 1e-12);
+        std::printf("  fp8(%u,%u,%u ps=%d acc=%d rep=%d): max_abs_err=%.6e cos=%.9f\n", rows,
+                    cols, nb, (int)preshuffled, (int)accum, (int)repeat_same_stream, max_abs_err,
+                    cos_sim);
+        assert(max_abs_err <= 2e-3);
+        assert(cos_sim > 0.999999);
+
+        (void)hipFree(d_w);
+        if (d_w_ps) (void)hipFree(d_w_ps);
+        (void)hipFree(d_sw);
+        (void)hipFree(d_x);
+        (void)hipFree(d_sx);
+        (void)hipFree(d_y);
+      };
+
+      // B1 prefill large-N checks (Full and tail N, row-major and preshuffled).
+      run_fp8_case(5120u, 1536u, 256u, false, false, false);
+      run_fp8_case(5120u, 1536u, 256u, true, false, false);
+      run_fp8_case(5120u, 1536u, 512u, true, false, false);
+      run_fp8_case(5120u, 1536u, 260u, false, false, false);
+      run_fp8_case(5120u, 1536u, 260u, true, false, false);
+
+      // B2 narrow decode + split-K (accum=false and accum=true + consecutive counter reset).
+      run_fp8_case(5120u, 1152u, 1u, false, false, false);
+      run_fp8_case(5120u, 1152u, 6u, false, true, false);
+      run_fp8_case(1024u, 1152u, 1u, false, false, true);
+      run_fp8_case(1024u, 1152u, 6u, false, true, true);
+      run_fp8_case(1024u, 1152u, 6u, true, true, true);
+      run_fp8_case(1536u, 1152u, 4u, false, true, true);
+      run_fp8_case(1024u, 1536u, 5u, false, true, true);
+
+      // B2 grouped multi-job narrow + split-K + counter reset check.
+      for (int ps_mode = 0; ps_mode <= 1; ++ps_mode) {
+        const bool preshuffled = (ps_mode != 0);
+        const uint32_t jrows[2] = {512u, 512u};
+        const uint32_t cols = 1152u, nb = 4u, total = jrows[0] + jrows[1];
+        const uint32_t sc_cols = cols / 128u;
+        std::vector<uint8_t> h_w0((size_t)jrows[0] * cols), h_w1((size_t)jrows[1] * cols);
+        std::vector<uint8_t> h_sw0((size_t)(jrows[0] / 128u) * sc_cols),
+            h_sw1((size_t)(jrows[1] / 128u) * sc_cols);
+        std::vector<uint8_t> h_x((size_t)nb * cols);
+        std::vector<float> h_sx((size_t)nb * sc_cols);
+        std::vector<float> h_y_gpu((size_t)total * nb, 0.0f);
+        for (size_t i = 0; i < h_w0.size(); ++i) h_w0[i] = make_e4m3(i + 31u);
+        for (size_t i = 0; i < h_w1.size(); ++i) h_w1[i] = make_e4m3(i + 99991u);
+        for (size_t i = 0; i < h_sw0.size(); ++i) h_sw0[i] = make_ue8m0(i + 1u);
+        for (size_t i = 0; i < h_sw1.size(); ++i) h_sw1[i] = make_ue8m0(i + 7u);
+        for (size_t i = 0; i < h_x.size(); ++i) h_x[i] = make_e4m3(i + 500009u);
+        for (uint32_t b = 0; b < nb; ++b)
+          for (uint32_t kb = 0; kb < sc_cols; ++kb)
+            h_sx[(size_t)b * sc_cols + kb] = 0.5f * (float)(1u + ((b + kb) % 3u));
+
+        uint8_t *d_w0 = nullptr, *d_w1 = nullptr, *d_ps0 = nullptr, *d_ps1 = nullptr;
+        uint8_t *d_sw0 = nullptr, *d_sw1 = nullptr, *d_x = nullptr;
+        float *d_sx = nullptr, *d_y = nullptr;
+        assert(hipMalloc(&d_w0, h_w0.size()) == hipSuccess);
+        assert(hipMalloc(&d_w1, h_w1.size()) == hipSuccess);
+        assert(hipMalloc(&d_sw0, h_sw0.size()) == hipSuccess);
+        assert(hipMalloc(&d_sw1, h_sw1.size()) == hipSuccess);
+        assert(hipMalloc(&d_x, h_x.size()) == hipSuccess);
+        assert(hipMalloc(&d_sx, h_sx.size() * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_y, h_y_gpu.size() * sizeof(float)) == hipSuccess);
+        assert(hipMemcpy(d_w0, h_w0.data(), h_w0.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_w1, h_w1.data(), h_w1.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sw0, h_sw0.data(), h_sw0.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sw1, h_sw1.data(), h_sw1.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_x, h_x.data(), h_x.size(), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(d_sx, h_sx.data(), h_sx.size() * sizeof(float), hipMemcpyHostToDevice) ==
+               hipSuccess);
+        assert(hipMemset(d_y, 0, h_y_gpu.size() * sizeof(float)) == hipSuccess);
+        if (preshuffled) {
+          assert(hipMalloc(&d_ps0, h_w0.size()) == hipSuccess);
+          assert(hipMalloc(&d_ps1, h_w1.size()) == hipSuccess);
+          aff::preshuffle_fp8_hip(d_w0, d_ps0, jrows[0], cols, nullptr);
+          aff::preshuffle_fp8_hip(d_w1, d_ps1, jrows[1], cols, nullptr);
+        }
+
+        aff::BatchGemmJob jobs[2] = {
+            {preshuffled ? d_ps0 : d_w0, d_sw0, d_y, jrows[0], 0u, 0u},
+            {preshuffled ? d_ps1 : d_w1, d_sw1, d_y + (size_t)jrows[0] * nb, jrows[1], 0u, 0u},
+        };
+        assert(aff::batch_gemm_fp8_multi_hip(jobs, 2u, d_x, d_sx, cols, nb, 0u, 0u, nullptr,
+                                             preshuffled));
+        assert(aff::batch_gemm_fp8_multi_hip(jobs, 2u, d_x, d_sx, cols, nb, 0u, 0u, nullptr,
+                                             preshuffled));
+        assert(hipDeviceSynchronize() == hipSuccess);
+        assert(hipMemcpy(h_y_gpu.data(), d_y, h_y_gpu.size() * sizeof(float),
+                         hipMemcpyDeviceToHost) == hipSuccess);
+
+        double max_abs_err = 0.0;
+        for (uint32_t ji = 0; ji < 2u; ++ji) {
+          const auto& hw = (ji == 0u) ? h_w0 : h_w1;
+          const auto& hsw = (ji == 0u) ? h_sw0 : h_sw1;
+          const size_t y_off = (ji == 0u) ? 0u : (size_t)jrows[0] * nb;
+          for (uint32_t r = 0; r < jrows[ji]; ++r) {
+            const uint32_t sr = r >> 7;
+            for (uint32_t b = 0; b < nb; ++b) {
+              float ref = 0.0f;
+              for (uint32_t kb = 0; kb < sc_cols; ++kb) {
+                float blk = 0.0f;
+                for (uint32_t k = 0; k < 128u; ++k) {
+                  blk += e4m3_to_f32_cpu(hw[(size_t)r * cols + kb * 128u + k]) *
+                         e4m3_to_f32_cpu(h_x[(size_t)b * cols + kb * 128u + k]);
+                }
+                ref += blk * (ue8m0_to_f32_cpu(hsw[(size_t)sr * sc_cols + kb]) *
+                              h_sx[(size_t)b * sc_cols + kb]);
+              }
+              const double err = std::fabs((double)h_y_gpu[y_off + (size_t)r * nb + b] - (double)ref);
+              if (err > max_abs_err) max_abs_err = err;
+            }
+          }
+        }
+        std::printf("  fp8_multi(512+512, 1152, 4, ps=%d): max_abs_err=%.6e\n", (int)preshuffled,
+                    max_abs_err);
+        assert(max_abs_err <= 2e-3);
+
+        (void)hipFree(d_w0);
+        (void)hipFree(d_w1);
+        if (d_ps0) (void)hipFree(d_ps0);
+        if (d_ps1) (void)hipFree(d_ps1);
+        (void)hipFree(d_sw0);
+        (void)hipFree(d_sw1);
+        (void)hipFree(d_x);
+        (void)hipFree(d_sx);
+        (void)hipFree(d_y);
+      }
+
+      std::printf("PASS: FP8 prefill 4x2 (B1) + inline split-K parity (B2)\n");
   }
 
   std::printf("ALL WAVE 2 PHASE 2B KERNEL TESTS PASSED.\n");
