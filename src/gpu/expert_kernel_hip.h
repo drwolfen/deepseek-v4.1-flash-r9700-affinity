@@ -225,7 +225,7 @@ struct ExpertTile {
 void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t max_nt,
                           const uint8_t* x8, const float* xs, const float* cb, uint32_t rows,
                           uint32_t cols, float wscale, void* stream = nullptr,
-                          bool y_bf16 = false);
+                          bool y_bf16 = false, bool allow_recon = true);
 
 void expert_set_recon_tiles(uint32_t max_tiles);
 uint32_t expert_recon_tiles();

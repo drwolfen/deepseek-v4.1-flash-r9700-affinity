@@ -442,11 +442,12 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   // Occupancy is a floor division, so the saved bytes are worth nothing unless they move the
   // quotient — while the ordering cost is paid either way. The predicate below enables the single
   // buffer only where it actually crosses a step.
-  constexpr uint32_t kLdsRest = kLutW * 4u + 2u * kBSz + kEPad;
+  constexpr uint32_t kLdsRest = kLutW * 4u + 2u * kBSz + NT * 16u * 4u + kEPad;
   constexpr bool kSingleA = kSingleAWanted &&
       kWgpLds / (kLdsRest + kASz) > kWgpLds / (kLdsRest + 2 * kASz);
   alignas(16) __shared__ uint8_t s_a_all[(kSingleA ? 1 : 2) * kASz];
   alignas(16) __shared__ uint8_t s_b_all[2 * kBSz + kEPad];
+  __shared__ uint32_t s_tok[NT * 16];
 
   const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
   const uint32_t m0 = blockIdx.x * kEM;
@@ -471,6 +472,9 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
       lut2[e] = (uint16_t)e4m3_pack2(cb[var * 64 + code * 2 + 0] * f,
                                      cb[var * 64 + code * 2 + 1] * f);
     }
+  }
+  for (uint32_t sn = tid; sn < NT * 16u; sn += kEThreads) {
+    s_tok[sn] = (sn < nt) ? (tok ? as_global(tok)[sn] : sn) : 0u;
   }
 
   // `raw` is written before it is read on every iteration of the K loop below — the first WMMA of a
@@ -515,7 +519,52 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   // Non-temporal on the CODE and FIELD planes only, and not on `x8`/`xs`/`cb`. Caching is not
   // arithmetic, so the output hash must not move across this change.
   auto ld_nt = [](const auto* p) { return __builtin_nontemporal_load(p); };
-  auto stage_a = [&](uint32_t buf, uint32_t c0) {
+  // NAMED SCALARS, NOT AN ARRAY. `uint32_t cw[5]` indexed by an unrolled `bb` looks like it
+  // must fold and does not — it lands in scratch and costs a double-digit percentage of the
+  // kernel. Check ScratchSize in `-Rpass-analysis=kernel-resource-usage` before changing this.
+  constexpr bool kWide = kETPR == 1 && kEBPT == 4;
+  constexpr bool kHalfTR = TR && (kETPR == 2 && kEBPT == 2);
+  constexpr bool kPrefA = kSingleA && (FMT == kFmtQuad2S) && (kWide || kHalfTR);
+  using u16_ua = uint16_t __attribute__((aligned(1)));
+  struct PrefA { uint32_t w0, w1, w2, w3, w4, f01, f2; };
+
+  auto load_a_regs = [&](uint32_t c0) -> PrefA {
+    PrefA p{};
+    const uint32_t row = m0 + sm;
+    if (row < rows) {
+      if constexpr (kWide) {
+        const AFF_GLOBAL uint8_t* cp0;
+        const AFF_GLOBAL uint8_t* fp0;
+        if constexpr (TR) {
+          const size_t g = (size_t)(c0 / kEK) * rows + row;
+          cp0 = as_global(data + g * (kEK / 16 * 5) + (size_t)sblk * 5);
+          fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
+        } else {
+          const uint32_t b0 = (c0 >> 4) + sblk;
+          cp0 = as_global(data + (size_t)row * code_bytes_row) + (size_t)b0 * 5;
+          fp0 = as_global(fields + (size_t)row * field_bytes_row) + (size_t)b0 * 6 / 8;
+        }
+        const auto* cp32 = (const AFF_GLOBAL uint32_t*)cp0;
+        p.w0 = ld_nt(&cp32[0]); p.w1 = ld_nt(&cp32[1]); p.w2 = ld_nt(&cp32[2]);
+        p.w3 = ld_nt(&cp32[3]); p.w4 = ld_nt(&cp32[4]);
+        p.f01 = (uint32_t)ld_nt((const AFF_GLOBAL u16_ua*)fp0);
+        p.f2  = (uint32_t)ld_nt(&fp0[2]);
+      } else if constexpr (kHalfTR) {
+        const size_t g = (size_t)(c0 / kEK) * rows + row;
+        const auto* g32 = (const AFF_GLOBAL uint32_t*)as_global(data + g * (kEK / 16 * 5));
+        const auto* gp = g32 + (sblk ? 2u : 0u);
+        p.w0 = ld_nt(&gp[0]); p.w1 = ld_nt(&gp[1]); p.w2 = ld_nt(&gp[2]);
+        if (sblk == 0u) {
+          const AFF_GLOBAL uint8_t* fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
+          p.f01 = (uint32_t)ld_nt((const AFF_GLOBAL u16_ua*)fp0);
+          p.f2  = (uint32_t)ld_nt(&fp0[2]);
+        }
+      }
+    }
+    return p;
+  };
+
+  auto decode_store_a = [&](uint32_t buf, uint32_t c0, const PrefA& p) {
     uint8_t* const s_a = s_a_all + (size_t)(kSingleA ? 0u : buf) * kASz;
 
     // ---- A: decode 32 weights (two 16-column blocks) a thread, straight into LDS as E4M3.
@@ -530,18 +579,22 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
         // kETPR threads that split the group, so `fsh0` picks out this thread's share rather than
         // the address doing it. That retires the straddle branch at MT=1 too: at kETPR=2 a thread's
         // two 6-bit fields start 12 bits into the group, which is not a byte, but it is a shift.
-        const AFF_GLOBAL uint8_t* cp0;
-        const AFF_GLOBAL uint8_t* fp0;
-        uint32_t fsh0;
-        if constexpr (TR) {
-          const size_t g = (size_t)(c0 / kEK) * rows + row;
-          cp0 = as_global(data + g * (kEK / 16 * 5) + (size_t)sblk * 5);
-          fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
+        const AFF_GLOBAL uint8_t* cp0 = nullptr;
+        const AFF_GLOBAL uint8_t* fp0 = nullptr;
+        uint32_t fsh0 = 0;
+        if constexpr (!kWide && !kHalfTR) {
+          if constexpr (TR) {
+            const size_t g = (size_t)(c0 / kEK) * rows + row;
+            cp0 = as_global(data + g * (kEK / 16 * 5) + (size_t)sblk * 5);
+            fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
+            fsh0 = sblk * 6;
+          } else {
+            cp0 = as_global(data + (size_t)row * code_bytes_row) + (size_t)b0 * 5;
+            fp0 = as_global(fields + (size_t)row * field_bytes_row) + (size_t)b0 * 6 / 8;
+            fsh0 = 0;
+          }
+        } else if constexpr (TR) {
           fsh0 = sblk * 6;
-        } else {
-          cp0 = as_global(data + (size_t)row * code_bytes_row) + (size_t)b0 * 5;
-          fp0 = as_global(fields + (size_t)row * field_bytes_row) + (size_t)b0 * 6 / 8;
-          fsh0 = 0;
         }
 
         // The two loads, widened. A thread's kEBPT blocks are consecutive and both planes are packed
@@ -556,38 +609,16 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
         // and is exactly 3 bytes wide, which retires both the straddle branch and the one-byte plane
         // overrun it existed to avoid.
         //
-        // NAMED SCALARS, NOT AN ARRAY. `uint32_t cw[5]` indexed by an unrolled `bb` looks like it
-        // must fold and does not — it lands in scratch and costs a double-digit percentage of the
-        // kernel. Check ScratchSize in `-Rpass-analysis=kernel-resource-usage` before changing this.
         // Under TR the same five dwords are still one aligned span, so the widened load survives the
         // reorder untouched.
-        constexpr bool kWide = kETPR == 1 && kEBPT == 4;
-        constexpr bool kHalfTR = TR && (kETPR == 2 && kEBPT == 2);
-        uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0, w4 = 0, f24 = 0;
-        if (kWide) {
-          const auto* cp32 = (const AFF_GLOBAL uint32_t*)cp0;
-          w0 = ld_nt(&cp32[0]); w1 = ld_nt(&cp32[1]); w2 = ld_nt(&cp32[2]);
-          w3 = ld_nt(&cp32[3]); w4 = ld_nt(&cp32[4]);
-        } else if (kHalfTR) {
-          const size_t g = (size_t)(c0 / kEK) * rows + row;
-          const auto* g32 = (const AFF_GLOBAL uint32_t*)as_global(data + g * (kEK / 16 * 5));
-          const auto* g16 = (const AFF_GLOBAL uint16_t*)g32;
-          if (sblk == 0u) {
-            w0 = ld_nt(&g32[0]); w1 = ld_nt(&g32[1]); w2 = (uint32_t)ld_nt(&g16[4]);
-          } else {
-            w0 = (uint32_t)ld_nt(&g16[5]); w1 = ld_nt(&g32[3]); w2 = ld_nt(&g32[4]);
-          }
-        }
+        const uint32_t w0 = p.w0, w1 = p.w1, w2 = p.w2, w3 = p.w3, w4 = p.w4;
+        uint32_t f24 = p.f01 | (p.f2 << 16);
         // Row-major reaches this only when kWide made 6*b0 a multiple of 24; TR always can, because
         // the group's three bytes are a unit by construction.
         if constexpr (kHalfTR) {
-          if (sblk == 0u) {
-            f24 = (uint32_t)ld_nt(&fp0[0]) | ((uint32_t)ld_nt(&fp0[1]) << 8) |
-                  ((uint32_t)ld_nt(&fp0[2]) << 16);
-          }
           const uint32_t f24_partner = aff::dpp_xor_lane<1u>(f24);
           if (sblk != 0u) f24 = f24_partner;
-        } else if constexpr (kWide || TR) {
+        } else if constexpr (!kWide && TR) {
           f24 = (uint32_t)ld_nt(&fp0[0]) | ((uint32_t)ld_nt(&fp0[1]) << 8) |
                 ((uint32_t)ld_nt(&fp0[2]) << 16);
         }
@@ -608,10 +639,10 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
             if (sblk == 0u) {
               win = (bb == 0u)
                         ? ((uint64_t)w0 | ((uint64_t)(w1 & 0xFFu) << 32))
-                        : ((uint64_t)(w1 >> 8) | ((uint64_t)w2 << 24));
+                        : ((uint64_t)(w1 >> 8) | ((uint64_t)(w2 & 0xFFFFu) << 24));
             } else {
               win = (bb == 0u)
-                        ? ((uint64_t)w0 | ((uint64_t)(w1 & 0xFFFFFFu) << 16))
+                        ? ((uint64_t)(w0 >> 16) | ((uint64_t)(w1 & 0xFFFFFFu) << 16))
                         : ((uint64_t)(w1 >> 24) | ((uint64_t)w2 << 8));
             }
           } else if (TR) {
@@ -686,6 +717,10 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     }
   };
 
+  auto stage_a = [&](uint32_t buf, uint32_t c0) {
+    decode_store_a(buf, c0, load_a_regs(c0));
+  };
+
   auto stage_b = [&](uint32_t buf, uint32_t c0) {
     uint8_t* const s_b = s_b_all + (size_t)buf * kBSz;
     // ---- B: the activation, already E4M3 and token-major, so a pure copy. Strided over
@@ -696,7 +731,7 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
       uint4 v = make_uint4(0, 0, 0, 0), w = make_uint4(0, 0, 0, 0);
       if (live) {
         // One indirection: an expert owns an arbitrary subset of the chunk's tokens.
-        const auto* p = as_global(x8 + (size_t)(tok ? as_global(tok)[sn] : sn) * cols + c0 + sk);
+        const auto* p = as_global(x8 + (size_t)s_tok[sn] * cols + c0 + sk);
         v = *(const AFF_GLOBAL uint4*)p;
         w = *(const AFF_GLOBAL uint4*)(p + 16);
       }
@@ -845,22 +880,29 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     float xs_cur[NT];
 #pragma unroll
     for (uint32_t j = 0; j < NT; ++j) xs_cur[j] = xrow[j][kb];
+    PrefA p1{};
     if (c0 + kEK < cols) {
-      if constexpr (!kSingleA) stage_a(1, c0 + kEK);
+      if constexpr (kPrefA) p1 = load_a_regs(c0 + kEK);
+      else if constexpr (!kSingleA) stage_a(1, c0 + kEK);
       stage_b(1, c0 + kEK);
     }
     mma_half(0, /*init=*/true, xs_cur);
     // A tail half-block only happens if `cols` is not a multiple of 128, which no shipped shape is
     // — `sc_cols = cols >> 7` above already assumes it. The guard is a guard, not a path.
     if (c0 + kEK < cols) {
-      if constexpr (kSingleA) stage_a(1, c0 + kEK);
+      if constexpr (kPrefA) decode_store_a(1, c0 + kEK, p1);
+      else if constexpr (kSingleA) stage_a(1, c0 + kEK);
       aff::lds_barrier();
+      PrefA p0{};
       if (c0 + 128 < cols) {
-        if constexpr (!kSingleA) stage_a(0, c0 + 128);
+        if constexpr (kPrefA) p0 = load_a_regs(c0 + 128);
+        else if constexpr (!kSingleA) stage_a(0, c0 + 128);
         stage_b(0, c0 + 128);
       }
       mma_half(1, /*init=*/false, xs_cur);
-      if constexpr (kSingleA) {
+      if constexpr (kPrefA) {
+        if (c0 + 128 < cols) decode_store_a(0, c0 + 128, p0);
+      } else if constexpr (kSingleA) {
         if (c0 + 128 < cols) stage_a(0, c0 + 128);
       }
     }
@@ -1039,19 +1081,51 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
   }
 }
 
-// One block a dim. Reads the whole contiguous `total`-wide row -- scattered within it, but every
-// byte of it is used by the block, so cache serves the order -- and writes consecutive tokens.
-__global__ void expert_scatter_slots_kernel(const uint16_t* __restrict__ y, float* __restrict__ block,
-                                            const uint32_t* __restrict__ ord,
-                                            const uint32_t* __restrict__ run, uint32_t nb_tok,
-                                            uint32_t nb_stride, uint32_t total) {
-  const uint16_t* __restrict__ row = y + (size_t)blockIdx.x * total;
+// Decode scatter: one WG of 64 dims per token so `run[t]`, `run[t+1]`, and `ord[i]` are
+// wave-uniform across all 64 adjacent dims.
+__global__ void expert_scatter_slots_dec_kernel(const uint16_t* __restrict__ y,
+                                                float* __restrict__ block,
+                                                const uint32_t* __restrict__ ord,
+                                                const uint32_t* __restrict__ run, uint32_t dim,
+                                                uint32_t nb_stride, uint32_t total) {
+  const uint32_t d = blockIdx.x * 64u + threadIdx.x;
+  if (d >= dim) return;
+  const uint32_t t = blockIdx.y;
+  const uint32_t a = run[t], b = run[t + 1];
+  if (a == b) return;
+  const uint16_t* __restrict__ row = y + (size_t)d * total;
+  float acc = 0.0f;
+  for (uint32_t i = a; i < b; ++i) acc += bf16_to_f32_dev(row[ord[i]]);
+  block[(size_t)d * nb_stride + t] += acc;
+}
+
+// Prefill scatter: each WG of 256 threads owns `D` adjacent dims so `run[t]`, `run[t+1]`, and
+// `ord[i]` are loaded once across `D` rows while token stores remain coalesced.
+template <uint32_t D>
+__global__ void expert_scatter_slots_wide_kernel(const uint16_t* __restrict__ y,
+                                                 float* __restrict__ block,
+                                                 const uint32_t* __restrict__ ord,
+                                                 const uint32_t* __restrict__ run, uint32_t dim,
+                                                 uint32_t nb_tok, uint32_t nb_stride,
+                                                 uint32_t total) {
+  const uint32_t d0 = blockIdx.x * D;
   for (uint32_t t = threadIdx.x; t < nb_tok; t += blockDim.x) {
     const uint32_t a = run[t], b = run[t + 1];
     if (a == b) continue;
-    float acc = 0.0f;
-    for (uint32_t i = a; i < b; ++i) acc += bf16_to_f32_dev(row[ord[i]]);
-    block[(size_t)blockIdx.x * nb_stride + t] += acc;
+    float acc[D];
+#pragma unroll
+    for (uint32_t k = 0; k < D; ++k) acc[k] = 0.0f;
+    for (uint32_t i = a; i < b; ++i) {
+      const uint32_t slot = ord[i];
+#pragma unroll
+      for (uint32_t k = 0; k < D; ++k) {
+        if (d0 + k < dim) acc[k] += bf16_to_f32_dev(y[(size_t)(d0 + k) * total + slot]);
+      }
+    }
+#pragma unroll
+    for (uint32_t k = 0; k < D; ++k) {
+      if (d0 + k < dim) block[(size_t)(d0 + k) * nb_stride + t] += acc[k];
+    }
   }
 }
 
@@ -3053,8 +3127,15 @@ void expert_scatter_slots_hip(const uint16_t* y, float* block, const uint32_t* o
                               const uint32_t* run, uint32_t dim, uint32_t nb_tok,
                               uint32_t nb_stride, uint32_t total, void* stream) {
   if (!dim || !nb_tok || !total) return;
-  hipLaunchKernelGGL(expert_scatter_slots_kernel, dim3(dim), dim3(256), 0, (hipStream_t)stream, y,
-                     block, ord, run, nb_tok, nb_stride, total);
+  if (nb_tok <= 32u) {
+    hipLaunchKernelGGL(expert_scatter_slots_dec_kernel, dim3((dim + 63u) / 64u, nb_tok),
+                       dim3(64), 0, (hipStream_t)stream, y, block, ord, run, dim, nb_stride,
+                       total);
+  } else {
+    hipLaunchKernelGGL((expert_scatter_slots_wide_kernel<4u>), dim3((dim + 3u) / 4u),
+                       dim3(256), 0, (hipStream_t)stream, y, block, ord, run, dim, nb_tok,
+                       nb_stride, total);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -3295,10 +3376,15 @@ uint32_t expert_recon_tiles() {
 
 void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t max_nt,
                           const uint8_t* x8, const float* xs, const float* cb, uint32_t rows,
-                          uint32_t cols, float wscale, void* stream, bool y_bf16) {
+                          uint32_t cols, float wscale, void* stream, bool y_bf16,
+                          bool allow_recon) {
   if (!n_tiles) return;
   const uint32_t ntiles = (max_nt + 15) / 16;
-  const uint32_t rcap = expert_recon_tiles();
+  static const bool recon_devplan = [] {
+    const char* s = std::getenv("AFF_MOE_RECON_DEVPLAN");
+    return s && *s && std::strcmp(s, "0") != 0;
+  }();
+  const uint32_t rcap = (allow_recon || recon_devplan) ? expert_recon_tiles() : 0u;
   // Gate tile-chunking on ntiles > 1 (wide prefill buckets). At decode (max_nt <= 16, ntiles == 1),
   // moe_plan pads n_tiles to cap (e.g. 36) with nt == 0 dummy tiles, so splitting at rcap == 32
   // issues a second launch per plane just to early-return on 4 empty tiles (+480 launches/step).

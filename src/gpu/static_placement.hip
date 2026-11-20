@@ -2136,17 +2136,21 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       for (uint32_t b = 4; b < 8; ++b) {
         if (!GRP.n[b]) continue;
         expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
-                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true);
+                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true,
+                             /*allow_recon=*/!plan_on);
         expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], q8_ptr,
-                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true);
+                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true,
+                             /*allow_recon=*/!plan_on);
       } }
       { AFF_XTRACE((int)dv, 3, st);
       for (uint32_t b = 0; b < 4; ++b) {
         if (!GRP.n[b]) continue;
         expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
-                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true);
+                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true,
+                             /*allow_recon=*/!plan_on);
         expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], q8_ptr,
-                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true);
+                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true,
+                             /*allow_recon=*/!plan_on);
       } }
       if (split) {
         // AFF_MOE_SINGLE_JOIN (#983, #984):
@@ -2189,13 +2193,15 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       for (uint32_t b = 4; b < 8; ++b) {
         if (!GRP.n[b]) continue;
         expert_gemm_wmma_hip(GRP.base[b][2], GRP.n[b], GRP.max_nt[b], (const uint8_t*)ba8_[dv],
-                             (const float*)bas_[dv], I.d_cb[dv], hidden, inter, 1.0f, hyb, /*y_bf16=*/true);
+                             (const float*)bas_[dv], I.d_cb[dv], hidden, inter, 1.0f, hyb, /*y_bf16=*/true,
+                             /*allow_recon=*/!plan_on);
       } }
       { AFF_XTRACE((int)dv, 5, st);
       for (uint32_t b = 0; b < 4; ++b) {
         if (!GRP.n[b]) continue;
         expert_gemm_wmma_hip(GRP.base[b][2], GRP.n[b], GRP.max_nt[b], (const uint8_t*)ba8_[dv],
-                             (const float*)bas_[dv], I.d_cb[dv], hidden, inter, 1.0f, st, /*y_bf16=*/true);
+                             (const float*)bas_[dv], I.d_cb[dv], hidden, inter, 1.0f, st, /*y_bf16=*/true,
+                             /*allow_recon=*/!plan_on);
       } }
       if (split) {
         AFF_HIP_CHECK(hipEventRecord(I.ev_dn[dv][es], hyb));
