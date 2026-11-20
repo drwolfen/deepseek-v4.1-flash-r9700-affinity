@@ -760,6 +760,7 @@ int main() {
       const FuseCase fcases[] = {
           {1u, 8u, true, false, 0u, 0u},
           {4u, 8u, true, true, 1u, 2u},
+          {5u, 8u, true, true, 1u, 3u},
           {6u, 8u, true, true, 0u, 6u},
           {16u, 4u, true, true, 2u, 8u},
           {6u, 8u, false, false, 0u, 0u},
@@ -788,7 +789,7 @@ int main() {
 
       for (const FuseCase& fc : fcases) {
         const size_t nh_hc = (size_t)fc.nh * E * nb;
-        std::vector<uint16_t> h_hc(nh_hc);
+        std::vector<uint16_t> h_hc(nh_hc), h_poison(nh_hc, 0x7FC0u);
         std::vector<float> h_blk0(max_blk), h_blk1(max_blk), h_post((size_t)fc.nh * nb),
             h_comb((size_t)fc.nh * fc.nh * nb);
         for (size_t i = 0; i < nh_hc; ++i)
@@ -811,7 +812,8 @@ int main() {
           const auto& hb = (r == 0) ? h_blk0 : h_blk1;
           assert(hipMemcpy(d_hc[r], h_hc.data(), nh_hc * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
           assert(hipMemcpy(d_out_ref[r], h_hc.data(), nh_hc * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
-          assert(hipMemcpy(d_out_fuse[r], h_hc.data(), nh_hc * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+          const uint16_t* const fuse_init = fc.ctl ? h_poison.data() : h_hc.data();
+          assert(hipMemcpy(d_out_fuse[r], fuse_init, nh_hc * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
           assert(hipMemcpy(d_blk_ref[r], hb.data(), max_blk * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
           assert(hipMemcpy(d_blk_fuse[r], hb.data(), max_blk * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
           assert(hipMemcpy(d_post[r], h_post.data(), h_post.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
@@ -858,13 +860,19 @@ int main() {
           for (float v : bzero) assert(v == 0.0f);
           if (fc.ctl) {
             for (uint32_t h = 0; h < fc.nh; ++h)
-              for (uint32_t d = 0; d < E; ++d)
+              for (uint32_t d = 0; d < E; ++d) {
                 for (uint32_t b = 0; b < fc.live; ++b)
                   assert(href[((size_t)h * E + d) * nb + b] == hfuse[((size_t)h * E + d) * nb + b]);
+                for (uint32_t b = fc.live; b < nb; ++b)
+                  assert(hfuse[((size_t)h * E + d) * nb + b] == 0u);
+              }
           } else {
-            for (uint32_t d = 0; d < E; ++d)
+            for (uint32_t d = 0; d < E; ++d) {
               for (uint32_t b = 0; b < fc.live; ++b)
                 assert(href[(size_t)d * nb + b] == hfuse[(size_t)d * nb + b]);
+              for (uint32_t b = fc.live; b < nb; ++b)
+                assert(hfuse[(size_t)d * nb + b] == 0u);
+            }
           }
           if (fc.tap) {
             assert(hipMemcpy(tref.data(), d_tap_ref[r], tap_elems * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);

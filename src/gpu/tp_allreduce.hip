@@ -751,13 +751,20 @@ __global__ void tp_ar_batch_hc_expand_kernel(
     }
   }
 
-  if (zb && live < nb) {
+  if (live < nb) {
     const uint32_t pad = nb - live;
     const size_t ptot = (size_t)(d1 - d0) * pad;
     for (size_t pidx = tid; pidx < ptot; pidx += nt) {
       const uint32_t d = d0 + (uint32_t)(pidx / pad);
       const uint32_t tok = live + (uint32_t)(pidx % pad);
-      block[(size_t)d * nb + tok] = 0.0f;
+      if (zb) block[(size_t)d * nb + tok] = 0.0f;
+      if constexpr (HasControl) {
+#pragma unroll
+        for (uint32_t dst = 0; dst < NH; ++dst)
+          out_hc[((size_t)dst * n_embd + d) * nb + tok] = 0u;
+      } else {
+        out_hc[(size_t)d * nb + tok] = 0u;
+      }
     }
   }
 }
