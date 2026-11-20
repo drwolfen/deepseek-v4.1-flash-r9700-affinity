@@ -131,6 +131,11 @@ void batch_quant_fp8_hip(const float* x, uint8_t* out, float* scales, uint32_t d
 void batch_swiglu_quant_fp8_hip(const float* g, const float* u, uint8_t* out, float* scales,
                                 uint32_t dim, uint32_t nb, float limit, void* stream = nullptr);
 
+// Quantise a token-major [nb][dim] f32 buffer directly into token-major E4M3 + per-(token,
+// 128-column) scale without a transpose pass. Requires dim % 128 == 0.
+void batch_quant_tm_fp8_hip(const float* src, uint8_t* out, float* scales, uint32_t dim,
+                            uint32_t nb, void* stream = nullptr);
+
 // Permute an E4M3 weight into the order the WMMA fragment wants, once at load. This is
 // vllm-radiance's shuffle_weight(w, (16,16)) and it is what `batch_gemm_fp8_hip` expects `W` to be
 // in. `dst` is the same size as `src`; rows and cols must both be multiples of 16.

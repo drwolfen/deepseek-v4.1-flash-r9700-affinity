@@ -250,6 +250,7 @@ struct StageRing {
 // ring bytes into decode time needs the VRAM-to-decode rate, which FLATTENS as the hit rate rises —
 // do not treat it as a constant when re-deriving these.
 constexpr size_t kRingPlaneBudget = 16u << 20;   // strides that scale with tokens x n_embd
+constexpr size_t kEngRingBudget   = 32u << 20;   // 512 x in_dim Engram tile fits >=2 ring slots
 constexpr size_t kRingCountBudget =  4u << 20;   // strides that scale with tokens alone
 
 // Headroom kept free when an allocation is sized against hipMemGetInfo. The driver's own working
@@ -877,6 +878,14 @@ bool DenseGpu::shexp_collect_cb(void* ctx, float* out, uint64_t hidden) {
 // rows, because W8A8 loses there) and idx_wq_b (its own kernels in indexer_gpu.hip).
 //
 // Everything that reads these bytes as rows aborts rather than proceeding; see `shard_rows`.
+inline bool engram_fp8_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_ENGRAM_FP8");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
 bool DenseGpu::ps_for(const char* name) {
   if (!name) return false;
   const char* s = std::strrchr(name, '.');
@@ -886,6 +895,7 @@ bool DenseGpu::ps_for(const char* name) {
   // kernel. The cost is that the draft's three stages lose the wq_a+wkv fusion — three launches a
   // block — against putting draft_kv on W8A8, which moves the emitted text. See draft_kv.
   if (!std::strcmp(s, "attn_kv") && !std::strncmp(name, "mtp.", 4)) return false;
+  if (!std::strcmp(s, "engram_wkv")) return engram_fp8_enabled();
   for (const char* w : {"attn_q_a", "attn_q_b", "attn_kv", "attn_out_b", "shexp_gate", "shexp_up",
                         "shexp_down"})
     if (!std::strcmp(s, w)) return true;
@@ -1085,7 +1095,11 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
                                     sh_sc_cols, s.nrows / 128, hipMemcpyHostToDevice));
         }
       }
-      if (ps_for(name) && quant == AFF_FP8_E4M3 && (s.nrows % 16) == 0 && (s.ncols % 16) == 0) {
+      const char* s_leaf = name ? std::strrchr(name, '.') : nullptr;
+      s_leaf = s_leaf ? s_leaf + 1 : (name ? name : "");
+      const bool eng_ok = std::strcmp(s_leaf, "engram_wkv") != 0 || (s.ncols % 128u) == 0u;
+      if (ps_for(name) && quant == AFF_FP8_E4M3 && (s.nrows % 16) == 0 && (s.ncols % 16) == 0 &&
+          eng_ok) {
         void* tmp = nullptr;
         if (hipMalloc(&tmp, nbytes) != hipSuccess) return -1;
         AFF_HIP_CHECK(hipMemcpy(tmp, s.data, nbytes, hipMemcpyDeviceToDevice));
@@ -5003,7 +5017,7 @@ bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t
       const uint32_t nt = std::min(tile, n - off);
       const float* const slice_rows = rows + (size_t)off * in_dim;
       const size_t row_bytes = (size_t)in_dim * nt * sizeof(float);
-      if (D.eng.fit(row_bytes, kRingPlaneBudget)) {
+      if (D.eng.fit(row_bytes, kEngRingBudget)) {
         uint32_t es = 0;
         uint8_t* const pin = D.eng.claim(&es);
         AFF_BLOCK_AT(aff::BlockSite::Begin, AFF_HIP_CHECK(D.eng.wait(es)));
@@ -5013,13 +5027,24 @@ bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t
       } else {
         AFF_HIP_CHECK(hipMemcpyAsync(D.e_stage, slice_rows, row_bytes, hipMemcpyHostToDevice, st));
       }
-      const float* x = D.e_stage;
-      if (nt > 1u) {                       // token-major -> dim-major; the identity at one token
-        batch_transpose_hip(D.e_stage, D.e_in, nt, in_dim, 1, st);
-        x = D.e_in;
+      if (engram_fp8_enabled() && e.quant == AFF_FP8_E4M3 && (in_dim % 128u) == 0u) {
+        // D.e_stage is already token-major [nt][in_dim]: quantize directly into D.e_in (holding
+        // [nt][in_dim] E4M3 + scales) and run W8A8 batch_gemm_fp8_hip without any transpose.
+        uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.e_in);
+        const size_t qs_off = ((size_t)nt * in_dim + 15u) & ~size_t(15);
+        float* const eqs = reinterpret_cast<float*>(eq8 + qs_off);
+        batch_quant_tm_fp8_hip(D.e_stage, eq8, eqs, in_dim, nt, st);
+        batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, D.e_out,
+                           (uint32_t)out_dim, in_dim, nt, 0u, 0u, st, e.sh[d].ps);
+      } else {
+        const float* x = D.e_stage;
+        if (nt > 1u) {                       // token-major -> dim-major; the identity at one token
+          batch_transpose_hip(D.e_stage, D.e_in, nt, in_dim, 1, st);
+          x = D.e_in;
+        }
+        batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), x,
+                       D.e_out, (uint32_t)out_dim, in_dim, nt, st);
       }
-      batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), x, D.e_out,
-                     (uint32_t)out_dim, in_dim, nt, st);
       void* const hc = batched ? (void*)((uint16_t*)D.b_hc + off)
                                : (void*)((float*)D.d_hc + off);
       // `e_out` is [out_dim][nt]; the state is [n_hc*n_embd][hc_stride], so shifting by `off`

@@ -1341,6 +1341,52 @@ __device__ __forceinline__ float stripe_sum(float* red, uint32_t s, uint32_t bl,
   return t;
 }
 
+template <uint32_t kTokPerBlk>
+__device__ __forceinline__ float stripe_sum_n(float* red, uint32_t s, uint32_t bl, float v) {
+  aff::lds_barrier();
+  red[s * kTokPerBlk + bl] = v;
+  aff::lds_barrier();
+  float t = 0.0f;
+  for (uint32_t k = 0; k < kBlkStripe; ++k) t += red[k * kTokPerBlk + bl];
+  return t;
+}
+
+__global__ __launch_bounds__(32) void batch_quant_tm_fp8_kernel(
+    const float* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ scales,
+    uint32_t nkb, uint32_t dim) {
+  const uint32_t kb = blockIdx.x, tok = blockIdx.y, lane = threadIdx.x;
+  const size_t base = ((size_t)tok * dim) + (size_t)kb * 128u;
+  float v0, v1, v2, v3;
+  if ((reinterpret_cast<uintptr_t>(src + base) & 15u) == 0u) {
+    const float4 v = reinterpret_cast<const float4*>(src + base)[lane];
+    v0 = v.x; v1 = v.y; v2 = v.z; v3 = v.w;
+  } else {
+    const float* p = src + base + lane * 4u;
+    v0 = p[0]; v1 = p[1]; v2 = p[2]; v3 = p[3];
+  }
+  float m = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+  m = aff::wave_reduce_max_dpp(m);
+  const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+  if (lane == 0u) scales[(size_t)tok * nkb + kb] = sc;
+  const float inv = 1.0f / sc;
+  const float c0 = fminf(448.0f, fmaxf(-448.0f, v0 * inv));
+  const float c1 = fminf(448.0f, fmaxf(-448.0f, v1 * inv));
+  const float c2 = fminf(448.0f, fmaxf(-448.0f, v2 * inv));
+  const float c3 = fminf(448.0f, fmaxf(-448.0f, v3 * inv));
+  int pk = 0;
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, pk, false);
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, pk, true);
+  if ((reinterpret_cast<uintptr_t>(out + base) & 3u) == 0u) {
+    reinterpret_cast<uint32_t*>(out + base)[lane] = (uint32_t)pk;
+  } else {
+    uint8_t* dst = out + base + lane * 4u;
+    dst[0] = (uint8_t)((uint32_t)pk & 0xffu);
+    dst[1] = (uint8_t)(((uint32_t)pk >> 8) & 0xffu);
+    dst[2] = (uint8_t)(((uint32_t)pk >> 16) & 0xffu);
+    dst[3] = (uint8_t)(((uint32_t)pk >> 24) & 0xffu);
+  }
+}
+
 __global__ __launch_bounds__(kBlkThreads) void batch_rms_norm_kernel(
     const float* __restrict__ x, const float* __restrict__ w32, const uint16_t* __restrict__ wb,
     float* __restrict__ out, uint32_t n, uint32_t nb, float eps) {
@@ -1449,13 +1495,15 @@ __global__ __launch_bounds__(kRmsQThr) void batch_rms_norm_q8_kernel(
   }
 }
 
-__global__ __launch_bounds__(kBlkThreads) void batch_rms_norm_rope_kernel(
+template <uint32_t kTokPerBlk = kBlkTok>
+__global__ __launch_bounds__(kTokPerBlk * kBlkStripe) void batch_rms_norm_rope_kernel(
     const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out, uint32_t n,
     uint32_t nb, float eps, uint32_t n_rot, uint32_t pos0, float freq_scale, float theta_scale,
     float ext_factor, float lo, float hi) {
-  __shared__ float red[kBlkStripe * kBlkTok];
-  const uint32_t bl = threadIdx.x & (kBlkTok - 1), s = threadIdx.x / kBlkTok;
-  const uint32_t b = blockIdx.x * kBlkTok + bl;
+  __shared__ float red[kBlkStripe * kTokPerBlk];
+  const uint32_t bl = (kTokPerBlk == 1u) ? 0u : (threadIdx.x & (kTokPerBlk - 1u));
+  const uint32_t s = (kTokPerBlk == 1u) ? threadIdx.x : (threadIdx.x / kTokPerBlk);
+  const uint32_t b = blockIdx.x * kTokPerBlk + bl;
   const bool live = b < nb;
   float acc = 0.0f;
   if (live)
@@ -1463,7 +1511,7 @@ __global__ __launch_bounds__(kBlkThreads) void batch_rms_norm_rope_kernel(
       const float v = x[(size_t)i * nb + b];
       acc += v * v;
     }
-  const float inv = rsqrtf(stripe_sum(red, s, bl, acc) / (float)n + eps);
+  const float inv = rsqrtf(stripe_sum_n<kTokPerBlk>(red, s, bl, acc) / (float)n + eps);
   if (live)
     for (uint32_t i = s; i < n; i += kBlkStripe)
       out[(size_t)i * nb + b] = x[(size_t)i * nb + b] * inv * (w ? w[i] : 1.0f);
@@ -1500,6 +1548,7 @@ __global__ void batch_rope_tail_bf16_kernel(uint16_t* __restrict__ x, uint32_t n
 
 // V4.1-1017: act_quant(o, 32, "ue8m0", scale_dtype, inplace=True) between inverse RoPE and wo_a.
 // Shared Wave32 block-32 E4M3 round-trip used by both standalone QDQ and fused attn_out_prep.
+template <bool HwFp8 = true>
 __device__ __forceinline__ uint16_t o_fp8_qdq_wave32(uint16_t bits) {
   const float f = wmma::bf16_to_f32(bits);
   float amax = aff::wave_reduce_max_dpp(fmaxf(fabsf(f), 1e-4f));
@@ -1509,8 +1558,15 @@ __device__ __forceinline__ uint16_t o_fp8_qdq_wave32(uint16_t bits) {
   const float inv_s = __uint_as_float((uint32_t)(127 - e) << 23);
   const float scaled = ((uint32_t)(e + 127) <= 253u) ? (f * inv_s) : (f / s);
   const float v = fminf(448.0f, fmaxf(-448.0f, scaled));
+  if (v == 0.0f) return wmma::f32_to_bf16(v);
+#if __has_builtin(__builtin_amdgcn_cvt_pk_fp8_f32) && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
+  if constexpr (HwFp8) {
+    const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v, 0.0f, 0, false);
+    const aff_f32x2 dq = e4m3_decode_pk<false>((uint32_t)pk);
+    return wmma::f32_to_bf16(dq.x * s);
+  }
+#endif
   const float a = fabsf(v);
-  if (a == 0.0f) return wmma::f32_to_bf16(v);
   const int ea = max((int)((__float_as_uint(a) >> 23) & 0xFFu) - 127, -6);
   const float ulp = __uint_as_float((uint32_t)(ea - 3 + 127) << 23);
   const float inv_ulp = __uint_as_float((uint32_t)(130 - ea) << 23);
@@ -1521,6 +1577,7 @@ __device__ __forceinline__ uint16_t o_fp8_qdq_wave32(uint16_t bits) {
 }
 
 // One wave32 owns one (block_of_32_dims, token b) in dim-major [dim][nb] bf16 layout.
+template <bool HwFp8 = true>
 __global__ void batch_o_fp8_qdq_bf16_kernel(uint16_t* __restrict__ x, uint32_t n_blocks32,
                                             uint32_t nb) {
   const uint32_t wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -1529,34 +1586,16 @@ __global__ void batch_o_fp8_qdq_bf16_kernel(uint16_t* __restrict__ x, uint32_t n
   if (wid >= total) return;
   const uint32_t b = wid % nb, blk = wid / nb;
   const size_t idx = (size_t)(blk * 32u + lane) * nb + b;
-  x[idx] = o_fp8_qdq_wave32(x[idx]);
+  x[idx] = o_fp8_qdq_wave32<HwFp8>(x[idx]);
 }
 
+template <bool HwFp8 = true>
 __global__ void o_fp8_qdq_f32_kernel(float* __restrict__ x, uint32_t n_blocks32) {
   const uint32_t blk = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const uint32_t lane = threadIdx.x & 31u;
   if (blk >= n_blocks32) return;
   const size_t idx = (size_t)blk * 32u + lane;
-  const float f = wmma::bf16_to_f32(wmma::f32_to_bf16(x[idx]));
-  float amax = aff::wave_reduce_max_dpp(fmaxf(fabsf(f), 1e-4f));
-  const uint32_t tbits = __float_as_uint(amax * (1.0f / 448.0f));
-  const int e = (int)((tbits >> 23) & 0xFFu) - 127 + ((tbits & 0x7FFFFFu) != 0u ? 1 : 0);
-  const float s = __uint_as_float((uint32_t)(e + 127) << 23);
-  const float inv_s = __uint_as_float((uint32_t)(127 - e) << 23);
-  const float scaled = ((uint32_t)(e + 127) <= 253u) ? (f * inv_s) : (f / s);
-  const float v = fminf(448.0f, fmaxf(-448.0f, scaled));
-  const float a = fabsf(v);
-  if (a == 0.0f) {
-    x[idx] = v;
-    return;
-  }
-  const int ea = max((int)((__float_as_uint(a) >> 23) & 0xFFu) - 127, -6);
-  const float ulp = __uint_as_float((uint32_t)(ea - 3 + 127) << 23);
-  const float inv_ulp = __uint_as_float((uint32_t)(130 - ea) << 23);
-  const float r = (a * inv_ulp + 12582912.0f) - 12582912.0f;
-  const uint32_t qbits = __float_as_uint(r * ulp) | (__float_as_uint(v) & 0x80000000u);
-  const float q = __uint_as_float(qbits) * s;
-  x[idx] = wmma::bf16_to_f32(wmma::f32_to_bf16(q));
+  x[idx] = wmma::bf16_to_f32(o_fp8_qdq_wave32<HwFp8>(wmma::f32_to_bf16(x[idx])));
 }
 
 // gate is clamped on ONE side, up on BOTH — see engine/ops.cpp, this asymmetry is from the model.
@@ -1608,7 +1647,8 @@ __global__ __launch_bounds__(kTrTile * kTrRows) void batch_transpose_kernel(
 // tail over [head_dim - n_rot, head_dim), optional Wave32 block-32 E4M3 QDQ, and coalesced
 // [n][nb] bf16 store. Produces bit-identical output to batch_transpose_bf16 + batch_rope_tail_bf16
 // + batch_o_fp8_qdq_bf16 while removing 2 kernel launches and 2 full global passes per layer.
-template <bool O_QDQ, uint32_t kTokTile = kTrTile, uint32_t kTileRows = kTrRows>
+template <bool O_QDQ, uint32_t kTokTile = kTrTile, uint32_t kTileRows = kTrRows,
+          bool HwOqdq = true>
 __global__ __launch_bounds__(kTrTile * kTileRows) void batch_attn_out_prep_kernel(
     const float* __restrict__ src, uint16_t* __restrict__ dst, uint32_t n_head, uint32_t head_dim,
     uint32_t n_rot, uint32_t pos0, uint32_t nb, float freq_scale, float theta_scale,
@@ -1658,7 +1698,7 @@ __global__ __launch_bounds__(kTrTile * kTileRows) void batch_attn_out_prep_kerne
       const uint32_t b = by + tr;
       const bool live = (b < nb) && (bx + tx < n);
       const uint16_t bits = live ? tile[tr][tx] : 0u;
-      const uint16_t qbits = o_fp8_qdq_wave32(bits);
+      const uint16_t qbits = o_fp8_qdq_wave32<HwOqdq>(bits);
       if (live) tile[tr][tx] = qbits;
     }
   }
@@ -1761,24 +1801,24 @@ __global__ void batch_head_rms_inv_kernel(const float* __restrict__ x, float* __
 // order the three-pass version had — it stored the scaled value to global and the rope loaded it
 // back. So this is bit-identical, not merely equivalent.
 constexpr uint32_t kQTr = 64, kQTrRows = 8;
-template <bool QRMS>
-__global__ __launch_bounds__(kQTr * kQTrRows) void batch_head_scale_rope_tr_kernel(
+template <bool QRMS, uint32_t kTokTile = kQTr, uint32_t kTileRows = kQTrRows>
+__global__ __launch_bounds__(kTokTile * kTileRows) void batch_head_scale_rope_tr_kernel(
     const float* __restrict__ src, uint16_t* __restrict__ dst, const float* __restrict__ inv,
     uint32_t n, uint32_t nb, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, float freq_scale,
     float theta_scale, float ext_factor, float lo, float hi) {
-  __shared__ float tile[kQTr][kQTr + 1];
-  const uint32_t bx = blockIdx.x * kQTr, by = blockIdx.y * kQTr;   // bx over tokens, by over dims
+  __shared__ float tile[kQTr][kTokTile + 1];
+  const uint32_t bx = blockIdx.x * kTokTile, by = blockIdx.y * kQTr; // bx over tokens, by over dims
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t b = bx + tx;
   const float sc = QRMS ? ((b < nb) ? inv[(size_t)(by / head_dim) * nb + b] : 0.0f) : 1.0f;
-  for (uint32_t k = 0; k < kQTr; k += kQTrRows)
+  for (uint32_t k = 0; k < kQTr; k += kTileRows)
     if (b < nb && by + ty + k < n)
       tile[ty + k][tx] = src[(size_t)(by + ty + k) * nb + b] * sc;
   aff::lds_barrier();
   const uint32_t dh = by % head_dim;
   if (dh >= head_dim - n_rot && b < nb) {
     const uint32_t k0 = (dh - (head_dim - n_rot)) / 2;         // this tile's first pair index
-    for (uint32_t p = ty; p < kQTr / 2; p += kQTrRows) {
+    for (uint32_t p = ty; p < kQTr / 2; p += kTileRows) {
       float c, sn;
       rope_cs(k0 + p, pos0 + b, freq_scale, theta_scale, ext_factor, lo, hi, 1.0f, &c, &sn);
       const float x0 = tile[2 * p][tx], x1 = tile[2 * p + 1][tx];
@@ -1787,9 +1827,22 @@ __global__ __launch_bounds__(kQTr * kQTrRows) void batch_head_scale_rope_tr_kern
     }
   }
   aff::lds_barrier();
-  for (uint32_t k = 0; k < kQTr; k += kQTrRows)
-    if (bx + ty + k < nb && by + tx < n)
-      dst[(size_t)(bx + ty + k) * n + by + tx] = wmma::f32_to_bf16(tile[tx][ty + k]);
+  if constexpr (kTokTile == 16u && kTileRows == 8u) {
+    const uint32_t tid = ty * kTokTile + tx;
+    const uint32_t dd = tid & (kQTr - 1u);
+    const uint32_t d = by + dd;
+    if (d < n) {
+#pragma unroll
+      for (uint32_t bb = tid >> 6; bb < kTokTile; bb += 2u) {
+        const uint32_t tok = bx + bb;
+        if (tok < nb) dst[(size_t)tok * n + d] = wmma::f32_to_bf16(tile[dd][bb]);
+      }
+    }
+  } else {
+    for (uint32_t k = 0; k < kQTr; k += kTileRows)
+      if (bx + ty + k < nb && by + tx < n)
+        dst[(size_t)(bx + ty + k) * n + by + tx] = wmma::f32_to_bf16(tile[tx][ty + k]);
+  }
 }
 
 // ---- hyper-connections ------------------------------------------------------------------------
@@ -2396,24 +2449,25 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_v41_collapse_sq_kernel(
     for (uint32_t h = 0; h < NH; ++h) s_pre[h * NB + tid] = pre_in[(size_t)h * NB + tid];
   }
   aff::lds_barrier();
-  float g[NH][NB];
-#pragma unroll
-  for (uint32_t h = 0; h < NH; ++h)
-#pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) g[h][b] = s_pre[h * NB + b];
   float acc_cur[NB] = {}, acc_hc[NB] = {};
   const bool vec_cur = (NB == 16u) && (((uintptr_t)cur & 15u) == 0u);
   for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
     float o[NB] = {};
-#pragma unroll
-    for (uint32_t h = 0; h < NH; ++h) {
+    auto step_h = [&](uint32_t h) __attribute__((always_inline)) {
       float v[NB];
       hcn_row<NB>(hc + ((size_t)h * n_embd + d) * NB, v);
 #pragma unroll
       for (uint32_t b = 0; b < NB; ++b) {
-        o[b] += v[b] * g[h][b];
+        o[b] += v[b] * s_pre[h * NB + b];
         acc_hc[b] += v[b] * v[b];
       }
+    };
+    if constexpr (NH <= 4u) {
+#pragma unroll
+      for (uint32_t h = 0; h < NH; ++h) step_h(h);
+    } else {
+#pragma unroll 1
+      for (uint32_t h = 0; h < NH; ++h) step_h(h);
     }
     if constexpr (NB == 16u) {
       if (vec_cur) {
@@ -3212,6 +3266,14 @@ void batch_swiglu_quant_fp8_hip(const float* g, const float* u, uint8_t* out, fl
   }
 }
 
+void batch_quant_tm_fp8_hip(const float* src, uint8_t* out, float* scales, uint32_t dim,
+                            uint32_t nb, void* stream) {
+  if (!nb || !dim || (dim % 128u) != 0u) return;
+  const uint32_t nkb = dim >> 7;
+  AFF_BLAUNCH(batch_quant_tm_fp8_kernel, dim3(nkb, nb), dim3(32), 0, (hipStream_t)stream, src, out,
+              scales, nkb, dim);
+}
+
 // Waves a block for the narrow (nb <= 16) instantiation, i.e. the M tile in units of 16 rows. Take
 // the widest tile that still leaves kSplitTarget blocks — two a CU on the 64-CU part this was tuned
 // against — and never fewer than one 16-row tile a wave.
@@ -3504,9 +3566,16 @@ bool batch_rms_norm_q8_hip(const float* x, const float* w32, const uint16_t* wbf
 
 void batch_rms_norm_rope_hip(const float* x, const float* w, float* out, uint32_t n, uint32_t n_rot,
                              uint32_t pos0, RopeDerived r, float eps, uint32_t nb, void* stream) {
-  AFF_BLAUNCH(batch_rms_norm_rope_kernel, dim3((nb + kBlkTok - 1) / kBlkTok),
-                     dim3(kBlkThreads), 0, (hipStream_t)stream, x, w, out, n, nb, eps, n_rot, pos0,
-                     r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi);
+  if (!nb) return;
+  if (nb <= kNarrowTok) {
+    AFF_BLAUNCH((batch_rms_norm_rope_kernel<1u>), dim3(nb), dim3(kBlkStripe), 0,
+                (hipStream_t)stream, x, w, out, n, nb, eps, n_rot, pos0, r.freq_scale,
+                r.theta_scale, r.ext_factor, r.lo, r.hi);
+  } else {
+    AFF_BLAUNCH((batch_rms_norm_rope_kernel<kBlkTok>), dim3((nb + kBlkTok - 1) / kBlkTok),
+                dim3(kBlkThreads), 0, (hipStream_t)stream, x, w, out, n, nb, eps, n_rot, pos0,
+                r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi);
+  }
 }
 
 bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint32_t n_head,
@@ -3518,12 +3587,22 @@ bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint3
   // which is what every other precondition on this path does.
   if (head_dim % kQTr || n_rot % kQTr || n_rot > head_dim) return false;
   const uint32_t n = n_head * head_dim;
-  const dim3 grid((nb + kQTr - 1) / kQTr, (n + kQTr - 1) / kQTr), blk(kQTr, kQTrRows);
+  const bool narrow_tr = (nb <= 16u);
+  const dim3 grid = narrow_tr
+                        ? dim3(1u, (n + kQTr - 1u) / kQTr)
+                        : dim3((nb + kQTr - 1u) / kQTr, (n + kQTr - 1u) / kQTr);
+  const dim3 blk = narrow_tr ? dim3(16u, 8u) : dim3(kQTr, kQTrRows);
   if (!qrms) {
     // V4.1: no per-head RMS — compile-time QRMS=false skips inv memset and global loads.
-    AFF_BLAUNCH((batch_head_scale_rope_tr_kernel<false>), grid, blk, 0, (hipStream_t)stream, x, dst,
-                nullptr, n, nb, head_dim, n_rot, pos0, r.freq_scale, r.theta_scale, r.ext_factor,
-                r.lo, r.hi);
+    if (narrow_tr) {
+      AFF_BLAUNCH((batch_head_scale_rope_tr_kernel<false, 16u, 8u>), grid, blk, 0,
+                  (hipStream_t)stream, x, dst, nullptr, n, nb, head_dim, n_rot, pos0,
+                  r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi);
+    } else {
+      AFF_BLAUNCH((batch_head_scale_rope_tr_kernel<false>), grid, blk, 0, (hipStream_t)stream, x,
+                  dst, nullptr, n, nb, head_dim, n_rot, pos0, r.freq_scale, r.theta_scale,
+                  r.ext_factor, r.lo, r.hi);
+    }
     return true;
   }
   if (!inv) return false;
@@ -3535,9 +3614,15 @@ bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint3
     AFF_BLAUNCH(batch_head_rms_inv_kernel, dim3(blk_inv), dim3(thr), 0, (hipStream_t)stream,
                 x, inv, n_head, head_dim, nb, eps);
   }
-  AFF_BLAUNCH((batch_head_scale_rope_tr_kernel<true>), grid, blk, 0, (hipStream_t)stream, x, dst,
-              inv, n, nb, head_dim, n_rot, pos0, r.freq_scale, r.theta_scale, r.ext_factor,
-              r.lo, r.hi);
+  if (narrow_tr) {
+    AFF_BLAUNCH((batch_head_scale_rope_tr_kernel<true, 16u, 8u>), grid, blk, 0,
+                (hipStream_t)stream, x, dst, inv, n, nb, head_dim, n_rot, pos0, r.freq_scale,
+                r.theta_scale, r.ext_factor, r.lo, r.hi);
+  } else {
+    AFF_BLAUNCH((batch_head_scale_rope_tr_kernel<true>), grid, blk, 0, (hipStream_t)stream, x, dst,
+                inv, n, nb, head_dim, n_rot, pos0, r.freq_scale, r.theta_scale, r.ext_factor,
+                r.lo, r.hi);
+  }
   return true;
 }
 
@@ -3552,6 +3637,11 @@ void batch_rope_tail_bf16_hip(uint16_t* x, uint32_t n_head, uint32_t head_dim, u
                      r.ext_factor, r.lo, r.hi, sin_sign);
 }
 
+inline bool hw_oqdq_enabled() {
+  const char* s = std::getenv("AFF_HW_OQDQ");
+  return !(s && *s && std::strcmp(s, "0") == 0);
+}
+
 void batch_o_fp8_qdq_bf16_hip(uint16_t* x, uint32_t n_blocks32, uint32_t nb, void* stream) {
   const uint32_t total_waves = n_blocks32 * nb;
   if (!total_waves) return;
@@ -3559,8 +3649,13 @@ void batch_o_fp8_qdq_bf16_hip(uint16_t* x, uint32_t n_blocks32, uint32_t nb, voi
   const uint32_t waves_per_blk = thr >> 5;
   const uint32_t blk =
       aff::safe_grid_blocks((total_waves + waves_per_blk - 1) / waves_per_blk, waves_per_blk);
-  AFF_BLAUNCH(batch_o_fp8_qdq_bf16_kernel, dim3(blk), dim3(thr), 0, (hipStream_t)stream, x,
-              n_blocks32, nb);
+  if (hw_oqdq_enabled()) {
+    AFF_BLAUNCH((batch_o_fp8_qdq_bf16_kernel<true>), dim3(blk), dim3(thr), 0, (hipStream_t)stream,
+                x, n_blocks32, nb);
+  } else {
+    AFF_BLAUNCH((batch_o_fp8_qdq_bf16_kernel<false>), dim3(blk), dim3(thr), 0, (hipStream_t)stream,
+                x, n_blocks32, nb);
+  }
 }
 
 void o_fp8_qdq_f32_hip(float* x, uint32_t n_blocks32, void* stream) {
@@ -3569,7 +3664,13 @@ void o_fp8_qdq_f32_hip(float* x, uint32_t n_blocks32, void* stream) {
   const uint32_t waves_per_blk = thr >> 5;
   const uint32_t blk =
       aff::safe_grid_blocks((n_blocks32 + waves_per_blk - 1) / waves_per_blk, waves_per_blk);
-  AFF_BLAUNCH(o_fp8_qdq_f32_kernel, dim3(blk), dim3(thr), 0, (hipStream_t)stream, x, n_blocks32);
+  if (hw_oqdq_enabled()) {
+    AFF_BLAUNCH((o_fp8_qdq_f32_kernel<true>), dim3(blk), dim3(thr), 0, (hipStream_t)stream, x,
+                n_blocks32);
+  } else {
+    AFF_BLAUNCH((o_fp8_qdq_f32_kernel<false>), dim3(blk), dim3(thr), 0, (hipStream_t)stream, x,
+                n_blocks32);
+  }
 }
 
 bool batch_attn_out_prep_hip(const float* src, uint16_t* dst, uint32_t n_head, uint32_t head_dim,
@@ -3579,30 +3680,43 @@ bool batch_attn_out_prep_hip(const float* src, uint16_t* dst, uint32_t n_head, u
   if (head_dim % kTrTile != 0u || n_rot % kTrTile != 0u || n_rot > head_dim) return false;
   if (o_qdq && (head_dim % 32u) != 0u) return false;
   const uint32_t n = n_head * head_dim;
+  const bool hw = hw_oqdq_enabled();
   if (nb <= 16u) {
     const dim3 grid((n + kTrTile - 1u) / kTrTile, 1u);
     const dim3 blk(kTrTile, 4u);
     if (o_qdq) {
-      AFF_BLAUNCH((batch_attn_out_prep_kernel<true, 16u, 4u>), grid, blk, 0, (hipStream_t)stream,
-                  src, dst, n_head, head_dim, n_rot, pos0, nb, r.freq_scale, r.theta_scale,
-                  r.ext_factor, r.lo, r.hi, sin_sign);
+      if (hw) {
+        AFF_BLAUNCH((batch_attn_out_prep_kernel<true, 16u, 4u, true>), grid, blk, 0,
+                    (hipStream_t)stream, src, dst, n_head, head_dim, n_rot, pos0, nb,
+                    r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign);
+      } else {
+        AFF_BLAUNCH((batch_attn_out_prep_kernel<true, 16u, 4u, false>), grid, blk, 0,
+                    (hipStream_t)stream, src, dst, n_head, head_dim, n_rot, pos0, nb,
+                    r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign);
+      }
     } else {
-      AFF_BLAUNCH((batch_attn_out_prep_kernel<false, 16u, 4u>), grid, blk, 0, (hipStream_t)stream,
-                  src, dst, n_head, head_dim, n_rot, pos0, nb, r.freq_scale, r.theta_scale,
-                  r.ext_factor, r.lo, r.hi, sin_sign);
+      AFF_BLAUNCH((batch_attn_out_prep_kernel<false, 16u, 4u, true>), grid, blk, 0,
+                  (hipStream_t)stream, src, dst, n_head, head_dim, n_rot, pos0, nb,
+                  r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign);
     }
     return true;
   }
   const dim3 grid((n + kTrTile - 1u) / kTrTile, (nb + kTrTile - 1u) / kTrTile);
   const dim3 blk(kTrTile, kTrRows);
   if (o_qdq) {
-    AFF_BLAUNCH((batch_attn_out_prep_kernel<true>), grid, blk, 0, (hipStream_t)stream, src, dst,
-                n_head, head_dim, n_rot, pos0, nb, r.freq_scale, r.theta_scale, r.ext_factor,
-                r.lo, r.hi, sin_sign);
+    if (hw) {
+      AFF_BLAUNCH((batch_attn_out_prep_kernel<true, kTrTile, kTrRows, true>), grid, blk, 0,
+                  (hipStream_t)stream, src, dst, n_head, head_dim, n_rot, pos0, nb,
+                  r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign);
+    } else {
+      AFF_BLAUNCH((batch_attn_out_prep_kernel<true, kTrTile, kTrRows, false>), grid, blk, 0,
+                  (hipStream_t)stream, src, dst, n_head, head_dim, n_rot, pos0, nb,
+                  r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign);
+    }
   } else {
-    AFF_BLAUNCH((batch_attn_out_prep_kernel<false>), grid, blk, 0, (hipStream_t)stream, src, dst,
-                n_head, head_dim, n_rot, pos0, nb, r.freq_scale, r.theta_scale, r.ext_factor,
-                r.lo, r.hi, sin_sign);
+    AFF_BLAUNCH((batch_attn_out_prep_kernel<false, kTrTile, kTrRows, true>), grid, blk, 0,
+                (hipStream_t)stream, src, dst, n_head, head_dim, n_rot, pos0, nb,
+                r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign);
   }
   return true;
 }

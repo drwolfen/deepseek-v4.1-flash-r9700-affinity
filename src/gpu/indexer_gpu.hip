@@ -8,6 +8,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace aff {
 namespace {
@@ -31,13 +33,16 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
     const float* __restrict__ ks, const float* __restrict__ hw, float* __restrict__ out,
     uint32_t nb, uint32_t n_keys, uint32_t n_head) {
 
-  __shared__ __align__(16) uint8_t s_q[kHG * 16u * kQLd];
+  // Reuse Q staging LDS for coalesced score writeout after the head loop completes (17,920 B
+  // total <= 18,432 B for >=3 WGs/WGP), separated by lds_barrier() before writing scores.
+  __shared__ __align__(16) union {
+    uint8_t q[kHG * 16u * kQLd];
+    float score[kIdxTokTile][K_VECS_PADDED];
+  } s_lds;
   // The head weight is per (token, head) -- it is the indexer's own projection of this token -- so
   // unlike the two scales it cannot leave the head loop. Staged [head][token] so the eight values a
   // lane needs, one per accumulator row, are contiguous.
   __shared__ float s_w[kHG * 16u];
-  // LDS bank-conflict-free score reduction plane (K_VECS_PADDED, +8 floats/row)
-  __shared__ float s_score[kIdxTokTile][K_VECS_PADDED];
 
   const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
   const uint32_t c = lane & 15u, hlf = lane >> 4;
@@ -89,7 +94,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
       const uint4* src = (const uint4*)(q8 + ((size_t)t * n_head + hg + hh) * kD + dq);
       uint4 a = make_uint4(0, 0, 0, 0), b = make_uint4(0, 0, 0, 0);
       if (t < nb) { a = src[0]; b = src[1]; }
-      uint8_t* dst = s_q + (size_t)row * kQLd + dq;
+      uint8_t* dst = s_lds.q + (size_t)row * kQLd + dq;
       *(uint64_t*)(dst + 0)  = *(const uint64_t*)&a.x;
       *(uint64_t*)(dst + 8)  = *(const uint64_t*)&a.z;
       *(uint64_t*)(dst + 16) = *(const uint64_t*)&b.x;
@@ -106,7 +111,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
       float wv[8];
 #pragma unroll
       for (int q = 0; q < 8; ++q) wv[q] = s_w[hh * 16u + hlf * 8u + (uint32_t)q];
-      const uint8_t* qp = s_q + (size_t)(hh * 16u + c) * kQLd + hlf * 8u;
+      const uint8_t* qp = s_lds.q + (size_t)(hh * 16u + c) * kQLd + hlf * 8u;
       wmma::i2v af[kD / 16u];
 #pragma unroll
       for (uint32_t d = 0; d < kD / 16u; ++d) af[d] = *(const wmma::i2v*)(qp + d * 16u);
@@ -125,6 +130,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
 
   // ---- both scales ride out here: ReLU commutes with a positive factor, so neither had to be
   // inside the head loop. Results staged through K_VECS_PADDED shared memory and coalesced to VRAM.
+  lds_barrier();
 #pragma unroll
   for (uint32_t n = 0; n < kKT; ++n) {
     const uint32_t key_in_block = wave * (kKT * 16u) + n * 16u + c;
@@ -135,7 +141,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
       const uint32_t tt = wmma::acc_row(lane, (uint32_t)q);
       const uint32_t t = t0 + tt;
       if (tt < kIdxTokTile && key_in_block < kIdxKeys) {
-        s_score[tt][key_in_block] = (t < nb && key < n_keys) ? (acc_out[n][q] * qs[t] * kscale) : 0.0f;
+        s_lds.score[tt][key_in_block] = (t < nb && key < n_keys) ? (acc_out[n][q] * qs[t] * kscale) : 0.0f;
       }
     }
   }
@@ -145,7 +151,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
     const uint32_t t = t0 + tt;
     const uint32_t key = blockIdx.y * kIdxKeys + kk;
     if (t < nb && key < n_keys) {
-      out[(size_t)t * n_keys + key] = s_score[tt][kk];
+      out[(size_t)t * n_keys + key] = s_lds.score[tt][kk];
     }
   }
 }
@@ -185,17 +191,22 @@ __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
 
   const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
   const uint32_t c = lane & 15u, hlf = lane >> 4;
+  const uint32_t tok = blockIdx.z;
+  const uint8_t* const q8_b = q8 + (size_t)tok * n_head * kD;
+  const float* const hw_b = hw + (size_t)tok * n_head;
+  float* const out_b = out + (size_t)tok * n_keys;
+  const float qs_b = qs[tok];
 
   // Q is n_head rows of 128 bytes and every block reads all of it, so it is staged once: 8 KB at
   // 16 bytes a thread a step, using 8-byte vectorized stores (uint64_t) to eliminate LDS conflicts.
   for (uint32_t i = tid; i < n_head * (kD / 16u); i += kThreads) {
     const uint32_t row = i / (kD / 16u), dq = (i % (kD / 16u)) * 16u;
-    const uint4 qv = *(const uint4*)(q8 + (size_t)row * kD + dq);
+    const uint4 qv = *(const uint4*)(q8_b + (size_t)row * kD + dq);
     uint8_t* dst = s_q + (size_t)row * kQLd + dq;
     *(uint64_t*)(dst + 0) = *(const uint64_t*)&qv.x;
     *(uint64_t*)(dst + 8) = *(const uint64_t*)&qv.z;
   }
-  if (tid < n_head) s_w[tid] = hw[tid];
+  if (tid < n_head) s_w[tid] = hw_b[tid];
   lds_barrier();
 
   const uint32_t key = blockIdx.x * (kWaves * 16u) + wave * 16u + c;
@@ -235,8 +246,8 @@ __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
 #pragma unroll
     for (int j = 0; j < 8; ++j) sum += s_w[mt + hlf * 8u + (uint32_t)j] * fmaxf(acc[j], 0.0f);
   }
-  sum += __shfl_xor(sum, 16);                  // the wave's other eight heads a tile
-  if (hlf == 0u && key < n_keys) out[key] = sum * qs[0] * ks[key];
+  sum += dpp_xor_lane<16u>(sum);               // the wave's other eight heads a tile
+  if (hlf == 0u && key < n_keys) out_b[key] = sum * qs_b * ks[key];
 }
 
 // ---- f32 rows -> E4M3 + one scale a row, on device ----------------------------------------------
@@ -1031,9 +1042,13 @@ void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, c
                         const float* hw, float* out, uint32_t nb, uint32_t n_keys,
                         uint32_t n_head, void* stream) {
   if (!nb || !n_keys || !n_head) return;
-  if (nb == 1u && n_head <= kIdxDecHeads && (n_head % 16u) == 0u) {
+  const char* narrow_env = std::getenv("AFF_IDX_NARROW");
+  const bool idx_narrow = !(narrow_env && *narrow_env && std::strcmp(narrow_env, "0") == 0);
+  const uint32_t dec_max_nb = idx_narrow ? 8u : 1u;
+  if (nb <= dec_max_nb && n_head <= kIdxDecHeads && (n_head % 16u) == 0u) {
     const uint32_t kpb = kWaves * 16u;                // 64 keys a block
-    hipLaunchKernelGGL(indexer_dec_kernel, dim3((n_keys + kpb - 1) / kpb), dim3(kThreads), 0,
+    const dim3 g((n_keys + kpb - 1u) / kpb, 1u, nb);
+    hipLaunchKernelGGL(indexer_dec_kernel, g, dim3(kThreads), 0,
                        (hipStream_t)stream, q8, qs, k8, ks, hw, out, n_keys, n_head);
     AFF_HIP_CHECK(hipGetLastError());
     return;

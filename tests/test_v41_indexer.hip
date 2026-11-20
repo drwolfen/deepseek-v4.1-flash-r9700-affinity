@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -203,6 +204,88 @@ int main() {
 
     (void)hipFree(d_q8); (void)hipFree(d_k8); (void)hipFree(d_qs); (void)hipFree(d_ks); (void)hipFree(d_hw); (void)hipFree(d_out);
     std::printf("PASS: Test 2 - LDS-padded K_VECS_PADDED + 8-byte Q-staged indexer score parity\n");
+  }
+
+  // ------------------------------------------------------------------------------------------------
+  // Test 2b: Indexer decode/narrow (nb <= 8) vs batched LDS union (nb = 16 / AFF_IDX_NARROW=0) parity
+  // ------------------------------------------------------------------------------------------------
+  {
+    const char* prev_idx = std::getenv("AFF_IDX_NARROW");
+    std::string prev_idx_val = prev_idx ? prev_idx : "";
+    const uint32_t nb_list[] = {1u, 5u, 6u, 8u, 16u};
+    const uint32_t n_head = 64u, n_keys = 384u, dim = kIdxDim;
+    for (uint32_t nb : nb_list) {
+      std::vector<float> h_q((size_t)nb * n_head * dim), h_k((size_t)n_keys * dim),
+          h_hw((size_t)nb * n_head);
+      for (size_t i = 0; i < h_q.size(); ++i) h_q[i] = std::sin((float)(i + nb) * 0.043f) * 0.6f;
+      for (size_t i = 0; i < h_k.size(); ++i) h_k[i] = std::cos((float)i * 0.067f) * 0.55f;
+      for (size_t i = 0; i < h_hw.size(); ++i) h_hw[i] = 0.4f + 0.6f * std::sin((float)i * 0.13f);
+
+      std::vector<uint8_t> h_q8((size_t)nb * n_head * dim), h_k8((size_t)n_keys * dim);
+      std::vector<float> h_qs(nb), h_ks(n_keys);
+      idx_encode_rows(h_q.data(), h_q8.data(), h_qs.data(), nb, n_head * dim);
+      idx_encode_rows(h_k.data(), h_k8.data(), h_ks.data(), n_keys, dim);
+
+      std::vector<float> ref_scores((size_t)nb * n_keys, 0.0f);
+      for (uint32_t t = 0; t < nb; ++t) {
+        for (uint32_t s = 0; s < n_keys; ++s) {
+          double sum = 0.0;
+          for (uint32_t h = 0; h < n_head; ++h) {
+            double dot = 0.0;
+            for (uint32_t d = 0; d < dim; ++d) {
+              dot += (double)f32_from_e4m3(h_q8[((size_t)t * n_head + h) * dim + d]) *
+                     (double)f32_from_e4m3(h_k8[(size_t)s * dim + d]);
+            }
+            if (dot > 0.0) sum += (double)h_hw[(size_t)t * n_head + h] * dot;
+          }
+          ref_scores[(size_t)t * n_keys + s] = (float)(sum * (double)h_qs[t] * (double)h_ks[s]);
+        }
+      }
+
+      uint8_t *d_q8 = nullptr, *d_k8 = nullptr;
+      float *d_qs = nullptr, *d_ks = nullptr, *d_hw = nullptr, *d_out1 = nullptr, *d_out0 = nullptr;
+      assert(hipMalloc(&d_q8, h_q8.size()) == hipSuccess);
+      assert(hipMalloc(&d_k8, h_k8.size()) == hipSuccess);
+      assert(hipMalloc(&d_qs, h_qs.size() * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_ks, h_ks.size() * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_hw, h_hw.size() * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_out1, (size_t)nb * n_keys * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_out0, (size_t)nb * n_keys * sizeof(float)) == hipSuccess);
+      assert(hipMemcpy(d_q8, h_q8.data(), h_q8.size(), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_k8, h_k8.data(), h_k8.size(), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_qs, h_qs.data(), h_qs.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_ks, h_ks.data(), h_ks.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_hw, h_hw.data(), h_hw.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+
+      setenv("AFF_IDX_NARROW", "1", 1);
+      indexer_scores_hip(d_q8, d_qs, d_k8, d_ks, d_hw, d_out1, nb, n_keys, n_head, nullptr);
+      setenv("AFF_IDX_NARROW", "0", 1);
+      indexer_scores_hip(d_q8, d_qs, d_k8, d_ks, d_hw, d_out0, nb, n_keys, n_head, nullptr);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      std::vector<float> h1((size_t)nb * n_keys), h0((size_t)nb * n_keys);
+      assert(hipMemcpy(h1.data(), d_out1, h1.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h0.data(), d_out0, h0.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+      double dot1 = 0.0, n1 = 0.0, nr = 0.0, dot0 = 0.0, n0 = 0.0;
+      for (size_t i = 0; i < h1.size(); ++i) {
+        dot1 += (double)h1[i] * (double)ref_scores[i];
+        n1 += (double)h1[i] * (double)h1[i];
+        dot0 += (double)h0[i] * (double)ref_scores[i];
+        n0 += (double)h0[i] * (double)h0[i];
+        nr += (double)ref_scores[i] * (double)ref_scores[i];
+      }
+      const double cos1 = dot1 / (std::sqrt(n1) * std::sqrt(nr));
+      const double cos0 = dot0 / (std::sqrt(n0) * std::sqrt(nr));
+      std::printf("  indexer nb=%2u: cos1=%.8f cos0=%.8f\n", nb, cos1, cos0);
+      assert(cos1 > 0.999999 && cos0 > 0.999999);
+      if (nb == 1u || nb == 16u) assert(std::memcmp(h1.data(), h0.data(), h1.size() * sizeof(float)) == 0);
+      for (void* p : {(void*)d_q8, (void*)d_k8, (void*)d_qs, (void*)d_ks, (void*)d_hw,
+                      (void*)d_out1, (void*)d_out0})
+        (void)hipFree(p);
+    }
+    if (prev_idx) setenv("AFF_IDX_NARROW", prev_idx_val.c_str(), 1);
+    else unsetenv("AFF_IDX_NARROW");
+    std::printf("PASS: Test 2b - Narrow/LDS-union indexer score parity nb={1,5,6,8,16}\n");
   }
 
   // ------------------------------------------------------------------------------------------------

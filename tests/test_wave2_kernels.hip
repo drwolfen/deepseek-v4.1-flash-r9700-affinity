@@ -888,6 +888,170 @@ int main() {
     }
   }
 
+  // Test 8: Exhaustive 65,536-BF16-value parity for HW vs SW o_fp8_qdq_wave32 (AFF_HW_OQDQ=1 vs =0)
+  {
+    const char* prev_hw = std::getenv("AFF_HW_OQDQ");
+    std::string prev_hw_val = prev_hw ? prev_hw : "";
+
+    // Pass A: all 65,536 BF16 values packed in 2048 Wave32 blocks (nb=1).
+    {
+      const uint32_t nb32 = 2048u;
+      std::vector<uint16_t> h_in(65536u), h_hw(65536u), h_sw(65536u);
+      for (uint32_t i = 0; i < 65536u; ++i) h_in[i] = (uint16_t)i;
+      uint16_t* d_buf = nullptr;
+      assert(hipMalloc(&d_buf, h_in.size() * sizeof(uint16_t)) == hipSuccess);
+
+      setenv("AFF_HW_OQDQ", "0", 1);
+      assert(hipMemcpy(d_buf, h_in.data(), h_in.size() * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+      aff::batch_o_fp8_qdq_bf16_hip(d_buf, nb32, 1u, nullptr);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      assert(hipMemcpy(h_sw.data(), d_buf, h_sw.size() * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+
+      setenv("AFF_HW_OQDQ", "1", 1);
+      assert(hipMemcpy(d_buf, h_in.data(), h_in.size() * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+      aff::batch_o_fp8_qdq_bf16_hip(d_buf, nb32, 1u, nullptr);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      assert(hipMemcpy(h_hw.data(), d_buf, h_hw.size() * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+
+      for (uint32_t i = 0; i < 65536u; ++i) assert(h_hw[i] == h_sw[i]);
+      (void)hipFree(d_buf);
+    }
+
+    // Pass B: every one of all 65,536 BF16 values tested in fixed-scale Wave32 context (lanes 1..31 = 1.0f),
+    // exercising normal, subnormal (<2^-6), signed-zero, clamping (+-448), Inf, and NaN paths.
+    {
+      const uint32_t nb32 = 65536u;
+      const size_t total = (size_t)nb32 * 32u;
+      std::vector<uint16_t> h_in(total, f32_to_bf16_cpu(1.0f)), h_hw(total), h_sw(total);
+      for (uint32_t v = 0; v < 65536u; ++v) h_in[(size_t)v * 32u] = (uint16_t)v;
+      uint16_t* d_buf = nullptr;
+      assert(hipMalloc(&d_buf, total * sizeof(uint16_t)) == hipSuccess);
+
+      setenv("AFF_HW_OQDQ", "0", 1);
+      assert(hipMemcpy(d_buf, h_in.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+      aff::batch_o_fp8_qdq_bf16_hip(d_buf, nb32, 1u, nullptr);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      assert(hipMemcpy(h_sw.data(), d_buf, total * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+
+      setenv("AFF_HW_OQDQ", "1", 1);
+      assert(hipMemcpy(d_buf, h_in.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+      aff::batch_o_fp8_qdq_bf16_hip(d_buf, nb32, 1u, nullptr);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      assert(hipMemcpy(h_hw.data(), d_buf, total * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+
+      for (size_t i = 0; i < total; ++i) assert(h_hw[i] == h_sw[i]);
+      (void)hipFree(d_buf);
+    }
+
+    if (prev_hw) setenv("AFF_HW_OQDQ", prev_hw_val.c_str(), 1);
+    else unsetenv("AFF_HW_OQDQ");
+    std::printf("PASS: Exhaustive 65,536-BF16 HW vs SW o_fp8_qdq_wave32 parity\n");
+  }
+
+  // Test 9: Direct token-major quant (batch_quant_tm_fp8_hip) + W8A8 GEMM & narrow RoPE parity
+  {
+    const uint32_t dim = 256u, rows = 128u;
+    for (uint32_t nt : {1u, 6u, 32u}) {
+      std::vector<float> h_src((size_t)nt * dim), h_y((size_t)rows * nt, 0.0f);
+      std::vector<uint8_t> h_w((size_t)rows * dim, 0x38u), h_sw((rows / 128u) * (dim / 128u), 127u);
+      for (size_t i = 0; i < h_src.size(); ++i)
+        h_src[i] = std::sin((float)(i + nt) * 0.11f) * 2.0f;
+      for (size_t i = 0; i < h_w.size(); ++i)
+        h_w[i] = (uint8_t)((i % 7u) | ((i % 2u) ? 0x30u : 0xb0u));
+
+      float *d_src = nullptr, *d_qs = nullptr, *d_y = nullptr;
+      uint8_t *d_q8 = nullptr, *d_w = nullptr, *d_ps = nullptr, *d_sw = nullptr;
+      assert(hipMalloc(&d_src, h_src.size() * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_q8, h_src.size()) == hipSuccess);
+      assert(hipMalloc(&d_qs, (size_t)nt * (dim / 128u) * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_w, h_w.size()) == hipSuccess);
+      assert(hipMalloc(&d_ps, h_w.size()) == hipSuccess);
+      assert(hipMalloc(&d_sw, h_sw.size()) == hipSuccess);
+      assert(hipMalloc(&d_y, h_y.size() * sizeof(float)) == hipSuccess);
+
+      assert(hipMemcpy(d_src, h_src.data(), h_src.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_w, h_w.data(), h_w.size(), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_sw, h_sw.data(), h_sw.size(), hipMemcpyHostToDevice) == hipSuccess);
+      aff::preshuffle_fp8_hip(d_w, d_ps, rows, dim, nullptr);
+      aff::batch_quant_tm_fp8_hip(d_src, d_q8, d_qs, dim, nt, nullptr);
+      aff::batch_gemm_fp8_hip(d_ps, d_sw, d_q8, d_qs, d_y, rows, dim, nt, 0u, 0u, nullptr, true);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      std::vector<uint8_t> g_q8(h_src.size());
+      std::vector<float> g_qs((size_t)nt * (dim / 128u));
+      assert(hipMemcpy(g_q8.data(), d_q8, g_q8.size(), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(g_qs.data(), d_qs, g_qs.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_y.data(), d_y, h_y.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+
+      double max_err = 0.0;
+      for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t b = 0; b < nt; ++b) {
+          float ref = 0.0f;
+          for (uint32_t kb = 0; kb < dim / 128u; ++kb) {
+            float blk = 0.0f;
+            for (uint32_t k = 0; k < 128u; ++k) {
+              blk += e4m3_to_f32_cpu(h_w[(size_t)r * dim + kb * 128u + k]) *
+                     e4m3_to_f32_cpu(g_q8[(size_t)b * dim + kb * 128u + k]);
+            }
+            ref += blk * g_qs[(size_t)b * (dim / 128u) + kb];
+          }
+          max_err = std::max(max_err, std::fabs((double)h_y[(size_t)r * nt + b] - (double)ref));
+        }
+      }
+      assert(max_err <= 2e-3);
+      for (void* p : {(void*)d_src, (void*)d_q8, (void*)d_qs, (void*)d_w, (void*)d_ps, (void*)d_sw, (void*)d_y})
+        (void)hipFree(p);
+    }
+
+    // Narrow RoPE specialization parity (nb = {1, 6, 16} vs wide nb=32 for leading columns)
+    aff::RopeDerived rope{1.0f, 1.0f / std::pow(10000.0f, 2.0f / 64.0f), 0.0f, 0.0f, 0.0f};
+    const uint32_t nh = 4u, hd = 64u, rot = 64u, n = nh * hd;
+    std::vector<float> h_x((size_t)n * 32u), h_inv((size_t)nh * 32u, 1.0f), h_rn((size_t)512u * 32u);
+    std::vector<uint16_t> h_ref((size_t)32u * n);
+    for (size_t i = 0; i < h_x.size(); ++i) h_x[i] = std::sin((float)i * 0.07f);
+    for (size_t i = 0; i < h_rn.size(); ++i) h_rn[i] = std::cos((float)i * 0.03f);
+    {
+      float *dx = nullptr, *dinv = nullptr, *drn = nullptr, *drno = nullptr;
+      uint16_t* ddst = nullptr;
+      assert(hipMalloc(&dx, h_x.size() * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&dinv, h_inv.size() * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&ddst, h_ref.size() * sizeof(uint16_t)) == hipSuccess);
+      assert(hipMalloc(&drn, h_rn.size() * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&drno, h_rn.size() * sizeof(float)) == hipSuccess);
+      assert(hipMemcpy(dx, h_x.data(), h_x.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(dinv, h_inv.data(), h_inv.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(drn, h_rn.data(), h_rn.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(aff::batch_head_rms_rope_tr_hip(dx, ddst, dinv, nh, hd, rot, 17u, rope, 1e-6f, 32u, nullptr, false));
+      aff::batch_rms_norm_rope_hip(drn, nullptr, drno, 512u, rot, 17u, rope, 1e-6f, 32u, nullptr);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      assert(hipMemcpy(h_ref.data(), ddst, h_ref.size() * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+      std::vector<float> h_rno_ref(h_rn.size());
+      assert(hipMemcpy(h_rno_ref.data(), drno, h_rno_ref.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+
+      for (uint32_t nb : {1u, 6u, 16u}) {
+        std::vector<float> sub_x((size_t)n * nb), sub_rn((size_t)512u * nb), sub_rno((size_t)512u * nb);
+        std::vector<uint16_t> sub_dst((size_t)nb * n);
+        for (uint32_t d = 0; d < n; ++d)
+          for (uint32_t b = 0; b < nb; ++b) sub_x[(size_t)d * nb + b] = h_x[(size_t)d * 32u + b];
+        for (uint32_t d = 0; d < 512u; ++d)
+          for (uint32_t b = 0; b < nb; ++b) sub_rn[(size_t)d * nb + b] = h_rn[(size_t)d * 32u + b];
+        assert(hipMemcpy(dx, sub_x.data(), sub_x.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+        assert(hipMemcpy(drn, sub_rn.data(), sub_rn.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+        assert(aff::batch_head_rms_rope_tr_hip(dx, ddst, dinv, nh, hd, rot, 17u, rope, 1e-6f, nb, nullptr, false));
+        aff::batch_rms_norm_rope_hip(drn, nullptr, drno, 512u, rot, 17u, rope, 1e-6f, nb, nullptr);
+        assert(hipDeviceSynchronize() == hipSuccess);
+        assert(hipMemcpy(sub_dst.data(), ddst, sub_dst.size() * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(sub_rno.data(), drno, sub_rno.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+        assert(std::memcmp(sub_dst.data(), h_ref.data(), (size_t)nb * n * sizeof(uint16_t)) == 0);
+        for (uint32_t d = 0; d < 512u; ++d)
+          for (uint32_t b = 0; b < nb; ++b)
+            assert(sub_rno[(size_t)d * nb + b] == h_rno_ref[(size_t)d * 32u + b]);
+      }
+      for (void* p : {(void*)dx, (void*)dinv, (void*)ddst, (void*)drn, (void*)drno}) (void)hipFree(p);
+    }
+    std::printf("PASS: batch_quant_tm_fp8_hip + narrow head/rms RoPE bit-identical parity\n");
+  }
+
   std::printf("ALL WAVE 2 PHASE 2B KERNEL TESTS PASSED.\n");
   return 0;
 }

@@ -308,7 +308,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       float mx = rs[0];
 #pragma unroll
       for (uint32_t u = 1; u < kKT / 32u; ++u) mx = fmaxf(mx, rs[u]);
-      for (int off = 16; off; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off));
+      mx = wave_reduce_max_dpp(mx);
       if (lane == 0) s_scur = (mx > 0.0f) ? mx : s_sprev;
     }
     __syncthreads();
@@ -362,7 +362,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
         acc[nt][j] = (rw[j] > 0.0f) ? acc[nt][j] * rw[j] * qs : kNeg;
         mt = fmaxf(mt, acc[nt][j]);
       }
-      mt = fmaxf(mt, __shfl_xor(mt, 16));
+      mt = fmaxf(mt, dpp_xor_lane<16u>(mt));
       if (lane < 16) s_red[wave * NH + nt * 16u + c] = mt;
     }
     __syncthreads();
@@ -382,7 +382,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
         acc[nt][j] = e;                               // acc becomes P in place
         psum += e;
       }
-      const float ps = psum + __shfl_xor(psum, 16);
+      const float ps = psum + dpp_xor_lane<16u>(psum);
       if (lane < 16) s_ps[wave * NH + hd] = ps;
     }
     __syncthreads();
@@ -527,7 +527,7 @@ __global__ __launch_bounds__(kCT) void flash_combine_kernel(
     float m = kNeg;
     for (uint32_t s = threadIdx.x; s < nsp; s += 32u)
       m = fmaxf(m, part_ml[(row + (size_t)s * plane) * 2]);
-    for (int off = 16; off; off >>= 1) m = fmaxf(m, __shfl_xor(m, off));
+    m = wave_reduce_max_dpp(m);
     float l = 0.0f;
     for (uint32_t s = threadIdx.x; s < nsp; s += 32u) {
       const float ms = part_ml[(row + (size_t)s * plane) * 2];
@@ -535,7 +535,7 @@ __global__ __launch_bounds__(kCT) void flash_combine_kernel(
       s_w[s] = w;
       l += part_ml[(row + (size_t)s * plane) * 2 + 1] * w;
     }
-    for (int off = 16; off; off >>= 1) l += __shfl_xor(l, off);
+    l = wave_reduce_add_dpp(l);
     if (threadIdx.x == 0) s_inv = (l > 0.0f) ? 1.0f / l : 0.0f;
   }
   __syncthreads();
