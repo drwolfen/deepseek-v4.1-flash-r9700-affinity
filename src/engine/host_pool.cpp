@@ -11,6 +11,10 @@
 #include <sys/mman.h>
 #include <cstdlib>
 #include <unistd.h>
+#ifdef __linux__
+#include <cerrno>
+#include <sys/syscall.h>
+#endif
 
 namespace aff {
 namespace {
@@ -208,6 +212,33 @@ bool HostExpertPool::init(const AffReader* aff, uint64_t budget_bytes, Wanted wa
     return false;
   }
   base_ = (uint8_t*)p;
+#ifdef __linux__
+  {
+    const char* numa_env = std::getenv("AFF_POOL_NUMA_NODE");
+    const int numa_node = (numa_env && *numa_env) ? std::atoi(numa_env) : 0;
+    static bool numa_logged = false;
+    if (numa_node >= 0 && numa_node < 63) {
+#ifdef SYS_mbind
+      unsigned long nodemask = 1ul << numa_node;
+      const long rc = ::syscall(SYS_mbind, base_, alloc_bytes_, 1 /*MPOL_PREFERRED*/,
+                                &nodemask, 64, 0);
+      if (!numa_logged) {
+        numa_logged = true;
+        if (rc == 0) {
+          aff::ui::err("host pool: NUMA policy MPOL_PREFERRED -> node %d (AFF_POOL_NUMA_NODE)\n",
+                       numa_node);
+        } else {
+          aff::ui::err("host pool: NUMA mbind(node %d) skipped (%s)\n",
+                       numa_node, std::strerror(errno));
+        }
+      }
+#endif
+    } else if (!numa_logged) {
+      numa_logged = true;
+      aff::ui::err("host pool: NUMA binding disabled (AFF_POOL_NUMA_NODE=%d)\n", numa_node);
+    }
+  }
+#endif
   // Tens of GiB is a lot of 4 KiB pages to walk, so ask for 2 MiB ones. The hint lands AFTER
   // MAP_POPULATE, so coverage is opportunistic — most of the pool, with khugepaged collapsing some
   // of the rest later.

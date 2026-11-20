@@ -1720,6 +1720,89 @@ int main() {
     }
   }
 
+  // 21. Test hybrid_tile128 bucket 3 (NT=8, max_nt=128) in moe_plan_hip + moe_plan_group_max_nt
+  {
+    assert(moe_plan_group_max_nt(0u) == 16u && moe_plan_group_max_nt(1u) == 32u &&
+           moe_plan_group_max_nt(2u) == 64u && moe_plan_group_max_nt(3u) == 128u);
+    assert(moe_plan_group_max_nt(4u) == 16u && moe_plan_group_max_nt(5u) == 32u &&
+           moe_plan_group_max_nt(6u) == 64u && moe_plan_group_max_nt(7u) == 128u);
+
+    const uint32_t ne = 256u, k = 2u, nb = 140u;
+    const uint32_t total = nb * k;
+    const uint32_t cap = moe_plan_tile_cap(nb, k, ne);
+    std::vector<uint64_t> h_plc(ne, 0x300000ull);
+    h_plc[0] = 0x100000ull | 1ull; // resident
+    h_plc[1] = 0x200000ull;        // pooled
+    std::vector<uint32_t> h_sel(total);
+    std::vector<float> h_wt(total, 0.5f);
+    for (uint32_t t = 0; t < nb; ++t) {
+      h_sel[t * k + 0u] = 0u;
+      h_sel[t * k + 1u] = 1u;
+    }
+    ExpertShardLayout sh{};
+    sh.stride = 4096u;
+    for (int pl = 0; pl < 3; ++pl) {
+      sh.data_off[pl] = 256u * (uint32_t)(pl + 1);
+      sh.scale_off[pl] = 1024u + 256u * (uint32_t)pl;
+      sh.rscale_off[pl] = 2048u + 256u * (uint32_t)pl;
+    }
+
+    uint32_t *d_sel = nullptr, *d_tok = nullptr, *d_ord = nullptr, *d_run = nullptr,
+             *d_col = nullptr, *d_cnt = nullptr;
+    uint64_t* d_plc = nullptr;
+    float *d_wt = nullptr, *d_wto = nullptr;
+    uint16_t *d_bg = nullptr, *d_bu = nullptr, *d_bydn = nullptr;
+    ExpertTile* d_tiles = nullptr;
+    MoePlanStatus* d_st = nullptr;
+    assert(hipMalloc(&d_sel, total * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_wt, total * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_plc, ne * sizeof(uint64_t)) == hipSuccess);
+    assert(hipMalloc(&d_tok, 2u * total * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_wto, total * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_ord, total * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_run, (nb + 1u) * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_col, total * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_tiles, (size_t)3u * 8u * cap * sizeof(ExpertTile)) == hipSuccess);
+    assert(hipMalloc(&d_cnt, 8u * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_st, sizeof(MoePlanStatus)) == hipSuccess);
+    assert(hipMalloc(&d_bg, 64u) == hipSuccess);
+    assert(hipMalloc(&d_bu, 64u) == hipSuccess);
+    assert(hipMalloc(&d_bydn, 64u) == hipSuccess);
+    assert(hipMemset(d_st, 0, sizeof(MoePlanStatus)) == hipSuccess);
+    assert(hipMemcpy(d_sel, h_sel.data(), total * sizeof(uint32_t), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_wt, h_wt.data(), total * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_plc, h_plc.data(), ne * sizeof(uint64_t), hipMemcpyHostToDevice) == hipSuccess);
+
+    MoePlanArgs A{};
+    A.sel = d_sel; A.wt = d_wt; A.plc = d_plc;
+    A.layer = 0; A.nb_tok = nb; A.k = k; A.n_expert = ne;
+    A.tok = d_tok; A.wt_out = d_wto; A.ord = d_ord; A.run = d_run; A.slot_col = d_col;
+    A.tiles = d_tiles; A.counts = d_cnt; A.status = d_st;
+    A.shard = sh; A.bg = d_bg; A.bu = d_bu; A.bydn = d_bydn; A.tile_cap = cap;
+    A.hybrid_tile128 = true;
+    assert(moe_plan_hip(A, nullptr));
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    MoePlanStatus st{};
+    std::vector<uint32_t> g_cnt(8u);
+    std::vector<ExpertTile> g_tiles((size_t)3u * 8u * cap);
+    assert(hipMemcpy(&st, d_st, sizeof(st), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(g_cnt.data(), d_cnt, 8u * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(g_tiles.data(), d_tiles, g_tiles.size() * sizeof(ExpertTile), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(st.taken == total && st.bad == 0u && st.over == 0u);
+    assert(g_cnt[0] == 1u && g_cnt[1] == 0u && g_cnt[2] == 2u && g_cnt[3] == 0u);
+    assert(g_cnt[4] == 1u && g_cnt[5] == 0u && g_cnt[6] == 0u && g_cnt[7] == 1u);
+    assert(g_tiles[0u * cap + 0u].nt == 12u);
+    assert(g_tiles[2u * cap + 0u].nt == 64u && g_tiles[2u * cap + 1u].nt == 64u);
+    assert(g_tiles[4u * cap + 0u].nt == 12u);
+    assert(g_tiles[7u * cap + 0u].nt == 128u);
+
+    for (void* p : {(void*)d_sel, (void*)d_wt, (void*)d_plc, (void*)d_tok, (void*)d_wto,
+                    (void*)d_ord, (void*)d_run, (void*)d_col, (void*)d_tiles, (void*)d_cnt,
+                    (void*)d_st, (void*)d_bg, (void*)d_bu, (void*)d_bydn})
+      (void)hipFree(p);
+  }
+
   std::printf("PASS: test_gpu_ports on gfx1201\n");
   return 0;
 }

@@ -175,6 +175,7 @@ struct MoePlanArgs {
   uint8_t*        pref_slab = nullptr;
   const uint8_t** pref_src  = nullptr;
   uint32_t        pref_cap  = 0;
+  bool            hybrid_tile128 = false;
 };
 
 // One workgroup. `nb_tok` is handled in groups of 64 tokens, so decode is one group and a 1408-token
@@ -211,11 +212,10 @@ constexpr uint32_t moe_plan_tile_cap(uint32_t nb_tok, uint32_t k, uint32_t n_exp
   return distinct + taken / kExpertWmmaTok;
 }
 
-// The `max_nt` region `b` must be launched with. Tiles split at kExpertWmmaTok = 64, so bucket b
-// holds widths in (16b, 16b+16], and `expert_gemm_wmma_hip` selects on `(max_nt + 15) / 16` — which
-// is b+1 for every width in that range. So this names the instantiation the true per-bucket maximum
-// would have named, exactly, for every reachable bucket.
-constexpr uint32_t moe_plan_group_max_nt(uint32_t group) { return 16u * ((group & 3u) + 1u); }
+// The `max_nt` region `b` must be launched with. Resident tiles split at kExpertWmmaTok = 64
+// (buckets 0..2), while pooled hybrid tiles with `hybrid_tile128` also emit bucket 3 up to 128
+// tokens (`16 << 3 = 128`).
+constexpr uint32_t moe_plan_group_max_nt(uint32_t group) { return 16u << (group & 3u); }
 
 // The widest tile `nb_tok` can produce, and therefore the last bucket that can be non-empty. An
 // expert cannot be routed the same token twice, so a tile is at most `min(nb_tok, 64)` wide.

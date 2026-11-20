@@ -117,6 +117,7 @@ struct StaticPlacement::Impl {
     enum class State : uint8_t { Free, Copying, Published, Quarantine };
     State state = State::Free;
     bool promote = false;
+    bool zero_d2h = false;
     uint32_t idx = 0;                       // layer * n_expert + expert
     uint64_t slab_slot = 0;                 // promote: written. demote: read, then freed.
     int64_t  pool_slot = -1;                // promote: read, then freed. demote: written.
@@ -668,7 +669,25 @@ void StaticPlacement::ssd_stage_arm(void* const* streams) {
 // See the comment at the stream's creation for why it is not the whole card: the zero-copy tiles
 // are bus-bound, so every CU past what keeps the link busy is taken from the resident GEMM beside
 // them.
-static constexpr double kHybridCuFrac = 0.25;
+static double hybrid_cu_frac() {
+  static const double f = [] {
+    const char* v = std::getenv("AFF_HYBRID_CU_FRAC");
+    double d = (v && *v) ? std::strtod(v, nullptr) : 0.50;
+    if (!(d > 0.0)) d = 0.50;
+    if (d < 0.0625) d = 0.0625;
+    if (d > 1.0) d = 1.0;
+    return d;
+  }();
+  return f;
+}
+
+static bool hybrid_cu_stripe() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_HYBRID_CU_STRIPE");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
 
 // How many times the mover issues each shard copy. 1 always, unless AFF_MOVER_DUP says otherwise —
 // a measurement knob for what the mover's link traffic actually costs, read once. See its use.
@@ -700,8 +719,9 @@ static inline uint32_t mover_dup(bool h2d) {
 }
 
 static uint32_t hybrid_cus(int dev) {
-  const uint32_t n = (uint32_t)(device_cus(dev) * kHybridCuFrac);
-  return n < 1u ? 1u : n;
+  const uint32_t total = device_cus(dev);
+  const uint32_t n = (uint32_t)(total * hybrid_cu_frac());
+  return n < 1u ? 1u : (n > total ? total : n);
 }
 
 bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
@@ -768,23 +788,51 @@ bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
       // is slower, not wrong, and saying so beats guessing later.
       const uint32_t total_cu = device_cus(devs_[i]);
       const uint32_t cus = hybrid_cus(devs_[i]);
+      const bool stripe = hybrid_cu_stripe();
       std::vector<uint32_t> mask((total_cu + 31u) / 32u, 0u);
-      for (uint32_t b = 0; b < cus; ++b) mask[b >> 5] |= 1u << (b & 31u);
-      // SAY WHICH ONE HAPPENED. Two traces at the same nominal budget disagreed by a factor of two
-      // on the hybrid stream's rate, which is the signature of an A/B whose flag never fired: a
-      // silent fallback to an unmasked stream is indistinguishable from a mask that did nothing.
-      const hipError_t merr =
-          hipExtStreamCreateWithCUMask(&I2.hyb[i], (uint32_t)mask.size(), mask.data());
-      if (merr != hipSuccess &&
-          hipStreamCreateWithFlags(&I2.hyb[i], hipStreamNonBlocking) != hipSuccess) {
-        I2.hyb[i] = nullptr;
-        continue;
+      const char* mode = "unmasked";
+      hipError_t merr = hipSuccess;
+      if (cus >= total_cu) {
+        for (uint32_t b = 0; b < total_cu; ++b) mask[b >> 5] |= 1u << (b & 31u);
+        if (hipStreamCreateWithFlags(&I2.hyb[i], hipStreamNonBlocking) != hipSuccess) {
+          I2.hyb[i] = nullptr;
+          continue;
+        }
+      } else {
+        if (stripe && total_cu >= 16u && (total_cu % 4u) == 0u) {
+          const uint32_t per_se = total_cu / 4u;
+          for (uint32_t c = 0; c < cus; ++c) {
+            const uint32_t b = (c & 3u) * per_se + (c >> 2);
+            mask[b >> 5] |= 1u << (b & 31u);
+          }
+          mode = "striped";
+        } else {
+          for (uint32_t b = 0; b < cus; ++b) mask[b >> 5] |= 1u << (b & 31u);
+          mode = "contiguous";
+        }
+        // SAY WHICH ONE HAPPENED. Two traces at the same nominal budget disagreed by a factor of two
+        // on the hybrid stream's rate, which is the signature of an A/B whose flag never fired: a
+        // silent fallback to an unmasked stream is indistinguishable from a mask that did nothing.
+        merr = hipExtStreamCreateWithCUMask(&I2.hyb[i], (uint32_t)mask.size(), mask.data());
+        if (merr != hipSuccess &&
+            hipStreamCreateWithFlags(&I2.hyb[i], hipStreamNonBlocking) != hipSuccess) {
+          I2.hyb[i] = nullptr;
+          continue;
+        }
       }
-      char cumsg[64];
-      std::snprintf(cumsg, sizeof cumsg, "CU-masked to the low %u of %u", cus, total_cu);
-      aff::ui::err("hybrid stream card %d: %s\n", devs_[i],
-                   merr == hipSuccess ? cumsg
-                                      : hipGetErrorString(merr));
+      std::string hex = "0x";
+      for (size_t w = mask.size(); w-- > 0;) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%08x", mask[w]);
+        hex += buf;
+      }
+      if (merr == hipSuccess) {
+        aff::ui::err("hybrid stream card %d: %u/%u CUs (%s, mask=%s)\n",
+                     devs_[i], cus, total_cu, mode, hex.c_str());
+      } else {
+        aff::ui::err("hybrid stream card %d: %s (fallback unmasked, wanted %s mask=%s)\n",
+                     devs_[i], hipGetErrorString(merr), mode, hex.c_str());
+      }
       std::array<hipEvent_t, Impl::kEvSlots>* rings[4] = {&I2.ev_q[i], &I2.ev_gu[i], &I2.ev_sw[i],
                                                           &I2.ev_dn[i]};
       hipEvent_t* evs[4 * Impl::kEvSlots];
@@ -895,48 +943,15 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   const uint32_t hidden = (uint32_t)L0.gate.cols;
   const uint32_t inter = (uint32_t)L0.gate.rows;
 
-  // ---- the batched routed arena comes FIRST, and it is allocated rather than estimated ---------
-  //
-  // Placement is greedy: it takes free VRAM minus a constant, so everything allocated after it lives
-  // on that constant — and the routed arena, the only such thing, scales with the prefill chunk.
-  // Three estimates failed before this: a flat constant, the constant plus a measured split share
-  // (how the cards split is a property of where placement put each expert, not of the model), and
-  // the constant plus the provable bound (grow_w8a8 reallocates per layer as `taken` climbs, so the
-  // peak is the final size plus what the freed predecessors fragmented). All three surfaced as
-  // hipErrorOutOfMemory from an unrelated launch much later, because a failed hipMalloc only sets
-  // the sticky error and this path declines the work.
-  //
-  // So: allocate the worst case here, once, before anyone measures free VRAM. `taken <= nb_tok*k`
-  // because a token has k picks and each lands on one card. It costs roughly twice the typical
-  // arena, against never reallocating and failing HERE rather than mid-forward.
-  if (batch_tok && k) {
-    const uint64_t bound = (uint64_t)batch_tok * k;
-    for (size_t i = 0; i < devs_.size(); ++i) {
-      AFF_HIP_CHECK(hipSetDevice(devs_[i]));
-      // n_tiles is bounded by the slot count, and its arena is ~0.1% of the rest; no need to be
-      // clever about how few experts 12288 slots can actually spread over.
-      if (!grow_w8a8(i, (uint32_t)bound, (uint32_t)bound, batch_tok, hidden, inter, batch_tok)) {
-        if (err) *err = "no VRAM for the batched routed arena at this prefill chunk";
-        delete impl_; impl_ = nullptr;
-        return false;
-      }
-    }
-  }
-
-  // How many experts fit per card, after leaving room for activations and scratch.
-  //
-  // PER CARD, not the minimum across cards. The cards are not symmetric: with `--tp-dense 1` the
-  // whole dense set lives on card 0 and card 1 holds nothing but experts, so taking the minimum
-  // sizes both slabs to the smaller card and leaves gigabytes of card 1 — hundreds of experts —
-  // allocated and unused.
   // ---- hold a SHARD of every resident expert on every card, not the whole of a fraction ----
   //
-  // Decided here, before the slab is sized, because it decides the slab's byte layout. It does NOT
-  // change how many experts are resident: a shard is 1/N of an expert plus `down`'s row scales, the
-  // one plane every card must keep whole, so `min(cap/shard)` and `sum(cap/whole)` come out within
-  // 0.1% of each other. What changes is that every card then does 1/N of every routed expert
-  // instead of all of some of them, which is worth hundreds of microseconds a token at the MoE
-  // all-reduce — that costs the max over cards rather than the mean.
+  // Decided here, before the routed arena and the slab are sized, because it decides both the
+  // shard's byte layout and the sharded intermediate width. It does NOT change how many experts are
+  // resident: a shard is 1/N of an expert plus `down`'s row scales, the one plane every card must
+  // keep whole, so `min(cap/shard)` and `sum(cap/whole)` come out within 0.1% of each other. What
+  // changes is that every card then does 1/N of every routed expert instead of all of some of them,
+  // which is worth hundreds of microseconds a token at the MoE all-reduce — that costs the max
+  // over cards rather than the mean.
   //
   // Residency is unaffected in kind as well as in count — an expert is resident or it is not, and
   // a non-resident one still streams whole to one card on the path it always used.
@@ -953,6 +968,43 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     shard_ = ExpertShardLayout{};
   }
   const uint64_t slot_stride = this->slot_stride();
+
+  // ---- the batched routed arena comes FIRST, and it is allocated rather than estimated ---------
+  //
+  // Placement is greedy: it takes free VRAM minus a constant, so everything allocated after it lives
+  // on that constant — and the routed arena, the only such thing, scales with the prefill chunk.
+  // Three estimates failed before this: a flat constant, the constant plus a measured split share
+  // (how the cards split is a property of where placement put each expert, not of the model), and
+  // the constant plus the provable bound (grow_w8a8 reallocates per layer as `taken` climbs, so the
+  // peak is the final size plus what the freed predecessors fragmented). All three surfaced as
+  // hipErrorOutOfMemory from an unrelated launch much later, because a failed hipMalloc only sets
+  // the sticky error and this path declines the work.
+  //
+  // So: allocate the worst case here, once, before anyone measures free VRAM. `taken <= nb_tok*k`
+  // because a token has k picks and each lands on one card. Exact cap over the sharded intermediate
+  // width avoids both the 1.5x over-reserve and mid-run ArenaGrow syncs.
+  if (batch_tok && k) {
+    const uint64_t bound = (uint64_t)batch_tok * k;
+    const uint32_t inter_shard = (tp_parts_ > 1) ? shard_.rows[0] : inter;
+    const uint32_t n_tiles_init =
+        (uint32_t)std::max<uint64_t>(bound, 8ull * aff::moe_plan_tile_cap(batch_tok, k, n_expert));
+    for (size_t i = 0; i < devs_.size(); ++i) {
+      AFF_HIP_CHECK(hipSetDevice(devs_[i]));
+      if (!grow_w8a8(i, (uint32_t)bound, n_tiles_init, batch_tok, hidden, inter_shard, batch_tok,
+                     /*exact_cap=*/true)) {
+        if (err) *err = "no VRAM for the batched routed arena at this prefill chunk";
+        delete impl_; impl_ = nullptr;
+        return false;
+      }
+    }
+  }
+
+  // How many experts fit per card, after leaving room for activations and scratch.
+  //
+  // PER CARD, not the minimum across cards. The cards are not symmetric: with `--tp-dense 1` the
+  // whole dense set lives on card 0 and card 1 holds nothing but experts, so taking the minimum
+  // sizes both slabs to the smaller card and leaves gigabytes of card 1 — hundreds of experts —
+  // allocated and unused.
 
   pref_cap_ = 0;
   if (const char* pr = std::getenv("AFF_PREFETCH_RING"); pr && *pr) {
@@ -1017,6 +1069,7 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   }
   const std::vector<uint64_t> raw_per_gpu = per_gpu;
   if (tp_parts_ > 1) {
+    total_slots = std::min<uint64_t>(total_slots, (uint64_t)n_layer * n_expert);
     for (size_t i = 0; i < devs_.size(); ++i) per_gpu[i] = total_slots;
     // The part count BY NUMBER, not "TP=2": it is the rank count now, and a banner that names the
     // wrong split is how a measurement gets attributed to a layout that did not run.
@@ -1025,6 +1078,9 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
                  tp_parts_, shard_.rows[0], (unsigned)aff->layer(0).gate.rows, shard_.cols[2],
                  (unsigned)aff->layer(0).down.cols, shard_.stride / 1048576.0,
                  (unsigned long long)total_slots);
+  } else if (devs_.size() == 1) {
+    total_slots = std::min<uint64_t>(total_slots, (uint64_t)n_layer * n_expert);
+    per_gpu[0] = total_slots;
   }
 
   if (total_slots == 0) {
@@ -1437,7 +1493,8 @@ inline PinLayout pin_layout(uint32_t cap_tok, uint32_t cap_slot, uint32_t cap_nb
 }  // namespace
 
 bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uint32_t nb_tok,
-                                uint32_t hidden, uint32_t inter, uint32_t nb_stride) {
+                                uint32_t hidden, uint32_t inter, uint32_t nb_stride,
+                                bool exact_cap) {
   // ---- A GROWTH FREES MEMORY THE CARDS ARE STILL READING -----------------------------------------
   //
   // Every buffer below is named by tiles and launch arguments of dispatches already in flight, and
@@ -1467,7 +1524,7 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
   // Slack on every growth: layers differ in how many slots land on a card, and a realloc a layer
   // would serialise the stream on the free.
   if (bcap_slot_[dv] < taken) {
-    const uint32_t cap = taken + (taken >> 1) + 64;
+    const uint32_t cap = exact_cap ? taken : (taken + (taken >> 1) + 64);
     // bf16: gate/up are read once by the SwiGLU, which requantises to E4M3 immediately, and `down`
     // once by the scatter, which sums into an f32 block. Both consumers run close to their DRAM
     // roofline over hundreds of MB a call, so the element width is most of what they cost.
@@ -1479,11 +1536,11 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
     bcap_slot_[dv] = cap;
   }
   if (bcap_tok_[dv] < taken * 2u) {
-    const uint32_t cap = taken * 2u + taken + 64;
+    const uint32_t cap = exact_cap ? (taken * 2u) : (taken * 2u + taken + 64);
     bcap_tok_[dv] = cap;
   }
   if (bcap_tile_[dv] < n_tiles) {
-    const uint32_t cap = n_tiles + (n_tiles >> 1) + 16;
+    const uint32_t cap = exact_cap ? n_tiles : (n_tiles + (n_tiles >> 1) + 16);
     bcap_tile_[dv] = cap;
   }
   if (bcap_nb_[dv] < nb_stride) {
@@ -1887,9 +1944,14 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         A.shard = shard_;
         A.bg = (uint16_t*)bg_[dv]; A.bu = (uint16_t*)bu_[dv]; A.bydn = (uint16_t*)bydn_[dv];
         A.tile_cap = cap;
+        static const bool hybrid_tile128 = [] {
+          const char* s = std::getenv("AFF_HYBRID_TILE128");
+          return !s || !*s || std::strcmp(s, "0") != 0;
+        }();
         A.pref_slab = d_pref_slab_[dv];
         A.pref_src  = d_pref_src_[dv];
         A.pref_cap  = pref_cap_;
+        A.hybrid_tile128 = hybrid_tile128;
         if (!moe_plan_hip(A, st)) {
           aff::ui::fatal("fatal: the plan kernel refused nb_tok %u k %u experts %u on card "
                        "%zu\n", nb_tok, k, n_expert_, dv);
@@ -1903,24 +1965,29 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         // decode nothing is wider than nb_tok <= 16, so exactly one bucket a class is launched and
         // the layer costs the same six launches it does today. Launching all four unconditionally
         // would take that to twenty-four.
-        const uint32_t last = moe_plan_last_group(nb_tok);
+        const uint32_t last_res = moe_plan_last_group(nb_tok);
+        const uint32_t w_hyb = std::min<uint32_t>(nb_tok, hybrid_tile128 ? 128u : kExpertWmmaTok);
+        const uint32_t last_hyb = w_hyb > 64u ? 3u : moe_plan_last_group(nb_tok);
         const bool has_pooled =
             I.pooled_layer_cnt.empty() ||
             ((dv * n_layer_ + layer) < I.pooled_layer_cnt.size() &&
              I.pooled_layer_cnt[dv * n_layer_ + layer] > 0u);
         const uint32_t n_cls = has_pooled ? 2u : 1u;
-        for (uint32_t cls = 0; cls < n_cls; ++cls)
-          for (uint32_t b = 0; b <= last; ++b) {
+        for (uint32_t cls = 0; cls < n_cls; ++cls) {
+          const uint32_t last_b = (cls == 0u) ? last_res : last_hyb;
+          for (uint32_t b = 0; b <= last_b; ++b) {
             const uint32_t g = cls * 4u + b;
             GRP.n[g] = cap;
             GRP.max_nt[g] = moe_plan_group_max_nt(g);
             for (uint32_t pl = 0; pl < 3u; ++pl)
               GRP.base[g][pl] = Tg + (size_t)(pl * 8u + g) * cap;
           }
+        }
         n_miss_tiles = has_pooled ? cap : 0u;
         _xbucket.stop();
         trace::g_xt.taken[dv] += taken;
-        trace::g_xt.tiles[dv] += (uint64_t)(last + 1u) * (uint64_t)n_cls * cap;
+        trace::g_xt.tiles[dv] +=
+            (uint64_t)(last_res + 1u + (has_pooled ? (last_hyb + 1u) : 0u)) * cap;
       } else {
       // Tiles, split at the kernel's widest token block and ordered by the NT template they need.
       // A tile of 8 tokens launched under NT=8 would stage and multiply 128 columns to use 8, so
@@ -2363,14 +2430,18 @@ bool StaticPlacement::placement_engine_init(HostExpertPool* pool,
   heat_.init(n_layer_, n_expert_, cfg.heat);
   resident_now_ = 0;
   uint64_t pooled = 0, ssd = 0;
+  bool all_in_pool = true;
   for (uint32_t l = 0; l < n_layer_; ++l)
     for (uint32_t e = 0; e < n_expert_; ++e) {
       const uint32_t idx = l * n_expert_ + e;
       if (is_v41_massive_expert(n_layer_, n_expert_, idx)) heat_.set_protected(idx, true);
+      const bool in_pool = pool->slot_of(l, e) >= 0;
+      all_in_pool &= in_pool;
       if (device_of_[idx] >= 0) { heat_.set_tier(idx, ExpertTier::Vram); ++resident_now_; }
-      else if (pool->slot_of(l, e) >= 0) { heat_.set_tier(idx, ExpertTier::Pool); ++pooled; }
+      else if (in_pool) { heat_.set_tier(idx, ExpertTier::Pool); ++pooled; }
       else { heat_.set_tier(idx, ExpertTier::Ssd); ++ssd; }
     }
+  pool_full_ = all_in_pool && (n_layer_ * n_expert_ > 0u);
   resident_target_ = resident_now_;
   heat_.resident_per_layer(&resident_at_load_);
   ever_moved_.assign((size_t)n_layer_ * n_expert_, 0u);
@@ -2390,12 +2461,13 @@ bool StaticPlacement::placement_engine_init(HostExpertPool* pool,
       return fail("could not create the mover's layer-boundary event");
   }
 
-  // One record per shadow slot is the natural bound: a promotion holds a slab slot for its whole
-  // life, so there can never be more in flight than there are shadows, and a demotion is gated by
-  // the pool slots those promotions free.
-  I.moves.assign(shadow_slots_, Impl::Move{});
+  // One record per shadow slot is the natural bound for bounded pools; under `pool_full_`
+  // zero-D2H demotes can issue concurrently with promotes, so size to `shadow_slots_ * 2` to keep
+  // demotes from stealing move records from promotes.
+  const uint32_t move_slots = pool_full_ ? shadow_slots_ * 2u : shadow_slots_;
+  I.moves.assign(move_slots, Impl::Move{});
 
-  for (uint32_t m = 0; m < shadow_slots_; ++m) {
+  for (uint32_t m = 0; m < move_slots; ++m) {
     for (size_t i = 0; i < R; ++i) {
       if (hipSetDevice(devs_[i]) != hipSuccess) return fail("hipSetDevice failed for a move event");
       if (hipEventCreateWithFlags(&I.moves[m].ev[i], hipEventDisableTiming) != hipSuccess)
@@ -2407,10 +2479,11 @@ bool StaticPlacement::placement_engine_init(HostExpertPool* pool,
   engine_on_ = true;
   aff::ui::err(// The strategy BY NAME: a banner that says "heat" whatever is running is how a
                // measurement ends up attributed to the arm that did not produce it.
-               "placement engine: %s, %u shadow slots, %u move%s a layer\n"
+               "placement engine: %s, %u shadow slots, %u move%s a layer%s\n"
                "                  at load %llu in VRAM / %llu pooled / %llu on ssd\n",
                cfg.strategy == PlacementEngineConfig::Strategy::Demand ? "demand" : "heat",
                shadow_slots_, cfg.moves_per_tick, cfg.moves_per_tick == 1 ? "" : "s",
+               pool_full_ ? " (zero-D2H full immutable host pool)" : "",
                (unsigned long long)resident_now_, (unsigned long long)pooled,
                (unsigned long long)ssd);
   return true;
@@ -2497,7 +2570,9 @@ void StaticPlacement::engine_tick(uint32_t layer, const uint32_t* sel, size_t to
   if (!rounds) ++estats_.dry;
   for (uint32_t r = 0; r < rounds; ++r)
   for (uint32_t m = 0; m < ecfg_.moves_per_tick; ++m) {
-    if (I.free_slab.empty() && I.free_pool.empty()) { ++estats_.no_supply; break; }
+    if (!pool_full_ && I.free_slab.empty() && I.free_pool.empty()) {
+      ++estats_.no_supply; break;
+    }
     uint32_t up = 0, down = 0;
     const bool got = ecfg_.strategy == PlacementEngineConfig::Strategy::Demand
                          ? heat_.pick_demand(&up, &down)
@@ -2506,7 +2581,7 @@ void StaticPlacement::engine_tick(uint32_t layer, const uint32_t* sel, size_t to
     bool moved = false;
     if (!I.free_slab.empty()) moved |= engine_issue(up, /*promote=*/true, streams);
     else ++estats_.starved_slab;
-    if (!I.free_pool.empty()) moved |= engine_issue(down, /*promote=*/false, streams);
+    if (pool_full_ || !I.free_pool.empty()) moved |= engine_issue(down, /*promote=*/false, streams);
     else ++estats_.starved_pool;
     if (!moved) break;
   }
@@ -2544,6 +2619,7 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
 
   M.promote = promote;
   M.idx = idx;
+  M.zero_d2h = false;
 
   if (promote) {
     const int64_t ps = pool_mut_->slot_of(l, e);
@@ -2566,6 +2642,12 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
       AFF_HIP_CHECK(hipEventRecord(M.ev[dv], I.mv[dv]));
     }
     estats_.h2d_bytes += (uint64_t)R * ss;
+  } else if (pool_full_) {
+    const int64_t ps = pool_mut_->slot_of(l, e);
+    if (ps < 0) return false;
+    M.pool_slot = ps;
+    M.slab_slot = offset_of_[idx] / ss;
+    M.zero_d2h = true;
   } else {
     const int64_t g = I.free_pool.back();
     uint8_t* dst = pool_mut_->slot_base(g);
@@ -2608,6 +2690,10 @@ void StaticPlacement::engine_retire(void* const* streams) {
       if (M.ev[dv] && hipEventQuery(M.ev[dv]) != hipSuccess) return false;
     return true;
   };
+  auto landed_copy = [&](Impl::Move& M) {
+    if (M.zero_d2h) return true;
+    return landed(M);
+  };
 
   // This tick's edits, one patch a card, applied on the compute streams below. Collected rather than
   // stored because the CARDS read the table when they RUN: a plain store lands in the middle of
@@ -2635,7 +2721,7 @@ void StaticPlacement::engine_retire(void* const* streams) {
     const uint32_t l = M.idx / n_expert_, e = M.idx % n_expert_;
 
     if (M.state == Impl::Move::State::Copying) {
-      if (!landed(M)) continue;
+      if (!landed_copy(M)) continue;
 
       // ---- PUBLISH. Both copies of the bytes are valid at this instant, which is what makes the
       // edit safe to make from this thread with nothing synchronised: the dispatch reads one table,
@@ -2675,7 +2761,7 @@ void StaticPlacement::engine_retire(void* const* streams) {
         }
         device_of_[M.idx] = 0;                        // sharded: "which card" is not a question
         offset_of_[M.idx] = M.slab_slot * slot_stride();
-        pool_mut_->bind(l, e, -1);
+        if (!pool_full_) pool_mut_->bind(l, e, -1);
         heat_.set_tier(M.idx, ExpertTier::Vram);
         ++resident_now_;
         ++estats_.promotions;
@@ -2710,7 +2796,7 @@ void StaticPlacement::engine_retire(void* const* streams) {
                 aff::ui::err("POOL-DOUBLE-MAP: pool slot %lld already bound to layer %u expert %u while demoting layer %u expert %u\n",
                              (long long)M.pool_slot, ll, ee, l, e);
         }
-        pool_mut_->bind(l, e, M.pool_slot);
+        if (!pool_full_) pool_mut_->bind(l, e, M.pool_slot);
         device_of_[M.idx] = -1;
         heat_.set_tier(M.idx, ExpertTier::Pool);
         --resident_now_;
@@ -2740,8 +2826,9 @@ void StaticPlacement::engine_retire(void* const* streams) {
     if (M.state == Impl::Move::State::Published) continue;   // this tick's; handled below
 
     if (!landed(M)) continue;
-    if (M.promote) I.free_pool.push_back(M.pool_slot);
+    if (M.promote) { if (!pool_full_) I.free_pool.push_back(M.pool_slot); }
     else           I.free_slab.push_back(M.slab_slot);
+    M.zero_d2h = false;
     M.state = Impl::Move::State::Free;
   }
 

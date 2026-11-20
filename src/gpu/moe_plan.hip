@@ -159,7 +159,9 @@ __device__ inline PlanLds plan_lds(char* raw, uint32_t n_expert, uint32_t nb_tok
 
 constexpr uint32_t kNone = 0xffffffffu;
 
-__global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a, uint32_t last_group) {
+__global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
+                                                               uint32_t last_group_res,
+                                                               uint32_t last_group_hyb) {
   extern __shared__ char raw[];
   const uint32_t NE = a.n_expert, NB = a.nb_tok, K = a.k, TOTAL = NB * K;
   PlanLds L = plan_lds(raw, NE, NB);
@@ -313,11 +315,13 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a, u
   __syncthreads();
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) {
     const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
-    const uint32_t q = c / kExpertWmmaTok, r = c % kExpertWmmaTok;
+    const bool hyb128 = (cls == 1u && a.hybrid_tile128);
+    const uint32_t wmax = hyb128 ? 128u : kExpertWmmaTok;
+    const uint32_t full_b = hyb128 ? 3u : 2u;
+    const uint32_t q = c / wmax, r = c % wmax;
     // One thread owns j, so these accumulate rather than race — and they DO have to accumulate:
-    // when the remainder is 33..64 wide it is a bucket-2 tile too, and lands in the same row as the
-    // full ones.
-    L.tc[(cls * 4u + 2u) * NE + j] += q;
+    // when the remainder lands in `full_b` it sits in the same row as the full tiles.
+    L.tc[(cls * 4u + full_b) * NE + j] += q;
     if (r) L.tc[(cls * 4u + plan_bucket(r)) * NE + j] += 1u;
   }
   __syncthreads();
@@ -339,7 +343,10 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a, u
   const uint32_t cap = a.tile_cap;
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) {
     const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
-    const uint32_t q = c / kExpertWmmaTok, r = c % kExpertWmmaTok;
+    const bool hyb128 = (cls == 1u && a.hybrid_tile128);
+    const uint32_t wmax = hyb128 ? 128u : kExpertWmmaTok;
+    const uint32_t full_b = hyb128 ? 3u : 2u;
+    const uint32_t q = c / wmax, r = c % wmax;
     const uint64_t pv = plc[e];
     uint8_t* base = (uint8_t*)(uintptr_t)(pv & ~1ull);
     if (cls == 1u && a.pref_slab && a.pref_src && (j - n_res) < a.pref_cap) {
@@ -368,17 +375,17 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a, u
       }
     };
     // Within its own region a group starts at 0, so the scan offset IS the slot.
-    const uint32_t s2 = L.tc[(cls * 4u + 2u) * NE + j];
+    const uint32_t sf = L.tc[(cls * 4u + full_b) * NE + j];
     for (uint32_t i = 0; i < q; ++i)
-      emit(cls * 4u + 2u, s2 + i, L.start[e] + i * kExpertWmmaTok, kExpertWmmaTok);
+      emit(cls * 4u + full_b, sf + i, L.start[e] + i * wmax, wmax);
     if (r) {
       const uint32_t b = plan_bucket(r);
-      // `+ q` when the remainder shares bucket 2 with this expert's own full tiles: the scan offset
+      // `+ q` when the remainder shares `full_b` with this expert's own full tiles: the scan offset
       // counts all of j's tiles in the bucket, and the host emits them in ascending `off`, so the
       // remainder is the last of them and not the first. Without this the remainder overwrites the
-      // expert's first full tile and one 64-wide tile of the dispatch is silently dropped.
-      const uint32_t at = L.tc[(cls * 4u + b) * NE + j] + (b == 2u ? q : 0u);
-      emit(cls * 4u + b, at, L.start[e] + q * kExpertWmmaTok, r);
+      // expert's first full tile and one full tile of the dispatch is silently dropped.
+      const uint32_t at = L.tc[(cls * 4u + b) * NE + j] + (b == full_b ? q : 0u);
+      emit(cls * 4u + b, at, L.start[e] + q * wmax, r);
     }
   }
   __syncthreads();
@@ -388,7 +395,8 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a, u
   // The host sizes the grid from `tile_cap`, which it can compute without the routing, and the
   // surplus is `nt = 0` — a tile the GEMM returns on before it builds its codebook.
   for (uint32_t g = 0; g < 8u; ++g) {
-    if ((g & 3u) > last_group) continue;
+    const uint32_t lg = (g < 4u) ? last_group_res : last_group_hyb;
+    if ((g & 3u) > lg) continue;
     for (uint32_t i = s_gtot[g] + threadIdx.x; i < cap; i += kPlanThreads)
       for (uint32_t pl = 0; pl < 3u; ++pl)
         a.tiles[(size_t)pl * 8u * cap + g * cap + i].nt = 0u;
@@ -467,8 +475,11 @@ bool moe_plan_hip(const MoePlanArgs& a, void* stream) {
   // this is on the dispatch path and hipGetDeviceProperties is a driver call.
   const size_t lds = moe_plan_lds_bytes(a.n_expert, a.nb_tok);
   if (lds > device_lds_per_block()) return false;
+  const uint32_t last_res = moe_plan_last_group(a.nb_tok);
+  const uint32_t last_hyb =
+      (a.hybrid_tile128 && a.nb_tok > kExpertWmmaTok) ? 3u : last_res;
   hipLaunchKernelGGL(moe_plan_kernel, dim3(1), dim3(kPlanThreads), lds, (hipStream_t)stream, a,
-                     moe_plan_last_group(a.nb_tok));
+                     last_res, last_hyb);
   return hipGetLastError() == hipSuccess;   // amdnas-fixes: an unbuilt plan must not be dispatched
 }
 

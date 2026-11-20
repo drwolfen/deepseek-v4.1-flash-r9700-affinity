@@ -499,6 +499,7 @@ private:
   PlacementEngineStats estats_;
   ExpertHeat heat_;
   bool engine_on_ = false;
+  bool pool_full_ = false;
   uint32_t shadow_slots_ = 0;
   double headroom_mib_ = 0.0;                 // 0 = the derived fraction; see set_driver_headroom_mib
   uint64_t resident_now_ = 0, resident_target_ = 0;
@@ -594,7 +595,7 @@ private:
   // Grows the arenas above to hold one layer's slots. Returns false if any allocation fails, in
   // which case the caller must not launch — the tiles point into buffers that do not exist.
   bool grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uint32_t nb_tok, uint32_t hidden,
-                 uint32_t inter, uint32_t nb_stride);
+                 uint32_t inter, uint32_t nb_stride, bool exact_cap = false);
 
   struct Impl;
   Impl* impl_ = nullptr;                                  // HIP handles, kept out of this header

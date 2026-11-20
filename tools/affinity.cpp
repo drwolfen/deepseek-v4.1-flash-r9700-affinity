@@ -1267,7 +1267,7 @@ int main(int argc, char** argv) {
     // does not get.
     const double shard_gib = (double)model.dspark_reader().layer(0).stride /
                              (double)std::max<size_t>(1, dense_gpu.ranks()) / 1073741824.0;
-    const double need = shard_gib * d_n_expert * n_stage * 1.05;
+    const double need = shard_gib * d_n_expert * n_stage * 1.005 + 0.01;
     // Under `ram` the slab is not empty but token: a placement with no slots at all cannot
     // initialise, and this is the smallest one that can. Those few experts are under a percent of
     // the draft and the pool holds the rest.
@@ -1531,6 +1531,16 @@ int main(int argc, char** argv) {
   }
 
   if (placement.enabled() && host_pool_mib != 0.0) {
+    uint64_t avail_kb = 0;
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+      char line[256];
+      while (std::fgets(line, sizeof line, f))
+        if (std::sscanf(line, "MemAvailable: %llu kB", (unsigned long long*)&avail_kb) == 1) break;
+      std::fclose(f);
+    }
+    const uint64_t reserve = (uint64_t)(host_pool_reserve_mib * 1048576.0);
+    const uint64_t avail = avail_kb * 1024ull;
+    const uint64_t ceiling = avail > reserve ? avail - reserve : 0;
     uint64_t budget = 0;
     if (host_pool_mib > 0) {
       budget = (uint64_t)(host_pool_mib * 1048576.0);
@@ -1538,16 +1548,7 @@ int main(int argc, char** argv) {
       // What the kernel says is available now, minus a reserve. MemAvailable already counts
       // reclaimable page cache, which is exactly the memory to convert into an owned pool; the
       // reserve is not optional because the machine brings up other work too.
-      uint64_t avail_kb = 0;
-      if (FILE* f = std::fopen("/proc/meminfo", "r")) {
-        char line[256];
-        while (std::fgets(line, sizeof line, f))
-          if (std::sscanf(line, "MemAvailable: %llu kB", (unsigned long long*)&avail_kb) == 1) break;
-        std::fclose(f);
-      }
-      const uint64_t reserve = (uint64_t)(host_pool_reserve_mib * 1048576.0);
-      const uint64_t avail = avail_kb * 1024ull;
-      budget = avail > reserve ? avail - reserve : 0;
+      budget = ceiling;
     }
     std::string perr;
     // The pool holds DEVICE bytes, not container bytes. A missing expert is never copied anywhere:
@@ -1563,13 +1564,27 @@ int main(int argc, char** argv) {
     // The slots come off the pool's own budget, so they cost that many experts of residency. That
     // is the price of the tier being dispatchable at all, and it is only paid when the pool cannot
     // cover the complement — which the report at exit names explicitly.
-    dash.stage(aff::ui::Stage::LoadPool, "reading the non-resident experts into RAM");
-    if (host_pool.init(&model.reader(), budget,
-                       [](void* v, uint32_t l, uint32_t e) {
-                         return !((StaticPlacement*)v)->resident(l, e);
-                       }, &placement, c.n_layer, c.n_expert, &perr,
+    const bool pool_full_env = [] {
+      const char* s = std::getenv("AFF_POOL_FULL");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
+    const uint64_t full_need = (uint64_t)c.n_layer * c.n_expert * placement.pool_out_stride();
+    const uint64_t eff_budget = (reserve && ceiling && budget > ceiling) ? ceiling : budget;
+    const bool want_full = pool_full_env &&
+                           placement.stats().resident_experts < placement.stats().total_experts &&
+                           eff_budget >= full_need;
+    dash.stage(aff::ui::Stage::LoadPool,
+               want_full ? "reading all experts into immutable RAM pool"
+                         : "reading the non-resident experts into RAM");
+    const HostExpertPool::Wanted pred =
+        want_full ? [](void*, uint32_t, uint32_t) { return true; }
+                  : [](void* v, uint32_t l, uint32_t e) {
+                      return !((StaticPlacement*)v)->resident(l, e);
+                    };
+    const uint64_t n_stage_pool = want_full ? 0ull : (uint64_t)c.n_expert;
+    if (host_pool.init(&model.reader(), budget, pred, &placement, c.n_layer, c.n_expert, &perr,
                        &StaticPlacement::pool_tf, &placement, placement.pool_out_stride(),
-                       c.n_expert, (uint64_t)(host_pool_reserve_mib * 1048576.0))) {
+                       n_stage_pool, reserve)) {
       const auto& hp = host_pool.stats();
       aff::ui::out("host pool: %llu experts in %.1f GiB of RAM in %.1f s (%.2f GB/s)"
                   ", %llu on the ssd tier, %.0f%% on 2 MiB pages\n",
