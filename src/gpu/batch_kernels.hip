@@ -280,8 +280,9 @@ __global__ void splitk_reduce_kernel(const float* __restrict__ ws, float* __rest
 // Reserve a fixed 4 KiB header at offset 0 for zeroed arrival counters (`splitk_buf_with_ctr`)
 // so counters stay at a fixed address across workspace size changes with zero per-call hipMemsetAsync.
 constexpr uint32_t kSplitCtrFloats = 1024u;
-struct SplitKWs { float* p = nullptr; size_t n = 0; };
-SplitKWs g_skws[kMaxGpuDevices];
+constexpr uint32_t kMaxSplitKStreams = 4u;
+struct SplitKWs { hipStream_t stream = nullptr; float* p = nullptr; size_t n = 0; bool bound = false; };
+SplitKWs g_skws[kMaxGpuDevices][kMaxSplitKStreams];
 
 
 // Blocks the split is aiming for. Both GEMMs use it: gemm_launch counts blocks, batch_gemm_fp8_hip
@@ -315,10 +316,23 @@ constexpr uint32_t kSplitTarget = 128u;
 // decoding different sequences and cannot be compared on either.
 constexpr uint32_t kSplitThinCap = 64u;
 
-float* splitk_buf_with_ctr(size_t need, unsigned int** ctr_out) {
+SplitKWs* select_splitk_slot(int dev, hipStream_t st) {
+  SplitKWs* const slots = g_skws[dev];
+  // First: exact stream match (already reserved or bound to this stream).
+  for (uint32_t i = 0; i < kMaxSplitKStreams; ++i)
+    if (slots[i].bound && slots[i].stream == st) return &slots[i];
+  // Second: unbound preallocated or empty slot.
+  for (uint32_t i = 0; i < kMaxSplitKStreams; ++i)
+    if (!slots[i].bound) { slots[i].stream = st; slots[i].bound = true; return &slots[i]; }
+  // Fallback if caller created more distinct streams than kMaxSplitKStreams.
+  return &slots[0];
+}
+
+float* splitk_buf_with_ctr(size_t need, unsigned int** ctr_out, hipStream_t st = nullptr) {
   int dev = 0;
   if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxGpuDevices) return nullptr;
-  SplitKWs& w = g_skws[dev];
+  SplitKWs* const wp = select_splitk_slot(dev, st);
+  SplitKWs& w = *wp;
   const size_t total_need = (size_t)kSplitCtrFloats + need;
   if (w.n < total_need) {
     if (w.p) (void)hipFree(w.p);
@@ -337,8 +351,8 @@ float* splitk_buf_with_ctr(size_t need, unsigned int** ctr_out) {
   return w.p + kSplitCtrFloats;
 }
 
-float* splitk_buf(size_t need) {
-  return splitk_buf_with_ctr(need, nullptr);
+float* splitk_buf(size_t need, hipStream_t st = nullptr) {
+  return splitk_buf_with_ctr(need, nullptr, st);
 }
 
 // ---- the W8A8 GEMM -------------------------------------------------------------------------------
@@ -3030,7 +3044,7 @@ void gemm_launch(uint32_t quant, const void* W, const uint8_t* S, const void* X,
     // the GEMM keep the wider tail.
     if (k2 > kSplitThinCap && (uint64_t)rows * nb < 8192) k2 = kSplitThinCap;
     if (k2 > 1) {
-      ws = splitk_buf((size_t)k2 * rows * nb);
+      ws = splitk_buf((size_t)k2 * rows * nb, st);
       if (ws) ksplit = k2;
     }
   }
@@ -3102,7 +3116,7 @@ bool batch_gemm_multi_hip(uint32_t quant, const BatchGemmJob* jobs, uint32_t n, 
     uint32_t k2 = (cols + ckw - 1) / ckw;
     if (k2 > kSplitThinCap && (uint64_t)total * nb < 8192) k2 = kSplitThinCap;
     if (k2 > 1) {
-      ws = splitk_buf((size_t)k2 * total * nb);
+      ws = splitk_buf((size_t)k2 * total * nb, (hipStream_t)stream);
       if (ws) ksplit = k2;
     }
   }
@@ -3277,10 +3291,10 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
     if (k2 > kSplitThinCap && (uint64_t)total * nb < 8192) k2 = kSplitThinCap;
     if (k2 > 1) {
       if (inline_split && tiles * gy <= kSplitCtrFloats) {
-        ws = splitk_buf_with_ctr((size_t)k2 * total * nb, &ctr_buf);
+        ws = splitk_buf_with_ctr((size_t)k2 * total * nb, &ctr_buf, (hipStream_t)stream);
         if (ws) ksplit = k2;
       } else {
-        ws = splitk_buf((size_t)k2 * total * nb);
+        ws = splitk_buf((size_t)k2 * total * nb, (hipStream_t)stream);
         if (ws) ksplit = k2;
       }
     }
@@ -3370,12 +3384,12 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
     if (k2 > kSplitThinCap && (uint64_t)rows * nb < 8192) k2 = kSplitThinCap;      // see gemm_launch
     if (k2 > 1) {
       if (inline_split && gx * gy <= kSplitCtrFloats) {
-        ws = splitk_buf_with_ctr((size_t)k2 * rows * nb, &ctr_buf);
+        ws = splitk_buf_with_ctr((size_t)k2 * rows * nb, &ctr_buf, (hipStream_t)stream);
         if (ws && ctr_buf) ksplit = k2;
         else if (ws && !accum) { ctr_buf = nullptr; ksplit = k2; }
         else { ws = nullptr; ctr_buf = nullptr; }
       } else if (!accum) {
-        ws = splitk_buf((size_t)k2 * rows * nb);
+        ws = splitk_buf((size_t)k2 * rows * nb, (hipStream_t)stream);
         if (ws) ksplit = k2;
       }
     }
@@ -3455,6 +3469,22 @@ void batch_gemm_grouped_hip(uint32_t quant, const void* W, const uint8_t* S, con
   for (uint32_t g = 0; g < n_groups; ++g)
     gemm_launch(quant, W, S, X, Y + (size_t)g * rank * nb, rank, group_dim, nb, g * group_dim,
                 g * rank, (hipStream_t)stream, x_bf16, aff_file, aff_line);
+}
+
+bool batch_splitk_reserve_hip(size_t peak_floats, void* stream) {
+  return splitk_buf_with_ctr(peak_floats, nullptr, (hipStream_t)stream) != nullptr;
+}
+
+void batch_splitk_release_hip(void* stream) {
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxGpuDevices) return;
+  const hipStream_t st = (hipStream_t)stream;
+  for (uint32_t i = 0; i < kMaxSplitKStreams; ++i) {
+    if (g_skws[dev][i].bound && g_skws[dev][i].stream == st) {
+      g_skws[dev][i].bound = false;
+      g_skws[dev][i].stream = nullptr;
+    }
+  }
 }
 
 void batch_rms_norm_hip(const float* x, const float* w32, const uint16_t* wbf16, float* out,

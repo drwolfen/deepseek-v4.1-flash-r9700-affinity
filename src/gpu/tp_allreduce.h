@@ -108,6 +108,7 @@ struct TpContext {
   unsigned* flags[kTpMaxRanks] = {};
   unsigned* seq[kTpMaxRanks] = {};            // device-resident per-block counters
   size_t max_floats = 0;                      // per sub-slot, i.e. one whole message
+  int last_scratch_nb = 0;                    // last gridDim.x on scratch; guards slot parity across width changes
   bool ready = false;
 
   // ---- a SECOND, disjoint set of the same three buffers -------------------------------
@@ -194,6 +195,19 @@ bool tp_fold_prepare(TpContext* ctx, size_t floats, std::string* err);
 // round trip 86 times a token for no reason. Call tp_sync() when the result must be on the host.
 void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n,
                    TpReduce mode = TpReduce::Auto);
+
+// Fused 2-rank exact FP32 all-reduce + batch HC post/expand (+ optional DSpark tap) over live
+// tokens [0, live) using ctx.scratch (0 B extra VRAM) and zeroing `block` across all [0, nb).
+bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
+                           float* const block[kTpMaxRanks],
+                           const uint16_t* const hc[kTpMaxRanks],
+                           const float* const post[kTpMaxRanks],
+                           const float* const comb[kTpMaxRanks], uint32_t n_embd,
+                           uint32_t n_hc, uint32_t nb, uint32_t live, bool has_control,
+                           int zb = 1, float* const tap[kTpMaxRanks] = nullptr,
+                           uint32_t b_lo = 0, uint32_t n_keep = 0, uint32_t row0 = 0,
+                           uint32_t rows_cap = 0, uint32_t row_stride = 0,
+                           uint32_t slot_off = 0);
 
 // Blocks until both ranks' streams are drained.
 void tp_sync(TpContext& ctx);

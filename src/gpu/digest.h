@@ -32,6 +32,7 @@ void xrank_check(uint32_t rank, uint32_t ranks, const void* p, size_t bytes, voi
 // cannot do, because two rank counts never agree bitwise. Synchronises, so it is a diagnostic and
 // never a measurement.
 void xrank_trace(uint32_t rank, const char* tag, const void* p, size_t bytes, void* stream);
+bool xrank_trace_enabled();
 
 // How many samples have been compared, for the one-line report at exit. A check that reports zero
 // checks is a failed check, not a passed one.

@@ -1317,9 +1317,15 @@ int main(int argc, char** argv) {
         const DenseGpu::RouteDev d = f->g->route_dev(r);
         rt[r].sel = d.sel; rt[r].wt = d.wt; rt[r].ready = d.ready;
       }
-      return f->c->run_batch_device(stage, sel, w, nb_tok, k, d_x, d_blk, f->g->batch_nb(),
-                                    f->cfg->n_embd, f->cfg->moe_inter, f->cfg->swiglu_limit, st,
-                                    handled, rt);
+      void* bwev[kMaxRanks] = {};
+      uint8_t bwdone[kMaxRanks] = {};
+      for (size_t r = 0; r < f->g->ranks(); ++r) bwev[r] = f->g->batch_shexp_event(r);
+      const uint32_t ret = f->c->run_batch_device(
+          stage, sel, w, nb_tok, k, d_x, d_blk, f->g->batch_nb(), f->cfg->n_embd,
+          f->cfg->moe_inter, f->cfg->swiglu_limit, st, handled, rt, bwev, bwdone);
+      for (size_t r = 0; r < f->g->ranks(); ++r)
+        if (bwdone[r]) f->g->clear_batch_shexp_event(r);
+      return ret;
     };
     dops.dev_plan = [](void* v, uint32_t stage) {
       return ((DrCtx*)v)->c->device_dispatch(stage);
@@ -1415,9 +1421,15 @@ int main(int argc, char** argv) {
         const DenseGpu::RouteDev d = f->g->route_dev(r);
         rt[r].sel = d.sel; rt[r].wt = d.wt; rt[r].ready = d.ready;
       }
-      return f->c->run_batch_device(layer, sel, w, nb_tok, k, d_x, d_blk, f->g->batch_nb(),
-                                    f->cfg->n_embd, f->cfg->moe_inter, f->cfg->swiglu_limit, st,
-                                    handled, rt);
+      void* bwev[kMaxRanks] = {};
+      uint8_t bwdone[kMaxRanks] = {};
+      for (size_t r = 0; r < f->g->ranks(); ++r) bwev[r] = f->g->batch_shexp_event(r);
+      const uint32_t ret = f->c->run_batch_device(
+          layer, sel, w, nb_tok, k, d_x, d_blk, f->g->batch_nb(), f->cfg->n_embd,
+          f->cfg->moe_inter, f->cfg->swiglu_limit, st, handled, rt, bwev, bwdone);
+      for (size_t r = 0; r < f->g->ranks(); ++r)
+        if (bwdone[r]) f->g->clear_batch_shexp_event(r);
+      return ret;
     }, &fctx);
     model.set_resident_pred([](void* v, uint32_t l, uint32_t e) {
       return ((StaticPlacement*)v)->resident(l, e);

@@ -155,6 +155,8 @@ public:
   void*  stream(size_t r) const;
   float* batch_norm_dev(size_t r) const;
   float* batch_block_dev(size_t r) const;
+  void*  batch_shexp_event(size_t r) const;
+  void   clear_batch_shexp_event(size_t r);
   uint32_t batch_nb() const { return b_nb_; }
 
   // The router's selection as a CARD can read it, which is what a device-built dispatch needs and
@@ -569,7 +571,9 @@ private:
   // no ordering — d_block is where it always was — only the fact that the sum has not happened
   // yet. hc_post clears it on every path, including the ones that decline the fold.
   uint32_t ar_pending_ = 0;
+  uint32_t b_ar_pending_ = 0;
   size_t   n_vec_ = 0, n_router_ = 0;
+  void     batch_shexp_join(size_t r);
   DenseGpuStats st_;
 
   // ---- the batch arena -------------------------------------------------------------------------

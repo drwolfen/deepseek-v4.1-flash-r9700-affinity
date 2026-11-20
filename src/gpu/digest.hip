@@ -78,14 +78,18 @@ __global__ __launch_bounds__(kThreads) void l2_kernel(const float* __restrict__ 
 
 } // namespace
 
-// AFF_NORM_TRACE=1 prints one line a visit. DIAGNOSTIC ONLY: it synchronises the stream to read the
-// value back, so the engine it measures is not the engine that ships.
-void xrank_trace(uint32_t rank, const char* tag, const void* p, size_t bytes, void* stream) {
+bool xrank_trace_enabled() {
   static const bool on = [] {
     const char* v = std::getenv("AFF_NORM_TRACE");
     return v && *v && *v != '0';
   }();
-  if (!on || !p || !bytes) return;
+  return on;
+}
+
+// AFF_NORM_TRACE=1 prints one line a visit. DIAGNOSTIC ONLY: it synchronises the stream to read the
+// value back, so the engine it measures is not the engine that ships.
+void xrank_trace(uint32_t rank, const char* tag, const void* p, size_t bytes, void* stream) {
+  if (!xrank_trace_enabled() || !p || !bytes) return;
   static double* h = nullptr;
   static double* d = nullptr;
   if (!h && (hipHostMalloc((void**)&h, sizeof(double), hipHostMallocMapped) != hipSuccess ||

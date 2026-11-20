@@ -28,6 +28,7 @@
 #include "gpu/tp_allreduce.h"
 #include "gpu/dense_gpu.h"        // kMaxRanks, asserted equal to kTpMaxRanks in tp_init
 #include "gpu/hip_common.h"
+#include "gpu/wmma.h"
 
 #include "ui/log.h"
 #include <hip/hip_fp8.h>
@@ -497,6 +498,7 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
 // S contiguous stages on 128-element group boundaries and overlaps PCIe BAR push of stage j with
 // local wait + quant + HBM reduce of stage j - 1. Wire format and outputs are bit-identical to
 // tp_ar_fp8_kernel.
+template <bool CacheStage>
 __global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
                                         TpPush8<1> push, const unsigned char* my_base,
                                         float* __restrict__ out,
@@ -527,6 +529,13 @@ __global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
   const int g1 = (g0 + gw < n_groups) ? (g0 + gw) : n_groups;
   const int gw_blk = (g1 > g0) ? (g1 - g0) : 0;
   constexpr int kPerLane = kTpFp8Group / kWave;  // 4
+  // Two ping-pong banks of 30 groups take 2 * 30 * (32 * 4 + 4) = 7,920 B <= 8 KiB LDS.
+  // Wave k owns identical groups g in both push_stage(st) and fold_stage(st), and the parity
+  // bank (st & 1) separates in-flight push_stage(st) from fold_stage(st - 1).
+  constexpr int kStageCacheGroups = 30;
+  __shared__ uint32_t s_pk[CacheStage ? 2 : 1][CacheStage ? kStageCacheGroups : 1]
+                          [CacheStage ? kWave : 1];
+  __shared__ float s_sc[CacheStage ? 2 : 1][CacheStage ? kStageCacheGroups : 1];
 
   auto quant_group = [&](int g, float& mine_scale, uint32_t& pk, bool write_peer) {
     const int lo = g * kTpFp8Group;
@@ -565,10 +574,18 @@ __global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
   auto push_stage = [&](int st) {
     const int sg0 = g0 + (gw_blk * st) / stages;
     const int sg1 = g0 + (gw_blk * (st + 1)) / stages;
+    const int bank = st & 1;
     for (int g = sg0 + wave; g < sg1; g += waves) {
       float sc_tmp;
       uint32_t pk_tmp;
       quant_group(g, sc_tmp, pk_tmp, true);
+      if constexpr (CacheStage) {
+        const int lg = g - sg0;
+        if (lg < kStageCacheGroups) {
+          s_pk[bank][lg][lane] = pk_tmp;
+          if (lane == 0) s_sc[bank][lg] = sc_tmp;
+        }
+      }
     }
   };
 
@@ -596,13 +613,24 @@ __global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
 
     const int sg0 = g0 + (gw_blk * st) / stages;
     const int sg1 = g0 + (gw_blk * (st + 1)) / stages;
+    const int bank = st & 1;
     for (int g = sg0 + wave; g < sg1; g += waves) {
       const int lo = g * kTpFp8Group;
       const int base_idx = lo + lane * kPerLane;
       const float peer_scale = m_scale0[g];
       float mine_scale;
       uint32_t pk;
-      quant_group(g, mine_scale, pk, false);
+      if constexpr (CacheStage) {
+        const int lg = g - sg0;
+        if (lg < kStageCacheGroups) {
+          pk = s_pk[bank][lg][lane];
+          mine_scale = s_sc[bank][lg];
+        } else {
+          quant_group(g, mine_scale, pk, false);
+        }
+      } else {
+        quant_group(g, mine_scale, pk, false);
+      }
 
       if (base_idx + (kPerLane - 1) < n) {
         const uint32_t peer_pk = *(const uint32_t*)(mb0 + base_idx);
@@ -633,6 +661,105 @@ __global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
     publish_stage(st);
   }
   fold_stage(stages - 1);
+}
+
+// Fused 2-rank exact FP32 all-reduce + batch HC post/expand (+ optional DSpark tap) over live
+// tokens [0, live) using ctx.scratch (0 B extra VRAM) and zeroing `block` across all [0, nb).
+template <uint32_t NH, bool HasTap, bool HasControl, bool LiveOne>
+__global__ void tp_ar_batch_hc_expand_kernel(
+    uint16_t* __restrict__ out_hc, float* __restrict__ block, const uint16_t* __restrict__ hc,
+    const float* __restrict__ post, const float* __restrict__ comb, uint32_t n_embd, uint32_t nb,
+    uint32_t live, int zb, float* __restrict__ tap, uint32_t b_lo, uint32_t n_keep,
+    uint32_t row0, uint32_t rows_cap, uint32_t row_stride, uint32_t slot_off,
+    float* __restrict__ peer_scratch, const float* __restrict__ my_scratch,
+    unsigned int* __restrict__ peer_flags, unsigned int* __restrict__ my_flags,
+    unsigned int* __restrict__ peer_wake, unsigned int* __restrict__ seq_ctrs,
+    unsigned int* __restrict__ timeout, size_t slot_floats) {
+  const uint32_t b_blk = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seq;
+  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b_blk], 1u) + 1u;
+  __syncthreads();
+  const unsigned int s = s_seq;
+  const int slot = (int)(s % TpContext::kTpSlots);
+
+  if (b_blk == 0 && tid == 0) store_sys_relaxed(peer_wake, s);
+
+  float* const ps = peer_scratch + (size_t)slot * slot_floats;
+  const float* const ms = my_scratch + (size_t)slot * slot_floats;
+
+  const uint32_t d_per_blk = (n_embd + gridDim.x - 1u) / gridDim.x;
+  const uint32_t d0 = (uint32_t)min((size_t)n_embd, (size_t)b_blk * d_per_blk);
+  const uint32_t d1 = (uint32_t)min((size_t)n_embd, (size_t)d0 + d_per_blk);
+  const size_t idx0 = LiveOne ? (size_t)d0 : (size_t)d0 * live;
+  const size_t idx1 = LiveOne ? (size_t)d1 : (size_t)d1 * live;
+
+  for (size_t idx = idx0 + tid; idx < idx1; idx += nt) {
+    const uint32_t d = LiveOne ? (uint32_t)idx : (uint32_t)(idx / live);
+    const uint32_t tok = LiveOne ? 0u : (uint32_t)(idx - (size_t)d * live);
+    ps[idx] = block[(size_t)d * nb + tok];
+  }
+
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  __syncthreads();
+
+  if (tid == 0) {
+    store_sys_rel(&peer_flags[b_blk], s);
+    const unsigned int* const f = &my_flags[b_blk];
+    unsigned long long z = 0;
+    unsigned int fv = load_sys_relaxed(f);
+    if ((int)(fv - s) < 0) {
+      do {
+        __builtin_amdgcn_s_sleep(1);
+        fv = load_sys_relaxed(f);
+      } while ((int)(fv - s) < 0 && ++z <= kTpSpinMax);
+      if ((int)(fv - s) < 0) note_timeout(timeout, s);
+    }
+  }
+  __syncthreads();
+  fence_sys_acq();
+
+  for (size_t idx = idx0 + tid; idx < idx1; idx += nt) {
+    const uint32_t d = LiveOne ? (uint32_t)idx : (uint32_t)(idx / live);
+    const uint32_t tok = LiveOne ? 0u : (uint32_t)(idx - (size_t)d * live);
+    const size_t blk_idx = (size_t)d * nb + tok;
+    const float bv = block[blk_idx] + ms[idx];
+    if (zb) block[blk_idx] = 0.0f;
+    if constexpr (HasControl) {
+      float v[NH];
+#pragma unroll
+      for (uint32_t src = 0; src < NH; ++src)
+        v[src] = wmma::bf16_to_f32(hc[((size_t)src * n_embd + d) * nb + tok]);
+      float tap_acc = 0.0f;
+#pragma unroll
+      for (uint32_t dst = 0; dst < NH; ++dst) {
+        float acc = bv * post[(size_t)dst * nb + tok];
+#pragma unroll
+        for (uint32_t src = 0; src < NH; ++src)
+          acc += comb[(size_t)(dst + src * NH) * nb + tok] * v[src];
+        const uint16_t h16 = wmma::f32_to_bf16(acc);
+        out_hc[((size_t)dst * n_embd + d) * nb + tok] = h16;
+        if constexpr (HasTap) tap_acc += wmma::bf16_to_f32(h16);
+      }
+      if constexpr (HasTap) {
+        if (tok >= b_lo && tok < b_lo + n_keep) {
+          const uint32_t row = row0 + (tok - b_lo);
+          if (row < rows_cap) tap[(size_t)row * row_stride + slot_off + d] = tap_acc / (float)NH;
+        }
+      }
+    } else {
+      out_hc[blk_idx] = wmma::f32_to_bf16(wmma::bf16_to_f32(out_hc[blk_idx]) + bv);
+    }
+  }
+
+  if (zb && live < nb) {
+    const uint32_t pad = nb - live;
+    const size_t ptot = (size_t)(d1 - d0) * pad;
+    for (size_t pidx = tid; pidx < ptot; pidx += nt) {
+      const uint32_t d = d0 + (uint32_t)(pidx / pad);
+      const uint32_t tok = live + (uint32_t)(pidx % pad);
+      block[(size_t)d * nb + tok] = 0.0f;
+    }
+  }
 }
 
 } // namespace
@@ -666,6 +793,7 @@ bool tp_grow(TpContext* ctx, size_t max_floats, std::string* err) {
     ctx->scratch[r] = (float*)sc;
   }
   ctx->max_floats = want;
+  ctx->last_scratch_nb = 0;
   return true;
 }
 
@@ -823,6 +951,7 @@ void tp_reset_seq(TpContext& ctx) {
                                    (hipStream_t)ctx.stream[r]));
     }
   }
+  ctx.last_scratch_nb = 0;
 }
 
 void tp_check(const TpContext& ctx) {
@@ -861,6 +990,7 @@ void tp_free(TpContext* ctx) {
   (void)hipHostFree(ctx->timeout);
   ctx->timeout = nullptr;
   ctx->timeout_dev = nullptr;
+  ctx->last_scratch_nb = 0;
   ctx->ready = false;
 }
 
@@ -880,6 +1010,21 @@ static inline bool tp_ar_staged_enabled() {
     return !(v && *v && std::strcmp(v, "0") == 0);
   }();
   return enabled;
+}
+
+static inline bool tp_ar_staged_cache_enabled() {
+  const char* v = std::getenv("AFF_TP_AR_STAGED_CACHE");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+static inline void tp_sync_on_grid_change(TpContext& ctx, int nb) {
+  if (ctx.ranks > 1 && ctx.last_scratch_nb != 0 && ctx.last_scratch_nb != nb) {
+    for (size_t r = 0; r < ctx.ranks; ++r) {
+      set_device(ctx.dev[r]);
+      AFF_HIP_CHECK(hipStreamSynchronize((hipStream_t)ctx.stream[r]));
+    }
+  }
+  ctx.last_scratch_nb = nb;
 }
 
 static inline int tp_ar_fp8_stages_cfg() {
@@ -939,6 +1084,7 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
     if (tp_ar_staged_enabled() && (size_t)n * sizeof(float) >= kTpStagedMinBytes) {
       const int stages = std::min(tp_ar_fp8_stages_cfg(), gw);
       if (stages >= 2) {
+        const bool cache_stage = tp_ar_staged_cache_enabled();
         for (size_t r = 0; r < ctx.ranks; ++r) {
           TpPush8<1> push{};
           const size_t q = 1u - r;
@@ -946,10 +1092,17 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
           push.flags[0] = ctx.flags[q];
           push.wake[0] = ctx.flags[q] + kTpFlagStride;
           set_device(ctx.dev[r]);
-          hipLaunchKernelGGL(tp_ar_fp8_staged_kernel, dim3(nb), dim3(256), 0,
-                             (hipStream_t)ctx.stream[r], in[r], push,
-                             (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
-                             ctx.timeout_dev, n, slot_bytes, scale_off, stages);
+          if (cache_stage) {
+            hipLaunchKernelGGL((tp_ar_fp8_staged_kernel<true>), dim3(nb), dim3(256), 0,
+                               (hipStream_t)ctx.stream[r], in[r], push,
+                               (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r],
+                               ctx.seq[r], ctx.timeout_dev, n, slot_bytes, scale_off, stages);
+          } else {
+            hipLaunchKernelGGL((tp_ar_fp8_staged_kernel<false>), dim3(nb), dim3(256), 0,
+                               (hipStream_t)ctx.stream[r], in[r], push,
+                               (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r],
+                               ctx.seq[r], ctx.timeout_dev, n, slot_bytes, scale_off, stages);
+          }
           AFF_HIP_CHECK(hipGetLastError());
         }
         return;
@@ -1016,6 +1169,7 @@ void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n
     const int nn = (int)n;
     int nb = (int)(((n + kTpFp8Group - 1) / kTpFp8Group + 63) / 64);
     nb = std::max(1, std::min(nb, kTpMaxBlocks));
+    tp_sync_on_grid_change(ctx, nb);
     const int peer_bytes = (int)(ctx.max_floats * sizeof(float));
     const int slot_bytes = (int)(np * ctx.max_floats * sizeof(float));
     const int scale_off = (int)ctx.max_floats;      // codes occupy [0,n); scales start past them
@@ -1039,6 +1193,7 @@ void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n
   // extra blocks add flag traffic without adding transfer.
   int nb = (int)((n4 + kTpWordsPerBlock - 1) / kTpWordsPerBlock);
   nb = std::max(1, std::min(nb, kTpMaxBlocks));
+  tp_sync_on_grid_change(ctx, nb);
   const int nt = 256;
 
   // Every rank's kernel must be IN FLIGHT together — each spins on the others' flags. Launching them
@@ -1053,6 +1208,71 @@ void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n
     case 6: tp_launch_exact<6>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
     default: tp_launch_exact<7>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
   }
+}
+
+bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
+                           float* const block[kTpMaxRanks],
+                           const uint16_t* const hc[kTpMaxRanks],
+                           const float* const post[kTpMaxRanks],
+                           const float* const comb[kTpMaxRanks], uint32_t n_embd,
+                           uint32_t n_hc, uint32_t nb, uint32_t live, bool has_control,
+                           int zb, float* const tap[kTpMaxRanks],
+                           uint32_t b_lo, uint32_t n_keep, uint32_t row0,
+                           uint32_t rows_cap, uint32_t row_stride, uint32_t slot_off) {
+  if (!ctx.ready || ctx.ranks != 2 || !n_embd || !nb || !live || live > nb) return false;
+  if (has_control && n_hc != 1u && n_hc != 2u && n_hc != 4u && n_hc != 8u) return false;
+  const size_t live_elems = (size_t)n_embd * live;
+  if (live_elems > ctx.max_floats) return false;
+
+  const size_t n4 = (live_elems + 3u) / 4u;
+  const int blk = std::max(1, std::min(kTpMaxBlocks, (int)((n4 + kTpWordsPerBlock - 1u) / kTpWordsPerBlock)));
+  tp_sync_on_grid_change(ctx, blk);
+  constexpr uint32_t nt = 256u;
+  const bool has_tap = tap && tap[0] && tap[1] && n_keep > 0;
+  const bool live_one = (live == 1u);
+
+  for (size_t r = 0; r < 2; ++r) {
+    const size_t q = 1u - r;
+    float* const ps = ctx.scratch[q];
+    const float* const ms = ctx.scratch[r];
+    unsigned int* const pf = ctx.flags[q];
+    unsigned int* const mf = ctx.flags[r];
+    unsigned int* const pw = ctx.flags[q] + kTpFlagStride;
+    float* const tap_r = has_tap ? tap[r] : nullptr;
+    set_device(ctx.dev[r]);
+    const hipStream_t st = (hipStream_t)ctx.stream[r];
+#define AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_)                                                     \
+  hipLaunchKernelGGL((tp_ar_batch_hc_expand_kernel<NH_, TAP_, CTL_, ONE_>), dim3(blk), dim3(nt),  \
+                     0, st, out_hc[r], block[r], hc ? hc[r] : nullptr,                            \
+                     post ? post[r] : nullptr, comb ? comb[r] : nullptr, n_embd, nb, live, zb,   \
+                     tap_r, b_lo, n_keep, row0, rows_cap, row_stride, slot_off, ps, ms, pf, mf,  \
+                     pw, ctx.seq[r], ctx.timeout_dev, ctx.max_floats)
+#define AFF_TP_BHC_CTL(NH_, TAP_, ONE_)                                                           \
+  do {                                                                                            \
+    if (has_control) AFF_TP_BHC_EXP(NH_, TAP_, true, ONE_);                                       \
+    else             AFF_TP_BHC_EXP(NH_, TAP_, false, ONE_);                                      \
+  } while (0)
+#define AFF_TP_BHC_TAP(NH_, ONE_)                                                                 \
+  do {                                                                                            \
+    if (has_tap) AFF_TP_BHC_CTL(NH_, true, ONE_);                                                 \
+    else         AFF_TP_BHC_CTL(NH_, false, ONE_);                                                \
+  } while (0)
+#define AFF_TP_BHC_ONE(NH_)                                                                       \
+  do {                                                                                            \
+    if (live_one) AFF_TP_BHC_TAP(NH_, true);                                                      \
+    else          AFF_TP_BHC_TAP(NH_, false);                                                     \
+  } while (0)
+    if (!has_control || n_hc == 4u) AFF_TP_BHC_ONE(4u);
+    else if (n_hc == 8u)            AFF_TP_BHC_ONE(8u);
+    else if (n_hc == 2u)            AFF_TP_BHC_ONE(2u);
+    else                            AFF_TP_BHC_ONE(1u);
+#undef AFF_TP_BHC_ONE
+#undef AFF_TP_BHC_TAP
+#undef AFF_TP_BHC_CTL
+#undef AFF_TP_BHC_EXP
+    AFF_HIP_CHECK(hipGetLastError());
+  }
+  return true;
 }
 
 void tp_sync(TpContext& ctx) {

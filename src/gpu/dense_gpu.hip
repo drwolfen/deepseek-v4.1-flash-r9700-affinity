@@ -276,6 +276,7 @@ struct DenseGpu::Impl {
     // ev_sd carries a record for THIS layer; waiting on one last recorded in some other layer, or
     // never, is a different ordering.
     bool sx_ev = false;
+    bool b_shexp_ev = false;       // recorded ev_sd on sstream for in-flight async batch_shexp
     // The held launch: everything shexp() would have passed to its two calls, kept until the router
     // has issued and the side stream can be released behind it. Shard pointers rather than copies —
     // `ent_` outlives every call and reg() does not move a shard once placed.
@@ -642,6 +643,8 @@ DenseGpu::~DenseGpu() {
     }
     if (D.ev_sx) (void)hipEventDestroy(D.ev_sx);
     if (D.ev_sd) (void)hipEventDestroy(D.ev_sd);
+    batch_splitk_release_hip(D.sstream);
+    batch_splitk_release_hip(D.stream);
     if (D.sstream) (void)hipStreamDestroy(D.sstream);
     if (D.stream) (void)hipStreamDestroy(D.stream);
   }
@@ -746,6 +749,12 @@ bool DenseGpu::init(uint64_t max_rows, uint64_t max_cols, std::string* err, size
     AFF_HIP_CHECK(hipStreamCreate(&impl_->dev[d].sstream));
     AFF_HIP_CHECK(hipEventCreateWithFlags(&impl_->dev[d].ev_sx, hipEventDisableTiming));
     AFF_HIP_CHECK(hipEventCreateWithFlags(&impl_->dev[d].ev_sd, hipEventDisableTiming));
+    // Pre-allocate per-stream Split-K buffers to exact decode/verify peak (<= 4 MiB/card total)
+    // so zero VRAM expert slots are lost and steady-state GEMMs never trigger mid-run syncs.
+    constexpr size_t kSplitKMainPeakFloats = 524224u;  // 64 * 8191 (< 2.01 MiB w/ ctr)
+    constexpr size_t kSplitKSidePeakFloats = 262144u;  // 1.00 MiB for overlapped shexp
+    (void)batch_splitk_reserve_hip(kSplitKMainPeakFloats, impl_->dev[d].stream);
+    (void)batch_splitk_reserve_hip(kSplitKSidePeakFloats, impl_->dev[d].sstream);
   }
   st_.ranks = use;
 
@@ -2850,6 +2859,21 @@ float* DenseGpu::batch_norm_dev(size_t r) const {
 float* DenseGpu::batch_block_dev(size_t r) const {
   return (impl_ && r < impl_->dev.size()) ? impl_->dev[r].b_block : nullptr;
 }
+void* DenseGpu::batch_shexp_event(size_t r) const {
+  if (!impl_ || r >= impl_->dev.size()) return nullptr;
+  return impl_->dev[r].b_shexp_ev ? (void*)impl_->dev[r].ev_sd : nullptr;
+}
+void DenseGpu::clear_batch_shexp_event(size_t r) {
+  if (impl_ && r < impl_->dev.size()) impl_->dev[r].b_shexp_ev = false;
+}
+void DenseGpu::batch_shexp_join(size_t r) {
+  if (!impl_ || r >= impl_->dev.size()) return;
+  Impl::Dev& D = impl_->dev[r];
+  if (!D.b_shexp_ev) return;
+  AFF_HIP_CHECK(hipSetDevice(D.id));
+  AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, D.ev_sd, 0));
+  D.b_shexp_ev = false;
+}
 
 bool DenseGpu::hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
   AFF_TRACE(8);
@@ -3967,28 +3991,38 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
     }
     if (!ensure_by(need_y, err)) return false;
   }
-  // b_cap_ is 0 when prefill batching is off; the decode path still wants one token's worth.
-  const uint32_t cap = b_cap_ ? b_cap_ : 1u;
+  // b_cap_ is 0 when prefill batching is off; cover the widest compressor group too so decode
+  // compress_one never frees and reallocates c_kv/c_sc/ci_kv/ci_sc/c_lat/ci_ky mid-run.
+  uint32_t max_ratio = 1u;
+  for (uint32_t l = 0; l < n_layer; ++l)
+    if (!v41 || key_layers[l]) max_ratio = std::max(max_ratio, ratios[l]);
+  const uint32_t cap = std::max<uint32_t>(b_cap_ ? b_cap_ : 1u, max_ratio);
   const uint32_t aw = 2u * width, aiw = 2u * idx_dim;
+  const uint32_t saved_slot = slot_;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    for (uint32_t l = 0; l < n_layer; ++l) {
-      const uint32_t r = ratios[l];
-      if (!r) continue;                       // ratio 0 compresses nothing and allocates nothing
-      if (v41 && !key_layers[l]) continue;    // V4.1 non-kv-source layers never compress
-      // The index COMPRESSOR exists on the ratio-4 layers alone — the same rule batch_compress
-      // applies when it derives `has_idx` from whether the caller bound idx_comp_wkv/wgate. The
-      // KEY CACHE is a separate question on V4.1, where `key_layers` names the kv sources; without
-      // it those layers would take the early return below on their first real call and never get
-      // one. Null means V4, where owning a ring and owning keys are the same thing.
-      const bool keys = v41 ? (key_layers[l] != 0) : false;
-      if (!compress_grow(&D, l, r, comp_width(r, width),
-                         (!v41 && r == 4u) ? comp_width(r, idx_dim) : 0u, keys)) {
-        if (err) *err = "compressor state for layer " + std::to_string(l);
-        return false;
+    for (uint32_t s = 0; s < n_slots_; ++s) {
+      slot_ = s;
+      for (uint32_t l = 0; l < n_layer; ++l) {
+        const uint32_t r = ratios[l];
+        if (!r) continue;                       // ratio 0 compresses nothing and allocates nothing
+        if (v41 && !key_layers[l]) continue;    // V4.1 non-kv-source layers never compress
+        // The index COMPRESSOR exists on the ratio-4 layers alone — the same rule batch_compress
+        // applies when it derives `has_idx` from whether the caller bound idx_comp_wkv/wgate. The
+        // KEY CACHE is a separate question on V4.1, where `key_layers` names the kv sources; without
+        // it those layers would take the early return below on their first real call and never get
+        // one. Null means V4, where owning a ring and owning keys are the same thing.
+        const bool keys = v41 ? (key_layers[l] != 0) : false;
+        if (!compress_grow(&D, l, r, comp_width(r, width),
+                           (!v41 && r == 4u) ? comp_width(r, idx_dim) : 0u, keys)) {
+          slot_ = saved_slot;
+          if (err) *err = "compressor state for layer " + std::to_string(l);
+          return false;
+        }
       }
     }
+    slot_ = saved_slot;
     // The compressor's per-chunk projection arena. batch_compress sizes this from b_nb_, THIS
     // chunk's token count, which is never more than b_cap_.
     if (D.c_cap_tok < cap) {
@@ -4232,9 +4266,11 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
     std::abort();
   }
   b_nb_ = nb; b_live_ = n_live; b_pos0_ = pos0;
+  b_ar_pending_ = 0;
   const size_t live_bytes = (size_t)n_live * n_embd * sizeof(float);
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
+    D.b_shexp_ev = false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
     keepalive_notify_active(D.id);
     // ---- through the ring, which is what deleted the drain that used to be here ------------------
@@ -5627,6 +5663,49 @@ bool DenseGpu::batch_attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_
 bool DenseGpu::batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
   if (!b_nb_) return false;
   AFF_TRACE(27);
+  for (size_t d = 0; d < impl_->dev.size(); ++d) batch_shexp_join(d);
+  const bool ar_fits = b_ar_pending_ == n_embd && impl_->tp.ready && impl_->dev.size() == 2 &&
+                       b_nb_ <= kNarrowTok && b_live_ > 0 && b_live_ <= b_nb_ &&
+                       !xrank_trace_enabled() &&
+                       ((size_t)n_embd * b_live_ <= impl_->tp.max_floats) &&
+                       (!has_control || n_hc == 1 || n_hc == 2 || n_hc == 4 || n_hc == 8);
+  const bool ar = b_ar_pending_ != 0 && ar_fits;
+  if (b_ar_pending_ && !ar_fits) {
+    float* p[kMaxRanks];
+    for (size_t d = 0; d < impl_->dev.size(); ++d) p[d] = impl_->dev[d].b_block;
+    reduce(p, p, (uint64_t)b_ar_pending_ * b_nb_);
+    for (size_t d = 0; d < impl_->dev.size(); ++d) {
+      AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
+      xrank_trace((uint32_t)d, "blk", impl_->dev[d].b_block,
+                  (size_t)b_ar_pending_ * b_nb_ * sizeof(float), impl_->dev[d].stream);
+    }
+    if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+  }
+  b_ar_pending_ = 0;
+  if (ar) {
+    uint16_t* out_p[kTpMaxRanks] = {};
+    float* blk_p[kTpMaxRanks] = {};
+    const uint16_t* hc_p[kTpMaxRanks] = {};
+    const float* post_p[kTpMaxRanks] = {};
+    const float* comb_p[kTpMaxRanks] = {};
+    for (size_t d = 0; d < 2; ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      keepalive_notify_active(D.id);
+      out_p[d] = has_control ? D.b_hc_next : D.b_hc;
+      blk_p[d] = D.b_block;
+      hc_p[d] = D.b_hc;
+      post_p[d] = D.b_post;
+      comb_p[d] = D.b_comb;
+    }
+    if (!tp_ar_batch_hc_expand(impl_->tp, out_p, blk_p, hc_p, post_p, comb_p, n_embd, n_hc,
+                               b_nb_, b_live_, has_control, /*zb=*/1))
+      return false;
+    if (has_control) {
+      for (size_t d = 0; d < 2; ++d) std::swap(impl_->dev[d].b_hc, impl_->dev[d].b_hc_next);
+    }
+    if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+    return true;
+  }
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -6050,10 +6129,81 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
     if (G.sh[d].row0 != W.sh[d].col0) return false;
     if (G.sh[d].nrows > b_g_cap_) return false;
   }
+  auto overlap_shexp_enabled = []() -> bool {
+    const char* s = std::getenv("AFF_OVERLAP_SHEXP");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  };
+  const bool want_overlap = overlap_shexp_enabled();
+
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     const uint32_t li = (uint32_t)G.sh[d].nrows;
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    batch_shexp_join(d);
+
+    // Overlap W8A8 shexp on D.sstream with router_topk + moe_plan + h_gu/h_down on D.stream.
+    // D.q8/D.qs must already be published on D.stream and NEVER mutated on D.sstream; SwiGLU quant
+    // must land in D.q8_sw (decode/verify) or D.b_q (prefill, dead during FFN) rather than D.q8.
+    uint8_t* sw_q8 = nullptr;
+    float* sw_qs = nullptr;
+    const uint8_t* in_q8 = nullptr;
+    const float* in_qs = nullptr;
+    bool can_async = false;
+    if (want_overlap && D.sstream && q8_ok(hg, hidden) && q8_ok(hu, hidden) && q8_ok(hd, li) &&
+        quant_act(d, D.b_norm, (uint32_t)hidden) &&
+        norm_q8_lookup(D.id, D.b_norm, (uint32_t)hidden, b_nb_, &in_q8, &in_qs)) {
+      if (b_nb_ <= kNarrowTok && q_slot_sw(d, li)) {
+        sw_q8 = D.q8_sw;
+        sw_qs = D.qs_sw;
+        can_async = true;
+      } else if ((li % 128u) == 0u && D.b_q && D.b_q_floats) {
+        const size_t q8_bytes = (size_t)b_nb_ * li;
+        const size_t qs_off = (q8_bytes + 15u) & ~size_t(15);
+        const size_t need_bytes = qs_off + (size_t)b_nb_ * (li / 128u) * sizeof(float);
+        if (D.b_q_floats * sizeof(float) >= need_bytes) {
+          sw_q8 = reinterpret_cast<uint8_t*>(D.b_q);
+          sw_qs = reinterpret_cast<float*>(sw_q8 + qs_off);
+          can_async = true;
+        }
+      }
+    }
+
+    if (can_async) {
+      const bool fused_gu = G.sh[d].ps == U.sh[d].ps && (uint64_t)2 * li <= b_g_cap_;
+      if (!fused_gu && li > b_u_cap_) return false;
+      AFF_HIP_CHECK(hipEventRecord(D.ev_sx, D.stream));
+      AFF_HIP_CHECK(hipStreamWaitEvent(D.sstream, D.ev_sx, 0));
+      float* yu = D.b_u;
+      const uint32_t xld = (uint32_t)hidden;
+      const uint32_t sxld = xld / 128u;
+      if (fused_gu) {
+        const BatchGemmJob bj[2] = {{G.sh[d].data, G.sh[d].scales, D.b_g, (uint32_t)li},
+                                    {U.sh[d].data, U.sh[d].scales, nullptr, (uint32_t)li}};
+        if (batch_gemm_fp8_multi_hip(bj, 2, in_q8, in_qs, (uint32_t)hidden, b_nb_, xld, sxld,
+                                     D.sstream, G.sh[d].ps)) {
+          yu = D.b_g + (size_t)li * b_nb_;
+        } else {
+          if (li > b_u_cap_) return false;
+          batch_gemm_fp8_hip((const uint8_t*)G.sh[d].data, G.sh[d].scales, in_q8, in_qs, D.b_g, li,
+                             (uint32_t)hidden, b_nb_, 0u, 0u, D.sstream, G.sh[d].ps, xld, sxld);
+          batch_gemm_fp8_hip((const uint8_t*)U.sh[d].data, U.sh[d].scales, in_q8, in_qs, D.b_u, li,
+                             (uint32_t)hidden, b_nb_, 0u, 0u, D.sstream, U.sh[d].ps, xld, sxld);
+        }
+      } else {
+        batch_gemm_fp8_hip((const uint8_t*)G.sh[d].data, G.sh[d].scales, in_q8, in_qs, D.b_g, li,
+                           (uint32_t)hidden, b_nb_, 0u, 0u, D.sstream, G.sh[d].ps, xld, sxld);
+        batch_gemm_fp8_hip((const uint8_t*)U.sh[d].data, U.sh[d].scales, in_q8, in_qs, D.b_u, li,
+                           (uint32_t)hidden, b_nb_, 0u, 0u, D.sstream, U.sh[d].ps, xld, sxld);
+      }
+      batch_swiglu_quant_fp8_hip(D.b_g, yu, sw_q8, sw_qs, li, b_nb_, limit, D.sstream);
+      batch_gemm_fp8_hip((const uint8_t*)W.sh[d].data, W.sh[d].scales, sw_q8, sw_qs, D.b_block,
+                         (uint32_t)hidden, li, b_nb_, 0u, 0u, D.sstream, W.sh[d].ps, li, li / 128u,
+                         /*accum=*/true);
+      AFF_HIP_CHECK(hipEventRecord(D.ev_sd, D.sstream));
+      D.b_shexp_ev = true;
+      continue;
+    }
+
     const bool q8 = q8_ok(hg, hidden) && q8_ok(hu, hidden) && quant_act(d, D.b_norm, (uint32_t)hidden);
     // gate and up read the SAME activation and differ only in the weight, so fusing them lifts the
     // pair onto the streaming ceiling. Fused, `up` lands immediately after `gate` in b_g and `yu` is
@@ -6107,6 +6257,7 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
 // rather than a partial, so adding it on both cards would have block_reduce double it.
 bool DenseGpu::batch_block_add(const float* src, uint32_t n_embd) {
   if (!b_nb_ || n_embd > b_qr_cap_) return false;
+  batch_shexp_join(0);
   Impl::Dev& D = impl_->dev[0];
   AFF_HIP_CHECK(hipSetDevice(D.id));
   AFF_HIP_CHECK(hipMemsetAsync(D.b_emb, 0, (size_t)b_nb_ * n_embd * sizeof(float), D.stream));
@@ -6121,8 +6272,30 @@ bool DenseGpu::batch_block_add(const float* src, uint32_t n_embd) {
 bool DenseGpu::batch_block_reduce(uint32_t n_embd) {
   if (!b_nb_) return false;
   AFF_TRACE(30);
+  if (b_ar_pending_) {
+    float* prev[kMaxRanks];
+    for (size_t d = 0; d < impl_->dev.size(); ++d) {
+      batch_shexp_join(d);
+      prev[d] = impl_->dev[d].b_block;
+    }
+    reduce(prev, prev, (uint64_t)b_ar_pending_ * b_nb_);
+    b_ar_pending_ = 0;
+  }
+  auto fuse_batch_ar_hc_enabled = []() -> bool {
+    const char* v = std::getenv("AFF_FUSE_BATCH_AR_HC");
+    return !(v && *v && std::strcmp(v, "0") == 0);
+  };
+  if (fuse_batch_ar_hc_enabled() && impl_->tp.ready && impl_->dev.size() == 2 &&
+      b_nb_ <= kNarrowTok && b_live_ > 0 && b_live_ <= b_nb_ && !xrank_trace_enabled() &&
+      ((size_t)n_embd * b_live_ <= impl_->tp.max_floats)) {
+    b_ar_pending_ = n_embd;
+    return true;
+  }
   float* p[kMaxRanks];
-  for (size_t d = 0; d < impl_->dev.size(); ++d) p[d] = impl_->dev[d].b_block;
+  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    batch_shexp_join(d);
+    p[d] = impl_->dev[d].b_block;
+  }
   reduce(p, p, (uint64_t)n_embd * b_nb_);
   // Post-reduce, so it is the one value every card holds and therefore the one thing comparable
   // between two RANK COUNTS. The partials before it are each a different share and always differ.
@@ -6225,6 +6398,7 @@ bool DenseGpu::batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_tap
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    batch_shexp_join(d);
     if (D.tap_bytes_s[slot_] < want) {
       if (D.b_tap_s[slot_]) (void)hipFree(D.b_tap_s[slot_]);
       D.b_tap_s[slot_] = nullptr; D.tap_bytes_s[slot_] = 0;
@@ -6232,6 +6406,53 @@ bool DenseGpu::batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_tap
       AFF_HIP_CHECK(hipMemsetAsync(D.b_tap_s[slot_], 0, want, D.stream));
       D.tap_bytes_s[slot_] = want;
     }
+  }
+  const bool ar_fits = b_ar_pending_ == n_embd && impl_->tp.ready && impl_->dev.size() == 2 &&
+                       b_nb_ <= kNarrowTok && b_live_ > 0 && b_live_ <= b_nb_ &&
+                       !xrank_trace_enabled() &&
+                       ((size_t)n_embd * b_live_ <= impl_->tp.max_floats) &&
+                       (n_hc == 1 || n_hc == 2 || n_hc == 4 || n_hc == 8);
+  const bool ar = b_ar_pending_ != 0 && ar_fits;
+  if (b_ar_pending_ && !ar_fits) {
+    float* p[kMaxRanks];
+    for (size_t d = 0; d < impl_->dev.size(); ++d) p[d] = impl_->dev[d].b_block;
+    reduce(p, p, (uint64_t)b_ar_pending_ * b_nb_);
+    for (size_t d = 0; d < impl_->dev.size(); ++d) {
+      AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
+      xrank_trace((uint32_t)d, "blk", impl_->dev[d].b_block,
+                  (size_t)b_ar_pending_ * b_nb_ * sizeof(float), impl_->dev[d].stream);
+    }
+    if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+  }
+  b_ar_pending_ = 0;
+  if (ar) {
+    uint16_t* out_p[kTpMaxRanks] = {};
+    float* blk_p[kTpMaxRanks] = {};
+    const uint16_t* hc_p[kTpMaxRanks] = {};
+    const float* post_p[kTpMaxRanks] = {};
+    const float* comb_p[kTpMaxRanks] = {};
+    float* tap_p[kTpMaxRanks] = {};
+    for (size_t d = 0; d < 2; ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      keepalive_notify_active(D.id);
+      out_p[d] = D.b_hc_next;
+      blk_p[d] = D.b_block;
+      hc_p[d] = D.b_hc;
+      post_p[d] = D.b_post;
+      comb_p[d] = D.b_comb;
+      tap_p[d] = D.b_tap_s[slot_];
+    }
+    if (!tp_ar_batch_hc_expand(impl_->tp, out_p, blk_p, hc_p, post_p, comb_p, n_embd, n_hc,
+                               b_nb_, b_live_, /*has_control=*/true, /*zb=*/1, tap_p, b_lo, n_keep,
+                               row0, rows_cap, (uint32_t)stride, slot * n_embd))
+      return false;
+    for (size_t d = 0; d < 2; ++d) std::swap(impl_->dev[d].b_hc, impl_->dev[d].b_hc_next);
+    if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+    return true;
+  }
+  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    AFF_HIP_CHECK(hipSetDevice(D.id));
     batch_hc_expand_hip(D.b_hc_next, D.b_block, D.b_hc, D.b_post, D.b_comb, n_embd, n_hc, b_nb_,
                         /*zb=*/1, D.stream, D.b_tap_s[slot_], b_lo, n_keep, row0, rows_cap,
                         (uint32_t)stride, slot * n_embd);

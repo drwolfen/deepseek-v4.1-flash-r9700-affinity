@@ -1111,6 +1111,65 @@ int main() {
         (void)hipFree(d_out[r]);
       }
       tp_free(&ctx);
+
+      // 13b. Staged AR LDS-cache parity (AFF_TP_AR_STAGED_CACHE=1 vs =0, bit-identical)
+      {
+        const char* prev_env = std::getenv("AFF_TP_AR_STAGED_CACHE");
+        std::string prev_val = prev_env ? prev_env : "";
+        TpContext ctx_p;
+        std::string perr;
+        const size_t max_np = 2097152u;
+        assert(tp_init(&ctx_p, max_np, &perr));
+        float *p_in[2] = {}, *p_out0[2] = {}, *p_out1[2] = {};
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx_p.dev[r]) == hipSuccess);
+          assert(hipMalloc(&p_in[r], max_np * sizeof(float)) == hipSuccess);
+          assert(hipMalloc(&p_out0[r], max_np * sizeof(float)) == hipSuccess);
+          assert(hipMalloc(&p_out1[r], max_np * sizeof(float)) == hipSuccess);
+        }
+        // Covers <= 30 groups/stage (all LDS cached: 1048576), > 30 groups/stage (2097152),
+        // and non-aligned tail (1049003).
+        const size_t cache_sizes[] = {1048576u, 1049003u, 2097152u};
+        for (size_t n : cache_sizes) {
+          std::vector<float> h0(n), h1(n);
+          for (size_t i = 0; i < n; ++i) {
+            h0[i] = std::sin((float)(i % 331u) * 0.043f) * 3.0f;
+            h1[i] = std::cos((float)(i % 277u) * 0.059f) * 2.5f;
+          }
+          for (int r = 0; r < 2; ++r) {
+            assert(hipSetDevice(ctx_p.dev[r]) == hipSuccess);
+            assert(hipMemcpy(p_in[r], (r == 0 ? h0 : h1).data(), n * sizeof(float),
+                             hipMemcpyHostToDevice) == hipSuccess);
+          }
+          setenv("AFF_TP_AR_STAGED_CACHE", "0", 1);
+          tp_all_reduce(ctx_p, p_in, p_out0, n, TpReduce::Fp8);
+          tp_sync(ctx_p);
+          tp_check(ctx_p);
+
+          setenv("AFF_TP_AR_STAGED_CACHE", "1", 1);
+          tp_all_reduce(ctx_p, p_in, p_out1, n, TpReduce::Fp8);
+          tp_sync(ctx_p);
+          tp_check(ctx_p);
+
+          std::vector<float> g0(n), g1(n), g1_peer(n);
+          assert(hipSetDevice(ctx_p.dev[0]) == hipSuccess);
+          assert(hipMemcpy(g0.data(), p_out0[0], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+          assert(hipMemcpy(g1.data(), p_out1[0], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+          assert(hipSetDevice(ctx_p.dev[1]) == hipSuccess);
+          assert(hipMemcpy(g1_peer.data(), p_out1[1], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+          assert(std::memcmp(g0.data(), g1.data(), n * sizeof(float)) == 0);
+          assert(std::memcmp(g1.data(), g1_peer.data(), n * sizeof(float)) == 0);
+        }
+        if (prev_env) setenv("AFF_TP_AR_STAGED_CACHE", prev_val.c_str(), 1);
+        else unsetenv("AFF_TP_AR_STAGED_CACHE");
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx_p.dev[r]) == hipSuccess);
+          (void)hipFree(p_in[r]);
+          (void)hipFree(p_out0[r]);
+          (void)hipFree(p_out1[r]);
+        }
+        tp_free(&ctx_p);
+      }
       assert(hipSetDevice(0) == hipSuccess);
     } else {
       std::printf("SKIP: TP=2 fp8 all-reduce test (%d device(s))\n", ndev);

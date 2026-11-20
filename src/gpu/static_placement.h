@@ -292,7 +292,9 @@ public:
                             uint32_t k, const float* const* d_x, float* const* d_block,
                             uint32_t nb_stride, uint32_t hidden, uint32_t inter, float limit,
                             void* const* streams, uint8_t* handled,
-                            const RouteDev* route = nullptr);
+                            const RouteDev* route = nullptr,
+                            void* const* block_wait_ev = nullptr,
+                            uint8_t* block_wait_done = nullptr);
 
   // ---- THE ONE DECISION ---------------------------------------------------------------------
   //

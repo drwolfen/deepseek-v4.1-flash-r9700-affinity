@@ -178,6 +178,12 @@ void batch_gemm_grouped_hip(uint32_t quant, const void* W, const uint8_t* S, con
                             const char* aff_file = __builtin_FILE(),
                             uint32_t aff_line = __builtin_LINE());
 
+// Pre-allocates the per-device Split-K scratch buffer (plus its 4 KiB arrival counter header) on
+// the current device for `stream`, eliminating mid-run hipMalloc + hipDeviceSynchronize pauses.
+// `batch_splitk_release_hip` unbinds the stream tag on teardown so another stream can reuse it.
+bool batch_splitk_reserve_hip(size_t peak_floats, void* stream = nullptr);
+void batch_splitk_release_hip(void* stream);
+
 // ---- the elementwise half ---------------------------------------------------------------------
 // All of these are one thread per token: dim-major storage puts consecutive tokens in consecutive
 // addresses, so a thread walking `dim` for its own token reads a fully coalesced column each step

@@ -1633,7 +1633,8 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
                                            float* const* d_block, uint32_t nb_stride,
                                            uint32_t hidden, uint32_t inter, float limit,
                                            void* const* streams, uint8_t* handled,
-                                           const RouteDev* route) {
+                                           const RouteDev* route, void* const* block_wait_ev,
+                                           uint8_t* block_wait_done) {
   if (!enabled_ || !nb_tok || !k || !d_x || !d_block || !handled || !streams) return 0;
   if (layer >= n_layer_) return 0;
   Impl& I = *impl_;
@@ -2273,6 +2274,10 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       if (split) {
         AFF_HIP_CHECK(hipEventRecord(I.ev_dn[dv][es], hyb));
         AFF_HIP_CHECK(hipStreamWaitEvent(st, I.ev_dn[dv][es], 0));
+      }
+      if (block_wait_ev && block_wait_ev[dv]) {
+        AFF_HIP_CHECK(hipStreamWaitEvent(st, (hipEvent_t)block_wait_ev[dv], 0));
+        if (block_wait_done) block_wait_done[dv] = 1u;
       }
       { AFF_XTRACE((int)dv, 6, st);
       if (moe_summed_down_enabled()) {

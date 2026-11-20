@@ -1,5 +1,6 @@
 #include "gpu/batch_kernels.h"
 #include "gpu/expert_kernel_hip.h"
+#include "gpu/tp_allreduce.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #ifdef NDEBUG
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -734,6 +736,156 @@ int main() {
       }
 
       std::printf("PASS: Multi-GEMM contiguous null-band regressions\n");
+  }
+
+  // Test 7: Live-only tp_ar_batch_hc_expand parity vs unfused tp_all_reduce + batch_hc_expand_hip
+  {
+    int ndev = 0, can01 = 0, can10 = 0;
+    if (hipGetDeviceCount(&ndev) == hipSuccess && ndev >= 1) {
+      const bool p2p = ndev >= 2 &&
+                       hipDeviceCanAccessPeer(&can01, 0, 1) == hipSuccess && can01 &&
+                       hipDeviceCanAccessPeer(&can10, 1, 0) == hipSuccess && can10;
+      const int devs[2] = {0, p2p ? 1 : 0};
+      const uint32_t E = 256u, nb = 16u, max_nh = 8u;
+      const size_t max_blk = (size_t)E * nb;
+      aff::TpContext ctx;
+      std::string err;
+      assert(aff::tp_init(&ctx, max_blk, &err, nullptr, 2, devs));
+
+      // Also verify Split-K reserve within <= 4 MiB/card succeeds on rank 0 streams.
+      assert(hipSetDevice(ctx.dev[0]) == hipSuccess);
+      assert(aff::batch_splitk_reserve_hip(524224u, ctx.stream[0]));
+
+      struct FuseCase { uint32_t live; uint32_t nh; bool ctl; bool tap; uint32_t b_lo; uint32_t keep; };
+      const FuseCase fcases[] = {
+          {1u, 8u, true, false, 0u, 0u},
+          {4u, 8u, true, true, 1u, 2u},
+          {6u, 8u, true, true, 0u, 6u},
+          {16u, 4u, true, true, 2u, 8u},
+          {6u, 8u, false, false, 0u, 0u},
+      };
+
+      const size_t hc_elems = (size_t)max_nh * E * nb;
+      const size_t comb_elems = (size_t)max_nh * max_nh * nb;
+      const size_t post_elems = (size_t)max_nh * nb;
+      const size_t tap_elems = (size_t)nb * E;
+
+      uint16_t *d_hc[2] = {}, *d_out_ref[2] = {}, *d_out_fuse[2] = {};
+      float *d_blk_ref[2] = {}, *d_blk_fuse[2] = {}, *d_post[2] = {}, *d_comb[2] = {},
+            *d_tap_ref[2] = {}, *d_tap_fuse[2] = {};
+      for (int r = 0; r < 2; ++r) {
+        assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+        assert(hipMalloc(&d_hc[r], hc_elems * sizeof(uint16_t)) == hipSuccess);
+        assert(hipMalloc(&d_out_ref[r], hc_elems * sizeof(uint16_t)) == hipSuccess);
+        assert(hipMalloc(&d_out_fuse[r], hc_elems * sizeof(uint16_t)) == hipSuccess);
+        assert(hipMalloc(&d_blk_ref[r], max_blk * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_blk_fuse[r], max_blk * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_post[r], post_elems * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_comb[r], comb_elems * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_tap_ref[r], tap_elems * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_tap_fuse[r], tap_elems * sizeof(float)) == hipSuccess);
+      }
+
+      for (const FuseCase& fc : fcases) {
+        const size_t nh_hc = (size_t)fc.nh * E * nb;
+        std::vector<uint16_t> h_hc(nh_hc);
+        std::vector<float> h_blk0(max_blk), h_blk1(max_blk), h_post((size_t)fc.nh * nb),
+            h_comb((size_t)fc.nh * fc.nh * nb);
+        for (size_t i = 0; i < nh_hc; ++i)
+          h_hc[i] = f32_to_bf16_cpu(0.05f * (float)((int)(i % 37u) - 18));
+        for (uint32_t d = 0; d < E; ++d) {
+          for (uint32_t b = 0; b < nb; ++b) {
+            const float p0 = std::sin((float)(d * nb + b) * 0.03f);
+            const float p1 = std::cos((float)(d * nb + b) * 0.05f);
+            h_blk0[(size_t)d * nb + b] = (b < fc.live) ? p0 : 123.0f;
+            h_blk1[(size_t)d * nb + b] = (b < fc.live) ? p1 : -456.0f;
+          }
+        }
+        for (size_t i = 0; i < h_post.size(); ++i)
+          h_post[i] = 0.25f + 0.05f * (float)(i % 9u);
+        for (size_t i = 0; i < h_comb.size(); ++i)
+          h_comb[i] = 0.02f * (float)((int)(i % 13u) - 6);
+
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+          const auto& hb = (r == 0) ? h_blk0 : h_blk1;
+          assert(hipMemcpy(d_hc[r], h_hc.data(), nh_hc * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+          assert(hipMemcpy(d_out_ref[r], h_hc.data(), nh_hc * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+          assert(hipMemcpy(d_out_fuse[r], h_hc.data(), nh_hc * sizeof(uint16_t), hipMemcpyHostToDevice) == hipSuccess);
+          assert(hipMemcpy(d_blk_ref[r], hb.data(), max_blk * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+          assert(hipMemcpy(d_blk_fuse[r], hb.data(), max_blk * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+          assert(hipMemcpy(d_post[r], h_post.data(), h_post.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+          assert(hipMemcpy(d_comb[r], h_comb.data(), h_comb.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+          assert(hipMemset(d_tap_ref[r], 0, tap_elems * sizeof(float)) == hipSuccess);
+          assert(hipMemset(d_tap_fuse[r], 0, tap_elems * sizeof(float)) == hipSuccess);
+        }
+
+        // Reference: standalone exact tp_all_reduce + batch_hc_expand_hip / add
+        aff::tp_all_reduce(ctx, d_blk_ref, d_blk_ref, max_blk, aff::TpReduce::Exact);
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+          if (fc.ctl) {
+            aff::batch_hc_expand_hip(d_out_ref[r], d_blk_ref[r], d_hc[r], d_post[r], d_comb[r], E,
+                                     fc.nh, nb, /*zb=*/1, ctx.stream[r],
+                                     fc.tap ? d_tap_ref[r] : nullptr, fc.b_lo, fc.keep, 0u, nb, E, 0u);
+          } else {
+            aff::batch_hc_add_bf16_hip(d_out_ref[r], d_blk_ref[r], max_blk, /*zb=*/1, ctx.stream[r]);
+          }
+        }
+        aff::tp_sync(ctx);
+
+        // Fused live-only AR + HC expand/add
+        uint16_t* const out_f[aff::kTpMaxRanks] = {d_out_fuse[0], d_out_fuse[1]};
+        float* const blk_f[aff::kTpMaxRanks] = {d_blk_fuse[0], d_blk_fuse[1]};
+        const uint16_t* const hc_f[aff::kTpMaxRanks] = {d_hc[0], d_hc[1]};
+        const float* const post_f[aff::kTpMaxRanks] = {d_post[0], d_post[1]};
+        const float* const comb_f[aff::kTpMaxRanks] = {d_comb[0], d_comb[1]};
+        float* const tap_f[aff::kTpMaxRanks] = {fc.tap ? d_tap_fuse[0] : nullptr,
+                                                fc.tap ? d_tap_fuse[1] : nullptr};
+        assert(aff::tp_ar_batch_hc_expand(ctx, out_f, blk_f, hc_f, post_f, comb_f, E, fc.nh, nb,
+                                          fc.live, fc.ctl, /*zb=*/1, fc.tap ? tap_f : nullptr,
+                                          fc.b_lo, fc.keep, 0u, nb, E, 0u));
+        aff::tp_sync(ctx);
+        aff::tp_check(ctx);
+
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+          std::vector<uint16_t> href(nh_hc), hfuse(nh_hc);
+          std::vector<float> bzero(max_blk), tref(tap_elems), tfuse(tap_elems);
+          assert(hipMemcpy(href.data(), d_out_ref[r], nh_hc * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+          assert(hipMemcpy(hfuse.data(), d_out_fuse[r], nh_hc * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+          assert(hipMemcpy(bzero.data(), d_blk_fuse[r], max_blk * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+          for (float v : bzero) assert(v == 0.0f);
+          if (fc.ctl) {
+            for (uint32_t h = 0; h < fc.nh; ++h)
+              for (uint32_t d = 0; d < E; ++d)
+                for (uint32_t b = 0; b < fc.live; ++b)
+                  assert(href[((size_t)h * E + d) * nb + b] == hfuse[((size_t)h * E + d) * nb + b]);
+          } else {
+            for (uint32_t d = 0; d < E; ++d)
+              for (uint32_t b = 0; b < fc.live; ++b)
+                assert(href[(size_t)d * nb + b] == hfuse[(size_t)d * nb + b]);
+          }
+          if (fc.tap) {
+            assert(hipMemcpy(tref.data(), d_tap_ref[r], tap_elems * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+            assert(hipMemcpy(tfuse.data(), d_tap_fuse[r], tap_elems * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+            assert(std::memcmp(tref.data(), tfuse.data(), fc.keep * E * sizeof(float)) == 0);
+          }
+        }
+      }
+
+      for (int r = 0; r < 2; ++r) {
+        assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+        for (void* p : {(void*)d_hc[r], (void*)d_out_ref[r], (void*)d_out_fuse[r],
+                        (void*)d_blk_ref[r], (void*)d_blk_fuse[r], (void*)d_post[r],
+                        (void*)d_comb[r], (void*)d_tap_ref[r], (void*)d_tap_fuse[r]})
+          (void)hipFree(p);
+      }
+      aff::batch_splitk_release_hip(ctx.stream[0]);
+      aff::tp_free(&ctx);
+      assert(hipSetDevice(0) == hipSuccess);
+      std::printf("PASS: tp_ar_batch_hc_expand live-only parity\n");
+    }
   }
 
   std::printf("ALL WAVE 2 PHASE 2B KERNEL TESTS PASSED.\n");
