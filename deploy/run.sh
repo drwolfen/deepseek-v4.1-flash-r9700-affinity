@@ -26,7 +26,10 @@ exec docker run --rm --name "$NAME" \
   -e AFF_RESIDENT_BIAS=0.008 \
   -e AFF_MOE_RECON_TILES=32 \
   -e AFF_PREFETCH_RING=0 \
-  -e AFF_NOBUDGET_MAX_TOKENS=16384 \
+  -e AFF_NOBUDGET_MAX_TOKENS=24576 \
+  -e AFF_THINK_REPLY_RESERVE=4096 \
+  -e AFF_THINK_LOOP_REPEATS=3 \
+  -e AFF_THINK_FREEZE_BREAKER=1 \
   -e AFF_HC_FUSED_V2=1 \
   -e AFF_HC_CHAINED=1 \
   -e AFF_HC_CHAINED_MIN_ROWS=1 \
@@ -57,7 +60,7 @@ exec docker run --rm --name "$NAME" \
     --placement-hysteresis 1.6 --placement-min-gain 3.0 \
     --placement-save "$MODELS/placement.affprof" \
     --prefill-chunk-size 2816 \
-    --default-effort 75 \
+    --default-effort 60 \
     --repeat-penalty 1.1 \
     --repeat-last-n 96 \
     --dry-delta 40 \
