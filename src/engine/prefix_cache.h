@@ -89,6 +89,13 @@ struct KvIo {
   bool (*load)(void* ctx, uint8_t part, uint32_t layer, uint32_t rank, uint64_t row0,
                uint64_t nrows, const void* src) = nullptr;
   void* ctx = nullptr;
+  bool (*save_async)(void* ctx, uint8_t part, uint32_t layer, uint32_t rank, uint64_t row0,
+                     uint64_t nrows, void* dst) = nullptr;
+  bool (*load_async)(void* ctx, uint8_t part, uint32_t layer, uint32_t rank, uint64_t row0,
+                     uint64_t nrows, const void* src) = nullptr;
+  bool (*sync_all)(void* ctx) = nullptr;
+  bool (*pin_host)(void* ctx, void* ptr, uint64_t bytes) = nullptr;
+  void (*unpin_host)(void* ctx, void* ptr) = nullptr;
 };
 
 struct PrefixCacheStats {

@@ -3334,8 +3334,8 @@ bool DenseGpu::kv_part_geometry(KvPart part, uint32_t layer, uint64_t* row_bytes
   return ok;
 }
 
-bool DenseGpu::kv_part_save(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0,
-                            uint64_t nrows, void* dst) const {
+bool DenseGpu::kv_part_save_async(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0,
+                                  uint64_t nrows, void* dst) const {
   if (!dst || !nrows || !impl_ || rank >= impl_->dev.size()) return false;
   void* b[2]; uint32_t nb = 0; uint64_t re = 0, rb = 0;
   if (!kv_part_bufs(part, layer, rank, &rb, &re, b, &nb)) return false;
@@ -3349,13 +3349,12 @@ bool DenseGpu::kv_part_save(KvPart part, uint32_t layer, uint32_t rank, uint64_t
     if (e == hipSuccess)
       e = hipMemcpyAsync((uint8_t*)dst + off, src, bytes, hipMemcpyDeviceToHost, D.stream);
   });
-  AFF_HIP_CHECK(hipStreamSynchronize(D.stream));
   AFF_HIP_CHECK(e);
   return ok;
 }
 
-bool DenseGpu::kv_part_load(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0,
-                            uint64_t nrows, const void* src) {
+bool DenseGpu::kv_part_load_async(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0,
+                                  uint64_t nrows, const void* src) {
   if (!src || !nrows || !impl_ || rank >= impl_->dev.size()) return false;
   void* b[2]; uint32_t nb = 0; uint64_t re = 0, rb = 0;
   if (!kv_part_bufs(part, layer, rank, &rb, &re, b, &nb)) return false;
@@ -3367,9 +3366,54 @@ bool DenseGpu::kv_part_load(KvPart part, uint32_t layer, uint32_t rank, uint64_t
     if (e == hipSuccess)
       e = hipMemcpyAsync(dst, (const uint8_t*)src + off, bytes, hipMemcpyHostToDevice, D.stream);
   });
-  AFF_HIP_CHECK(hipStreamSynchronize(D.stream));
   AFF_HIP_CHECK(e);
   return ok;
+}
+
+bool DenseGpu::kv_sync_rank(uint32_t rank) const {
+  if (!impl_ || rank >= impl_->dev.size()) return false;
+  Impl::Dev& D = impl_->dev[rank];
+  AFF_HIP_CHECK(hipSetDevice(D.id));
+  AFF_HIP_CHECK(hipStreamSynchronize(D.stream));
+  return true;
+}
+
+bool DenseGpu::kv_sync_all() const {
+  if (!impl_) return false;
+  for (size_t rk = 0; rk < impl_->dev.size(); ++rk) {
+    Impl::Dev& D = impl_->dev[rk];
+    AFF_HIP_CHECK(hipSetDevice(D.id));
+    AFF_HIP_CHECK(hipStreamSynchronize(D.stream));
+  }
+  return true;
+}
+
+bool DenseGpu::pin_host(void* ptr, size_t bytes) {
+  if (!ptr || !bytes) return false;
+  const hipError_t e = hipHostRegister(ptr, bytes, hipHostRegisterDefault);
+  if (e != hipSuccess) {
+    (void)hipGetLastError();
+    aff::ui::err("prefix cache: hipHostRegister(%zu bytes) declined (%s); using pageable host memory\n",
+                 bytes, hipGetErrorString(e));
+    return false;
+  }
+  return true;
+}
+
+void DenseGpu::unpin_host(void* ptr) {
+  if (!ptr) return;
+  const hipError_t e = hipHostUnregister(ptr);
+  if (e != hipSuccess) (void)hipGetLastError();
+}
+
+bool DenseGpu::kv_part_save(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0,
+                            uint64_t nrows, void* dst) const {
+  return kv_part_save_async(part, layer, rank, row0, nrows, dst) && kv_sync_rank(rank);
+}
+
+bool DenseGpu::kv_part_load(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0,
+                            uint64_t nrows, const void* src) {
+  return kv_part_load_async(part, layer, rank, row0, nrows, src) && kv_sync_rank(rank);
 }
 
 bool DenseGpu::kv_part_hash(KvPart part, uint32_t layer, uint64_t row0, uint64_t nrows, size_t rank,

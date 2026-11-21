@@ -1,4 +1,5 @@
 #include "server/server.h"
+#include "engine/chat_encode.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -333,6 +334,132 @@ void test_server_fifo_and_disconnect_abort() {
   std::printf("PASS: test_server_fifo_and_disconnect_abort\n");
 }
 
+void test_post_send_ordering_and_slot_hold() {
+  for (bool stream : {false, true}) {
+    aff::Server srv;
+    srv.set_model_name("DeepSeek-V4.1-Flash");
+    srv.set_slots(1);
+
+    std::atomic<bool> post_entered{false};
+    std::atomic<bool> allow_post_finish{false};
+    std::atomic<bool> post_finished{false};
+    std::atomic<bool> req2_entered{false};
+    std::atomic<bool> err_post_ran{false};
+
+    std::string err;
+    CHECK(srv.start("127.0.0.1", 0,
+                    [&](const aff::CompletionRequest& r, const aff::TokenSink& sink,
+                        aff::GenResult* res, uint32_t) {
+                      const std::string tag = r.messages.back().content;
+                      if (tag == "req1") {
+                        if (stream) sink("hello", aff::Delta::Content, false);
+                        res->content = "hello";
+                        res->finish_reason = "stop";
+                        res->post_send = [&]() {
+                          post_entered = true;
+                          while (!allow_post_finish.load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                          }
+                          post_finished = true;
+                        };
+                      } else if (tag == "req2") {
+                        req2_entered = true;
+                        if (stream) sink("world", aff::Delta::Content, false);
+                        res->content = "world";
+                        res->finish_reason = "stop";
+                      } else if (tag == "err") {
+                        res->error = "boom";
+                        res->post_send = [&]() { err_post_ran = true; };
+                      }
+                    },
+                    &err));
+    const uint16_t port = srv.port();
+
+    auto send_req = [&](const std::string& tag) -> int {
+      int fd = connect_loopback(port);
+      const std::string body = std::string("{\"stream\":") + (stream ? "true" : "false") +
+                               ",\"messages\":[{\"role\":\"user\",\"content\":\"" + tag + "\"}]}";
+      const std::string http = "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+                               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+      write_all(fd, http);
+      return fd;
+    };
+
+    // 1. Client gets complete reply + EOF BEFORE post_send unblocks!
+    int fd1 = send_req("req1");
+    const std::string resp1 = read_until_eof(fd1);
+    ::close(fd1);
+    CHECK(resp1.find("hello") != std::string::npos);
+    if (stream) CHECK(resp1.find("data: [DONE]") != std::string::npos);
+    while (!post_entered.load()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CHECK(!post_finished.load());
+
+    // 2. While slot 0 is held in post_send, req2 cannot enter gen_!
+    int fd2 = send_req("req2");
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    CHECK(!req2_entered.load());
+
+    // 3. Unblock post_send -> slot releases -> req2 runs and completes.
+    allow_post_finish = true;
+    const std::string resp2 = read_until_eof(fd2);
+    ::close(fd2);
+    CHECK(post_finished.load());
+    CHECK(req2_entered.load());
+    CHECK(resp2.find("world") != std::string::npos);
+
+    // 4. Error responses must NOT invoke post_send.
+    int fd_err = send_req("err");
+    (void)read_until_eof(fd_err);
+    ::close(fd_err);
+    CHECK(!err_post_ran.load());
+
+    srv.stop();
+  }
+  std::printf("PASS: test_post_send_ordering_and_slot_hold\n");
+}
+
+void test_preencoded_ids_and_json_string_edges() {
+  aff::CompletionRequest def_req;
+  CHECK(!def_req.has_preencoded_ids);
+  CHECK(def_req.preencoded_ids.empty());
+
+  // Large unescaped string (> 64 KiB) + escapes + BMP + surrogate pair
+  std::string big(70000, 'x');
+  const std::string body =
+      std::string(R"({"model":"m","messages":[{"role":"user","content":")") + big +
+      R"(\n\t\r\"\\\u0041\uD83D\uDE00\a"}]})";
+  aff::CompletionRequest req;
+  CHECK(aff::parse_completion_request(body, true, &req));
+  CHECK(req.messages.size() == 1);
+  const std::string expected = big + "\n\t\r\"\\A\xF0\x9F\x98\x80" "a";
+  CHECK(req.messages[0].content == expected);
+
+  // encode_messages reserve invariance on tool conversation
+  std::vector<aff::ChatMsg> msgs;
+  aff::ChatMsg sys;
+  sys.role = "system";
+  sys.content = "System instructions";
+  sys.tools.push_back({R"({"name":"calc","description":"Compute"})", "math", "Math tools"});
+  msgs.push_back(sys);
+  aff::ChatMsg usr;
+  usr.role = "user";
+  usr.content = std::string(4096, 'y');
+  msgs.push_back(usr);
+  aff::ChatMsg asst;
+  asst.role = "assistant";
+  asst.reasoning_content = "Thinking...";
+  asst.tool_calls.push_back({"call_1", "calc", R"({"expr":"1+1"})", "math"});
+  msgs.push_back(asst);
+  aff::EncodeOpts eo;
+  eo.v41 = true;
+  const std::string encoded = aff::encode_messages(msgs, eo);
+  CHECK(encoded.find("System instructions") != std::string::npos);
+  CHECK(encoded.find(std::string(4096, 'y')) != std::string::npos);
+  CHECK(encoded.find("Thinking...") != std::string::npos);
+
+  std::printf("PASS: test_preencoded_ids_and_json_string_edges\n");
+}
+
 } // namespace
 
 int main() {
@@ -341,6 +468,8 @@ int main() {
   test_sse_keepalive_and_fd_alive();
   test_server_http_preflight_chunked_and_content_length();
   test_server_fifo_and_disconnect_abort();
+  test_post_send_ordering_and_slot_hold();
+  test_preencoded_ids_and_json_string_edges();
   std::printf("PASS: all server tests passed.\n");
   return 0;
 }

@@ -172,30 +172,47 @@ std::string read_json_string(const char*& p) {
   p = skip_ws(p);
   if (*p != '"') return "";
   ++p;
+  const char* scan = p;
+  while (*scan && *scan != '"') {
+    if (*scan == '\\' && scan[1]) scan += 2;
+    else ++scan;
+  }
   std::string out;
+  out.reserve((size_t)(scan - p));
+  const auto hex4 = [](const char* q) {
+    for (int i = 0; i < 4; ++i)
+      if (!q[i] || !std::isxdigit((unsigned char)q[i])) return false;
+    return true;
+  };
   while (*p && *p != '"') {
-    if (*p == '\\' && p[1]) {
+    const char* chunk = p;
+    while (*p && *p != '"' && *p != '\\') ++p;
+    if (p > chunk) out.append(chunk, (size_t)(p - chunk));
+    if (*p != '\\') continue;
+    if (!p[1]) {
+      out.push_back('\\');
       ++p;
-      switch (*p) {
-        case 'n': out.push_back('\n'); break;
-        case 't': out.push_back('\t'); break;
-        case 'r': out.push_back('\r'); break;
-        case '"': out.push_back('"'); break;
-        case '\\': out.push_back('\\'); break;
-        case 'u': {
-          uint32_t cp = (uint32_t)std::strtoul(std::string(p + 1, p + 5).c_str(), nullptr, 16);
+      break;
+    }
+    ++p;
+    switch (*p) {
+      case 'n': out.push_back('\n'); break;
+      case 't': out.push_back('\t'); break;
+      case 'r': out.push_back('\r'); break;
+      case '"': out.push_back('"'); break;
+      case '\\': out.push_back('\\'); break;
+      case 'u': {
+        if (hex4(p + 1)) {
+          char hx[5] = {p[1], p[2], p[3], p[4], 0};
+          uint32_t cp = (uint32_t)std::strtoul(hx, nullptr, 16);
           p += 4;
           // A character outside the BMP is escaped as a surrogate PAIR, which is what any client
           // sending ASCII-safe JSON emits — Python's json.dumps does by default. Decoding the halves
           // separately gives two sequences that are not valid UTF-8, so an emoji in a tool result
           // reaches the model as mojibake and comes back out the same way.
-          const auto hex4 = [](const char* q) {
-            for (int i = 0; i < 4; ++i)
-              if (!std::isxdigit((unsigned char)q[i])) return false;
-            return true;
-          };
           if (cp >= 0xD800 && cp < 0xDC00 && p[1] == '\\' && p[2] == 'u' && hex4(p + 3)) {
-            const uint32_t lo = (uint32_t)std::strtoul(std::string(p + 3, p + 7).c_str(), nullptr, 16);
+            char lhx[5] = {p[3], p[4], p[5], p[6], 0};
+            const uint32_t lo = (uint32_t)std::strtoul(lhx, nullptr, 16);
             if (lo >= 0xDC00 && lo < 0xE000) {
               cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
               p += 6;
@@ -207,11 +224,13 @@ std::string read_json_string(const char*& p) {
                  out.push_back((char)(0x80|(cp&0x3F))); }
           else { out.push_back((char)(0xF0|(cp>>18))); out.push_back((char)(0x80|((cp>>12)&0x3F)));
                  out.push_back((char)(0x80|((cp>>6)&0x3F))); out.push_back((char)(0x80|(cp&0x3F))); }
-          break;
+        } else {
+          out.push_back('u');
         }
-        default: out.push_back(*p);
+        break;
       }
-    } else out.push_back(*p);
+      default: out.push_back(*p);
+    }
     ++p;
   }
   if (*p == '"') ++p;
@@ -1031,20 +1050,19 @@ void Server::serve_one(int fd) {
     }
     if (alive) send_all(fd, "data: [DONE]\n\n", 14);
     ::close(fd);
+    if (res.error.empty() && res.post_send) res.post_send();
     return;
   }
 
   GenResult res;
-  {
-    const int32_t slot_i = acquire_slot(fd, false, envelope, "", is_chat, nullptr);
-    if (slot_i < 0) {
-      ::close(fd);
-      return;
-    }
-    const uint32_t slot = (uint32_t)slot_i;
-    struct Rel { Server* s; uint32_t i; ~Rel() { s->release_slot(i); } } rel{this, slot};
-    gen_(r, [fd](const std::string&, Delta, bool) -> bool { return fd_alive(fd); }, &res, slot);
+  const int32_t slot_i = acquire_slot(fd, false, envelope, "", is_chat, nullptr);
+  if (slot_i < 0) {
+    ::close(fd);
+    return;
   }
+  const uint32_t slot = (uint32_t)slot_i;
+  struct Rel { Server* s; uint32_t i; ~Rel() { s->release_slot(i); } } rel{this, slot};
+  gen_(r, [fd](const std::string&, Delta, bool) -> bool { return fd_alive(fd); }, &res, slot);
   if (!res.error.empty()) {
     send_400(res.error);
     ::close(fd);
@@ -1080,6 +1098,7 @@ void Server::serve_one(int fd) {
   j += ",\"finish_reason\":\"" + res.finish_reason + "\"}]," + usage_json(res) + "}";
   reply("application/json", j);
   ::close(fd);
+  if (res.post_send) res.post_send();
 }
 
 bool Server::start(const std::string& host, uint16_t port, GenerateFn gen, std::string* err) {

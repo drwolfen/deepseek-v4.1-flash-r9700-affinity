@@ -197,8 +197,21 @@ struct PrefixCache::Impl {
   uint8_t*             ckbuf = nullptr;
   uint8_t*             hdr_buf = nullptr;
   uint64_t             hdr_bytes = 0;
+  bool                 use_async_save = false;
+  bool                 use_async_load = false;
+  std::vector<void*>   pinned_ptrs;
+  void (*unpin_host)(void* ctx, void* ptr) = nullptr;
+  void*                unpin_ctx = nullptr;
+
+  void unpin_all() {
+    if (unpin_host) {
+      for (void* p : pinned_ptrs) unpin_host(unpin_ctx, p);
+    }
+    pinned_ptrs.clear();
+  }
 
   ~Impl() {
+    unpin_all();
     for (uint8_t* p : stage) std::free(p);
     for (uint8_t* p : rbuf) std::free(p);
     std::free(gather);
@@ -348,16 +361,31 @@ bool PrefixCache::open(const Options& o, const std::vector<KvRegion>& regions, c
       close(); return false;
     }
   }
-  // One region's rows across a whole restore batch, which is the unit a restore hands to the cards.
-  uint64_t g = 0;
-  for (const KvRegion& r : app_)
-    g = std::max(g, (uint64_t)kSavedRanks * impl_->gblocks * (opt_.block_tokens / r.ratio) * r.row_bytes);
-  impl_->gather_bytes = g;
-  if (posix_memalign((void**)&impl_->gather, kAlign, (size_t)g) ||
+  // Whole-batch gather arena: `gblocks * blk_payload_` so every (region, saved_rank) slice in a
+  // batch stays disjoint when async H2D loads enqueue across all regions before one sync_all.
+  impl_->gather_bytes = round_up((uint64_t)impl_->gblocks * blk_payload_, kAlign);
+  if (posix_memalign((void**)&impl_->gather, kAlign, (size_t)impl_->gather_bytes) ||
       posix_memalign((void**)&impl_->ckbuf, kAlign, (size_t)ck_slot_) ||
       posix_memalign((void**)&impl_->hdr_buf, kAlign, (size_t)impl_->hdr_bytes)) {
     if (err) *err = "cannot allocate the prefix cache gather arena";
     close(); return false;
+  }
+
+  const char* bio = std::getenv("AFF_PCACHE_BATCH_IO");
+  const bool batch_env = !bio || !*bio || std::strcmp(bio, "0") != 0;
+  impl_->use_async_save = batch_env && io_.save_async && io_.sync_all;
+  impl_->use_async_load = batch_env && io_.load_async && io_.sync_all;
+  if (batch_env && io_.pin_host) {
+    impl_->unpin_host = io_.unpin_host;
+    impl_->unpin_ctx = io_.ctx;
+    auto try_pin = [&](void* p, uint64_t bytes) {
+      if (p && bytes && io_.pin_host(io_.ctx, p, bytes))
+        impl_->pinned_ptrs.push_back(p);
+    };
+    for (uint32_t i = 0; i < qd; ++i) try_pin(impl_->stage[i], ck_slot_);
+    try_pin(impl_->gather, impl_->gather_bytes);
+    try_pin(impl_->ckbuf, ck_slot_);
+    if (!impl_->rbuf.empty()) try_pin(impl_->rbuf[0], blk_slot_);
   }
 
   if (opt_.persistent) load_index();
@@ -473,6 +501,7 @@ void PrefixCache::close() {
       std::abort();
     }
     if (opt_.persistent && ready_) save_index();
+    impl_->unpin_all();
     delete impl_;
     impl_ = nullptr;
   }
@@ -610,7 +639,12 @@ int32_t PrefixCache::find_base_block(const uint8_t* parent, uint32_t pos, const 
       continue;
     if (impl_->blk_fd < 0) return (int32_t)s;
     if (!drained) {
-      drain();
+      bool busy;
+      {
+        std::lock_guard<std::mutex> lk(impl_->m);
+        busy = !impl_->jobs.empty() || impl_->in_flight > 0;
+      }
+      if (busy) drain();
       drained = true;
       if (!blk_[s].used || blk_[s].pos != pos || std::memcmp(blk_[s].parent, parent, 32) != 0)
         continue;
@@ -703,27 +737,42 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     }
     // Region by region across the whole batch, so the cards see one transfer per region rather than
     // one per region per block. At a 1M restore that is the difference between ten thousand
-    // transfers and ten million.
+    // transfers and ten million. Each region owns a disjoint slice of `impl_->gather` so async
+    // loads across all regions and ranks can share a single sync_all per batch.
+    bool batch_async_queued = false;
     for (uint32_t ri = 0; ri < app_.size(); ++ri) {
       const KvRegion& r = app_[ri];
       const uint64_t rpb = B / r.ratio, seg = rpb * r.row_bytes;
       uint64_t off, row0, nrows;
       region_span(app_, kSavedRanks, 0, B, ri, &off, &row0, &nrows);
+      uint8_t* dst_ri = impl_->gather + (uint64_t)g * off;
       // The batch's rows for this region, contiguous: the slots hold one block each and the cards
       // want one run across all of them.
+      for (uint32_t src_rk = 0; src_rk < kSavedRanks; ++src_rk) {
+        uint8_t* dst_rk = dst_ri + (uint64_t)src_rk * g * seg;
+        for (uint32_t i = 0; i < g; ++i)
+          std::memcpy(dst_rk + (uint64_t)i * seg,
+                      impl_->rbuf[i] + hdr + off + (uint64_t)src_rk * seg, (size_t)seg);
+      }
       for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
         const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
-        if (rk == 0 || (kSavedRanks > 1 && rk < kSavedRanks)) {
-          for (uint32_t i = 0; i < g; ++i)
-            std::memcpy(impl_->gather + (uint64_t)i * seg,
-                        impl_->rbuf[i] + hdr + off + (uint64_t)src_rk * seg, (size_t)seg);
-        }
-        if (!io_.load(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * rpb, (uint64_t)g * rpb,
-                      impl_->gather)) {
+        const uint8_t* src_ptr = dst_ri + (uint64_t)src_rk * g * seg;
+        const bool ok = impl_->use_async_load
+            ? io_.load_async(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * rpb,
+                             (uint64_t)g * rpb, src_ptr)
+            : io_.load(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * rpb,
+                       (uint64_t)g * rpb, src_ptr);
+        if (!ok) {
+          if (batch_async_queued) (void)io_.sync_all(io_.ctx);
           if (err) *err = "prefix cache: the engine refused a restored block";
           return false;
         }
+        if (impl_->use_async_load) batch_async_queued = true;
       }
+    }
+    if (batch_async_queued && !io_.sync_all(io_.ctx)) {
+      if (err) *err = "prefix cache: async restore sync failed";
+      return false;
     }
   }
 
@@ -750,13 +799,27 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     return false;
   }
   st_.bytes_read += ck_slot_;
+  bool ckpt_async_queued = false;
+  auto load_ckpt = [&](const KvRegion& r, uint32_t rk, uint64_t row0, uint64_t nrows,
+                       const uint8_t* src, const char* err_msg) -> bool {
+    const bool ok = impl_->use_async_load
+        ? io_.load_async(io_.ctx, r.part, r.layer, rk, row0, nrows, src)
+        : io_.load(io_.ctx, r.part, r.layer, rk, row0, nrows, src);
+    if (!ok) {
+      if (ckpt_async_queued) (void)io_.sync_all(io_.ctx);
+      if (err) *err = err_msg;
+      return false;
+    }
+    if (impl_->use_async_load) ckpt_async_queued = true;
+    return true;
+  };
   uint64_t off = hdr;
   for (const KvRegion& r : roll_) {
     for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
       const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
-      if (!io_.load(io_.ctx, r.part, r.layer, rk, 0, r.rows,
-                    impl_->ckbuf + off + (uint64_t)src_rk * r.rows * r.row_bytes)) {
-        if (err) *err = "prefix cache: the engine refused a restored ring";
+      if (!load_ckpt(r, rk, 0, r.rows,
+                     impl_->ckbuf + off + (uint64_t)src_rk * r.rows * r.row_bytes,
+                     "prefix cache: the engine refused a restored ring")) {
         return false;
       }
     }
@@ -769,6 +832,7 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
       const int32_t bs = find_base_block(parent, (nfull + 1) * B, ids + (size_t)nfull * B, tail);
       if (bs < 0) {
         if ((h->flags & kCkptFlagDelta) != 0) {
+          if (ckpt_async_queued) (void)io_.sync_all(io_.ctx);
           ++st_.verify_misses;
           drop(cs, true);
           if (err) *err = "prefix cache: state-only checkpoint missing base block in store";
@@ -779,6 +843,7 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
         ck_[cs].state_only = false;
       } else {
         if (!read_exact(impl_->blk_fd, impl_->rbuf[0], blk_slot_, (uint64_t)bs * blk_slot_)) {
+          if (ckpt_async_queued) (void)io_.sync_all(io_.ctx);
           if (err) *err = std::string("prefix cache: base block read failed: ") + std::strerror(errno);
           return false;
         }
@@ -789,6 +854,7 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
           ++st_.verify_misses;
           drop(bs, false);
           if ((h->flags & kCkptFlagDelta) != 0) {
+            if (ckpt_async_queued) (void)io_.sync_all(io_.ctx);
             drop(cs, true);
             if (err) *err = "prefix cache: base block failed verification";
             return false;
@@ -804,10 +870,10 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
             const uint64_t base_row0 = (uint64_t)nfull * base_nrows;
             for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
               const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
-              if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, base_row0, nrows,
-                            impl_->rbuf[0] + hdr + base_off +
-                                (uint64_t)src_rk * base_nrows * app_[ri].row_bytes)) {
-                if (err) *err = "prefix cache: the engine refused a restored delta partial block";
+              if (!load_ckpt(app_[ri], rk, base_row0, nrows,
+                             impl_->rbuf[0] + hdr + base_off +
+                                 (uint64_t)src_rk * base_nrows * app_[ri].row_bytes,
+                             "prefix cache: the engine refused a restored delta partial block")) {
                 return false;
               }
             }
@@ -825,15 +891,19 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
         if (!nrows) continue;
         for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
           const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
-          if (!io_.load(io_.ctx, app_[ri].part, app_[ri].layer, rk, row0, nrows,
-                        impl_->ckbuf + off + o +
-                            (uint64_t)src_rk * nrows * app_[ri].row_bytes)) {
-            if (err) *err = "prefix cache: the engine refused a restored partial block";
+          if (!load_ckpt(app_[ri], rk, row0, nrows,
+                         impl_->ckbuf + off + o +
+                             (uint64_t)src_rk * nrows * app_[ri].row_bytes,
+                         "prefix cache: the engine refused a restored partial block")) {
             return false;
           }
         }
       }
     }
+  }
+  if (ckpt_async_queued && !io_.sync_all(io_.ctx)) {
+    if (err) *err = "prefix cache: async checkpoint restore sync failed";
+    return false;
   }
   touch(cs, true);
   for (uint32_t i = nfull; i-- > 0; )
@@ -890,16 +960,28 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
     h->payload_bytes = blk_payload_; h->pos = (i + 1) * B;
     std::memcpy(h->key, keys.data() + (size_t)i * 32, 32);
     std::memcpy(buf + sizeof(SlotHeader), ids + (size_t)i * B, (size_t)B * sizeof(uint32_t));
+    bool blk_async_queued = false;
     for (uint32_t ri = 0; ri < app_.size(); ++ri) {
       uint64_t off, row0, nrows;
       region_span(app_, kSavedRanks, i * B, (i + 1) * B, ri, &off, &row0, &nrows);
-      for (uint32_t rk = 0; rk < kSavedRanks; ++rk)
-        if (!io_.save(io_.ctx, app_[ri].part, app_[ri].layer, rk, row0, nrows,
-                      buf + hdr + off + (uint64_t)rk * nrows * app_[ri].row_bytes)) {
+      for (uint32_t rk = 0; rk < kSavedRanks; ++rk) {
+        uint8_t* dst_ptr = buf + hdr + off + (uint64_t)rk * nrows * app_[ri].row_bytes;
+        const bool ok = impl_->use_async_save
+            ? io_.save_async(io_.ctx, app_[ri].part, app_[ri].layer, rk, row0, nrows, dst_ptr)
+            : io_.save(io_.ctx, app_[ri].part, app_[ri].layer, rk, row0, nrows, dst_ptr);
+        if (!ok) {
+          if (blk_async_queued) (void)io_.sync_all(io_.ctx);
           if (err) *err = "prefix cache: the engine refused to hand over a block";
           release_stage(bi);
           return false;
         }
+        if (impl_->use_async_save) blk_async_queued = true;
+      }
+    }
+    if (blk_async_queued && !io_.sync_all(io_.ctx)) {
+      if (err) *err = "prefix cache: async block save sync failed";
+      release_stage(bi);
+      return false;
     }
     Slot& sl = blk_[s];
     std::memcpy(sl.key, h->key, 32);
@@ -981,15 +1063,30 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
   block_key(fp_, parent, ids + (size_t)nfull * B, tail, h->key);
   if (tail) std::memcpy(buf + sizeof(SlotHeader), ids + (size_t)nfull * B,
                         (size_t)tail * sizeof(uint32_t));
+  bool ck_async_queued = false;
+  auto save_ckpt = [&](const KvRegion& r, uint32_t rk, uint64_t row0, uint64_t nrows,
+                       uint8_t* dst_ptr, const char* err_msg) -> bool {
+    const bool ok = impl_->use_async_save
+        ? io_.save_async(io_.ctx, r.part, r.layer, rk, row0, nrows, dst_ptr)
+        : io_.save(io_.ctx, r.part, r.layer, rk, row0, nrows, dst_ptr);
+    if (!ok) {
+      if (ck_async_queued) (void)io_.sync_all(io_.ctx);
+      if (err) *err = err_msg;
+      release_stage(bi);
+      return false;
+    }
+    if (impl_->use_async_save) ck_async_queued = true;
+    return true;
+  };
   uint64_t off = hdr;
   for (const KvRegion& r : roll_) {
-    for (uint32_t rk = 0; rk < kSavedRanks; ++rk)
-      if (!io_.save(io_.ctx, r.part, r.layer, rk, 0, r.rows,
-                    buf + off + (uint64_t)rk * r.rows * r.row_bytes)) {
-        if (err) *err = "prefix cache: the engine refused to hand over a ring";
-        release_stage(bi);
+    for (uint32_t rk = 0; rk < kSavedRanks; ++rk) {
+      if (!save_ckpt(r, rk, 0, r.rows,
+                     buf + off + (uint64_t)rk * r.rows * r.row_bytes,
+                     "prefix cache: the engine refused to hand over a ring")) {
         return false;
       }
+    }
     off += (uint64_t)kSavedRanks * r.rows * r.row_bytes;
   }
   if (!is_delta && tail) {
@@ -998,14 +1095,19 @@ bool PrefixCache::publish(const uint32_t* ids, uint32_t n, std::string* err) {
       uint64_t o, row0, nrows;
       region_span(app_, kSavedRanks, t0, t0 + tail, ri, &o, &row0, &nrows);
       if (!nrows) continue;
-      for (uint32_t rk = 0; rk < kSavedRanks; ++rk)
-        if (!io_.save(io_.ctx, app_[ri].part, app_[ri].layer, rk, row0, nrows,
-                      buf + off + o + (uint64_t)rk * nrows * app_[ri].row_bytes)) {
-          if (err) *err = "prefix cache: the engine refused to hand over a partial block";
-          release_stage(bi);
+      for (uint32_t rk = 0; rk < kSavedRanks; ++rk) {
+        if (!save_ckpt(app_[ri], rk, row0, nrows,
+                       buf + off + o + (uint64_t)rk * nrows * app_[ri].row_bytes,
+                       "prefix cache: the engine refused to hand over a partial block")) {
           return false;
         }
+      }
     }
+  }
+  if (ck_async_queued && !io_.sync_all(io_.ctx)) {
+    if (err) *err = "prefix cache: async checkpoint save sync failed";
+    release_stage(bi);
+    return false;
   }
   Slot& sl = ck_[cs];
   std::memcpy(sl.key, h->key, 32);

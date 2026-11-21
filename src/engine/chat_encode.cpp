@@ -385,7 +385,17 @@ std::string encode_messages(const std::vector<ChatMsg>& in, const EncodeOpts& op
 
   const int last_user = last_user_index(msgs);
 
-  std::string out = opts.add_bos ? kBos : "";
+  size_t est = 256;
+  for (const ChatMsg& m : msgs) {
+    est += m.content.size() + m.reasoning_content.size() + m.response_format.size() + 32;
+    for (const ToolDef& t : m.tools)
+      est += t.function_json.size() + t.ns.size() + t.ns_desc.size() + 64;
+    for (const ToolCall& tc : m.tool_calls)
+      est += tc.name.size() + tc.arguments.size() + tc.ns.size() + 64;
+  }
+  std::string out;
+  out.reserve(est);
+  if (opts.add_bos) out += kBos;
   for (size_t idx = 0; idx < msgs.size(); ++idx) {
     const ChatMsg& m = msgs[idx];
 

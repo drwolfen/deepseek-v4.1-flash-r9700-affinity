@@ -282,6 +282,20 @@ public:
   bool kv_part_load(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0, uint64_t nrows,
                     const void* src);
 
+  // Asynchronous counterparts that enqueue hipMemcpyAsync on the rank's stream without waiting;
+  // callers synchronize via kv_sync_rank / kv_sync_all before reading or reusing host staging.
+  bool kv_part_save_async(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0,
+                          uint64_t nrows, void* dst) const;
+  bool kv_part_load_async(KvPart part, uint32_t layer, uint32_t rank, uint64_t row0,
+                          uint64_t nrows, const void* src);
+  bool kv_sync_rank(uint32_t rank) const;
+  bool kv_sync_all() const;
+
+  // Register/unregister host staging buffers for DMA; returns false with no abort on failure so
+  // callers can fall back cleanly to pageable host memory.
+  static bool pin_host(void* ptr, size_t bytes);
+  static void unpin_host(void* ptr);
+
   // FNV-1a over rows [row0, row0 + nrows) as `rank` holds them, mixed into `h`.
   //
   // For proving a restored state is the state a straight prefill would have left, and for the one

@@ -74,6 +74,9 @@ struct CompletionRequest {
   bool suppress_final_think = false;      // reasoning_effort="none" while keeping thinking prefix cache
   bool has_temperature = false;           // so a server default is distinguishable from a request
   bool has_top_p = false;
+  // Populated by preflight_check on text-only requests so gen_ avoids re-encoding/tokenizing.
+  mutable std::vector<uint32_t> preencoded_ids;
+  mutable bool has_preencoded_ids = false;
 };
 
 // What one generation produced, once its markup has been parsed.
@@ -87,6 +90,9 @@ struct GenResult {
   uint32_t prompt_tokens = 0;
   uint32_t completion_tokens = 0;
   uint32_t cached_tokens = 0;
+  // Optional work (e.g. prefix cache publish) executed after HTTP reply / SSE [DONE] is sent and
+  // the client socket is closed, while the request's slot is still held.
+  std::function<void()> post_send;
   // Set when the request cannot be served as asked. The server answers 400 rather than an empty
   // completion, so the caller sees a refusal instead of a model that had nothing to say.
   std::string error;

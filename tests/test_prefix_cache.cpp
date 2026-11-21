@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 #include <dirent.h>
@@ -567,6 +568,305 @@ void test_prefix_cache_large_block_and_atomic_index() {
   std::printf("PASS: test_prefix_cache_large_block_and_atomic_index\n");
 }
 
+struct AsyncMultiSim {
+  MultiRegionContext base;
+  struct PendingOp {
+    bool is_save = false;
+    uint8_t part = 0;
+    uint32_t layer = 0;
+    uint32_t rank = 0;
+    uint64_t row0 = 0;
+    uint64_t nrows = 0;
+    void* dst = nullptr;
+    const void* src = nullptr;
+  };
+  std::vector<PendingOp> pending;
+  std::set<void*> pinned;
+  bool pin_should_fail = false;
+  uint64_t pin_calls = 0;
+  uint64_t unpin_calls = 0;
+  uint64_t sync_all_calls = 0;
+  uint64_t sync_io_calls = 0;
+  uint64_t async_save_calls = 0;
+  uint64_t async_load_calls = 0;
+};
+
+bool async_sim_save_sync(void* ctx, uint8_t part, uint32_t layer, uint32_t rank,
+                         uint64_t row0, uint64_t nrows, void* dst) {
+  auto* s = static_cast<AsyncMultiSim*>(ctx);
+  ++s->sync_io_calls;
+  return multi_save(&s->base, part, layer, rank, row0, nrows, dst);
+}
+
+bool async_sim_load_sync(void* ctx, uint8_t part, uint32_t layer, uint32_t rank,
+                         uint64_t row0, uint64_t nrows, const void* src) {
+  auto* s = static_cast<AsyncMultiSim*>(ctx);
+  ++s->sync_io_calls;
+  return multi_load(&s->base, part, layer, rank, row0, nrows, src);
+}
+
+bool async_sim_save_async(void* ctx, uint8_t part, uint32_t layer, uint32_t rank,
+                          uint64_t row0, uint64_t nrows, void* dst) {
+  auto* s = static_cast<AsyncMultiSim*>(ctx);
+  ++s->async_save_calls;
+  s->pending.push_back({true, part, layer, rank, row0, nrows, dst, nullptr});
+  return true;
+}
+
+bool async_sim_load_async(void* ctx, uint8_t part, uint32_t layer, uint32_t rank,
+                          uint64_t row0, uint64_t nrows, const void* src) {
+  auto* s = static_cast<AsyncMultiSim*>(ctx);
+  ++s->async_load_calls;
+  s->pending.push_back({false, part, layer, rank, row0, nrows, nullptr, src});
+  return true;
+}
+
+bool async_sim_sync_all(void* ctx) {
+  auto* s = static_cast<AsyncMultiSim*>(ctx);
+  ++s->sync_all_calls;
+  // Executing deferred copies inside sync_all proves host staging slices do not alias before sync.
+  for (const auto& op : s->pending) {
+    if (op.is_save) {
+      CHECK(multi_save(&s->base, op.part, op.layer, op.rank, op.row0, op.nrows, op.dst));
+    } else {
+      CHECK(multi_load(&s->base, op.part, op.layer, op.rank, op.row0, op.nrows, op.src));
+    }
+  }
+  s->pending.clear();
+  return true;
+}
+
+bool async_sim_pin(void* ctx, void* ptr, uint64_t bytes) {
+  auto* s = static_cast<AsyncMultiSim*>(ctx);
+  ++s->pin_calls;
+  if (s->pin_should_fail || !ptr || !bytes) return false;
+  CHECK(s->pinned.insert(ptr).second);
+  return true;
+}
+
+void async_sim_unpin(void* ctx, void* ptr) {
+  auto* s = static_cast<AsyncMultiSim*>(ctx);
+  ++s->unpin_calls;
+  CHECK(s->pinned.erase(ptr) == 1);
+}
+
+void test_prefix_cache_batched_pinned_io() {
+  char temp_template[] = "/tmp/aff_pcache_batch_XXXXXX";
+  char* temp_dir = ::mkdtemp(temp_template);
+  CHECK(temp_dir != nullptr);
+  std::string cache_dir(temp_dir);
+
+  const uint32_t B = 256;
+  const uint32_t total_tokens = 1280; // 5 blocks
+
+  auto make_sim = [&](bool pin_fail) {
+    AsyncMultiSim sim;
+    sim.pin_should_fail = pin_fail;
+    std::vector<aff::KvRegion> regions;
+    auto add_reg = [&](uint8_t part, uint32_t layer, uint64_t row_bytes, uint64_t rows,
+                       uint32_t ratio) {
+      regions.push_back(aff::KvRegion{part, layer, row_bytes, rows, ratio});
+      MultiRegionContext::RegBuf rb;
+      rb.part = part; rb.layer = layer; rb.row_bytes = row_bytes; rb.rows = rows; rb.ratio = ratio;
+      for (int rk = 0; rk < 2; ++rk) {
+        rb.data[rk].resize((size_t)(rows * row_bytes));
+        for (size_t i = 0; i < rb.data[rk].size(); ++i)
+          rb.data[rk][i] = (uint8_t)(((i * 97 + part * 31 + layer * 11 + 5) ^ (i >> 5)) & 0xFF);
+      }
+      sim.base.regs.push_back(std::move(rb));
+    };
+    add_reg(0, 0, 2048, 8, 0);
+    add_reg(4, 0, 512, 4, 0);
+    add_reg(1, 0, 512, total_tokens, 1);
+    add_reg(2, 0, 256, total_tokens / 8, 8);
+    add_reg(1, 1, 512, total_tokens, 1);
+    add_reg(3, 1, 64, total_tokens / 8, 8);
+    return std::make_pair(std::move(sim), std::move(regions));
+  };
+
+  auto [sim, regions] = make_sim(false);
+  std::vector<std::vector<uint8_t>> golden(sim.base.regs.size());
+  for (size_t i = 0; i < sim.base.regs.size(); ++i) golden[i] = sim.base.regs[i].data[0];
+
+  aff::KvIo io{&async_sim_save_sync, &async_sim_load_sync, &sim,
+               &async_sim_save_async, &async_sim_load_async, &async_sim_sync_all,
+               &async_sim_pin, &async_sim_unpin};
+
+  aff::PrefixCache::Options opt;
+  opt.dir = cache_dir;
+  opt.block_tokens = B;
+  opt.budget_bytes = 64ull << 20;
+  opt.ckpt_percent = 25;
+  opt.queue_depth = 3;
+  opt.ranks = 2;
+  opt.delta = true;
+
+  std::string err;
+  aff::PrefixCache cache;
+  CHECK(cache.open(opt, regions, io, 0x733de762fee253e6ull, &err));
+  // Expected pins: stage[0..2] (3) + gather (1) + ckbuf (1) + rbuf[0] (1) = 6
+  CHECK(sim.pin_calls == 6);
+  CHECK(sim.pinned.size() == 6);
+
+  std::vector<uint32_t> ids(total_tokens);
+  for (uint32_t i = 0; i < total_tokens; ++i) ids[i] = 7000 + i * 5;
+
+  // Publish 3 full blocks + 100 tail tokens (868)
+  const uint32_t pos1 = 3 * B + 100;
+  CHECK(cache.publish(ids.data(), pos1, &err));
+  cache.drain();
+  CHECK(sim.sync_io_calls == 0);
+  CHECK(sim.async_save_calls > 0);
+  // 3 blocks + 1 checkpoint = 4 sync_all calls
+  CHECK(sim.sync_all_calls == 4);
+
+  // Zero both ranks and restore all 3 blocks (g=3 > 1) + checkpoint in batched async mode.
+  for (auto& r : sim.base.regs)
+    for (int rk = 0; rk < 2; ++rk) std::fill(r.data[rk].begin(), r.data[rk].end(), 0);
+  sim.sync_all_calls = 0;
+  sim.async_load_calls = 0;
+
+  CHECK(cache.lookup(ids.data(), pos1, nullptr) == pos1);
+  CHECK(cache.restore(ids.data(), pos1, &err));
+  CHECK(sim.sync_io_calls == 0);
+  CHECK(sim.async_load_calls > 0);
+  // 1 sync_all for the 3-block batch across all regions/ranks + 1 sync_all for checkpoint (roll+tail)
+  CHECK(sim.sync_all_calls == 2);
+
+  for (size_t ri = 0; ri < sim.base.regs.size(); ++ri) {
+    const auto& r = sim.base.regs[ri];
+    const uint64_t expected_rows = r.ratio == 0 ? r.rows : (pos1 / r.ratio);
+    const size_t expected_bytes = (size_t)(expected_rows * r.row_bytes);
+    for (int rk = 0; rk < 2; ++rk)
+      CHECK(std::memcmp(r.data[rk].data(), golden[ri].data(), expected_bytes) == 0);
+  }
+
+  // Now restore golden state and publish block 3 (1024) so pos1 checkpoint becomes delta-backed.
+  for (size_t ri = 0; ri < sim.base.regs.size(); ++ri)
+    sim.base.regs[ri].data[0] = sim.base.regs[ri].data[1] = golden[ri];
+  CHECK(cache.publish(ids.data(), 4 * B, &err));
+  cache.drain();
+
+  for (auto& r : sim.base.regs)
+    for (int rk = 0; rk < 2; ++rk) std::fill(r.data[rk].begin(), r.data[rk].end(), 0);
+  sim.sync_all_calls = 0;
+  CHECK(cache.restore(ids.data(), pos1, &err));
+  CHECK(cache.stats().delta_ckpts_restored == 1);
+  CHECK(sim.sync_all_calls == 2);
+  for (size_t ri = 0; ri < sim.base.regs.size(); ++ri) {
+    const auto& r = sim.base.regs[ri];
+    const uint64_t expected_rows = r.ratio == 0 ? r.rows : (pos1 / r.ratio);
+    const size_t expected_bytes = (size_t)(expected_rows * r.row_bytes);
+    for (int rk = 0; rk < 2; ++rk)
+      CHECK(std::memcmp(r.data[rk].data(), golden[ri].data(), expected_bytes) == 0);
+  }
+
+  cache.close();
+  CHECK(sim.unpin_calls == 6);
+  CHECK(sim.pinned.empty());
+  rm_rf(cache_dir);
+
+  // Pinning failure fallback: pin_host returns false -> pageable fallback with zero unpin calls.
+  char temp_fb[] = "/tmp/aff_pcache_pinfb_XXXXXX";
+  char* dir_fb = ::mkdtemp(temp_fb);
+  CHECK(dir_fb != nullptr);
+  std::string fb_dir(dir_fb);
+  auto [sim_fb, regs_fb] = make_sim(true);
+  aff::KvIo io_fb{&async_sim_save_sync, &async_sim_load_sync, &sim_fb,
+                  &async_sim_save_async, &async_sim_load_async, &async_sim_sync_all,
+                  &async_sim_pin, &async_sim_unpin};
+  opt.dir = fb_dir;
+  aff::PrefixCache cache_fb;
+  CHECK(cache_fb.open(opt, regs_fb, io_fb, 0x733de762fee253e6ull, &err));
+  CHECK(sim_fb.pin_calls == 6);
+  CHECK(sim_fb.pinned.empty());
+  CHECK(cache_fb.publish(ids.data(), pos1, &err));
+  cache_fb.drain();
+  for (auto& r : sim_fb.base.regs)
+    for (int rk = 0; rk < 2; ++rk) std::fill(r.data[rk].begin(), r.data[rk].end(), 0);
+  CHECK(cache_fb.restore(ids.data(), pos1, &err));
+  for (size_t ri = 0; ri < sim_fb.base.regs.size(); ++ri) {
+    const auto& r = sim_fb.base.regs[ri];
+    const uint64_t expected_rows = r.ratio == 0 ? r.rows : (pos1 / r.ratio);
+    const size_t expected_bytes = (size_t)(expected_rows * r.row_bytes);
+    for (int rk = 0; rk < 2; ++rk)
+      CHECK(std::memcmp(r.data[rk].data(), golden[ri].data(), expected_bytes) == 0);
+  }
+  cache_fb.close();
+  CHECK(sim_fb.unpin_calls == 0);
+  rm_rf(fb_dir);
+
+  std::printf("PASS: test_prefix_cache_batched_pinned_io\n");
+}
+
+void test_prefix_cache_think_ckpt_simulation() {
+  char temp_template[] = "/tmp/aff_pcache_think_XXXXXX";
+  char* temp_dir = ::mkdtemp(temp_template);
+  CHECK(temp_dir != nullptr);
+  std::string cache_dir(temp_dir);
+
+  const uint32_t B = 512;
+  const uint32_t pos_think = 2 * B + 170; // 1194 tokens (at </think>)
+  const uint32_t turn_t_end = pos_think + 300;
+  const uint32_t turn_t1_len = pos_think + 406;
+
+  SimContext sim;
+  sim.ring_row_bytes = 4096;
+  sim.app_row_bytes = 256;
+  sim.ring.assign(4096, 0x5E);
+  sim.app.resize(2048 * 256);
+  for (size_t i = 0; i < sim.app.size(); ++i) sim.app[i] = (uint8_t)((i * 29 + 11) & 0xFF);
+
+  std::vector<aff::KvRegion> regions = {
+      {0, 0, 4096, 1, 0},
+      {1, 0, 256, 2048, 1},
+  };
+  aff::KvIo io{&sim_save, &sim_load, &sim};
+
+  aff::PrefixCache::Options opt;
+  opt.dir = cache_dir;
+  opt.block_tokens = B;
+  opt.budget_bytes = 64ull << 20;
+  opt.ckpt_percent = 25;
+  opt.queue_depth = 2;
+  opt.ranks = 1;
+  opt.delta = true;
+
+  std::string err;
+  aff::PrefixCache cache;
+  CHECK(cache.open(opt, regions, io, 0x733de762fee253e6ull, &err));
+
+  std::vector<uint32_t> ids_turn_t(turn_t_end);
+  for (uint32_t i = 0; i < turn_t_end; ++i) ids_turn_t[i] = 10000 + i;
+
+  // Turn T publishes think-close checkpoint at pos_think, then full turn end (after tool call).
+  CHECK(cache.publish(ids_turn_t.data(), pos_think, &err));
+  CHECK(cache.publish(ids_turn_t.data(), turn_t_end, &err));
+  cache.drain();
+
+  // Turn T+1 shares [0 .. pos_think) identically, then diverges right after pos_think (e.g.
+  // alphabetical JSON tool-call key reordering by client).
+  std::vector<uint32_t> ids_turn_t1(turn_t1_len);
+  for (uint32_t i = 0; i < pos_think; ++i) ids_turn_t1[i] = ids_turn_t[i];
+  for (uint32_t i = pos_think; i < turn_t1_len; ++i) ids_turn_t1[i] = 90000 + i;
+
+  uint32_t matched = 0;
+  const uint32_t hit = cache.lookup(ids_turn_t1.data(), turn_t1_len, &matched);
+  CHECK(hit == pos_think);
+  CHECK(matched == 2);
+
+  std::fill(sim.ring.begin(), sim.ring.end(), 0);
+  std::fill(sim.app.begin(), sim.app.end(), 0);
+  CHECK(cache.restore(ids_turn_t1.data(), hit, &err));
+  for (size_t i = 0; i < 4096; ++i) CHECK(sim.ring[i] == 0x5E);
+  for (size_t i = 0; i < (size_t)pos_think * 256; ++i)
+    CHECK(sim.app[i] == (uint8_t)((i * 29 + 11) & 0xFF));
+
+  cache.close();
+  rm_rf(cache_dir);
+  std::printf("PASS: test_prefix_cache_think_ckpt_simulation\n");
+}
+
 }  // namespace
 
 int main() {
@@ -575,6 +875,8 @@ int main() {
   test_prefix_cache_delta_multiregion_tp2();
   test_prefix_cache_cross_branch_divergence();
   test_prefix_cache_large_block_and_atomic_index();
+  test_prefix_cache_batched_pinned_io();
+  test_prefix_cache_think_ckpt_simulation();
   std::printf("PASS: all prefix cache and ignore_eos tests passed.\n");
   return 0;
 }

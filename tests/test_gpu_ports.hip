@@ -2,6 +2,7 @@
 #include "gpu/attn_flash.h"
 #include "gpu/batch_kernels.h"
 #include "gpu/compressor_gpu.h"
+#include "gpu/dense_gpu.h"
 #include "gpu/engram_gpu.h"
 #include "gpu/expert_kernel_hip.h"
 #include "gpu/indexer_gpu.h"
@@ -1860,6 +1861,68 @@ int main() {
                     (void*)d_ord, (void*)d_run, (void*)d_col, (void*)d_tiles, (void*)d_cnt,
                     (void*)d_st, (void*)d_bg, (void*)d_bu, (void*)d_bydn})
       (void)hipFree(p);
+  }
+
+  // 22. Test DenseGpu::kv_part_save_async / kv_part_load_async / kv_sync_all / pin_host / unpin_host
+  {
+    assert(!DenseGpu::pin_host(nullptr, 0));
+    DenseGpu::unpin_host(nullptr);
+    assert(hipGetLastError() == hipSuccess);
+
+    DenseGpu dg;
+    std::string dg_err;
+    assert(dg.init(64, 64, &dg_err, 1));
+    uint32_t comp_rows[1] = {16};
+    assert(dg.attn_init(1, 16, 64, 16, 16, comp_rows, KvDtype::FP8R, 64, 64, &dg_err));
+    uint32_t ratios[1] = {4};
+    assert(dg.reserve_runtime(1, ratios, 64, kIdxDim, 4, &dg_err));
+
+    const DenseGpu::KvPart parts[] = {
+        DenseGpu::KvPart::Raw,  DenseGpu::KvPart::Comp, DenseGpu::KvPart::Idx8,
+        DenseGpu::KvPart::IdxScale, DenseGpu::KvPart::Hist, DenseGpu::KvPart::IdxHist,
+    };
+    for (DenseGpu::KvPart part : parts) {
+      uint64_t rb = 0, rows = 0;
+      if (!dg.kv_part_geometry(part, 0, &rb, &rows)) continue;
+      const uint64_t nrows = std::min<uint64_t>(rows, 8);
+      const size_t bytes = (size_t)(nrows * rb);
+      const size_t alloc_bytes = (bytes + 4095u) & ~(size_t)4095u;
+
+      void *raw_src = nullptr, *raw_sync = nullptr, *raw_async = nullptr;
+      assert(::posix_memalign(&raw_src, 4096, alloc_bytes) == 0);
+      assert(::posix_memalign(&raw_sync, 4096, alloc_bytes) == 0);
+      assert(::posix_memalign(&raw_async, 4096, alloc_bytes) == 0);
+
+      auto* src = static_cast<uint8_t*>(raw_src);
+      auto* dst_sync = static_cast<uint8_t*>(raw_sync);
+      auto* dst_async = static_cast<uint8_t*>(raw_async);
+      for (size_t i = 0; i < bytes; ++i)
+        src[i] = (uint8_t)(((i * 53 + (uint8_t)part * 19 + 7) ^ (i >> 4)) & 0xFF);
+      std::memset(dst_sync, 0, bytes);
+      std::memset(dst_async, 0, bytes);
+
+      const bool p_src = DenseGpu::pin_host(src, alloc_bytes);
+      const bool p_dst = DenseGpu::pin_host(dst_async, alloc_bytes);
+
+      assert(dg.kv_part_load(part, 0, 0, 0, nrows, src));
+      assert(dg.kv_part_save(part, 0, 0, 0, nrows, dst_sync));
+      assert(std::memcmp(src, dst_sync, bytes) == 0);
+
+      // Overwrite device rows with zeros synchronously, then reload via async + kv_sync_all.
+      std::vector<uint8_t> zeros(bytes, 0);
+      assert(dg.kv_part_load(part, 0, 0, 0, nrows, zeros.data()));
+      assert(dg.kv_part_load_async(part, 0, 0, 0, nrows, src));
+      assert(dg.kv_sync_all());
+      assert(dg.kv_part_save_async(part, 0, 0, 0, nrows, dst_async));
+      assert(dg.kv_sync_rank(0));
+      assert(std::memcmp(dst_sync, dst_async, bytes) == 0);
+
+      if (p_src) DenseGpu::unpin_host(src);
+      if (p_dst) DenseGpu::unpin_host(dst_async);
+      std::free(raw_src);
+      std::free(raw_sync);
+      std::free(raw_async);
+    }
   }
 
   std::printf("PASS: test_gpu_ports on gfx1201\n");

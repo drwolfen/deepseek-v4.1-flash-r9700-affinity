@@ -182,6 +182,23 @@ static bool pc_load(void* ctx, uint8_t part, uint32_t layer, uint32_t rank, uint
                     uint64_t nrows, const void* src) {
   return ((DenseGpu*)ctx)->kv_part_load((DenseGpu::KvPart)part, layer, rank, row0, nrows, src);
 }
+static bool pc_save_async(void* ctx, uint8_t part, uint32_t layer, uint32_t rank, uint64_t row0,
+                          uint64_t nrows, void* dst) {
+  return ((DenseGpu*)ctx)->kv_part_save_async((DenseGpu::KvPart)part, layer, rank, row0, nrows, dst);
+}
+static bool pc_load_async(void* ctx, uint8_t part, uint32_t layer, uint32_t rank, uint64_t row0,
+                          uint64_t nrows, const void* src) {
+  return ((DenseGpu*)ctx)->kv_part_load_async((DenseGpu::KvPart)part, layer, rank, row0, nrows, src);
+}
+static bool pc_sync_all(void* ctx) {
+  return ((DenseGpu*)ctx)->kv_sync_all();
+}
+static bool pc_pin_host(void* /*ctx*/, void* ptr, uint64_t bytes) {
+  return DenseGpu::pin_host(ptr, (size_t)bytes);
+}
+static void pc_unpin_host(void* /*ctx*/, void* ptr) {
+  DenseGpu::unpin_host(ptr);
+}
 #endif
 
 // `aff-profile`'s output: a magic, two dimensions, then n_layer*n_expert float32 layer-major. The
@@ -1203,6 +1220,15 @@ int main(int argc, char** argv) {
       for (uint32_t l = 0; l < c.n_layer; ++l) mix(c.ratio_for(l));
 
       KvIo pio; pio.save = pc_save; pio.load = pc_load; pio.ctx = &dense_gpu;
+      const char* batch_io_env = std::getenv("AFF_PCACHE_BATCH_IO");
+      const bool batch_io = !batch_io_env || !*batch_io_env || std::strcmp(batch_io_env, "0") != 0;
+      if (batch_io) {
+        pio.save_async = pc_save_async;
+        pio.load_async = pc_load_async;
+        pio.sync_all = pc_sync_all;
+        pio.pin_host = pc_pin_host;
+        pio.unpin_host = pc_unpin_host;
+      }
       // Size the default from what the filesystem actually has rather than assuming a large SSD:
       // the store is preallocated, so a fixed default either fails to open or fills the disk.
       // A quarter of the free space, capped, and never more than is there.
@@ -2094,6 +2120,21 @@ int main(int argc, char** argv) {
   // block — and released around anything that waits on the network, so a slow reader cannot stall
   // the cards.
   std::mutex engine_mu;
+  // Context-bucketed adaptive verification EMAs (<32K, 32K..128K, >=128K), seeded across turns.
+  struct SpecEmaBucket {
+    std::mutex mu;
+    bool initialized = false;
+    float surv_ema[8] = {};
+    float conf_pred_ema[8] = {};
+    float conf_act_ema[8] = {};
+    float cost_ema[8] = {};
+    uint32_t cost_samples[8] = {};
+  };
+  SpecEmaBucket spec_ema_buckets[3];
+  const bool persist_spec_ema = [] {
+    const char* s = std::getenv("AFF_PERSIST_SPEC_EMA");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
   // `emit` takes each accepted token and returns false to stop. Returns how many were emitted.
   auto spec_decode = [&](uint32_t slot, SeqState& st, const Model::BlockOut& seed_blk, uint32_t first,
                          std::vector<uint32_t>& hist, uint32_t max_new, bool ignore_eos_,
@@ -2103,7 +2144,9 @@ int main(int argc, char** argv) {
                          // lambda is defined above where `force_ids` is parsed. Only ever non-null
                          // from the one-shot benchmark path; the server never forces.
                          const std::vector<uint32_t>* force = nullptr,
-                         ThinkingBudget* budget = nullptr) -> uint32_t {
+                         ThinkingBudget* budget = nullptr,
+                         const std::function<bool()>& check_think_closed = nullptr,
+                         const std::function<void(uint32_t)>& on_think_ckpt = nullptr) -> uint32_t {
     const uint32_t B = dspark_on ? c.dspark_block : 0u;
     const bool draft_on = dspark_on && c.dspark_block > 0;
     // Sized from the checkpoint, not from B: dspark_draft writes dspark_block_size ids through this
@@ -2214,6 +2257,20 @@ int main(int argc, char** argv) {
     // narrower verify touches proportionally fewer non-resident PCIe experts per layer.
     float cost_ema[kMaxQ] = {0.0f, 48.0f, 68.0f, 82.0f, 95.0f, 108.0f, 120.0f, 132.0f};
     uint32_t cost_samples[kMaxQ] = {};
+    const size_t ema_bucket_idx = st.pos < 32768u ? 0u : (st.pos < 131072u ? 1u : 2u);
+    if (persist_spec_ema && adaptive_width_on) {
+      SpecEmaBucket& b = spec_ema_buckets[ema_bucket_idx];
+      std::lock_guard<std::mutex> lk(b.mu);
+      if (b.initialized) {
+        for (uint32_t qi = 0; qi < kMaxQ; ++qi) {
+          surv_ema[qi] = b.surv_ema[qi];
+          conf_pred_ema[qi] = b.conf_pred_ema[qi];
+          conf_act_ema[qi] = b.conf_act_ema[qi];
+          cost_ema[qi] = b.cost_ema[qi];
+          cost_samples[qi] = b.cost_samples[qi];
+        }
+      }
+    }
     const char* probe_env = std::getenv("AFF_SPEC_PROBE_NEIGHBOR");
     const bool probe_neighbor_on = probe_env && *probe_env && std::strcmp(probe_env, "0") != 0;
     bool probe_in_flight = false;
@@ -2556,6 +2613,22 @@ int main(int argc, char** argv) {
         ++generated;
         if (next == kEosToken && !ignore_eos_) { stop = true; break; }
         if (!emit(next)) { stop = true; break; }
+        if ((!forcing || i == k) && check_think_closed && check_think_closed()) {
+          std::unique_lock<std::mutex> step(engine_mu);
+          dense_gpu.set_slot(slot);
+          if (i < k) {
+            model.rollback(&st, P + i + 1);
+            if (n_slots_gt1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
+            seed_n = vb.tap_rows ? std::min<uint32_t>(vb.tap_rows, i + 1) : 0u;
+            seed_pos0 = P;
+            tail = next;
+          }
+          if (on_think_ckpt) {
+            const uint32_t pub_pos = (uint32_t)std::min<size_t>(st.pos, hist.size());
+            on_think_ckpt(pub_pos);
+          }
+          break;
+        }
       }
       // `next` must be the token at s->pos whatever the loop above did with the count.
       next = tail;
@@ -2587,6 +2660,25 @@ int main(int argc, char** argv) {
       // Stopping BETWEEN blocks, never inside one: the fingerprint, the acceptance counters and the
       // placement report are the result of the run and all of them still get printed.
       if (dash.quit_requested()) stop = true;
+    }
+    if (persist_spec_ema && adaptive_width_on && my_blocks >= 4) {
+      SpecEmaBucket& b = spec_ema_buckets[ema_bucket_idx];
+      std::lock_guard<std::mutex> lk(b.mu);
+      const float alpha = b.initialized ? 0.5f : 1.0f;
+      for (uint32_t qi = 0; qi < kMaxQ; ++qi) {
+        auto blend_clamp = [&](float cur, float prev, float lo, float hi) {
+          if (!std::isfinite(cur)) return prev;
+          const float v = b.initialized ? ((1.0f - alpha) * prev + alpha * cur) : cur;
+          return std::clamp(v, lo, hi);
+        };
+        b.surv_ema[qi] = blend_clamp(surv_ema[qi], b.surv_ema[qi], 0.05f, 1.0f);
+        b.conf_pred_ema[qi] = blend_clamp(conf_pred_ema[qi], b.conf_pred_ema[qi], 0.05f, 1.0f);
+        b.conf_act_ema[qi] = blend_clamp(conf_act_ema[qi], b.conf_act_ema[qi], 0.05f, 1.0f);
+        b.cost_ema[qi] = (qi == 0) ? 0.0f : blend_clamp(cost_ema[qi], b.cost_ema[qi], 5.0f, 500.0f);
+        b.cost_samples[qi] =
+            std::min<uint32_t>(std::max(b.cost_samples[qi], cost_samples[qi]), 256u);
+      }
+      b.initialized = true;
     }
     if (slot_dbg)
       aff::ui::err("LOCAL slot %u: %u blocks, %u accepted (%.2f tok/blk), %u generated\n", slot, my_blocks,
@@ -3022,13 +3114,15 @@ int main(int argc, char** argv) {
       }
       const bool raw_mode = raw_completions && req.raw_prompt;
       const std::string prompt = raw_mode ? req.prompt : encode_messages(msgs, eo);
-      const std::vector<uint32_t> ids = tok.encode(prompt, false);
+      std::vector<uint32_t> ids = tok.encode(prompt, false);
       if (ids.size() + 32 >= kMaxKvPositions) {
         return "context_length_exceeded: the prompt is " + std::to_string(ids.size()) +
                " tokens and this engine serves at most " +
                std::to_string(kMaxKvPositions > 32 ? kMaxKvPositions - 32 : 0) +
                " (--kv-size " + std::to_string(kMaxKvPositions) + ")";
       }
+      req.preencoded_ids = std::move(ids);
+      req.has_preencoded_ids = true;
     }
     return {};
   };
@@ -3192,10 +3286,15 @@ int main(int argc, char** argv) {
     }
 
     const bool raw_mode = raw_completions && req.raw_prompt;
-    const std::string prompt = raw_mode ? req.prompt : encode_messages(msgs, eo);
-    // add_bos false: the encoder put the BOS in the string, and a second one is a different prompt.
-    std::vector<uint32_t> ids = tok.vocab_size() ? tok.encode(prompt, false)
-                                                 : std::vector<uint32_t>{1};
+    std::vector<uint32_t> ids;
+    if (req_image_b64.empty() && req.has_preencoded_ids) {
+      ids = std::move(req.preencoded_ids);
+      req.has_preencoded_ids = false;
+    } else {
+      const std::string prompt = raw_mode ? req.prompt : encode_messages(msgs, eo);
+      // add_bos false: the encoder put the BOS in the string, and a second one is a different prompt.
+      ids = tok.vocab_size() ? tok.encode(prompt, false) : std::vector<uint32_t>{1};
+    }
 
     Model::PrefillVision pv;
     if (!req_image_b64.empty() && n_vision_tokens > 0 && vit.ready()) {
@@ -3289,6 +3388,7 @@ int main(int argc, char** argv) {
     const uint32_t n_pre = ids.empty() ? 0u : (uint32_t)ids.size() - 1;
     uint32_t from = 0;
     uint32_t matched_blocks = 0;              // read again below, by the promotion boundary
+    uint32_t last_ckpt_pos = 0;
     if (prefix_cache.ready() && n_pre && pv.count == 0) {
       uint32_t& matched = matched_blocks;
       std::string rerr;
@@ -3304,6 +3404,7 @@ int main(int argc, char** argv) {
         if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
           model.restore_state(&st, hit, ids.data());
           from = hit;
+          last_ckpt_pos = hit;
         }
       }
       // One line a request. What a prefix cache does is invisible from the outside — a miss and a
@@ -3378,12 +3479,25 @@ int main(int argc, char** argv) {
       std::string perr;
       if (!prefix_cache.publish(ids.data(), promote, &perr))
         aff::ui::err("prefix cache: %s\n", perr.c_str());
-      else
+      else {
+        last_ckpt_pos = promote;
         aff::ui::err("prefix cache: promoted a resume point at %u (%u blocks held)\n",
                      promote, matched_blocks);
+      }
       from = promote;
     }
-    if (n_pre > from) {
+    const uint32_t stride_blocks = [] {
+      const char* s = std::getenv("AFF_PCACHE_STRIDE_BLOCKS");
+      return (s && *s) ? (uint32_t)std::strtoul(s, nullptr, 10) : 16u;
+    }();
+    while (n_pre > from) {
+      uint32_t target = n_pre;
+      if (prefix_cache.ready() && pv.count == 0 && stride_blocks > 0) {
+        const uint32_t B = prefix_cache.block_tokens();
+        const uint64_t next_ckpt = ((uint64_t)(from / B) + stride_blocks) * B;
+        if (next_ckpt > from && next_ckpt < n_pre && next_ckpt + c.sliding <= n_pre)
+          target = (uint32_t)next_ckpt;
+      }
       if (!heartbeat_fn()) {
         res->finish_reason = "stop";
         sink("", Delta::Content, true);
@@ -3391,12 +3505,12 @@ int main(int argc, char** argv) {
       }
       std::unique_lock<std::mutex> step(engine_mu);
       dense_gpu.set_slot(slot);
-      kv_reserve_for((uint64_t)ids.size() + 2);
+      kv_reserve_for(target == n_pre ? (uint64_t)ids.size() + 2 : (uint64_t)target + 2);
       watch_prefill(true);
       bool pre_ok = false;
       {
         PrefillAliveGuard alive_guard(model, &heartbeat_fn);
-        pre_ok = model.forward_prefill(ids.data() + from, n_pre - from, &st, nullptr,
+        pre_ok = model.forward_prefill(ids.data() + from, target - from, &st, nullptr,
                                        nullptr, nullptr, true, &blk,
                                        pv.count > 0 ? &pv : nullptr);
       }
@@ -3408,6 +3522,32 @@ int main(int argc, char** argv) {
         res->finish_reason = "stop";
         sink("", Delta::Content, true);
         return;
+      }
+      if (target < n_pre && prefix_cache.ready()) {
+        std::string perr;
+        if (!prefix_cache.publish(ids.data(), target, &perr))
+          aff::ui::err("prefix cache: %s\n", perr.c_str());
+        else {
+          last_ckpt_pos = target;
+          aff::ui::err("prefix cache: stride checkpoint at %u/%u tokens\n", target, n_pre);
+        }
+      }
+      from = target;
+    }
+    const bool prefill_ckpt_on = [] {
+      const char* s = std::getenv("AFF_PCACHE_PREFILL_CKPT");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
+    if (prefill_ckpt_on && prefix_cache.ready() && pv.count == 0 &&
+        n_pre >= last_ckpt_pos + prefix_cache.block_tokens()) {
+      std::unique_lock<std::mutex> step(engine_mu);
+      dense_gpu.set_slot(slot);
+      std::string perr;
+      if (!prefix_cache.publish(ids.data(), n_pre, &perr))
+        aff::ui::err("prefix cache: %s\n", perr.c_str());
+      else {
+        last_ckpt_pos = n_pre;
+        aff::ui::err("prefix cache: prefill checkpoint at %u tokens\n", n_pre);
       }
     }
 #ifdef AFF_WITH_HIP
@@ -3578,6 +3718,28 @@ int main(int argc, char** argv) {
       budget_ptr = &budget;
     }
 
+    const bool think_ckpt_on = [] {
+      const char* s = std::getenv("AFF_PCACHE_THINK_CKPT");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
+    bool think_ckpt_armed = think_ckpt_on && prefix_cache.ready() && !raw_mode &&
+                            gen_tm == ThinkingMode::Thinking && pv.count == 0;
+    bool think_ckpt_pending = false;
+    auto check_think_closed = [&]() -> bool {
+      if (!think_ckpt_pending) return false;
+      think_ckpt_pending = false;
+      return true;
+    };
+    auto on_think_ckpt = [&](uint32_t pub_pos) {
+      std::string perr;
+      if (pub_pos && !prefix_cache.publish(hist.data(), pub_pos, &perr))
+        aff::ui::err("prefix cache: %s\n", perr.c_str());
+      else if (pub_pos) {
+        last_ckpt_pos = pub_pos;
+        aff::ui::err("prefix cache: think-close checkpoint at %u tokens\n", pub_pos);
+      }
+    };
+
     run_view = {ids.size(), total_budget, hist.size(), 0.0, std::chrono::steady_clock::now()};
     // Per-request speculation accounting. The counters are global and cumulative, so a snapshot
     // either side of the call is this request's share — which is the only way to see acceptance
@@ -3632,6 +3794,11 @@ int main(int argc, char** argv) {
         if (te == std::string::npos) return true;        // still reasoning
         open_think = false;
         streamed = te + think_end.size();
+        if (think_ckpt_armed) {
+          think_ckpt_armed = false;
+          if (hist.size() >= last_ckpt_pos + prefix_cache.block_tokens())
+            think_ckpt_pending = true;
+        }
       }
       // A tool call is withheld until it is complete, so nothing streams while its arguments are generated.
       // An empty, not-done piece is a heartbeat: the server turns it into an empty-delta SSE chunk when
@@ -3690,7 +3857,8 @@ int main(int argc, char** argv) {
       }
       if (hit_stop) { raw.resize(stop_at); return false; }
       return true;
-    }, &sc, nullptr, budget_ptr);
+    }, &sc, nullptr, budget_ptr, check_think_closed, on_think_ckpt);
+    const auto t_dec_end = std::chrono::steady_clock::now();
     if (arm_budget && budget.force_closed()) {
       aff::ui::err("server: thinking budget force-closed </think> at %d/%u tokens (reason=%s)\n",
                    budget.thought_tokens(), total_budget, budget.close_reason());
@@ -3713,17 +3881,43 @@ int main(int argc, char** argv) {
     // already does after a rejected tail, and it is safe for the same reason: the rows above `upto`
     // are overwritten by the next tokens before anything reads them.
     if (prefix_cache.ready() && !hist.empty()) {
-      std::unique_lock<std::mutex> step(engine_mu);
-      dense_gpu.set_slot(slot);
+      const char* post_sse_env = std::getenv("AFF_PCACHE_POST_SSE");
+      const bool post_sse = !post_sse_env || !*post_sse_env || std::strcmp(post_sse_env, "0") != 0;
       // A raw one-token request is also used to prime an input prefix. Speculative
       // verification can have consumed its generated token; do not let that discarded
       // output become a cache hit in the following request. Keep normal turns unchanged.
       const size_t cache_end = raw_mode && total_budget == 1 ? ids.size() : hist.size();
       const uint32_t upto = (uint32_t)std::min<size_t>(st.pos, cache_end);
-      if (st.pos > upto) model.rollback(&st, upto);
-      std::string perr;
-      if (upto && !prefix_cache.publish(hist.data(), upto, &perr))
-        aff::ui::err("prefix cache: %s\n", perr.c_str());
+      {
+        std::unique_lock<std::mutex> step(engine_mu);
+        dense_gpu.set_slot(slot);
+        if (st.pos > upto) model.rollback(&st, upto);
+        if (!post_sse && upto) {
+          const auto t_pub0 = std::chrono::steady_clock::now();
+          std::string perr;
+          if (!prefix_cache.publish(hist.data(), upto, &perr))
+            aff::ui::err("prefix cache: %s\n", perr.c_str());
+          const double pub_ms =
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pub0).count();
+          if (pub_ms > 10.0)
+            aff::ui::err("prefix cache: published %u tokens in %.1f ms\n", upto, pub_ms);
+        }
+      }
+      if (post_sse && upto) {
+        res->post_send = [&prefix_cache, &dense_gpu, &engine_mu, slot, upto,
+                          pub_ids = std::move(hist)]() {
+          std::unique_lock<std::mutex> step(engine_mu);
+          dense_gpu.set_slot(slot);
+          const auto t_pub0 = std::chrono::steady_clock::now();
+          std::string perr;
+          if (!prefix_cache.publish(pub_ids.data(), upto, &perr))
+            aff::ui::err("prefix cache: %s\n", perr.c_str());
+          const double pub_ms =
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pub0).count();
+          if (pub_ms > 10.0)
+            aff::ui::err("prefix cache: published %u tokens in %.1f ms\n", upto, pub_ms);
+        };
+      }
     }
     // Truncation has to be distinguishable from a finished answer: a caller that sees "stop" on a
     // reply cut at max_tokens has no way to know it was cut, and will hand the fragment on as whole.
@@ -3733,7 +3927,7 @@ int main(int argc, char** argv) {
       const uint64_t nd = pa.drafted - p_before.drafted;
       const uint64_t na = pa.accepted - p_before.accepted;
       const double el =
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - t_dec0).count();
+          std::chrono::duration<double>(t_dec_end - t_dec0).count();
       aff::ui::err("slot %u: %u tok in %.2fs (%.1f t/s), %llu blocks, %llu drafted, %llu accepted "
                    "(%.1f%%, %.2f tok/block)\n", slot, made, el, el > 0 ? made / el : 0.0,
                    (unsigned long long)nb, (unsigned long long)nd, (unsigned long long)na,
