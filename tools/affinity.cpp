@@ -19,6 +19,7 @@
 #include "engine/prefix_cache.h"
 #include "engine/cactus.h"
 #include "engine/thinking_budget.h"
+#include "engine/suffix_draft.h"
 #include "vision/vit.h"
 
 #include "ui/dashboard.h"
@@ -2187,11 +2188,12 @@ int main(int argc, char** argv) {
   struct SpecEmaBucket {
     std::mutex mu;
     bool initialized = false;
-    float surv_ema[8] = {};
-    float conf_pred_ema[8] = {};
-    float conf_act_ema[8] = {};
-    float cost_ema[8] = {};
-    uint32_t cost_samples[8] = {};
+    enum : uint32_t { kMaxQ = aff::kSpecTok + 1 };
+    float surv_ema[kMaxQ] = {};
+    float conf_pred_ema[kMaxQ] = {};
+    float conf_act_ema[kMaxQ] = {};
+    float cost_ema[kMaxQ] = {};
+    uint32_t cost_samples[kMaxQ] = {};
   };
   SpecEmaBucket spec_ema_buckets[3];
   const bool persist_spec_ema = [] {
@@ -2214,9 +2216,12 @@ int main(int argc, char** argv) {
     const uint32_t B = dspark_on ? c.dspark_block : 0u;
     const bool draft_on = dspark_on && c.dspark_block > 0;
     // Sized from the checkpoint, not from B: dspark_draft writes dspark_block_size ids through this
-    // pointer and takes no count, so the buffer's length must come from where the writer's does.
-    std::vector<uint32_t> draft(c.dspark_block ? c.dspark_block : 1u), fed(B + 1);
-    std::vector<uint8_t> match(B ? B : 1u);
+    // pointer and takes no count, so the buffer's length must come from where the writer's does,
+    // and at least aff::kSpecTok - 1 so SuffixDecoding proposals up to 15 tokens fit cleanly.
+    std::vector<uint32_t> draft(
+        std::max<size_t>(c.dspark_block ? c.dspark_block : 1u, aff::kSpecTok - 1u));
+    std::vector<uint32_t> fed(aff::kSpecTok);
+    std::vector<uint8_t> match(aff::kSpecTok - 1u);
     Model::BlockOut vb;
     // Sampling is the model card's operating point (temperature 1.0, top_p 0.95); greedy is what a
     // caller gets by passing nothing, and is still what the benchmarks that need a fixed stream use.
@@ -2346,15 +2351,64 @@ int main(int argc, char** argv) {
     // and online per-width cost EMA tracks step latency (ms) per width q.
     const char* aw_env = std::getenv("AFF_ADAPTIVE_WIDTH");
     const bool adaptive_width_on = (!aw_env || !*aw_env || std::strcmp(aw_env, "0") != 0) && kConfT <= 0.0f;
+    // SuffixDecoding empirical n-gram drafting and adaptive draft depth stop.
+    const bool draft_suffix_on = [] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX");
+      return !(v && *v && std::strcmp(v, "0") == 0);
+    }();
+    const int sfx_min_match = [] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX_MIN_MATCH");
+      if (!v || !*v) return 4;
+      char* end = nullptr;
+      const long x = std::strtol(v, &end, 10);
+      if (end == v) return 4;
+      return (int)std::clamp<long>(x, 1L, (long)aff::SuffixDraftIndex::kMaxMinMatch);
+    }();
+    const float sfx_min_score = [] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX_MIN_SCORE");
+      if (!v || !*v) return 0.35f;
+      char* end = nullptr;
+      const float x = std::strtof(v, &end);
+      return (end != v && std::isfinite(x)) ? std::max(0.0f, x) : 0.35f;
+    }();
+    const uint32_t sfx_max = [] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX_MAX");
+      if (!v || !*v) return 12u;
+      char* end = nullptr;
+      const long x = std::strtol(v, &end, 10);
+      if (end == v) return 12u;
+      return (uint32_t)std::clamp<long>(x, 1L, (long)(aff::kSpecTok - 1u));
+    }();
+    const float sfx_min_expect = [] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX_MIN_EXPECT");
+      if (!v || !*v) return 2.0f;
+      char* end = nullptr;
+      const float x = std::strtof(v, &end);
+      return (end != v && std::isfinite(x)) ? std::max(0.0f, x) : 2.0f;
+    }();
+    const bool draft_depth_stop_on = [] {
+      const char* v = std::getenv("AFF_DRAFT_DEPTH_STOP");
+      return !(v && *v && std::strcmp(v, "0") == 0);
+    }();
+    aff::SuffixDraftIndex suffix_idx;
+    suffix_idx.reset(1ull);
+    std::vector<int32_t> suffix_buf(aff::kSpecTok);
     // Cactus rejection sampling with escape mixture, length-fade and acceptance cap (AFF_CACTUS_DELTA, default 0 = off; AFF_CACTUS_ESCAPE, default 0.25).
     const aff::CactusParams cactus_params = aff::CactusParams::from_env();
-    constexpr uint32_t kMaxQ = 8;
+    constexpr uint32_t kMaxQ = aff::kSpecTok + 1;
+    static_assert(SpecEmaBucket::kMaxQ == kMaxQ, "SpecEmaBucket size must match kMaxQ");
     float surv_ema[kMaxQ] = {1.0f, 0.75f, 0.60f, 0.48f, 0.38f, 0.30f, 0.24f, 0.19f};
     float conf_pred_ema[kMaxQ] = {1.0f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f};
     float conf_act_ema[kMaxQ]  = {1.0f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f};
     // Seed relative step costs (ms) for q = 0..7 on dual R9700 hybrid PCIe tier:
     // narrower verify touches proportionally fewer non-resident PCIe experts per layer.
     float cost_ema[kMaxQ] = {0.0f, 48.0f, 68.0f, 82.0f, 95.0f, 108.0f, 120.0f, 132.0f};
+    for (uint32_t q = 8; q < kMaxQ; ++q) {
+      surv_ema[q] = (q == 8) ? 0.15f : surv_ema[q - 1] * 0.8f;
+      conf_pred_ema[q] = 0.75f;
+      conf_act_ema[q] = 0.75f;
+      cost_ema[q] = cost_ema[7] + 12.0f * (float)(q - 7);
+    }
     uint32_t cost_samples[kMaxQ] = {};
     const size_t ema_bucket_idx = st.pos < 32768u ? 0u : (st.pos < 131072u ? 1u : 2u);
     if (persist_spec_ema && adaptive_width_on) {
@@ -2383,11 +2437,12 @@ int main(int argc, char** argv) {
     uint32_t cost_row_exact_samples[kMaxQ] = {};
     bool last_clean_accept = false;
     uint32_t zero_run = 0;
+    uint32_t depth_stop_skips = 0;
     uint32_t seed_n = seed_blk.tap_rows, seed_pos0 = seed_blk.tap_pos0;
     uint32_t next = first, generated = 0;
     bool stop = false;
     std::vector<double> accept_u;
-    accept_u.reserve(B + 1);
+    accept_u.reserve(aff::kSpecTok);
     while (generated < max_new && !stop) {
       if (sc) dry_ids_for(vb.dry_ids);
       // ONE BLOCK is one step. Taken here and dropped right after `rollback`, which is the last
@@ -2422,92 +2477,127 @@ int main(int argc, char** argv) {
       // single-token prompt. One unspeculated block gets past it.
       const uint32_t rem_out = max_new - generated;
       uint32_t nd = 0;
+      bool used_suffix = false;
       const bool forcing = budget && budget->injecting();
+      const bool has_force = force && !force->empty();
       const bool skip_draft = !forcing && kBackoff && zero_run >= kBackoff;
       if (forcing) {
         nd = (uint32_t)std::min<std::size_t>(
             {budget->pending_close_tokens(), (std::size_t)B, (std::size_t)(rem_out - 1u)});
-      } else if (draft_on && st.pos && !skip_draft) {
-        if (!model.dspark_draft(next, &st, draft.data())) {
-          aff::ui::fatal("fatal: dspark_draft refused at position %u\n", st.pos);
-          std::abort();
+      } else if (!has_force && rem_out > 1u) {
+        const uint32_t max_nd = std::min<uint32_t>(aff::kSpecTok - 1u, rem_out - 1u);
+        if (draft_suffix_on && max_nd >= (uint32_t)sfx_min_match) {
+          auto prop = suffix_idx.propose(
+              hist, 1ull, sfx_min_match,
+              (int)std::min<uint32_t>(sfx_max, max_nd), sfx_min_score, suffix_buf.data());
+          if (prop.n >= sfx_min_match && prop.expect >= sfx_min_expect) {
+            nd = std::min<uint32_t>((uint32_t)prop.n, max_nd);
+            used_suffix = true;
+            for (uint32_t i = 0; i < nd; ++i)
+              draft[i] = static_cast<uint32_t>(suffix_buf[i]);
+          }
         }
-        nd = B;
-        const std::vector<float>& conf = model.dspark_confidence();
-        // Confidence gating: verify only the prefix the draft is confident about. `nd` may fall to
-        // 0, which is a plain one-token step through the same code. See the note at kConfT.
-        if (kConfT > 0.0f) {
-          if (conf.size() >= B) {
-            uint32_t n2 = 0;
-            while (n2 < B && conf[n2] >= kConfT) ++n2;
-            nd = n2;
-          }
-        } else if (adaptive_width_on && B >= 2) {
-          // Cost-aware adaptive width selection over q = 2 .. B+1 (nd = 1 .. B).
-          const uint32_t max_q = std::min<uint32_t>(B + 1, kMaxQ - 1);
-          float util[kMaxQ] = {};
-          float best_u = -1.0f;
-          uint32_t best_q = max_q;
-          float survival = 1.0f;
-          float exp_commits = 1.0f; // target bonus token at the accept frontier
-          for (uint32_t q = 2; q <= max_q; ++q) {
-            const uint32_t d = q - 1; // candidate index 1..B (conf[d-1])
-            float p_cond = 0.0f;
-            if (d - 1 < conf.size()) {
-              const float scale = std::clamp(
-                  conf_act_ema[d] / std::max(conf_pred_ema[d], 0.05f), 0.25f, 1.50f);
-              p_cond = std::clamp(conf[d - 1] * scale, 0.0f, 1.0f);
-              survival *= p_cond;
-            } else {
-              const float prev_s = std::max(surv_ema[d - 1], 0.05f);
-              p_cond = std::clamp(surv_ema[d] / prev_s, 0.0f, 1.0f);
-              survival *= p_cond;
-            }
-            exp_commits += survival;
-            const float c_ms = std::max(cost_ema[q], 1.0f);
-            util[q] = exp_commits / c_ms;
-            if (util[q] > best_u) {
-              best_u = util[q];
-              best_q = q;
+        if (!used_suffix && draft_on && st.pos && !skip_draft) {
+          bool depth_stop = false;
+          if (draft_depth_stop_on && !probe_in_flight) {
+            if (adaptive_width_on && B >= 2 && my_blocks >= 4 &&
+                cost_samples[1] >= 4 && cost_samples[2] >= 4 &&
+                surv_ema[1] < 0.25f &&
+                (1.0f + surv_ema[1]) / std::max(cost_ema[2], 1.0f) <
+                    1.0f / std::max(cost_ema[1], 1.0f)) {
+              if ((depth_stop_skips & 7u) != 7u) {
+                depth_stop = true;
+                ++depth_stop_skips;
+              } else {
+                depth_stop_skips = 0u;
+              }
+            } else if (kBackoff == 0u && zero_run >= 2u) {
+              depth_stop = true;
             }
           }
-          // After a clean all-accepted block, explore one wider width if within 3% utility.
-          if (last_clean_accept && best_q < max_q && util[best_q + 1] >= best_u * 0.97f)
-            best_q += 1;
-          if (probe_neighbor_on) {
-            if (!probe_in_flight) {
-              steps_since_probe++;
-              if (steps_since_probe >= 32) {
-                const uint32_t nbr = (best_q < max_q) ? best_q + 1 : best_q - 1;
-                if (nbr >= 2) {
-                  probe_in_flight = true;
-                  probe_phase = 0;
-                  probe_anchor_q = best_q;
-                  probe_target_q = nbr;
-                  probe_samples_anchor.clear();
-                  probe_samples_target.clear();
+          if (!depth_stop) {
+            if (!model.dspark_draft(next, &st, draft.data())) {
+              aff::ui::fatal("fatal: dspark_draft refused at position %u\n", st.pos);
+              std::abort();
+            }
+            nd = std::min<uint32_t>(B, max_nd);
+            const std::vector<float>& conf = model.dspark_confidence();
+            // Confidence gating: verify only the prefix the draft is confident about. `nd` may fall to
+            // 0, which is a plain one-token step through the same code. See the note at kConfT.
+            if (kConfT > 0.0f) {
+              if (conf.size() >= B) {
+                uint32_t n2 = 0;
+                while (n2 < B && conf[n2] >= kConfT) ++n2;
+                nd = n2;
+              }
+            } else if (adaptive_width_on && B >= 2) {
+              // Cost-aware adaptive width selection over q = 2 .. B+1 (nd = 1 .. B).
+              const uint32_t max_q = std::min<uint32_t>({B + 1u, kMaxQ - 1u, max_nd + 1u});
+              float util[kMaxQ] = {};
+              float best_u = -1.0f;
+              uint32_t best_q = max_q;
+              float survival = 1.0f;
+              float exp_commits = 1.0f; // target bonus token at the accept frontier
+              for (uint32_t q = 2; q <= max_q; ++q) {
+                const uint32_t d = q - 1; // candidate index 1..B (conf[d-1])
+                float p_cond = 0.0f;
+                if (d - 1 < conf.size()) {
+                  const float scale = std::clamp(
+                      conf_act_ema[d] / std::max(conf_pred_ema[d], 0.05f), 0.25f, 1.50f);
+                  p_cond = std::clamp(conf[d - 1] * scale, 0.0f, 1.0f);
+                  survival *= p_cond;
+                } else {
+                  const float prev_s = std::max(surv_ema[d - 1], 0.05f);
+                  p_cond = std::clamp(surv_ema[d] / prev_s, 0.0f, 1.0f);
+                  survival *= p_cond;
+                }
+                exp_commits += survival;
+                const float c_ms = std::max(cost_ema[q], 1.0f);
+                util[q] = exp_commits / c_ms;
+                if (util[q] > best_u) {
+                  best_u = util[q];
+                  best_q = q;
                 }
               }
+              // After a clean all-accepted block, explore one wider width if within 3% utility.
+              if (last_clean_accept && best_q < max_q && util[best_q + 1] >= best_u * 0.97f)
+                best_q += 1;
+              if (probe_neighbor_on) {
+                if (!probe_in_flight) {
+                  steps_since_probe++;
+                  if (steps_since_probe >= 32) {
+                    const uint32_t nbr = (best_q < max_q) ? best_q + 1 : best_q - 1;
+                    if (nbr >= 2) {
+                      probe_in_flight = true;
+                      probe_phase = 0;
+                      probe_anchor_q = best_q;
+                      probe_target_q = nbr;
+                      probe_samples_anchor.clear();
+                      probe_samples_target.clear();
+                    }
+                  }
+                }
+                if (probe_in_flight) {
+                  const uint32_t run_q = (probe_phase < 4) ? probe_anchor_q : probe_target_q;
+                  nd = run_q - 1;
+                } else {
+                  nd = best_q - 1;
+                }
+              } else {
+                nd = best_q - 1;
+              }
             }
-            if (probe_in_flight) {
-              const uint32_t run_q = (probe_phase < 4) ? probe_anchor_q : probe_target_q;
-              nd = run_q - 1;
-            } else {
-              nd = best_q - 1;
+            if (conf_dbg) {
+              std::string cs;
+              for (uint32_t i = 0; i < conf.size(); ++i)
+                cs += std::to_string(conf[i]) + (i + 1 < conf.size() ? "," : "");
+              aff::ui::err("spec-conf P=%u nd=%u conf=[%s]\n", st.pos, nd, cs.c_str());
             }
-          } else {
-            nd = best_q - 1;
           }
-        }
-        if (conf_dbg) {
-          std::string cs;
-          for (uint32_t i = 0; i < conf.size(); ++i)
-            cs += std::to_string(conf[i]) + (i + 1 < conf.size() ? "," : "");
-          aff::ui::err("spec-conf P=%u nd=%u conf=[%s]\n", st.pos, nd, cs.c_str());
         }
       }
       if (!forcing) nd = std::min(nd, rem_out - 1u);
-      if (skip_draft) zero_run = 0;   // this step was the backoff; draft again next block
+      if (skip_draft && !used_suffix) zero_run = 0;   // this step was the backoff; draft again next block
       const uint32_t P = st.pos;
       if (slot_dbg && nd) {
         std::string ds;
@@ -2515,7 +2605,7 @@ int main(int argc, char** argv) {
           ds += std::to_string(forcing ? (uint32_t)budget->pending_close_token(i) : draft[i]) +
                 (i + 1 < nd ? "," : "");
         aff::ui::err("slot %u DRAFT P=%u next=%u -> [%s]%s\n", slot, P, next, ds.c_str(),
-                     forcing ? " (forced)" : "");
+                     forcing ? " (forced)" : (used_suffix ? " (suffix)" : ""));
       }
       fed[0] = next;
       if (forcing) {
@@ -2627,64 +2717,71 @@ int main(int argc, char** argv) {
       const double step_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_t0).count();
       step.unlock();                    // the cards are free from here; the rest is host-side
-      if (adaptive_width_on && nd > 0 && !forcing && !close_cut) {
+      if (adaptive_width_on && !forcing && !close_cut) {
         const uint32_t q_off = std::min<uint32_t>(nd + 1, kMaxQ - 1);
-        last_clean_accept = (k == nd);
         // Update step cost EMA after warmup (ignore first 2 cold steps per width, clamp outliers).
         // Under greedy decoding (temp=0 / !sc), avoid wall-clock timing jitter altering verify width decisions (PR #967).
-        if (sc && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
-          const float clamped_ms = std::min((float)step_ms, cost_ema[q_off] * 1.25f);
-          cost_ema[q_off] = 0.85f * cost_ema[q_off] + 0.15f * clamped_ms;
+        // Also isolate from SuffixDecoding steps, which skip dspark_draft overhead.
+        if (sc && !used_suffix && q_off < kMaxQ && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
+          const float clamped_ms = (cost_ema[q_off] > 0.0f)
+              ? std::min((float)step_ms, cost_ema[q_off] * 1.25f)
+              : (float)step_ms;
+          cost_ema[q_off] = (cost_ema[q_off] > 0.0f)
+              ? (0.85f * cost_ema[q_off] + 0.15f * clamped_ms)
+              : clamped_ms;
         }
-        if (probe_neighbor_on && step_ms > 1.0) {
-          // Exact row count tracking (PR #429 / PR #452)
-          if (++cost_row_exact_samples[q_off] > 2) {
-            if (cost_row_exact_ema[q_off] <= 0.0f) {
-              cost_row_exact_ema[q_off] = (float)step_ms;
-            } else {
-              const float cl = std::min((float)step_ms, cost_row_exact_ema[q_off] * 1.30f);
-              cost_row_exact_ema[q_off] = 0.85f * cost_row_exact_ema[q_off] + 0.15f * cl;
-            }
-          }
-          if (probe_in_flight) {
-            if (probe_phase < 4) {
-              probe_samples_anchor.push_back((float)step_ms);
-            } else {
-              probe_samples_target.push_back((float)step_ms);
-            }
-            probe_phase++;
-            if (probe_phase >= 8) {
-              if (probe_samples_anchor.size() >= 4 && probe_samples_target.size() >= 4) {
-                std::sort(probe_samples_anchor.begin(), probe_samples_anchor.end());
-                std::sort(probe_samples_target.begin(), probe_samples_target.end());
-                const float med_anchor = 0.5f * (probe_samples_anchor[1] + probe_samples_anchor[2]);
-                const float med_target = 0.5f * (probe_samples_target[1] + probe_samples_target[2]);
-                if (med_anchor > 0.0f && med_target > 0.0f) {
-                  const float ratio = med_target / med_anchor;
-                  cost_ema[probe_target_q] = 0.70f * cost_ema[probe_target_q] + 0.30f * (cost_ema[probe_anchor_q] * ratio);
-                }
+        if (nd > 0 && !used_suffix) {
+          last_clean_accept = (k == nd);
+          if (probe_neighbor_on && step_ms > 1.0) {
+            // Exact row count tracking (PR #429 / PR #452)
+            if (++cost_row_exact_samples[q_off] > 2) {
+              if (cost_row_exact_ema[q_off] <= 0.0f) {
+                cost_row_exact_ema[q_off] = (float)step_ms;
+              } else {
+                const float cl = std::min((float)step_ms, cost_row_exact_ema[q_off] * 1.30f);
+                cost_row_exact_ema[q_off] = 0.85f * cost_row_exact_ema[q_off] + 0.15f * cl;
               }
-              probe_in_flight = false;
-              steps_since_probe = 0;
+            }
+            if (probe_in_flight) {
+              if (probe_phase < 4) {
+                probe_samples_anchor.push_back((float)step_ms);
+              } else {
+                probe_samples_target.push_back((float)step_ms);
+              }
+              probe_phase++;
+              if (probe_phase >= 8) {
+                if (probe_samples_anchor.size() >= 4 && probe_samples_target.size() >= 4) {
+                  std::sort(probe_samples_anchor.begin(), probe_samples_anchor.end());
+                  std::sort(probe_samples_target.begin(), probe_samples_target.end());
+                  const float med_anchor = 0.5f * (probe_samples_anchor[1] + probe_samples_anchor[2]);
+                  const float med_target = 0.5f * (probe_samples_target[1] + probe_samples_target[2]);
+                  if (med_anchor > 0.0f && med_target > 0.0f) {
+                    const float ratio = med_target / med_anchor;
+                    cost_ema[probe_target_q] = 0.70f * cost_ema[probe_target_q] + 0.30f * (cost_ema[probe_anchor_q] * ratio);
+                  }
+                }
+                probe_in_flight = false;
+                steps_since_probe = 0;
+              }
             }
           }
-        }
-        // Update prefix survival EMAs and per-depth confidence calibration.
-        const std::vector<float>& conf = model.dspark_confidence();
-        for (uint32_t d = 1; d <= nd && d < kMaxQ; ++d) {
-          const float survived = (k >= d) ? 1.0f : 0.0f;
-          surv_ema[d] = 0.80f * surv_ema[d] + 0.20f * survived;
-          // Conditional acceptance at depth d is observed when depth d-1 was accepted.
-          if (d - 1 <= k && d - 1 < conf.size()) {
-            const float cond_hit = (k >= d) ? 1.0f : 0.0f;
-            conf_pred_ema[d] = 0.90f * conf_pred_ema[d] + 0.10f * conf[d - 1];
-            conf_act_ema[d]  = 0.90f * conf_act_ema[d]  + 0.10f * cond_hit;
+          // Update prefix survival EMAs and per-depth confidence calibration.
+          const std::vector<float>& conf = model.dspark_confidence();
+          for (uint32_t d = 1; d <= nd && d < kMaxQ; ++d) {
+            const float survived = (k >= d) ? 1.0f : 0.0f;
+            surv_ema[d] = 0.80f * surv_ema[d] + 0.20f * survived;
+            // Conditional acceptance at depth d is observed when depth d-1 was accepted.
+            if (d - 1 <= k && d - 1 < conf.size()) {
+              const float cond_hit = (k >= d) ? 1.0f : 0.0f;
+              conf_pred_ema[d] = 0.90f * conf_pred_ema[d] + 0.10f * conf[d - 1];
+              conf_act_ema[d]  = 0.90f * conf_act_ema[d]  + 0.10f * cond_hit;
+            }
           }
-        }
-        // If rejected at depth k+1, deeper prefix survival gets a zero observation.
-        if (k < nd) {
-          for (uint32_t d = nd + 1; d <= B && d < kMaxQ; ++d)
-            surv_ema[d] = 0.80f * surv_ema[d];
+          // If rejected at depth k+1, deeper prefix survival gets a zero observation.
+          if (k < nd) {
+            for (uint32_t d = nd + 1; d <= B && d < kMaxQ; ++d)
+              surv_ema[d] = 0.80f * surv_ema[d];
+          }
         }
       }
       seed_n = vb.tap_rows ? std::min<uint32_t>(vb.tap_rows, k + 1) : 0u;
@@ -2751,7 +2848,7 @@ int main(int argc, char** argv) {
       // ...and the check that it kept up. Writing past the backed range is a memory violation
       // inside an attention kernel with no useful diagnostic, so this refuses instead. It cannot
       // fire in normal operation: the margin is thousands of blocks of lookahead.
-      if (st.pos + B + 2 > dense_gpu.kv_backed_positions()) {
+      if (st.pos + aff::kSpecTok + 1 > dense_gpu.kv_backed_positions()) {
         aff::ui::err("kv cache: sequence reached %u and only %llu positions are backed; stopping\n",
                      st.pos, (unsigned long long)dense_gpu.kv_backed_positions());
         stop = true;
@@ -3024,7 +3121,10 @@ int main(int argc, char** argv) {
       // accepted fraction: acceptance stops at the first miss, so position 4's contribution to the
       // total is conditioned on 0..3 all being right, while this is not.
       aff::ui::out("        marginal hit by position:");
-      for (uint32_t j = 0; j < B && j < kSpecTok; ++j)
+      uint32_t max_pos = std::min<uint32_t>(B, kSpecTok);
+      for (uint32_t j = max_pos; j < kSpecTok; ++j)
+        if (p.pos_n[j]) max_pos = j + 1;
+      for (uint32_t j = 0; j < max_pos; ++j)
         aff::ui::out(" %u:%.0f%%", j, p.pos_n[j] ? 100.0 * (double)p.pos_hit[j] / (double)p.pos_n[j]
                                                 : 0.0);
       aff::ui::out("\n");
