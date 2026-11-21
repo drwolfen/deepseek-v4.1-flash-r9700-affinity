@@ -666,14 +666,15 @@ void StaticPlacement::ssd_stage_arm(void* const* streams) {
 }
 
 // How much of the card a hybrid dispatch may occupy, as a FRACTION of whatever the device reports.
-// See the comment at the stream's creation for why it is not the whole card: the zero-copy tiles
-// are bus-bound, so every CU past what keeps the link busy is taken from the resident GEMM beside
-// them.
+// On RDNA4 (gfx12xx, 4 SEs x 8 WGPs = 32 WGPs), 0.25 contiguous (0x000000ff, SE0 only) paired with
+// GPU_MAX_HW_QUEUES=1 confines the PCIe-bound hybrid stream to one Shader Engine while leaving
+// SE1-SE3 uncontended for resident MoE/dense work and avoiding the multi-SE CU-mask stall seen with
+// 16-WGP masks (0x0000ffff / 0x0f0f0f0f). Override with AFF_HYBRID_CU_FRAC / AFF_HYBRID_CU_STRIPE=1.
 static double hybrid_cu_frac() {
   static const double f = [] {
     const char* v = std::getenv("AFF_HYBRID_CU_FRAC");
-    double d = (v && *v) ? std::strtod(v, nullptr) : 0.50;
-    if (!(d > 0.0)) d = 0.50;
+    double d = (v && *v) ? std::strtod(v, nullptr) : 0.25;
+    if (!(d > 0.0)) d = 0.25;
     if (d < 0.0625) d = 0.0625;
     if (d > 1.0) d = 1.0;
     return d;
@@ -684,7 +685,7 @@ static double hybrid_cu_frac() {
 static bool hybrid_cu_stripe() {
   static const bool on = [] {
     const char* v = std::getenv("AFF_HYBRID_CU_STRIPE");
-    return !v || !*v || std::strcmp(v, "0") != 0;
+    return v && *v && std::strcmp(v, "0") != 0;
   }();
   return on;
 }

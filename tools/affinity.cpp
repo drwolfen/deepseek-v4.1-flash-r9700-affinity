@@ -3572,7 +3572,7 @@ int main(int argc, char** argv) {
     }
     const uint32_t stride_blocks = [] {
       const char* s = std::getenv("AFF_PCACHE_STRIDE_BLOCKS");
-      return (s && *s) ? (uint32_t)std::strtoul(s, nullptr, 10) : 32u;
+      return (s && *s) ? (uint32_t)std::strtoul(s, nullptr, 10) : 64u;
     }();
     const bool prefill_ckpt_on = [] {
       const char* s = std::getenv("AFF_PCACHE_PREFILL_CKPT");
