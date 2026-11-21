@@ -14,6 +14,7 @@ void ExpertHeat::init(uint32_t n_layer, uint32_t n_expert, const HeatParams& p) 
   tier_.assign(n, ExpertTier::Ssd);
   busy_.assign(n, 0u);
   protected_.assign(n, 0u);
+  cooldown_until_.assign(n, 0ull);
   res_count_.assign(n_layer, 0u);
   demand_.clear();
   demand_.reserve(n_expert);
@@ -23,6 +24,8 @@ void ExpertHeat::set_tier(uint32_t idx, ExpertTier t) {
   const uint32_t l = idx / n_expert_;
   if (tier_[idx] == ExpertTier::Vram && t != ExpertTier::Vram) --res_count_[l];
   else if (tier_[idx] != ExpertTier::Vram && t == ExpertTier::Vram) ++res_count_[l];
+  if (ticks_ > 0 && params_.cooldown_steps > 0 && tier_[idx] != t)
+    cooldown_until_[idx] = ticks_ + (uint64_t)params_.cooldown_steps * n_layer_;
   tier_[idx] = t;
 }
 
@@ -34,8 +37,14 @@ void ExpertHeat::observe(uint32_t layer, const uint32_t* experts, uint32_t n,
   // which makes `min_gain = 1.0` mean 1/decay activations rather than one and is the kind of
   // off-by-a-constant that only shows up as a threshold that does not do what it says.
   for (uint32_t e = 0; e < n_expert_; ++e) row[e] *= params_.decay;
-  for (uint32_t i = 0; i < n; ++i)
-    if (experts[i] < n_expert_) row[experts[i]] += counts ? (float)counts[i] : 1.0f;
+  for (uint32_t i = 0; i < n; ++i) {
+    if (experts[i] < n_expert_) {
+      float credit = counts ? (float)counts[i] : 1.0f;
+      if (params_.max_block_credit > 0 && credit > (float)params_.max_block_credit)
+        credit = (float)params_.max_block_credit;
+      row[experts[i]] += credit;
+    }
+  }
   ++ticks_;
 }
 
@@ -55,7 +64,7 @@ bool ExpertHeat::pick(uint32_t* promote, uint32_t* demote) const {
   float hot_h = 0.0f, cold_h = 0.0f;
   uint32_t hot_res = 0, cold_res = 0;             // resident count of the candidate's layer
   for (size_t i = 0; i < n; ++i) {
-    if (busy_[i]) continue;
+    if (busy_[i] || ticks_ < cooldown_until_[i]) continue;
     const float h = heat_[i];
     const uint32_t rc = res_count_[i / n_expert_];
     if (tier_[i] == ExpertTier::Pool) {
@@ -106,11 +115,12 @@ bool ExpertHeat::pick_demand(uint32_t* promote, uint32_t* demote) {
     // dispatch reports it as missing for one more layer. Its `busy` flag is what stops it being
     // admitted twice. Not `Ssd` either — there is no dispatch path for one, so promoting out of it
     // would name bytes nothing can read.
-    if (busy_[idx] || tier_[idx] != ExpertTier::Pool) continue;
+    if (busy_[idx] || ticks_ < cooldown_until_[idx] || tier_[idx] != ExpertTier::Pool) continue;
     uint32_t cold = UINT32_MAX, cold_res = 0;
     float cold_h = 0.0f;
     for (size_t i = 0; i < n; ++i) {
-      if (busy_[i] || protected_[i] || tier_[i] != ExpertTier::Vram) continue;
+      if (busy_[i] || protected_[i] || ticks_ < cooldown_until_[i] || tier_[i] != ExpertTier::Vram)
+        continue;
       const float h = heat_[i];
       const uint32_t rc = res_count_[i / n_expert_];
       // Identical to `pick`'s victim half, tie-break included: on an exact tie take from the layer

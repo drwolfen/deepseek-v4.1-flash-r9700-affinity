@@ -90,6 +90,7 @@ struct GenResult {
   uint32_t prompt_tokens = 0;
   uint32_t completion_tokens = 0;
   uint32_t cached_tokens = 0;
+  uint32_t reasoning_tokens = 0;
   // Optional work (e.g. prefix cache publish) executed after HTTP reply / SSE [DONE] is sent and
   // the client socket is closed, while the request's slot is still held.
   std::function<void()> post_send;

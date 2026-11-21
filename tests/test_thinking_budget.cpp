@@ -342,6 +342,125 @@ void test_suppress_final_think_and_prefix_invariance() {
   std::printf("PASS: test_suppress_final_think_and_prefix_invariance\n");
 }
 
+void test_full_vocab_freeze_short_loop_low_novelty_and_clean_trace() {
+  // 1) Executive-freeze spiral using merged ".\n\n" token (990) & DRY-varied wording (~42 distinct tokens)
+  {
+    std::vector<int32_t> sorted_nl = {201, 271, 990, 1500};
+    BudgetHook h = make_hook(reply_reserve_within(4096, 16384), /*loop_repeats=*/3, /*freeze_enabled=*/true);
+    h.freeze_distinct_max = 56;
+    h.freeze_nl_sorted = &sorted_nl;
+    h.short_loop_span = 24;
+    h.short_loop_repeats = 4;
+    h.short_loop_window = 1024;
+    h.novelty_window = 512;
+    h.novelty_min_tokens = 1024;
+    h.novelty_min_ratio = 0.28f;
+
+    ThinkingBudget b(&h, 16384);
+    for (int i = 0; i < 350; ++i) {
+      auto d = b.apply(10000 + i);
+      REQUIRE(!d.cut);
+    }
+    // 41 distinct word tokens + merged ".\n\n" token 990 = 42 distinct tokens (<= 56), >= 64 nl per 256.
+    // Perturb cycle periodically so 24-tok short_loop does not trigger before freeze_churn.
+    bool fired = false;
+    for (int i = 0; i < 340; ++i) {
+      const int32_t tok = (i % 3 == 2) ? 990 : (40000 + ((i * 7 + (i / 19)) % 41));
+      auto d = b.apply(tok);
+      if (d.cut) {
+        fired = true;
+        break;
+      }
+    }
+    REQUIRE(fired);
+    REQUIRE(b.force_closed());
+    REQUIRE(b.thought_tokens() < 700);
+    REQUIRE(std::strcmp(b.close_reason(), "freeze_churn") == 0);
+  }
+
+  // 2) Short-loop (span=24, repeats=4, window=1024) triggers early on 24-tok repeat.
+  {
+    BudgetHook h = make_hook(reply_reserve_within(4096, 16384), /*loop_repeats=*/3, /*freeze_enabled=*/true);
+    h.freeze_distinct_max = 56;
+    h.short_loop_span = 24;
+    h.short_loop_repeats = 4;
+    h.short_loop_window = 1024;
+    h.novelty_window = 512;
+    h.novelty_min_tokens = 1024;
+    h.novelty_min_ratio = 0.28f;
+
+    ThinkingBudget b(&h, 16384);
+    for (int i = 0; i < 50; ++i) REQUIRE(!b.apply(1000 + i).cut);
+    bool fired = false;
+    for (int rep = 0; rep < 4 && !fired; ++rep) {
+      for (int j = 0; j < 24; ++j) {
+        auto d = b.apply(30000 + j);
+        if (d.cut) {
+          fired = true;
+          break;
+        }
+      }
+    }
+    REQUIRE(fired);
+    REQUIRE(b.short_loop_triggered());
+    REQUIRE(std::strcmp(b.close_reason(), "short_loop") == 0);
+  }
+
+  // 3) Bigram low-novelty spiral with DRY perturbations (no newlines, period > 1024 -> no short_loop).
+  {
+    BudgetHook h = make_hook(reply_reserve_within(4096, 16384), /*loop_repeats=*/3, /*freeze_enabled=*/true);
+    h.freeze_distinct_max = 56;
+    h.short_loop_span = 24;
+    h.short_loop_repeats = 4;
+    h.short_loop_window = 1024;
+    h.novelty_window = 512;
+    h.novelty_min_tokens = 1024;
+    h.novelty_min_ratio = 0.28f;
+
+    ThinkingBudget b(&h, 16384);
+    bool fired = false;
+    for (int t = 0; t < 1500; ++t) {
+      const int32_t tok = (t % 17 == 0) ? (7100 + ((t / 17) % 13)) : (7000 + (t % 12));
+      auto d = b.apply(tok);
+      if (d.cut) {
+        fired = true;
+        break;
+      }
+    }
+    REQUIRE(fired);
+    REQUIRE(b.novelty_triggered());
+    REQUIRE(std::strcmp(b.close_reason(), "low_novelty") == 0);
+  }
+
+  // 4) Normal diverse math/code trace (2,000+ tokens) triggers ZERO false positives across all breakers.
+  {
+    std::vector<int32_t> sorted_nl = {201, 271, 990};
+    BudgetHook h = make_hook(reply_reserve_within(4096, 16384), /*loop_repeats=*/3, /*freeze_enabled=*/true);
+    h.freeze_distinct_max = 56;
+    h.freeze_nl_sorted = &sorted_nl;
+    h.short_loop_span = 24;
+    h.short_loop_repeats = 4;
+    h.short_loop_window = 1024;
+    h.novelty_window = 512;
+    h.novelty_min_tokens = 1024;
+    h.novelty_min_ratio = 0.28f;
+
+    ThinkingBudget b(&h, 16384);
+    for (int t = 0; t < 2400; ++t) {
+      const int32_t tok = (t % 20 == 19) ? 201 : (20000 + ((t * 131 + (t / 7) * 17) % 600));
+      auto d = b.apply(tok);
+      REQUIRE(!d.cut);
+      REQUIRE(!b.force_closed());
+    }
+    auto end_dec = b.apply(128822);
+    REQUIRE(!end_dec.cut);
+    REQUIRE(b.naturally_closed());
+    REQUIRE(!b.force_closed());
+  }
+
+  std::printf("PASS: test_full_vocab_freeze_short_loop_low_novelty_and_clean_trace\n");
+}
+
 }  // namespace
 
 int main() {
@@ -350,6 +469,7 @@ int main() {
   test_loop_repeat();
   test_executive_freeze_breaker();
   test_suppress_final_think_and_prefix_invariance();
+  test_full_vocab_freeze_short_loop_low_novelty_and_clean_trace();
   std::printf("ALL thinking_budget tests passed\n");
   return 0;
 }

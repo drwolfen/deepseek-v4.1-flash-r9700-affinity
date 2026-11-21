@@ -386,6 +386,18 @@ int main(int argc, char** argv) {
   // should run.
   PlacementEngineConfig pcfg;
   pcfg.strategy = PlacementEngineConfig::Strategy::Heat;
+  if (const char* v = std::getenv("AFF_PLC_DECAY"); v && *v)
+    pcfg.heat.decay = (float)std::strtod(v, nullptr);
+  else
+    pcfg.heat.decay = 0.992f;
+  if (const char* v = std::getenv("AFF_PLC_MAX_BLOCK_CREDIT"); v && *v)
+    pcfg.heat.max_block_credit = (uint32_t)std::strtoul(v, nullptr, 10);
+  else
+    pcfg.heat.max_block_credit = 2u;
+  if (const char* v = std::getenv("AFF_PLC_COOLDOWN"); v && *v)
+    pcfg.heat.cooldown_steps = (uint32_t)std::strtoul(v, nullptr, 10);
+  else
+    pcfg.heat.cooldown_steps = 16u;
   // Taken from the free VRAM left after the slabs rather than from residency, so turning the engine
   // on costs no hit rate. It also bounds how many transfers can be in flight, which is why it is not
   // larger.
@@ -689,8 +701,7 @@ int main(int argc, char** argv) {
         "                              link doing it: a swap costs two shards and a miss costs one.\n"
         "      --placement-moves N     swaps started per layer dispatch (default 8; above 8 the\n"
         "                              guard binds before the budget does)\n"
-        "      --placement-decay F     heat decay per dispatch (default 0.98, half-life ~200\n"
-        "                              tokens)\n"
+        "      --placement-decay F     heat decay per dispatch (default 0.992, env AFF_PLC_DECAY)\n"
         "      --placement-hysteresis F  promote only at this heat ratio (default 1.25)\n"
         "      --placement-min-gain F  ...and by at least this many activations (default 1.5).\n"
         "                              Link traffic is U-shaped in this and the default is near the\n"
@@ -1020,20 +1031,26 @@ int main(int argc, char** argv) {
   std::vector<int32_t> think_marker_ids;
   std::vector<int32_t> think_close_ids;
   std::vector<int32_t> think_nl_ids;
+  std::vector<uint32_t> dry_exempt_ids;
   if (tok.vocab_size()) {
     for (uint32_t id : tok.encode(kThinkEnd, false))
       think_marker_ids.push_back((int32_t)id);
     for (uint32_t id : tok.encode(std::string("\n") + kThinkEnd + "\n\n", false))
       think_close_ids.push_back((int32_t)id);
-    auto add_nl = [&](const std::string& s) {
-      for (uint32_t id : tok.encode(s, false)) {
-        const int32_t iid = (int32_t)id;
-        if (std::find(think_nl_ids.begin(), think_nl_ids.end(), iid) == think_nl_ids.end())
-          think_nl_ids.push_back(iid);
-      }
-    };
-    add_nl("\n");
-    add_nl("\n\n");
+    if (tok.eos() >= 0) dry_exempt_ids.push_back((uint32_t)tok.eos());
+    for (int32_t mid : think_marker_ids)
+      if (mid >= 0) dry_exempt_ids.push_back((uint32_t)mid);
+    const uint32_t vsz = tok.vocab_size();
+    for (uint32_t id = 0; id < vsz; ++id) {
+      const std::string& p = tok.decode_one(id);
+      if (p.find('\n') != std::string::npos)
+        think_nl_ids.push_back((int32_t)id);
+      if (p.rfind("<\xef\xbd\x9c", 0) == 0 || p == "</think>" || p == "<think>")
+        dry_exempt_ids.push_back(id);
+    }
+    std::sort(dry_exempt_ids.begin(), dry_exempt_ids.end());
+    dry_exempt_ids.erase(std::unique(dry_exempt_ids.begin(), dry_exempt_ids.end()),
+                         dry_exempt_ids.end());
   }
 
 
@@ -1611,6 +1628,11 @@ int main(int argc, char** argv) {
     const bool want_full = pool_full_env &&
                            placement.stats().resident_experts < placement.stats().total_experts &&
                            eff_budget >= full_need;
+    if (pool_full_env && placement.stats().resident_experts < placement.stats().total_experts &&
+        !want_full) {
+      aff::ui::err("host pool: AFF_POOL_FULL=1 fell back to partial pool (eff_budget %.1f GiB < full_need %.1f GiB)\n",
+                   (double)eff_budget / 1073741824.0, (double)full_need / 1073741824.0);
+    }
     dash.stage(aff::ui::Stage::LoadPool,
                want_full ? "reading all experts into immutable RAM pool"
                          : "reading the non-resident experts into RAM");
@@ -2172,12 +2194,26 @@ int main(int argc, char** argv) {
       if (sc->repeat_penalty != 1.0f && sc->repeat_last_n) {
         const size_t take = std::min<size_t>(hist.size(), sc->repeat_last_n);
         vb.penalty_ids.assign(hist.end() - (std::ptrdiff_t)take, hist.end());
+        auto is_penalty_exempt = [&](uint32_t id) {
+          if (tok.eos() >= 0 && id == (uint32_t)tok.eos()) return true;
+          for (int32_t mid : think_marker_ids)
+            if (mid >= 0 && id == (uint32_t)mid) return true;
+          return false;
+        };
+        vb.penalty_ids.erase(
+            std::remove_if(vb.penalty_ids.begin(), vb.penalty_ids.end(), is_penalty_exempt),
+            vb.penalty_ids.end());
       } else {
         vb.penalty_ids.clear();
       }
       // DRY is computed per block, below: the suffix n-gram moves with every accepted token.
       vb.dry_delta = sc->dry_delta;
     }
+    const size_t gen_start_pos = hist.size();
+    const bool dry_gen_only = [] {
+      const char* s = std::getenv("AFF_DRY_GEN_ONLY");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
     // DRY ids for THIS block: the tokens that continued a repeated key.
     //
     // The signal is how often the CURRENT suffix key has already occurred in the recent window.
@@ -2195,8 +2231,9 @@ int main(int argc, char** argv) {
       const size_t ng = sc->dry_ngram;
       if (hist.size() <= ng + 1) return;
       const size_t end = hist.size();
-      const size_t lo = end > (size_t)sc->dry_window + ng ? end - (size_t)sc->dry_window - ng : 0;
-      const uint32_t eos = (uint32_t)tok.eos();
+      size_t lo = end > (size_t)sc->dry_window + ng ? end - (size_t)sc->dry_window - ng : 0;
+      if (dry_gen_only) lo = std::max(lo, gen_start_pos);
+      if (end <= lo + ng) return;
       const size_t need = std::max<size_t>(2, sc->dry_min_repeats);
       std::vector<std::pair<uint32_t, uint32_t>> cont;   // (token, times it followed the key)
       uint32_t occurrences = 0;
@@ -2207,7 +2244,8 @@ int main(int argc, char** argv) {
         if (!same) continue;
         ++occurrences;
         const uint32_t nx = hist[i + ng];
-        if (nx == eos) continue;            // never suppress the way out
+        if (std::binary_search(dry_exempt_ids.begin(), dry_exempt_ids.end(), nx))
+          continue;            // never suppress structural markers or EOS
         bool found = false;
         for (auto& c : cont)
           if (c.first == nx) { ++c.second; found = true; break; }
@@ -3665,6 +3703,7 @@ int main(int argc, char** argv) {
                                     : ThinkingMode::Chat;
     bool open_think = !raw_mode && gen_tm == ThinkingMode::Thinking;
     size_t think_streamed = 0;
+    uint32_t counted_think_tokens = 0;
     // A token boundary is not a character boundary: an emoji arrives as two tokens, and cutting
     // between them puts half a character in a JSON string, which is not valid UTF-8 and not valid
     // JSON. Back the cut up to the last complete character; the rest goes out with the next token.
@@ -3702,6 +3741,14 @@ int main(int argc, char** argv) {
     ThinkingBudget budget;
     ThinkingBudget* budget_ptr = nullptr;
     if (arm_budget) {
+      auto env_int = [](const char* k, int def) {
+        const char* s = std::getenv(k);
+        return (s && *s) ? std::atoi(s) : def;
+      };
+      auto env_float = [](const char* k, float def) {
+        const char* s = std::getenv(k);
+        return (s && *s) ? std::strtof(s, nullptr) : def;
+      };
       budget_hook.close_token_ids = think_close_ids;
       budget_hook.marker_token_ids = think_marker_ids;
       budget_hook.hard_limit_remaining =
@@ -3712,8 +3759,14 @@ int main(int argc, char** argv) {
       budget_hook.freeze_min_tokens = 512;
       budget_hook.freeze_window = 256;
       budget_hook.freeze_nl_thresh = 64;
-      budget_hook.freeze_distinct_max = 36;
-      budget_hook.freeze_nl_token_ids = think_nl_ids;
+      budget_hook.freeze_distinct_max = std::max(1, env_int("AFF_THINK_FREEZE_DISTINCT", 56));
+      budget_hook.freeze_nl_sorted = &think_nl_ids;
+      budget_hook.short_loop_span = std::max(0, env_int("AFF_THINK_SHORT_LOOP_SPAN", 24));
+      budget_hook.short_loop_repeats = std::max(0, env_int("AFF_THINK_SHORT_LOOP_REPEATS", 4));
+      budget_hook.short_loop_window = std::max(1, env_int("AFF_THINK_SHORT_LOOP_WINDOW", 1024));
+      budget_hook.novelty_window = std::max(0, env_int("AFF_THINK_NOVELTY_WINDOW", 512));
+      budget_hook.novelty_min_ratio = std::clamp(env_float("AFF_THINK_NOVELTY_MIN", 0.28f), 0.0f, 1.0f);
+      budget_hook.novelty_min_tokens = std::max(0, env_int("AFF_THINK_NOVELTY_MIN_TOKENS", 1024));
       budget = ThinkingBudget(&budget_hook, (int)total_budget);
       budget_ptr = &budget;
     }
@@ -3791,7 +3844,7 @@ int main(int argc, char** argv) {
           think_streamed = safe_r;
           if (!sink(piece, Delta::Reasoning, false)) return false;
         }
-        if (te == std::string::npos) return true;        // still reasoning
+        if (te == std::string::npos) { ++counted_think_tokens; return true; }        // still reasoning
         open_think = false;
         streamed = te + think_end.size();
         if (think_ckpt_armed) {
@@ -3865,6 +3918,7 @@ int main(int argc, char** argv) {
     }
     res->prompt_tokens = (uint32_t)ids.size();
     res->completion_tokens = made;
+    res->reasoning_tokens = arm_budget ? (uint32_t)budget.thought_tokens() : counted_think_tokens;
     // Back to the idle banner: the stage was moved to prefill and then decode by this request, and
     // a server that stayed on "decode" between requests would report the last one forever.
     dash.stage(aff::ui::Stage::Serve, serve_addr);

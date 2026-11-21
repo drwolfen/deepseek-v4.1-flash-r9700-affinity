@@ -89,6 +89,11 @@ struct HeatParams {
   // rate at every setting and simply takes proportionally longer to get there, which is the proof
   // that this knob does nothing but delay.
   uint32_t warmup_ticks = 0;
+  // Cap per-block heat credit added in one observe() call (0 = uncapped).
+  uint32_t max_block_credit = 0;
+  // Minimum dispatch steps (cooldown_steps * n_layer ticks) before an expert moved by set_tier()
+  // can be selected again by pick() or pick_demand() (0 = disabled).
+  uint32_t cooldown_steps = 0;
 };
 
 class ExpertHeat {
@@ -178,6 +183,7 @@ private:
   std::vector<ExpertTier> tier_;
   std::vector<uint8_t> busy_;
   std::vector<uint8_t> protected_;
+  std::vector<uint64_t> cooldown_until_;
   // ---- THE TIE-BREAK, and it is not cosmetic ---------------------------------------------------
   //
   // Most resident experts are cold — the resident set answers a far smaller share of activations

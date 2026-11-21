@@ -2304,8 +2304,12 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       const char* s = std::getenv("AFF_PREFILL_FREEZE_PLC");
       return !s || !*s || std::strcmp(s, "0") != 0;
     }();
-    if (prefill_freeze_plc && nb_tok > 16u) engine_retire(streams);
-    else                                    engine_tick(layer, sel, total, streams, plan_on);
+    if (prefill_freeze_plc && nb_tok > 16u) {
+      engine_retire(streams);
+      if (plan_on) act_drain();
+    } else {
+      engine_tick(layer, sel, total, streams, plan_on);
+    }
   }
 
   // ---- what the card says about the plan, read BEHIND the issue frontier -------------------------

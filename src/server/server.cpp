@@ -384,7 +384,9 @@ static std::string usage_json(const GenResult& g) {
   return "\"usage\":{\"prompt_tokens\":" + std::to_string(g.prompt_tokens) +
          ",\"completion_tokens\":" + std::to_string(g.completion_tokens) +
          ",\"total_tokens\":" + std::to_string(t) +
-         ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(g.cached_tokens) + "}}";
+         ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(g.cached_tokens) + "}" +
+         ",\"completion_tokens_details\":{\"reasoning_tokens\":" +
+         std::to_string(g.reasoning_tokens) + "}}";
 }
 
 // The raw text of the value at `key`, braces and all. The parser above reads scalars; tools and

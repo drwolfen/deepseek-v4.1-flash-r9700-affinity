@@ -457,6 +457,41 @@ void test_preencoded_ids_and_json_string_edges() {
   CHECK(encoded.find(std::string(4096, 'y')) != std::string::npos);
   CHECK(encoded.find("Thinking...") != std::string::npos);
 
+  // Verify completion_tokens_details.reasoning_tokens in HTTP usage JSON (non-stream & SSE).
+  {
+    aff::Server srv;
+    srv.set_model_name("DeepSeek-V4.1-Flash");
+    srv.set_slots(1);
+    std::string err;
+    CHECK(srv.start("127.0.0.1", 0,
+                    [](const aff::CompletionRequest&, const aff::TokenSink& sink,
+                       aff::GenResult* res, uint32_t) {
+                      sink("ok", aff::Delta::Content, false);
+                      res->content = "ok";
+                      res->prompt_tokens = 10;
+                      res->completion_tokens = 25;
+                      res->cached_tokens = 4;
+                      res->reasoning_tokens = 18;
+                      res->finish_reason = "stop";
+                    },
+                    &err));
+    const uint16_t port = srv.port();
+    for (bool st : {false, true}) {
+      int fd = connect_loopback(port);
+      const std::string body =
+          std::string("{\"stream\":") + (st ? "true" : "false") +
+          R"(,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]})";
+      const std::string http = "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+                               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+      write_all(fd, http);
+      const std::string resp = read_until_eof(fd);
+      ::close(fd);
+      CHECK(resp.find(R"("prompt_tokens_details":{"cached_tokens":4})") != std::string::npos);
+      CHECK(resp.find(R"("completion_tokens_details":{"reasoning_tokens":18})") != std::string::npos);
+    }
+    srv.stop();
+  }
+
   std::printf("PASS: test_preencoded_ids_and_json_string_edges\n");
 }
 
