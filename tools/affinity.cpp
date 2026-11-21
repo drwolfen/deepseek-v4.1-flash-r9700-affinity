@@ -36,6 +36,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -429,15 +430,15 @@ int main(int argc, char** argv) {
   if (const char* v = std::getenv("AFF_PLC_DECAY"); v && *v)
     pcfg.heat.decay = (float)std::strtod(v, nullptr);
   else
-    pcfg.heat.decay = 0.992f;
+    pcfg.heat.decay = 0.98f;
   if (const char* v = std::getenv("AFF_PLC_MAX_BLOCK_CREDIT"); v && *v)
     pcfg.heat.max_block_credit = (uint32_t)std::strtoul(v, nullptr, 10);
   else
-    pcfg.heat.max_block_credit = 2u;
+    pcfg.heat.max_block_credit = 0u;
   if (const char* v = std::getenv("AFF_PLC_COOLDOWN"); v && *v)
     pcfg.heat.cooldown_steps = (uint32_t)std::strtoul(v, nullptr, 10);
   else
-    pcfg.heat.cooldown_steps = 16u;
+    pcfg.heat.cooldown_steps = 0u;
   // Taken from the free VRAM left after the slabs rather than from residency, so turning the engine
   // on costs no hit rate. It also bounds how many transfers can be in flight, which is why it is not
   // larger.
@@ -741,7 +742,7 @@ int main(int argc, char** argv) {
         "                              link doing it: a swap costs two shards and a miss costs one.\n"
         "      --placement-moves N     swaps started per layer dispatch (default 8; above 8 the\n"
         "                              guard binds before the budget does)\n"
-        "      --placement-decay F     heat decay per dispatch (default 0.992, env AFF_PLC_DECAY)\n"
+        "      --placement-decay F     heat decay per dispatch (default 0.98, env AFF_PLC_DECAY)\n"
         "      --placement-hysteresis F  promote only at this heat ratio (default 1.25)\n"
         "      --placement-min-gain F  ...and by at least this many activations (default 1.5).\n"
         "                              Link traffic is U-shaped in this and the default is near the\n"
@@ -2195,7 +2196,7 @@ int main(int argc, char** argv) {
   SpecEmaBucket spec_ema_buckets[3];
   const bool persist_spec_ema = [] {
     const char* s = std::getenv("AFF_PERSIST_SPEC_EMA");
-    return !s || !*s || std::strcmp(s, "0") != 0;
+    return s && *s && std::strcmp(s, "0") != 0;
   }();
   // `emit` takes each accepted token and returns false to stop. Returns how many were emitted.
   auto spec_decode = [&](uint32_t slot, SeqState& st, const Model::BlockOut& seed_blk, uint32_t first,
@@ -2208,7 +2209,8 @@ int main(int argc, char** argv) {
                          const std::vector<uint32_t>* force = nullptr,
                          ThinkingBudget* budget = nullptr,
                          const std::function<bool()>& check_think_closed = nullptr,
-                         const std::function<void(uint32_t)>& on_think_ckpt = nullptr) -> uint32_t {
+                         const std::function<void(uint32_t)>& on_think_ckpt = nullptr,
+                         const size_t* dry_floor = nullptr) -> uint32_t {
     const uint32_t B = dspark_on ? c.dspark_block : 0u;
     const bool draft_on = dspark_on && c.dspark_block > 0;
     // Sized from the checkpoint, not from B: dspark_draft writes dspark_block_size ids through this
@@ -2272,7 +2274,11 @@ int main(int argc, char** argv) {
       if (hist.size() <= ng + 1) return;
       const size_t end = hist.size();
       size_t lo = end > (size_t)sc->dry_window + ng ? end - (size_t)sc->dry_window - ng : 0;
-      if (dry_gen_only) lo = std::max(lo, gen_start_pos);
+      if (dry_gen_only) {
+        size_t floor_pos = gen_start_pos;
+        if (dry_floor && *dry_floor > floor_pos) floor_pos = *dry_floor;
+        lo = std::max(lo, floor_pos);
+      }
       if (end <= lo + ng) return;
       const size_t need = std::max<size_t>(2, sc->dry_min_repeats);
       std::vector<std::pair<uint32_t, uint32_t>> cont;   // (token, times it followed the key)
@@ -3570,7 +3576,7 @@ int main(int argc, char** argv) {
     }();
     const bool prefill_ckpt_on = [] {
       const char* s = std::getenv("AFF_PCACHE_PREFILL_CKPT");
-      return !s || !*s || std::strcmp(s, "0") != 0;
+      return s && *s && std::strcmp(s, "0") != 0;
     }();
     // Leave the final sliding window (128 tokens) past the prefill checkpoint when DSpark is active
     // so a full prompt restore still prefills that tail and warms the 3-layer draft KV cache.
@@ -3582,7 +3588,17 @@ int main(int argc, char** argv) {
       uint32_t target = n_pre;
       if (prefix_cache.ready() && pv.count == 0 && stride_blocks > 0) {
         const uint32_t B = prefix_cache.block_tokens();
-        const uint64_t next_ckpt = ((uint64_t)(from / B) + stride_blocks) * B;
+        const uint64_t raw_stride = (uint64_t)stride_blocks * B;
+        uint64_t step = raw_stride;
+        if (prefill_chunk > 0 && B > 0) {
+          const uint64_t g = std::gcd((uint64_t)prefill_chunk, (uint64_t)B);
+          const uint64_t unit = ((uint64_t)prefill_chunk / g) * (uint64_t)B;
+          if (unit > 0 && unit <= raw_stride * 2)
+            step = ((raw_stride + unit - 1) / unit) * unit;
+          else
+            step = ((raw_stride + prefill_chunk - 1) / prefill_chunk) * prefill_chunk;
+        }
+        const uint64_t next_ckpt = (uint64_t)from + step;
         if (next_ckpt > from && next_ckpt < n_pre && next_ckpt + c.sliding <= n_pre)
           target = (uint32_t)next_ckpt;
       }
@@ -3846,6 +3862,12 @@ int main(int argc, char** argv) {
       }
     };
 
+    const bool dry_reset_on_think_close = [] {
+      const char* s = std::getenv("AFF_DRY_RESET_ON_THINK_CLOSE");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
+    size_t dry_floor = hist.size();
+
     run_view = {ids.size(), total_budget, hist.size(), 0.0, std::chrono::steady_clock::now()};
     // Per-request speculation accounting. The counters are global and cumulative, so a snapshot
     // either side of the call is this request's share — which is the only way to see acceptance
@@ -3899,6 +3921,7 @@ int main(int argc, char** argv) {
         }
         if (te == std::string::npos) { ++counted_think_tokens; return true; }        // still reasoning
         open_think = false;
+        if (dry_reset_on_think_close) dry_floor = hist.size();
         streamed = te + think_end.size();
         if (think_ckpt_armed) {
           think_ckpt_armed = false;
@@ -3963,7 +3986,7 @@ int main(int argc, char** argv) {
       }
       if (hit_stop) { raw.resize(stop_at); return false; }
       return true;
-    }, &sc, nullptr, budget_ptr, check_think_closed, on_think_ckpt);
+    }, &sc, nullptr, budget_ptr, check_think_closed, on_think_ckpt, &dry_floor);
     const auto t_dec_end = std::chrono::steady_clock::now();
     if (arm_budget && budget.force_closed()) {
       aff::ui::err("server: thinking budget force-closed </think> at %d/%u tokens (reason=%s)\n",
