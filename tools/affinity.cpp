@@ -25,6 +25,7 @@
 #include "ui/log.h"
 #include <atomic>
 #include <cstdarg>
+#include <dirent.h>
 #include <thread>
 #include <random>
 #include <cstdio>
@@ -225,8 +226,47 @@ static bool load_expert_profile(const std::string& path, std::vector<float>* out
 
 // `ToolBlockScanState` and `tool_block_close_end` live in `engine/chat_encode.h`.
 
+// On RDNA4 (gfx12xx, e.g. gfx1201), ROCm/TheRock#9297 causes pending hipStreamWaitEvent calls
+// on secondary hardware queues mapped to the same CP pipe as a busy queue to add ~10-17 us per
+// small kernel launch. Limiting HIP to 1 normal hardware queue per priority keeps regular streams
+// on one queue while CU-masked hipExtStreamCreateWithCUMask streams retain their dedicated queue.
+static bool apply_gfx12_hw_queue_workaround() {
+  if (std::getenv("GPU_MAX_HW_QUEUES") != nullptr) return false;
+  if (const char* keep = std::getenv("AFF_KEEP_HW_QUEUES");
+      keep && *keep && std::strcmp(keep, "0") != 0)
+    return false;
+  DIR* dir = ::opendir("/sys/class/kfd/kfd/topology/nodes");
+  if (!dir) return false;
+  bool is_gfx12 = false;
+  while (struct dirent* ent = ::readdir(dir)) {
+    if (ent->d_name[0] == '.') continue;
+    char path[320];
+    std::snprintf(path, sizeof path, "/sys/class/kfd/kfd/topology/nodes/%s/properties", ent->d_name);
+    if (std::FILE* f = std::fopen(path, "r")) {
+      char line[256];
+      while (std::fgets(line, sizeof line, f)) {
+        unsigned long ver = 0;
+        if (std::sscanf(line, "gfx_target_version %lu", &ver) == 1 &&
+            ver >= 120000ul && ver < 121000ul) {
+          is_gfx12 = true;
+          break;
+        }
+      }
+      std::fclose(f);
+    }
+    if (is_gfx12) break;
+  }
+  ::closedir(dir);
+  if (!is_gfx12) return false;
+  return ::setenv("GPU_MAX_HW_QUEUES", "1", 0) == 0;
+}
+
 int main(int argc, char** argv) {
+  const bool gfx12_hq_applied = apply_gfx12_hw_queue_workaround();
   aff::print_build_stamp("affinity");
+  if (gfx12_hq_applied)
+    aff::ui::err("rocm/gfx12: set GPU_MAX_HW_QUEUES=1 (avoids ROCm/TheRock#9297 multi-queue wait "
+                 "penalty; set GPU_MAX_HW_QUEUES or AFF_KEEP_HW_QUEUES=1 to override)\n");
   // dspark_path empty means "<model>.dspark.aff if present". Naming one explicitly makes a load
   // failure fatal: a run that asked for the draft and silently did not get it measures the wrong
   // thing while looking healthy.
@@ -3526,8 +3566,18 @@ int main(int argc, char** argv) {
     }
     const uint32_t stride_blocks = [] {
       const char* s = std::getenv("AFF_PCACHE_STRIDE_BLOCKS");
-      return (s && *s) ? (uint32_t)std::strtoul(s, nullptr, 10) : 16u;
+      return (s && *s) ? (uint32_t)std::strtoul(s, nullptr, 10) : 32u;
     }();
+    const bool prefill_ckpt_on = [] {
+      const char* s = std::getenv("AFF_PCACHE_PREFILL_CKPT");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
+    // Leave the final sliding window (128 tokens) past the prefill checkpoint when DSpark is active
+    // so a full prompt restore still prefills that tail and warms the 3-layer draft KV cache.
+    const uint32_t prefill_ckpt_pos =
+        (prefill_ckpt_on && prefix_cache.ready() && pv.count == 0)
+            ? (dspark_on ? (n_pre > c.sliding ? n_pre - c.sliding : 0u) : n_pre)
+            : 0u;
     while (n_pre > from) {
       uint32_t target = n_pre;
       if (prefix_cache.ready() && pv.count == 0 && stride_blocks > 0) {
@@ -3535,6 +3585,10 @@ int main(int argc, char** argv) {
         const uint64_t next_ckpt = ((uint64_t)(from / B) + stride_blocks) * B;
         if (next_ckpt > from && next_ckpt < n_pre && next_ckpt + c.sliding <= n_pre)
           target = (uint32_t)next_ckpt;
+      }
+      if (prefill_ckpt_pos > from && prefill_ckpt_pos < target &&
+          prefill_ckpt_pos >= last_ckpt_pos + prefix_cache.block_tokens()) {
+        target = prefill_ckpt_pos;
       }
       if (!heartbeat_fn()) {
         res->finish_reason = "stop";
@@ -3567,16 +3621,15 @@ int main(int argc, char** argv) {
           aff::ui::err("prefix cache: %s\n", perr.c_str());
         else {
           last_ckpt_pos = target;
-          aff::ui::err("prefix cache: stride checkpoint at %u/%u tokens\n", target, n_pre);
+          if (target == prefill_ckpt_pos)
+            aff::ui::err("prefix cache: prefill checkpoint at %u/%u tokens\n", target, n_pre);
+          else
+            aff::ui::err("prefix cache: stride checkpoint at %u/%u tokens\n", target, n_pre);
         }
       }
       from = target;
     }
-    const bool prefill_ckpt_on = [] {
-      const char* s = std::getenv("AFF_PCACHE_PREFILL_CKPT");
-      return !s || !*s || std::strcmp(s, "0") != 0;
-    }();
-    if (prefill_ckpt_on && prefix_cache.ready() && pv.count == 0 &&
+    if (prefill_ckpt_pos == n_pre && prefix_cache.ready() && pv.count == 0 &&
         n_pre >= last_ckpt_pos + prefix_cache.block_tokens()) {
       std::unique_lock<std::mutex> step(engine_mu);
       dense_gpu.set_slot(slot);

@@ -6200,7 +6200,7 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
   }
   auto overlap_shexp_enabled = []() -> bool {
     const char* s = std::getenv("AFF_OVERLAP_SHEXP");
-    return !s || !*s || std::strcmp(s, "0") != 0;
+    return s && *s && std::strcmp(s, "0") != 0;
   };
   const bool want_overlap = overlap_shexp_enabled();
 

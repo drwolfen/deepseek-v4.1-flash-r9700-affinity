@@ -718,12 +718,6 @@ static inline uint32_t mover_dup(bool h2d) {
   return ((kMoverDupDir == MoverDupDir::H2D) == h2d) ? kMoverDup : 1u;
 }
 
-static uint32_t hybrid_cus(int dev) {
-  const uint32_t total = device_cus(dev);
-  const uint32_t n = (uint32_t)(total * hybrid_cu_frac());
-  return n < 1u ? 1u : (n > total ? total : n);
-}
-
 bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
   pool_ = p;
   pool_registered_ = false;
@@ -782,32 +776,38 @@ bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
     I2.ev_seq.assign(devs_.size(), 0ull);
     for (size_t i = 0; i < devs_.size(); ++i) {
       if (hipSetDevice(devs_[i]) != hipSuccess) { I2.hyb[i] = nullptr; continue; }
-      // The low `cus` of however many the device has. The mask is sized from the CU count rather
-      // than fixed at two words, so a part with more than 64 does not silently get a mask covering
-      // only its first 64. Falls back to an unmasked stream where the runtime has no masking — that
-      // is slower, not wrong, and saying so beats guessing later.
+      // On RDNA4 (gfx12xx), hipExtStreamCreateWithCUMask takes WGP bits (1 bit = 1 WGP = 2 CUs),
+      // while hipDeviceProp_t::multiProcessorCount is WGPs and device_cus() doubles it to CUs.
+      // Size the bitmask in the hardware unit (WGPs on gfx12, CUs elsewhere) and read it back via
+      // hipExtStreamGetCUMask so what was requested and what hardware accepted are both printed.
+      hipDeviceProp_t prop{};
+      (void)hipGetDeviceProperties(&prop, devs_[i]);
+      const bool wgp_mask = std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
       const uint32_t total_cu = device_cus(devs_[i]);
-      const uint32_t cus = hybrid_cus(devs_[i]);
+      const uint32_t mask_bits = (wgp_mask && total_cu >= 2u) ? (total_cu / 2u) : total_cu;
+      const double frac = hybrid_cu_frac();
+      const uint32_t want_bits = std::clamp<uint32_t>((uint32_t)std::lround(mask_bits * frac),
+                                                      1u, mask_bits);
       const bool stripe = hybrid_cu_stripe();
-      std::vector<uint32_t> mask((total_cu + 31u) / 32u, 0u);
+      std::vector<uint32_t> mask((mask_bits + 31u) / 32u, 0u);
       const char* mode = "unmasked";
       hipError_t merr = hipSuccess;
-      if (cus >= total_cu) {
-        for (uint32_t b = 0; b < total_cu; ++b) mask[b >> 5] |= 1u << (b & 31u);
+      if (want_bits >= mask_bits) {
+        for (uint32_t b = 0; b < mask_bits; ++b) mask[b >> 5] |= 1u << (b & 31u);
         if (hipStreamCreateWithFlags(&I2.hyb[i], hipStreamNonBlocking) != hipSuccess) {
           I2.hyb[i] = nullptr;
           continue;
         }
       } else {
-        if (stripe && total_cu >= 16u && (total_cu % 4u) == 0u) {
-          const uint32_t per_se = total_cu / 4u;
-          for (uint32_t c = 0; c < cus; ++c) {
+        if (stripe && mask_bits >= 8u && (mask_bits % 4u) == 0u) {
+          const uint32_t per_se = mask_bits / 4u;
+          for (uint32_t c = 0; c < want_bits; ++c) {
             const uint32_t b = (c & 3u) * per_se + (c >> 2);
             mask[b >> 5] |= 1u << (b & 31u);
           }
           mode = "striped";
         } else {
-          for (uint32_t b = 0; b < cus; ++b) mask[b >> 5] |= 1u << (b & 31u);
+          for (uint32_t b = 0; b < want_bits; ++b) mask[b >> 5] |= 1u << (b & 31u);
           mode = "contiguous";
         }
         // SAY WHICH ONE HAPPENED. Two traces at the same nominal budget disagreed by a factor of two
@@ -820,18 +820,34 @@ bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
           continue;
         }
       }
-      std::string hex = "0x";
-      for (size_t w = mask.size(); w-- > 0;) {
-        char buf[16];
-        std::snprintf(buf, sizeof buf, "%08x", mask[w]);
-        hex += buf;
-      }
+      auto fmt_mask = [](const std::vector<uint32_t>& m) {
+        std::string hex = "0x";
+        for (size_t w = m.size(); w-- > 0;) {
+          char buf[16];
+          std::snprintf(buf, sizeof buf, "%08x", m[w]);
+          hex += buf;
+        }
+        return hex;
+      };
+      std::vector<uint32_t> hw(mask.size(), 0u);
+      bool have_hw = false;
       if (merr == hipSuccess) {
-        aff::ui::err("hybrid stream card %d: %u/%u CUs (%s, mask=%s)\n",
-                     devs_[i], cus, total_cu, mode, hex.c_str());
+        if (want_bits >= mask_bits) {
+          hw = mask;
+          have_hw = true;
+        } else {
+          have_hw = (hipExtStreamGetCUMask(I2.hyb[i], (uint32_t)hw.size(), hw.data()) == hipSuccess);
+        }
+      }
+      const std::string req_hex = fmt_mask(mask);
+      const char* unit = wgp_mask ? "WGPs" : "CUs";
+      if (merr == hipSuccess) {
+        const std::string hw_hex = have_hw ? fmt_mask(hw) : std::string("unknown");
+        aff::ui::err("hybrid stream card %d: %u/%u %s (%s, req=%s, hw=%s)\n",
+                     devs_[i], want_bits, mask_bits, unit, mode, req_hex.c_str(), hw_hex.c_str());
       } else {
-        aff::ui::err("hybrid stream card %d: %s (fallback unmasked, wanted %s mask=%s)\n",
-                     devs_[i], hipGetErrorString(merr), mode, hex.c_str());
+        aff::ui::err("hybrid stream card %d: %s (fallback unmasked, wanted %s req=%s)\n",
+                     devs_[i], hipGetErrorString(merr), mode, req_hex.c_str());
       }
       std::array<hipEvent_t, Impl::kEvSlots>* rings[4] = {&I2.ev_q[i], &I2.ev_gu[i], &I2.ev_sw[i],
                                                           &I2.ev_dn[i]};

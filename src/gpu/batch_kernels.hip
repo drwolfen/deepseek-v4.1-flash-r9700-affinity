@@ -339,8 +339,13 @@ float* splitk_buf_with_ctr(size_t need, unsigned int** ctr_out, hipStream_t st =
     w.p = nullptr;
     w.n = 0;
     if (hipMalloc(&w.p, total_need * sizeof(float)) != hipSuccess) return nullptr;
-    if (hipMemset(w.p, 0, (size_t)kSplitCtrFloats * sizeof(uint32_t)) != hipSuccess ||
-        hipDeviceSynchronize() != hipSuccess) {
+    // Zero the counter header on the caller's stream when supplied so preallocation does not
+    // materialize an extra hardware queue on the legacy default stream.
+    const hipError_t zero_err =
+        st ? hipMemsetAsync(w.p, 0, (size_t)kSplitCtrFloats * sizeof(uint32_t), st)
+           : hipMemset(w.p, 0, (size_t)kSplitCtrFloats * sizeof(uint32_t));
+    const hipError_t sync_err = st ? hipStreamSynchronize(st) : hipDeviceSynchronize();
+    if (zero_err != hipSuccess || sync_err != hipSuccess) {
       (void)hipFree(w.p);
       w.p = nullptr;
       return nullptr;
