@@ -8,14 +8,14 @@ on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless s
 
 ## [5.4.0] — 2026-11-21 — "RDNA 4 gfx1201 queue/SE-mask stabilization, zero-D2H host pool & agentic serving optimizations"
 
-Wave 7 production release. Eliminates RDNA 4 (`gfx1201`) KFD multi-queue / multi-SE decode bimodal slowdown (`GPU_MAX_HW_QUEUES=1` + single-SE `0.25` contiguous CU mask), removes all placement D2H traffic (`AFF_POOL_FULL=1`), expands resident MoE slots to `3,563`, adds chunk-aligned stride & `</think>` prefix-cache checkpoints, hardens DRY/ThinkingBudget behavior, and speeds up MoE/dense/indexer/Engram kernels.
+Wave 7 production release (`9f44992..b2ab8d3`). Eliminates RDNA 4 (`gfx1201`) KFD multi-queue / multi-SE decode bimodal slowdown (`GPU_MAX_HW_QUEUES=1` + single-SE `0.25` contiguous CU mask), removes all placement D2H traffic (`AFF_POOL_FULL=1`), expands resident MoE slots to `3,563` clean (`3,593` live production with card-1 bonus slab), adds chunk-aligned stride & `</think>` prefix-cache checkpoints, hardens DRY/ThinkingBudget behavior, and speeds up MoE/dense/indexer/Engram kernels.
 
 ### Added & Changed
 - **RDNA 4 (`gfx1201`) KFD Single-Queue + Single-SE Hybrid Stabilization (`dcac58a`, `765a5af`)**: Auto-sets `GPU_MAX_HW_QUEUES=1` on `gfx12xx` (`AFF_KEEP_HW_QUEUES=1` to override), fixes WGP-vs-CU bitmask sizing with `hipExtStreamGetCUMask` readback, and defaults the hybrid PCIe stream to single-SE 25% contiguous (`AFF_HYBRID_CU_FRAC=0.25`, `AFF_HYBRID_CU_STRIPE=0`, `0x000000ff` SE0-only, `10` KFD queues vs `16`). Eliminates the `~17–26 us` per-kernel ROCm/TheRock `#9297` wait penalty and multi-SE contention (`6/6` = `100%` FAST mode vs bimodal `v5.3.0`).
-- **Zero-D2H Immutable Full Host Pool & +76 Resident Experts (`e202e76`, `521c4b5`)**: `AFF_POOL_FULL=1` pins all `15,360` experts across `182.4 GiB` of 2 MiB THP RAM, eliminating `136+ GiB` D2H writeback (`0.00 GiB` D2H) and freeing VRAM headroom to reach **`3,563` resident experts** (`+76` vs clean `v5.3.0`, `+46` vs `v5.3.0` prod).
-- **MoE, Dense, Indexer, TP2 & Engram Kernel Upgrades (`9f44992`, `4760b1f`, `97e9f1d`, `da295eb`)**: Branchless `kHalfTR`, explicit `stage_a` prefetch, `s_tok` LDS hoist, wider scatter grid, pre-allocated split-K/compressor buffers, live-only `AR + hc_post` expand fusion (`out_hc` tail zeroing fix), LDS-padded `K_VECS_PADDED` indexer + narrow verify, flash DPP reduction, W8A8 Engram `wkv`, and hardware FP8 QDQ.
-- **Agentic Prefix Cache, SSE & Single-Pass Tokenizer (`6fce4ab`, `dcac58a`, `521c4b5`, `765a5af`)**: Pinned async batched KV save/load, post-SSE prefix-cache publish, `</think>` checkpoints (`AFF_PCACHE_THINK_CKPT=1`), chunk-aligned `64`-block (`33,792`-tok) stride checkpoints via `std::gcd(prefill_chunk, B)`, single-pass chat encoding, and `AFF_PCACHE_PREFILL_CKPT=0` default.
-- **DRY & ThinkingBudget Hardening (`ff50a23`, `521c4b5`, `b2ab8d3`)**: Gen-only DRY (`AFF_DRY_GEN_ONLY=1`), special-token DRY exemptions, `</think>` DRY floor reset (`AFF_DRY_RESET_ON_THINK_CLOSE=1`), raised `dry_min_repeats=4` + `c.second >= req_c` with `2x` protection for prompt-verbatim `(ng+1)`-grams, `completion_tokens_details.reasoning_tokens` usage reporting, and multi-scale/novelty/full-vocab freeze breakers.
+- **Zero-D2H Immutable Full Host Pool & +76 Resident Experts (`e202e76`, `521c4b5`)**: `AFF_POOL_FULL=1` pins all `15,360` experts across `182.4 GiB` of 2 MiB THP RAM, eliminating `136+ GiB` D2H writeback (`0.00 GiB` D2H) and freeing VRAM headroom to reach **`3,563` resident experts** cleanly (`+76` vs clean `v5.3.0`, `+46` vs `v5.3.0` prod; **`3,593`** live production).
+- **MoE, Dense, Indexer, TP2 & Engram Kernel Upgrades (`9f44992`, `4760b1f`, `97e9f1d`, `da295eb`)**: Branchless `kHalfTR`, explicit `stage_a` prefetch, `s_tok` LDS hoist, wider scatter grid, pre-allocated split-K/compressor buffers, live-only `AR + hc_post` expand fusion (`out_hc` tail zeroing fix), LDS-padded `K_VECS_PADDED` indexer + narrow verify (`nb<=8`), flash DPP reduction, W8A8 Engram `wkv` (`AFF_ENGRAM_FP8=1`), and hardware FP8 QDQ (`AFF_HW_OQDQ=1`).
+- **Agentic Prefix Cache, SSE & Single-Pass Tokenizer (`6fce4ab`, `dcac58a`, `521c4b5`, `765a5af`)**: Pinned async batched KV save/load (`AFF_PCACHE_BATCH_IO=1`), post-SSE prefix-cache publish (`AFF_PCACHE_POST_SSE=1`), `</think>` checkpoints (`AFF_PCACHE_THINK_CKPT=1`), chunk-aligned `64`-block (`33,792`-tok) stride checkpoints via `std::gcd(prefill_chunk, B)`, single-pass `preencoded_ids` chat encoding, and `AFF_PCACHE_PREFILL_CKPT=0` default.
+- **DRY & ThinkingBudget Hardening (`ff50a23`, `521c4b5`, `b2ab8d3`)**: Gen-only DRY (`AFF_DRY_GEN_ONLY=1`), `eos`/`</think>`/`<｜*` exemptions, `vb.penalty_ids` exclusions, `</think>` DRY floor reset (`AFF_DRY_RESET_ON_THINK_CLOSE=1`), raised `dry_min_repeats=4` + `c.second >= req_c` with `2x` protection for prompt-verbatim `(ng+1)`-grams, `completion_tokens_details.reasoning_tokens` usage reporting, anti-thrash `ExpertHeat`, and multi-scale/novelty/full-vocab freeze breakers.
 
 ### Performance & Verification
 - **Clean 2-Arm Paired Benchmark (`rc5` vs `rc5_arm1 v5.3.0` / FAST `rc4_arm1 v5.3.0`, `NGEN=192`)**:
@@ -38,6 +38,33 @@ Wave 6 production release. Optimizes `gfx1201` Wave32 HIP kernels across Wave A 
 ### Performance & Verification
 - **Paired 3-Arm Benchmark (`NGEN=192`)**: `+24.9%` to `+43.8%` `tg` (`41.47–42.23 tok/s` @16K–64K), `+37.05%` slot `blocks/s`, `+34.9%` 4-prompt DSpark (`21.33 tok/s`), `-34.0%` `dense-gpu`, `-85.2%` `x_gu+x_down`, `resident_experts=3,517`, `free_vram_mib=[353, 355]`, `kfd_release_s=2.800 s`.
 - **Tests**: 13/13 filtered CPU `ctest` + 5/5 GPU binaries (ROCm 10.1 & 10.2) + 2/2 fallback-toggle GPU runs PASS (`0` `hipError`).
+
+## [5.2.0] — 2026-11-19 — "VRAM reclaim, fused attn_out prep & host/SSE/tokenizer pipeline"
+
+Wave 5 production release (`44e81ee`, `4ada6fa`). Reclaimed dead V4.1 Q-RMS/compressor allocations and tiled Engram H2D (`-616 MiB/card`) while accelerating dense/SSE/tokenizer paths.
+
+### Added & Changed
+- **VRAM Reclaim & Resident Capacity (`b13cbf2`)**: Expanded GPU-resident MoE slots by **`+101`** (`3,416 -> 3,517` experts, `[355, 354] MiB` free VRAM).
+- **HIP Decode & Prefill Fusions (`3f24d07`, `44e81ee`)**: Added `AFF_FUSED_ATTN_OUT_PREP`, `kFKNarrow=128` (`AFF_FP8_NARROW128`), `AFF_REUSE_NORM_Q8`, single-drain draft confidence, threadpool skip on decode Engram (`live < 64`), and prefill-before-decode synchronization.
+- **Host, SSE & Tokenizer Optimizations (`45ea4eb`, `f424cfd`, `54c5d78`, `d24e31d`, `60676eb`)**: Client `fd_alive` disconnect cancellation (`1.12 s`, `0` wasted tokens), 15 s empty-delta SSE keepalives, lock-free `/health`, skipped prefill logits, O(1) `decode_one` + BPE/LCP caching, hardened O(1) delta prefix-cache lookup, and 9/9 CPU `ctest` + 4/4 GPU tests PASS.
+
+### Performance
+- Warm Pass-2 decode (`tg2`) **41.00–41.72 tok/s** (`+30.2%` to `+56.1%` over `v5.1.2`); cached multi-turn TTFT `-47.0% @64K` (`2.049 s -> 1.086 s`) and `-55.9% @100K` (`2.386 s -> 1.052 s`).
+
+## [5.1.2] — 2026-11-17 — "ThinkingBudget, Executive-Freeze breaker & cache-preserving effort=none"
+
+Wave 4C production release (`c52e95e`, `8025372`).
+- Ported Lucebox `ThinkingBudget` (`AFF_THINK_REPLY_RESERVE=4096`, `AFF_THINK_LOOP_REPEATS=3` over `loop_span=64`), added `AFF_THINK_FREEZE_BREAKER=1`, synchronized DSpark speculative rollback across forced `</think>` injection, and added cache-preserving `reasoning_effort: "none"` (`suppress_final_think`); 7/7 CPU unit tests PASS.
+
+## [5.1.1] — 2026-11-17 — "TP=2 delta prefix-cache restore offset & UTF-8 streaming hotfix"
+
+Wave 4B hotfix (`63cd104`, `be545d6`).
+- Fixed `PrefixCache::restore()` multi-region/TP=2 rank offset indexing across `app_` regions (no `pcache` wipe required) and added strict UTF-8 streaming holdback/sanitization and validating `json_escape`; 6/6 CPU unit tests PASS.
+
+## [5.1.0] — 2026-11-16 — "DSpark masked tile skip, state-only delta pcache & DSML parser hardening"
+
+Wave 4A production release (`839665f`, `e559b1b`).
+- Added `AFF_DRAFT_SKIP_MASKED=1` (`+22.2%` decode: `16.93 -> 20.69 tok/s`, **`73.33%`** MoonMath-1017 DSpark acceptance vs `67.52%`), `AFF_PCACHE_DELTA=1` (`1.42x` TTFT), `ignore_eos=true`, `gridDim.y > 65535` guard (`#1006`), DSML nested XML / multi-invoke splitting (`#1020`), and MoE RAW barrier validation (`#983`, `#984`); retained `AFF_ATTN_LOOKAHEAD=0`; 6/6 CPU tests PASS.
 
 ## [5.0.0] — 2026-11-16 — "RDNA 4 sparse indexer & 3,416 resident experts"
 
