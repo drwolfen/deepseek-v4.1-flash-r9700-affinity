@@ -2171,6 +2171,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       if (!bops_.attn_out(bops_.ctx, w.wo_a.gpu, w.wo_b.gpu, NH, W, ROT, rd, 8, OR, E)) return false;
       // See the single-token path: wo_b is Col, so every card holds a partial of the chunk's block.
       if (bops_.block_reduce && !bops_.block_reduce(bops_.ctx, E)) return false;
+      if (bops_.prefetch_hint) bops_.prefetch_hint(bops_.ctx, w.shexp_gate.gpu, w.shexp_up.gpu);
       if (!bops_.hc_post(bops_.ctx, w.hc_attn_fn.data != nullptr, E, HC)) return false;
       AFF_PH(attn_out);
 
@@ -2435,6 +2436,17 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         const char* v = std::getenv("AFF_FUSE_HC_TAP");
         return !v || !*v || std::strcmp(v, "0") != 0;
       }();
+      if (bops_.prefetch_hint) {
+        int32_t pf0 = -1, pf1 = -1;
+        if (l + 1 < cfg_.n_layer) {
+          const bool next_eng = eng_on_ && (l + 1 < eng_slot_.size()) && eng_slot_[l + 1] >= 0;
+          pf0 = next_eng ? layers_[l + 1].engram_wkv.gpu : layers_[l + 1].wq_a.gpu;
+          pf1 = next_eng ? -1 : layers_[l + 1].wkv.gpu;
+        } else {
+          pf0 = head_.gpu;
+        }
+        bops_.prefetch_hint(bops_.ctx, pf0, pf1);
+      }
       if (do_tap && fuse_tap && w.hc_ffn_fn.data != nullptr && bops_.hc_post_tap) {
         const uint32_t b_lo = base >= tap_first ? 0u : tap_first - base;
         if (!bops_.hc_post_tap(bops_.ctx, true, (uint32_t)tap_at[l], NT, b_lo, live - b_lo,
@@ -2730,6 +2742,7 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
     if (!bops_.draft_attend(bops_.ctx, layer, B, P, win_lo, kq)) return false;
     if (!bops_.attn_out(bops_.ctx, w.wo_a.gpu, w.wo_b.gpu, NH, W, ROT, rd, 8, OR, E)) return false;
     if (bops_.block_reduce && !bops_.block_reduce(bops_.ctx, E)) return false;
+    if (bops_.prefetch_hint) bops_.prefetch_hint(bops_.ctx, w.shexp_gate.gpu, w.shexp_up.gpu);
     if (!bops_.hc_post(bops_.ctx, w.hc_attn_fn.data != nullptr, E, HC)) return false;
     AFF_PH(draft_attn);
 
@@ -2784,6 +2797,12 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
             std::abort();
           }
     if (bops_.block_reduce && !bops_.block_reduce(bops_.ctx, E)) return false;
+    if (bops_.prefetch_hint) {
+      if (st + 1 < NS)
+        bops_.prefetch_hint(bops_.ctx, D.stage[st + 1].wq_a.gpu, D.stage[st + 1].wkv.gpu);
+      else
+        bops_.prefetch_hint(bops_.ctx, head_.gpu, -1);
+    }
     if (!bops_.hc_post(bops_.ctx, w.hc_ffn_fn.data != nullptr, E, HC)) return false;
     AFF_PH(draft_ffn);
   }

@@ -338,6 +338,13 @@ private:
     bool     ps = false;
     uint8_t* w4_data = nullptr;     // device, group-128 int4 copy for `output` head
     uint16_t* w4_scales = nullptr;  // device, [nrows][ncols/128] bf16 scales for `output` head
+    uint8_t*  b12_sm = nullptr;     // device, bf16x12 sign+mantissa for `output` head
+    uint8_t*  b12_exp4 = nullptr;   // device, bf16x12 4-bit exponent deltas
+    uint8_t*  b12_mexp = nullptr;   // device, bf16x12 per-32 block max exponent
+    uint32_t* b12_esc_off = nullptr;
+    uint16_t* b12_esc_col = nullptr;
+    uint16_t* b12_esc_val = nullptr;
+    uint32_t  b12_n_esc = 0;
     uint64_t data_bytes = 0, scales_bytes = 0;   // amdnas-fixes weight-verify: sizes for the read-back digest
   };
   struct Entry {
@@ -345,6 +352,7 @@ private:
     uint32_t quant = 0;
     uint64_t rows = 0, cols = 0;
     Split split = Split::Row;
+    bool is_engram = false;
   };
   static Split split_for(const char* name);
   // True for the fp8 tensors stored in WMMA fragment order.
@@ -586,6 +594,8 @@ private:
   // yet. hc_post clears it on every path, including the ones that decline the fold.
   uint32_t ar_pending_ = 0;
   uint32_t b_ar_pending_ = 0;
+  int32_t  pending_pf0_ = -1;
+  int32_t  pending_pf1_ = -1;
   size_t   n_vec_ = 0, n_router_ = 0;
   void     batch_shexp_join(size_t r);
   DenseGpuStats st_;
@@ -682,6 +692,7 @@ private:
   bool     batch_attn_out(int32_t woa, int32_t wob, uint32_t n_head, uint32_t width,
                           uint32_t n_rot, RopeDerived rope, uint32_t n_groups, uint64_t rank,
                           uint64_t hidden);
+  void     batch_prefetch_hint(int32_t h0, int32_t h1);
   bool     batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc);
   bool     batch_router(int32_t h, uint32_t n_expert, uint64_t n_embd, float* logits);
   bool     batch_shexp(int32_t g, int32_t u, int32_t d, uint64_t hidden, uint64_t inter,

@@ -749,6 +749,9 @@ public:
     // confidence unused, which is the default (the accept rule needs no score).
     bool (*draft_confidence)(void* ctx, int32_t cw, int32_t w1, uint32_t n_embd, uint32_t rank,
                              uint32_t n, float* out) = nullptr;
+    // Optional hint naming up to two weight handles (`h0`, `h1`, -1 when unused) to prefetch
+    // beside the upcoming cross-card all-reduce (`AFF_PREFETCH_BESIDE`).
+    void (*prefetch_hint)(void* ctx, int32_t h0, int32_t h1) = nullptr;
     void* ctx = nullptr;
   };
   void set_batch_ops(const BatchOps& b) { bops_ = b; }
