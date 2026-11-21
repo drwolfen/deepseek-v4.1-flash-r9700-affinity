@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(affinity-engine VERSION 5.4.0 LANGUAGES CXX)
+project(affinity-engine VERSION 5.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,7 +44,7 @@ else()
       set(AFF_VERSION_STR "v${AFF_VER_FILE}")
     endif()
   else()
-    set(AFF_VERSION_STR "v5.4.0")
+    set(AFF_VERSION_STR "v5.5.0")
   endif()
 endif()
 
@@ -253,6 +253,7 @@ if(AFF_HAVE_TESTS)
   aff_cpu_test(test_w4_head w4_head)
   aff_cpu_test(test_hadamard_block32 hadamard_block32)
   aff_cpu_test(test_thinking_budget thinking_budget)
+  aff_cpu_test(test_suffix_draft suffix_draft)
 endif()
 
 if(AFF_HIP)

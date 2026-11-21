@@ -1171,6 +1171,122 @@ int main() {
         }
         tp_free(&ctx_p);
       }
+
+      // 13c. TpReduce::Coded (R2 lossless coded BF16 AR + raw 0xFF fallback + AFF_TP_AR_CODED=1)
+      {
+        auto save_env = [](const char* k, bool& has, std::string& val) {
+          const char* v = std::getenv(k);
+          has = (v != nullptr);
+          val = v ? v : "";
+        };
+        auto restore_env = [](const char* k, bool has, const std::string& val) {
+          if (has) setenv(k, val.c_str(), 1);
+          else unsetenv(k);
+        };
+        bool had_coded = false, had_mode = false, had_wake = false, had_reg = false;
+        std::string prev_coded, prev_mode, prev_wake, prev_reg;
+        save_env("AFF_TP_AR_CODED", had_coded, prev_coded);
+        save_env("AFF_TP_AR_MODE", had_mode, prev_mode);
+        save_env("AFF_AR_WAKE_STORE", had_wake, prev_wake);
+        save_env("AFF_AR_REG_FORM", had_reg, prev_reg);
+        unsetenv("AFF_TP_AR_MODE");
+        setenv("AFF_TP_AR_CODED", "1", 1);
+
+        TpContext ctx_c;
+        std::string cerr;
+        const size_t max_nc = 2097152u;
+        assert(tp_init(&ctx_c, max_nc, &cerr));
+        float *c_in[2] = {}, *c_out[2] = {};
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx_c.dev[r]) == hipSuccess);
+          assert(hipMalloc(&c_in[r], max_nc * sizeof(float)) == hipSuccess);
+          assert(hipMalloc(&c_out[r], max_nc * sizeof(float)) == hipSuccess);
+        }
+        struct CodedCase {
+          size_t n;
+          TpReduce mode;
+          bool alias;
+          bool reset_after;
+          int wake_store;
+          int reg_form;
+        };
+        const CodedCase ccases[] = {
+            {2563u, TpReduce::Coded, false, false, 1, 1},
+            {32768u, TpReduce::Auto, false, false, 1, 1},
+            {262144u, TpReduce::Coded, false, false, 0, 0},
+            {1048576u, TpReduce::Coded, false, false, 1, 0},
+            {1048576u, TpReduce::Auto, false, false, 0, 1},
+            {1049003u, TpReduce::Coded, true, true, 1, 1},
+            {2097152u, TpReduce::Coded, false, false, 1, 1},
+            {2097152u, TpReduce::Auto, true, false, 0, 0},
+        };
+        for (const CodedCase& tc : ccases) {
+          const size_t n = tc.n;
+          std::vector<float> h0(n), h1(n), ref(n);
+          for (size_t i = 0; i < n; ++i) {
+            h0[i] = std::sin((float)(i % 331u) * 0.043f) * 3.0f;
+            h1[i] = std::cos((float)(i % 277u) * 0.059f) * 2.5f;
+          }
+          // Group 0: +0.0 and -0.0
+          h0[0] = 0.0f;  h1[0] = 0.0f;
+          h0[1] = -0.0f; h1[1] = 0.0f;
+          h0[2] = -0.0f; h1[2] = -0.0f;
+          // Group 1 (64..127): subnormals -> 0xFF fallback
+          h0[64] = bf16_to_f32_cpu(0x0001u); h1[64] = bf16_to_f32_cpu(0x0002u);
+          h0[65] = bf16_to_f32_cpu(0x8042u); h1[65] = bf16_to_f32_cpu(0x8001u);
+          // Group 2 (128..191): +-Inf -> 0xFF fallback
+          h0[128] = bf16_to_f32_cpu(0x7F80u); h1[128] = bf16_to_f32_cpu(0x7F80u);
+          h0[129] = bf16_to_f32_cpu(0xFF80u); h1[129] = bf16_to_f32_cpu(0xFF80u);
+          // Group 3 (192..255): wide exponent span > 14 -> 0xFF fallback
+          h0[192] = 1.0f;                     h1[192] = std::ldexp(1.0f, -20);
+          h0[193] = std::ldexp(1.0f, -20);    h1[193] = 1.0f;
+          // Odd tail / late-stage boundary fallback cases
+          if (n > 2048u) {
+            const size_t tail = n - 1u;
+            h0[tail] = bf16_to_f32_cpu(0x7F80u); h1[tail] = 1.0f;
+            h0[n - 11u] = -0.0f;                 h1[n - 11u] = -0.0f;
+            const size_t mid = (n / 2u) & ~size_t(63);
+            h0[mid] = 1.0f;                      h1[mid] = 2.0f;
+            h0[mid + 1u] = std::ldexp(1.0f, -24); h1[mid + 1u] = bf16_to_f32_cpu(0x0015u);
+          }
+          for (size_t i = 0; i < n; ++i)
+            ref[i] = bf16_to_f32_cpu(f32_to_bf16_cpu(h0[i])) +
+                     bf16_to_f32_cpu(f32_to_bf16_cpu(h1[i]));
+
+          setenv("AFF_AR_WAKE_STORE", tc.wake_store ? "1" : "0", 1);
+          setenv("AFF_AR_REG_FORM", tc.reg_form ? "1" : "0", 1);
+          assert(hipSetDevice(ctx_c.dev[0]) == hipSuccess);
+          assert(hipMemcpy(c_in[0], h0.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+          assert(hipSetDevice(ctx_c.dev[1]) == hipSuccess);
+          assert(hipMemcpy(c_in[1], h1.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+          float* const* dst_ptrs = tc.alias ? c_in : c_out;
+          tp_all_reduce(ctx_c, c_in, dst_ptrs, n, tc.mode);
+          tp_sync(ctx_c);
+          tp_check(ctx_c);
+
+          std::vector<float> got0(n), got1(n);
+          assert(hipSetDevice(ctx_c.dev[0]) == hipSuccess);
+          assert(hipMemcpy(got0.data(), dst_ptrs[0], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+          assert(hipSetDevice(ctx_c.dev[1]) == hipSuccess);
+          assert(hipMemcpy(got1.data(), dst_ptrs[1], n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+          assert(std::memcmp(got0.data(), got1.data(), n * sizeof(float)) == 0);
+          assert(std::memcmp(got0.data(), ref.data(), n * sizeof(float)) == 0);
+          if (tc.reset_after) {
+            tp_reset_seq(ctx_c);
+            tp_sync(ctx_c);
+          }
+        }
+        restore_env("AFF_TP_AR_CODED", had_coded, prev_coded);
+        restore_env("AFF_TP_AR_MODE", had_mode, prev_mode);
+        restore_env("AFF_AR_WAKE_STORE", had_wake, prev_wake);
+        restore_env("AFF_AR_REG_FORM", had_reg, prev_reg);
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx_c.dev[r]) == hipSuccess);
+          (void)hipFree(c_in[r]);
+          (void)hipFree(c_out[r]);
+        }
+        tp_free(&ctx_c);
+      }
       assert(hipSetDevice(0) == hipSuccess);
     } else {
       std::printf("SKIP: TP=2 fp8 all-reduce test (%d device(s))\n", ndev);
