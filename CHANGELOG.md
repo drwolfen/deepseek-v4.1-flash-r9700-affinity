@@ -6,6 +6,26 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [5.4.0] — 2026-11-21 — "RDNA 4 gfx1201 queue/SE-mask stabilization, zero-D2H host pool & agentic serving optimizations"
+
+Wave 7 production release. Eliminates RDNA 4 (`gfx1201`) KFD multi-queue / multi-SE decode bimodal slowdown (`GPU_MAX_HW_QUEUES=1` + single-SE `0.25` contiguous CU mask), removes all placement D2H traffic (`AFF_POOL_FULL=1`), expands resident MoE slots to `3,563`, adds chunk-aligned stride & `</think>` prefix-cache checkpoints, hardens DRY/ThinkingBudget behavior, and speeds up MoE/dense/indexer/Engram kernels.
+
+### Added & Changed
+- **RDNA 4 (`gfx1201`) KFD Single-Queue + Single-SE Hybrid Stabilization (`dcac58a`, `765a5af`)**: Auto-sets `GPU_MAX_HW_QUEUES=1` on `gfx12xx` (`AFF_KEEP_HW_QUEUES=1` to override), fixes WGP-vs-CU bitmask sizing with `hipExtStreamGetCUMask` readback, and defaults the hybrid PCIe stream to single-SE 25% contiguous (`AFF_HYBRID_CU_FRAC=0.25`, `AFF_HYBRID_CU_STRIPE=0`, `0x000000ff` SE0-only, `10` KFD queues vs `16`). Eliminates the `~17–26 us` per-kernel ROCm/TheRock `#9297` wait penalty and multi-SE contention (`6/6` = `100%` FAST mode vs bimodal `v5.3.0`).
+- **Zero-D2H Immutable Full Host Pool & +76 Resident Experts (`e202e76`, `521c4b5`)**: `AFF_POOL_FULL=1` pins all `15,360` experts across `182.4 GiB` of 2 MiB THP RAM, eliminating `136+ GiB` D2H writeback (`0.00 GiB` D2H) and freeing VRAM headroom to reach **`3,563` resident experts** (`+76` vs clean `v5.3.0`, `+46` vs `v5.3.0` prod).
+- **MoE, Dense, Indexer, TP2 & Engram Kernel Upgrades (`9f44992`, `4760b1f`, `97e9f1d`, `da295eb`)**: Branchless `kHalfTR`, explicit `stage_a` prefetch, `s_tok` LDS hoist, wider scatter grid, pre-allocated split-K/compressor buffers, live-only `AR + hc_post` expand fusion (`out_hc` tail zeroing fix), LDS-padded `K_VECS_PADDED` indexer + narrow verify, flash DPP reduction, W8A8 Engram `wkv`, and hardware FP8 QDQ.
+- **Agentic Prefix Cache, SSE & Single-Pass Tokenizer (`6fce4ab`, `dcac58a`, `521c4b5`, `765a5af`)**: Pinned async batched KV save/load, post-SSE prefix-cache publish, `</think>` checkpoints (`AFF_PCACHE_THINK_CKPT=1`), chunk-aligned `64`-block (`33,792`-tok) stride checkpoints via `std::gcd(prefill_chunk, B)`, single-pass chat encoding, and `AFF_PCACHE_PREFILL_CKPT=0` default.
+- **DRY & ThinkingBudget Hardening (`ff50a23`, `521c4b5`, `b2ab8d3`)**: Gen-only DRY (`AFF_DRY_GEN_ONLY=1`), special-token DRY exemptions, `</think>` DRY floor reset (`AFF_DRY_RESET_ON_THINK_CLOSE=1`), raised `dry_min_repeats=4` + `c.second >= req_c` with `2x` protection for prompt-verbatim `(ng+1)`-grams, `completion_tokens_details.reasoning_tokens` usage reporting, and multi-scale/novelty/full-vocab freeze breakers.
+
+### Performance & Verification
+- **Clean 2-Arm Paired Benchmark (`rc5` vs `rc5_arm1 v5.3.0` / FAST `rc4_arm1 v5.3.0`, `NGEN=192`)**:
+  - `4K` (`4,031` tok): `pp1 = 624.0 tok/s` (`+3.28%` / `+2.94%`), `tg2 = 48.24 tok/s` (`+8.16%` / `+6.16%`).
+  - `16K` (`16,104` tok): `pp1 = 1,300.5 tok/s` (`+7.37%` / `+7.26%`), `tg2 = 45.81 tok/s` (`+1.15%` / `+3.92%`).
+  - `64K` (`63,863` tok): `pp1 = 1,409.0 tok/s` (`45.3 s`, `+4.83%` / `+4.27%`), `tg2 = 46.73 tok/s` (`+17.86%` / `+10.13%`), `pp2 = 2,593.2 tok/s` (`24.6 s`).
+  - **4-Prompt `temp=0.0` DSpark**: **`22.70 tok/s`** mean stream (`+15.17%` / `+9.08%`).
+  - **Multi-Turn `80K -> 123K`**: Cold `80K` TTFT `77.696 s` (`-4.38%` / `-4.79%`), `123K` extend TTFT `37.031 s` (`-4.59%` / `-2.89%`), cached turns resume in `0.949 s` and `0.901 s`.
+- **`rc6` Verification (`b2ab8d3`)**: `l4k` `tg2 = 46.24 tok/s` (`pp1 = 618.9`), `14/14` CPU `ctest`, `5/5` GPU binaries (`0` `hipError`), `539` `gfx1201` ELF kernels with `0` scratch bytes and `0` VGPR spill (`-ffp-contract=off` preserved), **`3/3` functional tests PASS** (`test_a_stride`, `test_b_think_ckpt`, and **`3/3` consecutive `test_c_dry_reasoning`**), prefix-cache fingerprint `0x733de762fee543e6` preserved.
+
 ## [5.3.0] — 2026-11-19 — "RDNA 4 Wave32 HIP kernel optimizations"
 
 Wave 6 production release. Optimizes `gfx1201` Wave32 HIP kernels across Wave A (`dfb34cb`), Wave B (`c20ed32`), and multi-GEMM band / WGP fence fixes (`e1f6be3`), retaining ROCm `10.1.0-full` (`+3.55%` composite over ROCm `10.2.0-full`).
