@@ -57,9 +57,13 @@ inline void set_device(int d) { (void)hipSetDevice(d); }
 
 constexpr size_t kTpWakeBytes = 64;
 constexpr int kTpFp8RegCacheGroups = 8;
-constexpr size_t kTpStagedMinBytes = 4u << 20;  // 4 MiB floor for staged TP=2 FP8 overlap
+constexpr int kTpCodedRegCacheGroups = 4;
+constexpr int kTpCodedStageIters = 2;
+constexpr size_t kTpStagedMinBytes = 4u << 20;  // 4 MiB floor for staged TP=2 FP8/Coded overlap
 constexpr int kTpFp8DefaultStages = 8;
 constexpr int kTpFp8MaxStages = 8;
+constexpr uint32_t kTpArFlagFastRel   = 1u << 0;
+constexpr uint32_t kTpArFlagWakeEarly = 1u << 1;
 // Per-peer flag stride: [0, kTpMaxBlocks) holds unstaged block flags;
 // [kTpMaxBlocks, (1 + kTpFp8MaxStages) * kTpMaxBlocks) holds per-(stage, block) flags.
 constexpr size_t kTpFlagStride = (size_t)kTpMaxBlocks * (1u + (size_t)kTpFp8MaxStages);
@@ -69,6 +73,10 @@ __device__ __forceinline__ void store_sys_rel(unsigned int* p, unsigned int v) {
 }
 __device__ __forceinline__ void store_sys_relaxed(unsigned int* p, unsigned int v) {
   __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ void publish_flag(unsigned int* p, unsigned int v, bool fast_rel) {
+  if (fast_rel) store_sys_relaxed(p, v);
+  else store_sys_rel(p, v);
 }
 __device__ __forceinline__ unsigned int load_sys_relaxed(const unsigned int* p) {
   return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -99,22 +107,27 @@ __device__ __forceinline__ float4 f4add(float4 a, float4 b) {
 // engine is tuned on — the push and the reduce collapse to exactly the single-peer straight line
 // they were before the generalisation, with no loop and no indirection through the peer table.
 // NRANK_SYNC ports N-rank flag sync from StillDeadcode/libr4d PR #2 (9e0728e).
-template <int NPEER, bool NRANK_SYNC = false>
-__global__ void tp_ar_kernel(const float4* __restrict__ in,
+template <int NPEER, bool NRANK_SYNC = false, bool REG_CACHE = false>
+__global__ __launch_bounds__(256) void tp_ar_kernel(const float4* __restrict__ in,
                              TpPush<NPEER> push, const float4* my_scratch,
                              float4* __restrict__ out,
                              unsigned int* my_flags,
                              unsigned int* seq_ctrs, unsigned int* timeout,
-                             int n4, int slot_stride4, int peer_stride4, int own) {
+                             int n4, int slot_stride4, int peer_stride4, int own,
+                             uint32_t ar_flags) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) {
+#pragma unroll
+    for (int j = 0; j < NPEER; ++j) store_sys_relaxed(push.wake[j], 1u);
+  }
 
   __shared__ unsigned int s_seq;
   if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  __syncthreads();
+  aff::lds_barrier();
   const unsigned int s = s_seq;
   const int slot = (int)(s % TpContext::kTpSlots);
 
-  if (b == 0 && tid == 0) {
+  if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) {
 #pragma unroll
     for (int j = 0; j < NPEER; ++j) store_sys_relaxed(push.wake[j], s);
   }
@@ -134,7 +147,22 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
   // Push my chunk into every peer's scratch, unrolled for memory-level parallelism: PCIe wants many
   // writes in flight, and one per thread per iteration does not saturate it. `in` is read once and
   // fanned out from registers — the crossings are what this costs, not the local reads.
-  {
+  constexpr int kExactRegCap = 8;
+  float4 r_in[(REG_CACHE && NPEER == 1) ? kExactRegCap : 1];
+  if constexpr (REG_CACHE && NPEER == 1) {
+    const int k0 = start + tid;
+#pragma unroll
+    for (int i = 0; i < kExactRegCap; ++i) {
+      const int k = k0 + i * nt;
+      if (k < end) r_in[i] = in[k];
+    }
+#pragma unroll
+    for (int i = 0; i < kExactRegCap; ++i) {
+      const int k = k0 + i * nt;
+      if (k < end) ps[0][k] = r_in[i];
+    }
+    for (int k = k0 + kExactRegCap * nt; k < end; k += nt) ps[0][k] = in[k];
+  } else {
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
       const float4 v0 = in[k], v1 = in[k + nt], v2 = in[k + 2 * nt], v3 = in[k + 3 * nt];
@@ -152,12 +180,13 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
 
   // Drain posted writes without an L2 invalidate — see the header comment.
   asm volatile("s_wait_storecnt 0x0" ::: "memory");
-  __syncthreads();
+  aff::lds_barrier();
+  const bool fast_rel = (ar_flags & kTpArFlagFastRel) != 0u;
 
   if constexpr (NRANK_SYNC && NPEER > 1) {
     if (tid == 0) {
 #pragma unroll
-      for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
+      for (int j = 0; j < NPEER; ++j) publish_flag(&push.flags[j][b], s, fast_rel);
     }
     if (tid < NPEER) {
       const unsigned int* f = &my_flags[tid * kTpFlagStride + b];
@@ -174,23 +203,23 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
   } else {
     if (tid == 0) {
 #pragma unroll
-      for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
+      for (int j = 0; j < NPEER; ++j) publish_flag(&push.flags[j][b], s, fast_rel);
       unsigned long long z = 0;
 #pragma unroll
       for (int j = 0; j < NPEER; ++j) {
         const unsigned int* f = &my_flags[j * kTpFlagStride + b];
         unsigned int v = load_sys_relaxed(f);
-        if (v < s) {
+        if ((int)(v - s) < 0) {
           do {
             __builtin_amdgcn_s_sleep(1);
             v = load_sys_relaxed(f);
-          } while (v < s && ++z <= kTpSpinMax);
-          if (v < s) note_timeout(timeout, s);
+          } while ((int)(v - s) < 0 && ++z <= kTpSpinMax);
+          if ((int)(v - s) < 0) note_timeout(timeout, s);
         }
       }
     }
   }
-  __syncthreads();
+  aff::lds_barrier();
   fence_sys_acq();
 
   // out = the sum of every rank's input, mine from `in` and the rest from my scratch.
@@ -205,15 +234,34 @@ __global__ void tp_ar_kernel(const float4* __restrict__ in,
   {
     int k = start + tid;
     if constexpr (NPEER == 1) {
-      // The two-rank straight line, kept verbatim: one peer, no source table, no select.
-      for (; k + 3 * nt < end; k += 4 * nt) {
-        const float4 a0 = in[k], a1 = in[k + nt], a2 = in[k + 2 * nt], a3 = in[k + 3 * nt];
-        const float4 b0 = ms[0][k], b1 = ms[0][k + nt];
-        const float4 b2 = ms[0][k + 2 * nt], b3 = ms[0][k + 3 * nt];
-        out[k]          = f4add(a0, b0); out[k + nt]     = f4add(a1, b1);
-        out[k + 2 * nt] = f4add(a2, b2); out[k + 3 * nt] = f4add(a3, b3);
+      if constexpr (REG_CACHE) {
+        const int k0 = start + tid;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+          float4 r_peer[2];
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            const int kj = k0 + (g * 2 + j) * nt;
+            if (kj < end) r_peer[j] = ms[0][kj];
+          }
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            const int kj = k0 + (g * 2 + j) * nt;
+            if (kj < end) out[kj] = f4add(r_in[g * 2 + j], r_peer[j]);
+          }
+        }
+        for (int kt = k0 + kExactRegCap * nt; kt < end; kt += nt) out[kt] = f4add(in[kt], ms[0][kt]);
+      } else {
+        // The two-rank straight line, kept verbatim: one peer, no source table, no select.
+        for (; k + 3 * nt < end; k += 4 * nt) {
+          const float4 a0 = in[k], a1 = in[k + nt], a2 = in[k + 2 * nt], a3 = in[k + 3 * nt];
+          const float4 b0 = ms[0][k], b1 = ms[0][k + nt];
+          const float4 b2 = ms[0][k + 2 * nt], b3 = ms[0][k + 3 * nt];
+          out[k]          = f4add(a0, b0); out[k + nt]     = f4add(a1, b1);
+          out[k + 2 * nt] = f4add(a2, b2); out[k + 3 * nt] = f4add(a3, b3);
+        }
+        for (; k < end; k += nt) out[k] = f4add(in[k], ms[0][k]);
       }
-      for (; k < end; k += nt) out[k] = f4add(in[k], ms[0][k]);
     } else {
       // src[p] is where rank p's contribution lives as this rank sees it: `in` for my own, the
       // matching sub-slot for everyone else. Summing over p in order is then the same expression on
@@ -259,21 +307,25 @@ struct TpPush8 {
 };
 
 template <int NPEER, bool NRANK_SYNC = false, bool CACHE_REGS = false>
-__global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
+__global__ __launch_bounds__(256) void tp_ar_fp8_kernel(const float* __restrict__ in,
                                  TpPush8<NPEER> push, const unsigned char* my_base,
                                  float* __restrict__ out,
                                  unsigned int* my_flags,
                                  unsigned int* seq_ctrs, unsigned int* timeout,
                                  int n, int slot_stride_bytes, int peer_stride_bytes,
-                                 int scale_off_bytes, int own) {
+                                 int scale_off_bytes, int own, uint32_t ar_flags) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) {
+#pragma unroll
+    for (int j = 0; j < NPEER; ++j) store_sys_relaxed(push.wake[j], 1u);
+  }
   __shared__ unsigned int s_seq;
   if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  __syncthreads();
+  aff::lds_barrier();
   const unsigned int s = s_seq;
   const int slot = (int)(s % TpContext::kTpSlots);
 
-  if (b == 0 && tid == 0) {
+  if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) {
 #pragma unroll
     for (int j = 0; j < NPEER; ++j) store_sys_relaxed(push.wake[j], s);
   }
@@ -356,11 +408,12 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
   }
 
   asm volatile("s_wait_storecnt 0x0" ::: "memory");
-  __syncthreads();
+  aff::lds_barrier();
+  const bool fast_rel = (ar_flags & kTpArFlagFastRel) != 0u;
   if constexpr (NRANK_SYNC && NPEER > 1) {
     if (tid == 0) {
       #pragma unroll
-      for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
+      for (int j = 0; j < NPEER; ++j) publish_flag(&push.flags[j][b], s, fast_rel);
     }
     if (tid < NPEER) {
       const unsigned int* f = &my_flags[tid * kTpFlagStride + b];
@@ -377,23 +430,23 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
   } else {
     if (tid == 0) {
       #pragma unroll
-      for (int j = 0; j < NPEER; ++j) store_sys_rel(&push.flags[j][b], s);
+      for (int j = 0; j < NPEER; ++j) publish_flag(&push.flags[j][b], s, fast_rel);
       unsigned long long z = 0;
       #pragma unroll
       for (int j = 0; j < NPEER; ++j) {
         const unsigned int* f = &my_flags[j * kTpFlagStride + b];
         unsigned int fv = load_sys_relaxed(f);
-        if (fv < s) {
+        if ((int)(fv - s) < 0) {
           do {
             __builtin_amdgcn_s_sleep(1);
             fv = load_sys_relaxed(f);
-          } while (fv < s && ++z <= kTpSpinMax);
-          if (fv < s) note_timeout(timeout, s);
+          } while ((int)(fv - s) < 0 && ++z <= kTpSpinMax);
+          if ((int)(fv - s) < 0) note_timeout(timeout, s);
         }
       }
     }
   }
-  __syncthreads();
+  aff::lds_barrier();
   fence_sys_acq();
 
   // Reduce against MY OWN QUANTISED value, not my exact one — see the replication comment above.
@@ -499,21 +552,22 @@ __global__ void tp_ar_fp8_kernel(const float* __restrict__ in,
 // local wait + quant + HBM reduce of stage j - 1. Wire format and outputs are bit-identical to
 // tp_ar_fp8_kernel.
 template <bool CacheStage>
-__global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
+__global__ __launch_bounds__(256) void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
                                         TpPush8<1> push, const unsigned char* my_base,
                                         float* __restrict__ out,
                                         unsigned int* my_flags,
                                         unsigned int* seq_ctrs, unsigned int* timeout,
                                         int n, int slot_stride_bytes, int scale_off_bytes,
-                                        int stages) {
+                                        int stages, uint32_t ar_flags) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], 1u);
   __shared__ unsigned int s_seq;
   if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  __syncthreads();
+  aff::lds_barrier();
   const unsigned int s = s_seq;
   const int slot = (int)(s % TpContext::kTpSlots);
 
-  if (b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
+  if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
 
   unsigned char* const pb0 = push.base[0] + (size_t)slot * slot_stride_bytes;
   float* const p_scale0 = (float*)(pb0 + scale_off_bytes);
@@ -589,10 +643,11 @@ __global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
     }
   };
 
+  const bool fast_rel = (ar_flags & kTpArFlagFastRel) != 0u;
   auto publish_stage = [&](int st) {
     asm volatile("s_wait_storecnt 0x0" ::: "memory");
-    __syncthreads();
-    if (tid == 0) store_sys_rel(&push.flags[0][(size_t)(1 + st) * kTpMaxBlocks + b], s);
+    aff::lds_barrier();
+    if (tid == 0) publish_flag(&push.flags[0][(size_t)(1 + st) * kTpMaxBlocks + b], s, fast_rel);
   };
 
   auto fold_stage = [&](int st) {
@@ -608,7 +663,7 @@ __global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
         if ((int)(fv - s) < 0) note_timeout(timeout, s);
       }
     }
-    __syncthreads();
+    aff::lds_barrier();
     fence_sys_acq();
 
     const int sg0 = g0 + (gw_blk * st) / stages;
@@ -663,10 +718,388 @@ __global__ void tp_ar_fp8_staged_kernel(const float* __restrict__ in,
   fold_stage(stages - 1);
 }
 
-// Fused 2-rank exact FP32 all-reduce + batch HC post/expand (+ optional DSpark tap) over live
-// tokens [0, live) using ctx.scratch (0 B extra VRAM) and zeroing `block` across all [0, nb).
-template <uint32_t NH, bool HasTap, bool HasControl, bool LiveOne>
-__global__ void tp_ar_batch_hc_expand_kernel(
+// Lossless 12.125-bit exponent-delta BF16 codec (R2) for 64-element groups across 8 adjacent
+// Wave32 lanes. Encodes normals within span <= 14 exponents + exact +-0.0 into 96 B/group + 1 B
+// base_exp, with 128 B raw BF16 fallback (base_exp == 0xFF) for subnormals, Inf/NaN, or wide
+// exponent span so all 65,536 BF16 values round-trip bit-exactly.
+__device__ __forceinline__ unsigned r4d_arc_shfl(unsigned v, int src) {
+  return (unsigned)__builtin_amdgcn_ds_bpermute(src << 2, (int)v);
+}
+
+struct R4dArcEnc { unsigned w[3]; unsigned base; };
+
+__device__ __forceinline__ R4dArcEnc r4d_arc_enc(int4 v) {
+  const unsigned d[4] = {(unsigned)v.x, (unsigned)v.y, (unsigned)v.z, (unsigned)v.w};
+  unsigned emin = 255u, emax = 0u, bad = 0u;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const unsigned u = (d[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+    const unsigned e = (u >> 7) & 0xffu, m = u & 0x7fu;
+    if (e) { emin = e < emin ? e : emin; emax = e > emax ? e : emax; }
+    bad |= (unsigned)(e == 0u && m != 0u) | (unsigned)(e == 255u);
+  }
+  const int lane = (int)(threadIdx.x & 31u);
+#pragma unroll
+  for (int s = 1; s < 8; s <<= 1) {
+    const unsigned a = r4d_arc_shfl(emin, lane ^ s);
+    const unsigned b = r4d_arc_shfl(emax, lane ^ s);
+    const unsigned c = r4d_arc_shfl(bad, lane ^ s);
+    emin = a < emin ? a : emin;
+    emax = b > emax ? b : emax;
+    bad |= c;
+  }
+  R4dArcEnc r;
+  const unsigned base = (emin == 255u) ? 1u : emin;
+  r.base = (bad || emax > base + 14u) ? 0xFFu : base;
+  unsigned c[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const unsigned u = (d[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+    const unsigned e = (u >> 7) & 0xffu, m = u & 0x7fu, sg = u >> 15;
+    c[i] = (sg << 11) | (m << 4) | (e ? (e - base + 1u) & 15u : 0u);
+  }
+  r.w[0] = c[0] | (c[1] << 12) | (c[2] << 24);
+  r.w[1] = (c[2] >> 8) | (c[3] << 4) | (c[4] << 16) | (c[5] << 28);
+  r.w[2] = (c[5] >> 4) | (c[6] << 8) | (c[7] << 20);
+  return r;
+}
+
+__device__ __forceinline__ int4 r4d_arc_dec(const unsigned (&w)[3], unsigned base) {
+  unsigned c[8];
+  c[0] = w[0] & 0xfffu;
+  c[1] = (w[0] >> 12) & 0xfffu;
+  c[2] = (w[0] >> 24) | ((w[1] & 0xfu) << 8);
+  c[3] = (w[1] >> 4) & 0xfffu;
+  c[4] = (w[1] >> 16) & 0xfffu;
+  c[5] = (w[1] >> 28) | ((w[2] & 0xffu) << 4);
+  c[6] = (w[2] >> 8) & 0xfffu;
+  c[7] = w[2] >> 20;
+  unsigned u[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const unsigned off = c[i] & 15u;
+    u[i] = ((c[i] >> 11) << 15) | ((off ? base + off - 1u : 0u) << 7) | ((c[i] >> 4) & 0x7fu);
+  }
+  int4 v;
+  v.x = (int)(u[0] | (u[1] << 16));
+  v.y = (int)(u[2] | (u[3] << 16));
+  v.z = (int)(u[4] | (u[5] << 16));
+  v.w = (int)(u[6] | (u[7] << 16));
+  return v;
+}
+
+__device__ __forceinline__ int4 coded_load_bf16_chunk(const float* __restrict__ in, int n,
+                                                      int base_idx, bool vec_in) {
+  uint16_t h[8];
+  if (vec_in && base_idx + 7 < n) {
+    const float4 v0 = *(const float4*)(in + base_idx);
+    const float4 v1 = *(const float4*)(in + base_idx + 4);
+    h[0] = wmma::f32_to_bf16(v0.x); h[1] = wmma::f32_to_bf16(v0.y);
+    h[2] = wmma::f32_to_bf16(v0.z); h[3] = wmma::f32_to_bf16(v0.w);
+    h[4] = wmma::f32_to_bf16(v1.x); h[5] = wmma::f32_to_bf16(v1.y);
+    h[6] = wmma::f32_to_bf16(v1.z); h[7] = wmma::f32_to_bf16(v1.w);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int idx = base_idx + i;
+      h[i] = (idx < n) ? wmma::f32_to_bf16(in[idx]) : 0u;
+    }
+  }
+  int4 r;
+  r.x = (int)((uint32_t)h[0] | ((uint32_t)h[1] << 16));
+  r.y = (int)((uint32_t)h[2] | ((uint32_t)h[3] << 16));
+  r.z = (int)((uint32_t)h[4] | ((uint32_t)h[5] << 16));
+  r.w = (int)((uint32_t)h[6] | ((uint32_t)h[7] << 16));
+  return r;
+}
+
+__device__ __forceinline__ void coded_push_group(uint32_t* pb, uint8_t* p_bases, int g, int sub,
+                                                 int4 raw) {
+  const R4dArcEnc e = r4d_arc_enc(raw);
+  uint32_t* const g_pb = pb + (size_t)g * 32u;
+  if (e.base == 0xFFu) {
+    *(int4*)(g_pb + sub * 4) = raw;
+  } else {
+    g_pb[sub]      = e.w[0];
+    g_pb[8 + sub]  = e.w[1];
+    g_pb[16 + sub] = e.w[2];
+  }
+  if (sub == 0) p_bases[g] = (uint8_t)e.base;
+}
+
+__device__ __forceinline__ void coded_fold_group(const uint32_t* mb, const uint8_t* m_bases,
+                                                 float* __restrict__ out, int n, int g, int sub,
+                                                 int4 raw, bool vec_out) {
+  const uint32_t* const g_mb = mb + (size_t)g * 32u;
+  const uint8_t pbase = m_bases[g];
+  int4 peer_raw;
+  if (pbase == 0xFFu) {
+    peer_raw = *(const int4*)(g_mb + sub * 4);
+  } else {
+    unsigned w[3];
+    w[0] = g_mb[sub];
+    w[1] = g_mb[8 + sub];
+    w[2] = g_mb[16 + sub];
+    peer_raw = r4d_arc_dec(w, (unsigned)pbase);
+  }
+  const int base_idx = g * kTpCodedGroup + sub * 8;
+  const unsigned md[4] = {(unsigned)raw.x, (unsigned)raw.y, (unsigned)raw.z, (unsigned)raw.w};
+  const unsigned pd[4] = {(unsigned)peer_raw.x, (unsigned)peer_raw.y, (unsigned)peer_raw.z,
+                          (unsigned)peer_raw.w};
+  if (base_idx + 7 < n) {
+    float o[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint16_t mh = (uint16_t)((md[i >> 1] >> ((i & 1) * 16)) & 0xffffu);
+      const uint16_t ph = (uint16_t)((pd[i >> 1] >> ((i & 1) * 16)) & 0xffffu);
+      o[i] = wmma::bf16_to_f32(mh) + wmma::bf16_to_f32(ph);
+    }
+    if (vec_out) {
+      *(float4*)(out + base_idx)     = make_float4(o[0], o[1], o[2], o[3]);
+      *(float4*)(out + base_idx + 4) = make_float4(o[4], o[5], o[6], o[7]);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) out[base_idx + i] = o[i];
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int idx = base_idx + i;
+      if (idx < n) {
+        const uint16_t mh = (uint16_t)((md[i >> 1] >> ((i & 1) * 16)) & 0xffffu);
+        const uint16_t ph = (uint16_t)((pd[i >> 1] >> ((i & 1) * 16)) & 0xffffu);
+        out[idx] = wmma::bf16_to_f32(mh) + wmma::bf16_to_f32(ph);
+      }
+    }
+  }
+}
+
+template <bool CACHE_REGS = false>
+__global__ __launch_bounds__(256) void tp_ar_coded_kernel(
+    const float* __restrict__ in, TpPush8<1> push, const unsigned char* my_base,
+    float* __restrict__ out, unsigned int* my_flags, unsigned int* seq_ctrs,
+    unsigned int* timeout, int n, size_t slot_stride_bytes, size_t base_off_bytes,
+    uint32_t ar_flags) {
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], 1u);
+  __shared__ unsigned int s_seq;
+  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
+  aff::lds_barrier();
+  const unsigned int s = s_seq;
+  const int slot = (int)(s % TpContext::kTpSlots);
+  if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
+
+  unsigned char* const pb_bytes = push.base[0] + (size_t)slot * slot_stride_bytes;
+  uint32_t* const pb = (uint32_t*)pb_bytes;
+  uint8_t* const p_bases = (uint8_t*)(pb_bytes + base_off_bytes);
+  const unsigned char* const mb_bytes = my_base + (size_t)slot * slot_stride_bytes;
+  const uint32_t* const mb = (const uint32_t*)mb_bytes;
+  const uint8_t* const m_bases = (const uint8_t*)(mb_bytes + base_off_bytes);
+
+  const int n_groups = (n + kTpCodedGroup - 1) / kTpCodedGroup;
+  const int waves = nt / kWave;
+  const int lane = tid & (kWave - 1);
+  const int wave = tid / kWave;
+  const int sub = lane & 7;
+  const int gw = (n_groups + nb - 1) / nb;
+  const int g0 = b * gw;
+  const int g1 = (g0 + gw < n_groups) ? (g0 + gw) : n_groups;
+  const bool vec_in = (((uintptr_t)in & 15u) == 0u);
+  const bool vec_out = (((uintptr_t)out & 15u) == 0u);
+
+  int4 reg_raw[CACHE_REGS ? kTpCodedRegCacheGroups : 1];
+  if constexpr (CACHE_REGS) {
+#pragma unroll
+    for (int gi = 0; gi < kTpCodedRegCacheGroups; ++gi) {
+      const int gw_i = g0 + wave * 4 + gi * (waves * 4);
+      if (gw_i < g1) {
+        const int g = gw_i + (lane >> 3);
+        if (g < g1) {
+          const int4 raw = coded_load_bf16_chunk(in, n, g * kTpCodedGroup + sub * 8, vec_in);
+          reg_raw[gi] = raw;
+          coded_push_group(pb, p_bases, g, sub, raw);
+        }
+      }
+    }
+    for (int gw_i = g0 + wave * 4 + kTpCodedRegCacheGroups * (waves * 4); gw_i < g1;
+         gw_i += waves * 4) {
+      const int g = gw_i + (lane >> 3);
+      if (g < g1) {
+        const int4 raw = coded_load_bf16_chunk(in, n, g * kTpCodedGroup + sub * 8, vec_in);
+        coded_push_group(pb, p_bases, g, sub, raw);
+      }
+    }
+  } else {
+    for (int gw_i = g0 + wave * 4; gw_i < g1; gw_i += waves * 4) {
+      const int g = gw_i + (lane >> 3);
+      if (g < g1) {
+        const int4 raw = coded_load_bf16_chunk(in, n, g * kTpCodedGroup + sub * 8, vec_in);
+        coded_push_group(pb, p_bases, g, sub, raw);
+      }
+    }
+  }
+
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  aff::lds_barrier();
+  if (tid == 0) {
+    const bool fast_rel = (ar_flags & kTpArFlagFastRel) != 0u;
+    publish_flag(&push.flags[0][b], s, fast_rel);
+    const unsigned int* const f = &my_flags[b];
+    unsigned long long z = 0;
+    unsigned int fv = load_sys_relaxed(f);
+    if ((int)(fv - s) < 0) {
+      do {
+        __builtin_amdgcn_s_sleep(1);
+        fv = load_sys_relaxed(f);
+      } while ((int)(fv - s) < 0 && ++z <= kTpSpinMax);
+      if ((int)(fv - s) < 0) note_timeout(timeout, s);
+    }
+  }
+  aff::lds_barrier();
+  fence_sys_acq();
+
+  if constexpr (CACHE_REGS) {
+#pragma unroll
+    for (int gi = 0; gi < kTpCodedRegCacheGroups; ++gi) {
+      const int gw_i = g0 + wave * 4 + gi * (waves * 4);
+      if (gw_i < g1) {
+        const int g = gw_i + (lane >> 3);
+        if (g < g1) {
+          coded_fold_group(mb, m_bases, out, n, g, sub, reg_raw[gi], vec_out);
+        }
+      }
+    }
+    for (int gw_i = g0 + wave * 4 + kTpCodedRegCacheGroups * (waves * 4); gw_i < g1;
+         gw_i += waves * 4) {
+      const int g = gw_i + (lane >> 3);
+      if (g < g1) {
+        const int4 raw = coded_load_bf16_chunk(in, n, g * kTpCodedGroup + sub * 8, vec_in);
+        coded_fold_group(mb, m_bases, out, n, g, sub, raw, vec_out);
+      }
+    }
+  } else {
+    for (int gw_i = g0 + wave * 4; gw_i < g1; gw_i += waves * 4) {
+      const int g = gw_i + (lane >> 3);
+      if (g < g1) {
+        const int4 raw = coded_load_bf16_chunk(in, n, g * kTpCodedGroup + sub * 8, vec_in);
+        coded_fold_group(mb, m_bases, out, n, g, sub, raw, vec_out);
+      }
+    }
+  }
+}
+
+template <bool CacheStage>
+__global__ __launch_bounds__(256) void tp_ar_coded_staged_kernel(
+    const float* __restrict__ in, TpPush8<1> push, const unsigned char* my_base,
+    float* __restrict__ out, unsigned int* my_flags, unsigned int* seq_ctrs,
+    unsigned int* timeout, int n, size_t slot_stride_bytes, size_t base_off_bytes,
+    int stages, uint32_t ar_flags) {
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], 1u);
+  __shared__ unsigned int s_seq;
+  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
+  aff::lds_barrier();
+  const unsigned int s = s_seq;
+  const int slot = (int)(s % TpContext::kTpSlots);
+  if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
+
+  unsigned char* const pb_bytes = push.base[0] + (size_t)slot * slot_stride_bytes;
+  uint32_t* const pb = (uint32_t*)pb_bytes;
+  uint8_t* const p_bases = (uint8_t*)(pb_bytes + base_off_bytes);
+  const unsigned char* const mb_bytes = my_base + (size_t)slot * slot_stride_bytes;
+  const uint32_t* const mb = (const uint32_t*)mb_bytes;
+  const uint8_t* const m_bases = (const uint8_t*)(mb_bytes + base_off_bytes);
+
+  const int n_groups = (n + kTpCodedGroup - 1) / kTpCodedGroup;
+  const int waves = nt / kWave;
+  const int lane = tid & (kWave - 1);
+  const int wave = tid / kWave;
+  const int sub = lane & 7;
+  const int gw = (n_groups + nb - 1) / nb;
+  const int g0 = b * gw;
+  const int g1 = (g0 + gw < n_groups) ? (g0 + gw) : n_groups;
+  const int gw_blk = (g1 > g0) ? (g1 - g0) : 0;
+  const bool vec_in = (((uintptr_t)in & 15u) == 0u);
+  const bool vec_out = (((uintptr_t)out & 15u) == 0u);
+  const bool fast_rel = (ar_flags & kTpArFlagFastRel) != 0u;
+
+  __shared__ int4 s_raw[CacheStage ? 2 : 1][CacheStage ? kTpCodedStageIters : 1]
+                       [CacheStage ? 256 : 1];
+
+  auto push_stage = [&](int st) {
+    const int sg0 = g0 + (gw_blk * st) / stages;
+    const int sg1 = g0 + (gw_blk * (st + 1)) / stages;
+    const int bank = st & 1;
+    int li = 0;
+    for (int gw_i = sg0 + wave * 4; gw_i < sg1; gw_i += waves * 4, ++li) {
+      const int g = gw_i + (lane >> 3);
+      if (g < sg1) {
+        const int4 raw = coded_load_bf16_chunk(in, n, g * kTpCodedGroup + sub * 8, vec_in);
+        if constexpr (CacheStage) {
+          if (li < kTpCodedStageIters) s_raw[bank][li][tid] = raw;
+        }
+        coded_push_group(pb, p_bases, g, sub, raw);
+      }
+    }
+  };
+
+  auto publish_stage = [&](int st) {
+    asm volatile("s_wait_storecnt 0x0" ::: "memory");
+    aff::lds_barrier();
+    if (tid == 0) publish_flag(&push.flags[0][(size_t)(1 + st) * kTpMaxBlocks + b], s, fast_rel);
+  };
+
+  auto fold_stage = [&](int st) {
+    if (tid == 0) {
+      const unsigned int* const f = &my_flags[(size_t)(1 + st) * kTpMaxBlocks + b];
+      unsigned long long z = 0;
+      unsigned int fv = load_sys_relaxed(f);
+      if ((int)(fv - s) < 0) {
+        do {
+          __builtin_amdgcn_s_sleep(1);
+          fv = load_sys_relaxed(f);
+        } while ((int)(fv - s) < 0 && ++z <= kTpSpinMax);
+        if ((int)(fv - s) < 0) note_timeout(timeout, s);
+      }
+    }
+    aff::lds_barrier();
+    fence_sys_acq();
+
+    const int sg0 = g0 + (gw_blk * st) / stages;
+    const int sg1 = g0 + (gw_blk * (st + 1)) / stages;
+    const int bank = st & 1;
+    int li = 0;
+    for (int gw_i = sg0 + wave * 4; gw_i < sg1; gw_i += waves * 4, ++li) {
+      const int g = gw_i + (lane >> 3);
+      if (g < sg1) {
+        int4 raw;
+        if constexpr (CacheStage) {
+          if (li < kTpCodedStageIters) raw = s_raw[bank][li][tid];
+          else raw = coded_load_bf16_chunk(in, n, g * kTpCodedGroup + sub * 8, vec_in);
+        } else {
+          raw = coded_load_bf16_chunk(in, n, g * kTpCodedGroup + sub * 8, vec_in);
+        }
+        coded_fold_group(mb, m_bases, out, n, g, sub, raw, vec_out);
+      }
+    }
+  };
+
+  push_stage(0);
+  publish_stage(0);
+  for (int st = 1; st < stages; ++st) {
+    push_stage(st);
+    fold_stage(st - 1);
+    publish_stage(st);
+  }
+  fold_stage(stages - 1);
+}
+
+// Fused 2-rank exact FP32 all-reduce + batch HC post/expand (+ optional DSpark tap, V4.1
+// pre_in collapse+sq, and side-band Infinity Cache prefetch) over live tokens [0, live) using
+// ctx.scratch (0 B extra VRAM) and zeroing `block` across all [0, nb).
+template <uint32_t NH, bool HasTap, bool HasControl, bool LiveOne, bool HasPreCollapse,
+          bool RegForm>
+__global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
     uint16_t* __restrict__ out_hc, float* __restrict__ block, const uint16_t* __restrict__ hc,
     const float* __restrict__ post, const float* __restrict__ comb, uint32_t n_embd, uint32_t nb,
     uint32_t live, int zb, float* __restrict__ tap, uint32_t b_lo, uint32_t n_keep,
@@ -674,36 +1107,169 @@ __global__ void tp_ar_batch_hc_expand_kernel(
     float* __restrict__ peer_scratch, const float* __restrict__ my_scratch,
     unsigned int* __restrict__ peer_flags, unsigned int* __restrict__ my_flags,
     unsigned int* __restrict__ peer_wake, unsigned int* __restrict__ seq_ctrs,
-    unsigned int* __restrict__ timeout, size_t slot_floats) {
+    unsigned int* __restrict__ timeout, size_t slot_floats, uint32_t ar_blk,
+    uint32_t ar_flags, const float* __restrict__ pre_in, float* __restrict__ out_cur,
+    float* __restrict__ out_part, const uint4* __restrict__ pf_p0, size_t pf_n16_0,
+    const uint4* __restrict__ pf_p1, size_t pf_n16_1, uint32_t pf_blocks) {
   const uint32_t b_blk = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  if ((ar_flags & kTpArFlagWakeEarly) && b_blk == 0u && tid == 0u) {
+    store_sys_relaxed(peer_wake, 1u);
+  }
+  if (b_blk >= ar_blk) {
+    const uint32_t pid = b_blk - ar_blk;
+    const size_t p_stride = (size_t)pf_blocks * nt;
+    unsigned int init_f = 0u;
+    if ((tid & 31u) == 0u) init_f = load_sys_relaxed(&my_flags[0]);
+    init_f = (unsigned int)__shfl((int)init_f, 0, kWave);
+    auto peer_done = [&]() -> bool {
+      unsigned int f = 0u;
+      if ((tid & 31u) == 0u) f = load_sys_relaxed(&my_flags[0]);
+      f = (unsigned int)__shfl((int)f, 0, kWave);
+      return f != init_f;
+    };
+    unsigned int acc = 0u;
+    uint32_t iter = 0u;
+    bool stop = false;
+    for (size_t i = (size_t)pid * nt + tid; i < pf_n16_0; i += p_stride) {
+      const uint4 v = pf_p0[i];
+      acc ^= (v.x ^ v.y ^ v.z ^ v.w);
+      if ((++iter & 15u) == 0u && peer_done()) { stop = true; break; }
+    }
+    if (!stop) {
+      for (size_t i = (size_t)pid * nt + tid; i < pf_n16_1; i += p_stride) {
+        const uint4 v = pf_p1[i];
+        acc ^= (v.x ^ v.y ^ v.z ^ v.w);
+        if ((++iter & 15u) == 0u && peer_done()) break;
+      }
+    }
+    asm volatile("" :: "v"(acc));
+    return;
+  }
+
   __shared__ unsigned int s_seq;
-  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b_blk], 1u) + 1u;
-  __syncthreads();
+  __shared__ float s_pre[HasPreCollapse ? (NH * 16u) : 1u];
+  __shared__ float s_red_cur[HasPreCollapse ? (16u * 256u) : 1u];
+  __shared__ float s_red_hc[HasPreCollapse ? (16u * 256u) : 1u];
+  const uint32_t eff_live = LiveOne ? 1u : live;
+  if (tid == 0u) s_seq = atomicAdd(&seq_ctrs[b_blk], 1u) + 1u;
+  if constexpr (HasPreCollapse) {
+    if (tid < NH * 16u) {
+      const uint32_t h = tid >> 4;
+      const uint32_t b = tid & 15u;
+      s_pre[tid] = (b < eff_live) ? pre_in[(size_t)h * nb + b] : 0.0f;
+    }
+    for (uint32_t b = 0u; b < eff_live; ++b) {
+      s_red_cur[b * 256u + tid] = 0.0f;
+      s_red_hc[b * 256u + tid] = 0.0f;
+    }
+  }
+  aff::lds_barrier();
   const unsigned int s = s_seq;
   const int slot = (int)(s % TpContext::kTpSlots);
 
-  if (b_blk == 0 && tid == 0) store_sys_relaxed(peer_wake, s);
+  if (!(ar_flags & kTpArFlagWakeEarly) && b_blk == 0u && tid == 0u) {
+    store_sys_relaxed(peer_wake, s);
+  }
 
   float* const ps = peer_scratch + (size_t)slot * slot_floats;
   const float* const ms = my_scratch + (size_t)slot * slot_floats;
 
-  const uint32_t d_per_blk = (n_embd + gridDim.x - 1u) / gridDim.x;
+  const uint32_t d_per_blk_raw = (n_embd + ar_blk - 1u) / ar_blk;
+  const uint32_t d_per_blk = RegForm ? ((d_per_blk_raw + 3u) & ~3u) : d_per_blk_raw;
   const uint32_t d0 = (uint32_t)min((size_t)n_embd, (size_t)b_blk * d_per_blk);
   const uint32_t d1 = (uint32_t)min((size_t)n_embd, (size_t)d0 + d_per_blk);
-  const size_t idx0 = LiveOne ? (size_t)d0 : (size_t)d0 * live;
-  const size_t idx1 = LiveOne ? (size_t)d1 : (size_t)d1 * live;
+  const size_t idx0 = LiveOne ? (size_t)d0 : (size_t)d0 * eff_live;
+  const size_t idx1 = LiveOne ? (size_t)d1 : (size_t)d1 * eff_live;
+  const size_t blk_elems = idx1 - idx0;
 
-  for (size_t idx = idx0 + tid; idx < idx1; idx += nt) {
-    const uint32_t d = LiveOne ? (uint32_t)idx : (uint32_t)(idx / live);
-    const uint32_t tok = LiveOne ? 0u : (uint32_t)(idx - (size_t)d * live);
-    ps[idx] = block[(size_t)d * nb + tok];
+  constexpr uint32_t kRegChunks = 3u;
+  constexpr uint32_t kRegCap = kRegChunks * 4u;
+  float r_blk[RegForm ? kRegCap : 1u];
+
+  const uint32_t d0_t = LiveOne ? (d0 + (RegForm ? (tid * 4u) : tid))
+                                : (d0 + (RegForm ? (tid * 4u) : tid) / eff_live);
+  const uint32_t tok0_t = LiveOne ? 0u : ((RegForm ? (tid * 4u) : tid) % eff_live);
+
+  if constexpr (RegForm) {
+    const uint32_t step_d = LiveOne ? (nt * 4u) : ((nt * 4u) / eff_live);
+    const uint32_t step_tok = LiveOne ? 0u : ((nt * 4u) - step_d * eff_live);
+    const bool vec_blk = (!LiveOne) && (eff_live == nb) && ((nb & 3u) == 0u) &&
+                         (((uintptr_t)block & 15u) == 0u);
+    uint32_t d_g = d0_t, tok_g = tok0_t;
+#pragma unroll
+    for (uint32_t g = 0u; g < kRegChunks; ++g) {
+      const size_t off = (size_t)g * (nt * 4u) + (size_t)tid * 4u;
+      if (off + 3u < blk_elems) {
+        if (vec_blk) {
+          const float4 b4 = *(const float4*)(block + (size_t)d_g * nb + tok_g);
+          r_blk[g * 4u + 0u] = b4.x;
+          r_blk[g * 4u + 1u] = b4.y;
+          r_blk[g * 4u + 2u] = b4.z;
+          r_blk[g * 4u + 3u] = b4.w;
+          *(float4*)(ps + idx0 + off) = b4;
+        } else {
+          uint32_t d = d_g, tok = tok_g;
+#pragma unroll
+          for (uint32_t j = 0u; j < 4u; ++j) {
+            r_blk[g * 4u + j] = block[(size_t)d * nb + tok];
+            if constexpr (!LiveOne) {
+              ++tok;
+              if (tok == live) { tok = 0u; ++d; }
+            } else {
+              ++d;
+            }
+          }
+          *(float4*)(ps + idx0 + off) =
+              make_float4(r_blk[g * 4u + 0u], r_blk[g * 4u + 1u],
+                          r_blk[g * 4u + 2u], r_blk[g * 4u + 3u]);
+        }
+      } else if (off < blk_elems) {
+        uint32_t d = d_g, tok = tok_g;
+#pragma unroll
+        for (uint32_t j = 0u; j < 4u; ++j) {
+          if (off + j < blk_elems) {
+            const float val = block[(size_t)d * nb + tok];
+            r_blk[g * 4u + j] = val;
+            ps[idx0 + off + j] = val;
+          }
+          if constexpr (!LiveOne) {
+            ++tok;
+            if (tok == live) { tok = 0u; ++d; }
+          } else {
+            ++d;
+          }
+        }
+      }
+      if constexpr (!LiveOne) {
+        tok_g += step_tok;
+        d_g += step_d;
+        if (tok_g >= live) { tok_g -= live; ++d_g; }
+      } else {
+        d_g += nt * 4u;
+      }
+    }
+  } else {
+    const uint32_t step_d = LiveOne ? nt : (nt / live);
+    const uint32_t step_tok = LiveOne ? 0u : (nt - step_d * live);
+    uint32_t d = d0_t, tok = tok0_t;
+    for (size_t idx = idx0 + tid; idx < idx1; idx += nt) {
+      ps[idx] = block[(size_t)d * nb + tok];
+      if constexpr (!LiveOne) {
+        tok += step_tok;
+        d += step_d;
+        if (tok >= live) { tok -= live; ++d; }
+      } else {
+        d += nt;
+      }
+    }
   }
 
   asm volatile("s_wait_storecnt 0x0" ::: "memory");
-  __syncthreads();
+  aff::lds_barrier();
 
-  if (tid == 0) {
-    store_sys_rel(&peer_flags[b_blk], s);
+  if (tid == 0u) {
+    const bool fast_rel = (ar_flags & kTpArFlagFastRel) != 0u;
+    publish_flag(&peer_flags[b_blk], s, fast_rel);
     const unsigned int* const f = &my_flags[b_blk];
     unsigned long long z = 0;
     unsigned int fv = load_sys_relaxed(f);
@@ -715,30 +1281,36 @@ __global__ void tp_ar_batch_hc_expand_kernel(
       if ((int)(fv - s) < 0) note_timeout(timeout, s);
     }
   }
-  __syncthreads();
+  aff::lds_barrier();
   fence_sys_acq();
 
-  for (size_t idx = idx0 + tid; idx < idx1; idx += nt) {
-    const uint32_t d = LiveOne ? (uint32_t)idx : (uint32_t)(idx / live);
-    const uint32_t tok = LiveOne ? 0u : (uint32_t)(idx - (size_t)d * live);
+  auto process_elem = [&](uint32_t d, uint32_t tok, float bv) __attribute__((always_inline)) {
     const size_t blk_idx = (size_t)d * nb + tok;
-    const float bv = block[blk_idx] + ms[idx];
     if (zb) block[blk_idx] = 0.0f;
     if constexpr (HasControl) {
       float v[NH];
 #pragma unroll
-      for (uint32_t src = 0; src < NH; ++src)
+      for (uint32_t src = 0u; src < NH; ++src)
         v[src] = wmma::bf16_to_f32(hc[((size_t)src * n_embd + d) * nb + tok]);
       float tap_acc = 0.0f;
+      float cval = 0.0f;
+      float hsq = 0.0f;
 #pragma unroll
-      for (uint32_t dst = 0; dst < NH; ++dst) {
+      for (uint32_t dst = 0u; dst < NH; ++dst) {
         float acc = bv * post[(size_t)dst * nb + tok];
 #pragma unroll
-        for (uint32_t src = 0; src < NH; ++src)
+        for (uint32_t src = 0u; src < NH; ++src)
           acc += comb[(size_t)(dst + src * NH) * nb + tok] * v[src];
         const uint16_t h16 = wmma::f32_to_bf16(acc);
         out_hc[((size_t)dst * n_embd + d) * nb + tok] = h16;
-        if constexpr (HasTap) tap_acc += wmma::bf16_to_f32(h16);
+        if constexpr (HasTap || HasPreCollapse) {
+          const float hf = wmma::bf16_to_f32(h16);
+          if constexpr (HasTap) tap_acc += hf;
+          if constexpr (HasPreCollapse) {
+            cval += hf * s_pre[dst * 16u + tok];
+            hsq += hf * hf;
+          }
+        }
       }
       if constexpr (HasTap) {
         if (tok >= b_lo && tok < b_lo + n_keep) {
@@ -746,25 +1318,117 @@ __global__ void tp_ar_batch_hc_expand_kernel(
           if (row < rows_cap) tap[(size_t)row * row_stride + slot_off + d] = tap_acc / (float)NH;
         }
       }
+      if constexpr (HasPreCollapse) {
+        out_cur[blk_idx] = cval;
+        s_red_cur[tok * 256u + tid] += cval * cval;
+        s_red_hc[tok * 256u + tid] += hsq;
+      }
     } else {
       out_hc[blk_idx] = wmma::f32_to_bf16(wmma::bf16_to_f32(out_hc[blk_idx]) + bv);
+    }
+  };
+
+  if constexpr (RegForm) {
+    const uint32_t step_d = LiveOne ? (nt * 4u) : ((nt * 4u) / eff_live);
+    const uint32_t step_tok = LiveOne ? 0u : ((nt * 4u) - step_d * eff_live);
+    uint32_t d_g = d0_t, tok_g = tok0_t;
+#pragma unroll
+    for (uint32_t g = 0u; g < kRegChunks; ++g) {
+      const size_t off = (size_t)g * (nt * 4u) + (size_t)tid * 4u;
+      if (off + 3u < blk_elems) {
+        const float4 m4 = *(const float4*)(ms + idx0 + off);
+        const float m_arr[4] = {m4.x, m4.y, m4.z, m4.w};
+        uint32_t d = d_g, tok = tok_g;
+#pragma unroll
+        for (uint32_t j = 0u; j < 4u; ++j) {
+          process_elem(d, tok, r_blk[g * 4u + j] + m_arr[j]);
+          if constexpr (!LiveOne) {
+            ++tok;
+            if (tok == eff_live) { tok = 0u; ++d; }
+          } else {
+            ++d;
+          }
+        }
+      } else if (off < blk_elems) {
+        uint32_t d = d_g, tok = tok_g;
+#pragma unroll
+        for (uint32_t j = 0u; j < 4u; ++j) {
+          if (off + j < blk_elems) {
+            process_elem(d, tok, r_blk[g * 4u + j] + ms[idx0 + off + j]);
+          }
+          if constexpr (!LiveOne) {
+            ++tok;
+            if (tok == eff_live) { tok = 0u; ++d; }
+          } else {
+            ++d;
+          }
+        }
+      }
+      if constexpr (!LiveOne) {
+        tok_g += step_tok;
+        d_g += step_d;
+        if (tok_g >= eff_live) { tok_g -= eff_live; ++d_g; }
+      } else {
+        d_g += nt * 4u;
+      }
+    }
+  } else {
+    const uint32_t step_d = LiveOne ? nt : (nt / eff_live);
+    const uint32_t step_tok = LiveOne ? 0u : (nt - step_d * eff_live);
+    uint32_t d = d0_t, tok = tok0_t;
+    for (size_t idx = idx0 + tid; idx < idx1; idx += nt) {
+      const float bv = block[(size_t)d * nb + tok] + ms[idx];
+      process_elem(d, tok, bv);
+      if constexpr (!LiveOne) {
+        tok += step_tok;
+        d += step_d;
+        if (tok >= eff_live) { tok -= eff_live; ++d; }
+      } else {
+        d += nt;
+      }
     }
   }
 
   if (live < nb) {
     const uint32_t pad = nb - live;
     const size_t ptot = (size_t)(d1 - d0) * pad;
+    const uint32_t pstep_d = nt / pad;
+    const uint32_t pstep_tok = nt - pstep_d * pad;
+    uint32_t pd = d0 + tid / pad;
+    uint32_t ptok = tid % pad;
     for (size_t pidx = tid; pidx < ptot; pidx += nt) {
-      const uint32_t d = d0 + (uint32_t)(pidx / pad);
-      const uint32_t tok = live + (uint32_t)(pidx % pad);
-      if (zb) block[(size_t)d * nb + tok] = 0.0f;
+      const uint32_t tok = live + ptok;
+      if (zb) block[(size_t)pd * nb + tok] = 0.0f;
       if constexpr (HasControl) {
 #pragma unroll
-        for (uint32_t dst = 0; dst < NH; ++dst)
-          out_hc[((size_t)dst * n_embd + d) * nb + tok] = 0u;
+        for (uint32_t dst = 0u; dst < NH; ++dst)
+          out_hc[((size_t)dst * n_embd + pd) * nb + tok] = 0u;
+        if constexpr (HasPreCollapse) out_cur[(size_t)pd * nb + tok] = 0.0f;
       } else {
-        out_hc[(size_t)d * nb + tok] = 0u;
+        out_hc[(size_t)pd * nb + tok] = 0u;
       }
+      ptok += pstep_tok;
+      pd += pstep_d;
+      if (ptok >= pad) { ptok -= pad; ++pd; }
+    }
+  }
+
+  if constexpr (HasPreCollapse) {
+    aff::lds_barrier();
+    for (uint32_t st = 128u; st > 0u; st >>= 1) {
+      if (tid < st) {
+        for (uint32_t b = 0u; b < eff_live; ++b) {
+          s_red_cur[b * 256u + tid] += s_red_cur[b * 256u + tid + st];
+          s_red_hc[b * 256u + tid]  += s_red_hc[b * 256u + tid + st];
+        }
+      }
+      aff::lds_barrier();
+    }
+    if (tid < 16u) {
+      const float v_hc  = (tid < eff_live) ? s_red_hc[tid * 256u]  : 0.0f;
+      const float v_cur = (tid < eff_live) ? s_red_cur[tid * 256u] : 0.0f;
+      out_part[(size_t)b_blk * 16u + tid] = v_hc;
+      out_part[(size_t)(32u + b_blk) * 16u + tid] = v_cur;
     }
   }
 }
@@ -951,11 +1615,18 @@ void tp_reset_seq(TpContext& ctx) {
       AFF_HIP_CHECK(hipMemsetAsync(ctx.seq[r], 0, kTpMaxBlocks * sizeof(unsigned),
                                    (hipStream_t)ctx.stream[r]));
     }
-    // fseq is a 2-element array (fold path, 2 ranks only). Do not index past it.
-    if (r < 2 && ctx.fseq[r]) {
-      set_device(ctx.dev[r]);
-      AFF_HIP_CHECK(hipMemsetAsync(ctx.fseq[r], 0, kTpMaxBlocks * sizeof(unsigned),
-                                   (hipStream_t)ctx.stream[r]));
+    // fseq and fflags are 2-element arrays (fold path, 2 ranks only). Do not index past it.
+    if (r < 2) {
+      if (ctx.fflags[r]) {
+        set_device(ctx.dev[r]);
+        AFF_HIP_CHECK(hipMemsetAsync(ctx.fflags[r], 0, kTpMaxBlocks * sizeof(unsigned),
+                                     (hipStream_t)ctx.stream[r]));
+      }
+      if (ctx.fseq[r]) {
+        set_device(ctx.dev[r]);
+        AFF_HIP_CHECK(hipMemsetAsync(ctx.fseq[r], 0, kTpMaxBlocks * sizeof(unsigned),
+                                     (hipStream_t)ctx.stream[r]));
+      }
     }
   }
   ctx.last_scratch_nb = 0;
@@ -1024,6 +1695,40 @@ static inline bool tp_ar_staged_cache_enabled() {
   return !(v && *v && std::strcmp(v, "0") == 0);
 }
 
+static inline bool tp_ar_fast_rel_enabled() {
+  const char* v = std::getenv("AFF_AR_FAST_REL");
+  return v && std::strcmp(v, "1") == 0;
+}
+
+static inline bool tp_ar_wake_store_enabled() {
+  const char* v = std::getenv("AFF_AR_WAKE_STORE");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+static inline bool tp_ar_reg_form_enabled() {
+  const char* v = std::getenv("AFF_AR_REG_FORM");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+static inline bool tp_ar_coded_enabled() {
+  const char* v = std::getenv("AFF_TP_AR_CODED");
+  return v && *v && std::strcmp(v, "0") != 0;
+}
+
+static inline size_t tp_ar_prefetch_max_bytes() {
+  const char* v = std::getenv("AFF_PREFETCH_MB");
+  if (!v || !*v) return (size_t)8u << 20;
+  const long mb = std::strtol(v, nullptr, 10);
+  return mb > 0 ? ((size_t)mb << 20) : 0u;
+}
+
+static inline uint32_t tp_ar_flags_cfg() {
+  uint32_t f = 0u;
+  if (tp_ar_fast_rel_enabled()) f |= kTpArFlagFastRel;
+  if (tp_ar_wake_store_enabled()) f |= kTpArFlagWakeEarly;
+  return f;
+}
+
 static inline void tp_sync_on_grid_change(TpContext& ctx, int nb) {
   if (ctx.ranks > 1 && ctx.last_scratch_nb != 0 && ctx.last_scratch_nb != nb) {
     for (size_t r = 0; r < ctx.ranks; ++r) {
@@ -1052,6 +1757,9 @@ template <int NPEER>
 void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4, int nb, int nt,
                      int slot4, int peer4) {
   const bool tp_nrank_sync = tp_nrank_sync_enabled();
+  const bool reg_cache = (NPEER == 1) && tp_ar_reg_form_enabled() &&
+                         ((size_t)n4 <= (size_t)nb * (size_t)nt * 8u);
+  const uint32_t ar_flags = tp_ar_flags_cfg();
   const size_t np = ctx.ranks - 1;
   for (size_t r = 0; r < ctx.ranks; ++r) {
     TpPush<NPEER> push{};
@@ -1064,16 +1772,21 @@ void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4
       ++j;
     }
     set_device(ctx.dev[r]);
-    if (tp_nrank_sync && NPEER > 1) {
-      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_kernel<NPEER, true>), dim3(nb), dim3(nt), 0,
+    if (reg_cache) {
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_kernel<NPEER, false, true>), dim3(nb), dim3(nt), 0,
                          (hipStream_t)ctx.stream[r], (const float4*)in[r], push,
                          (const float4*)ctx.scratch[r], (float4*)out[r], ctx.flags[r], ctx.seq[r],
-                         ctx.timeout_dev, n4, slot4, peer4, (int)r);
+                         ctx.timeout_dev, n4, slot4, peer4, (int)r, ar_flags);
+    } else if (tp_nrank_sync && NPEER > 1) {
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_kernel<NPEER, true, false>), dim3(nb), dim3(nt), 0,
+                         (hipStream_t)ctx.stream[r], (const float4*)in[r], push,
+                         (const float4*)ctx.scratch[r], (float4*)out[r], ctx.flags[r], ctx.seq[r],
+                         ctx.timeout_dev, n4, slot4, peer4, (int)r, ar_flags);
     } else {
-      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_kernel<NPEER, false>), dim3(nb), dim3(nt), 0,
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_kernel<NPEER, false, false>), dim3(nb), dim3(nt), 0,
                          (hipStream_t)ctx.stream[r], (const float4*)in[r], push,
                          (const float4*)ctx.scratch[r], (float4*)out[r], ctx.flags[r], ctx.seq[r],
-                         ctx.timeout_dev, n4, slot4, peer4, (int)r);
+                         ctx.timeout_dev, n4, slot4, peer4, (int)r, ar_flags);
     }
     AFF_HIP_CHECK(hipGetLastError());
   }
@@ -1083,6 +1796,7 @@ template <int NPEER>
 void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, int nb,
                    int slot_bytes, int peer_bytes, int scale_off) {
   const bool tp_nrank_sync = tp_nrank_sync_enabled();
+  const uint32_t ar_flags = tp_ar_flags_cfg();
   const size_t np = ctx.ranks - 1;
   const int n_groups = (n + kTpFp8Group - 1) / kTpFp8Group;
   const int gw = (n_groups + nb - 1) / nb;
@@ -1103,12 +1817,14 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
             hipLaunchKernelGGL((tp_ar_fp8_staged_kernel<true>), dim3(nb), dim3(256), 0,
                                (hipStream_t)ctx.stream[r], in[r], push,
                                (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r],
-                               ctx.seq[r], ctx.timeout_dev, n, slot_bytes, scale_off, stages);
+                               ctx.seq[r], ctx.timeout_dev, n, slot_bytes, scale_off, stages,
+                               ar_flags);
           } else {
             hipLaunchKernelGGL((tp_ar_fp8_staged_kernel<false>), dim3(nb), dim3(256), 0,
                                (hipStream_t)ctx.stream[r], in[r], push,
                                (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r],
-                               ctx.seq[r], ctx.timeout_dev, n, slot_bytes, scale_off, stages);
+                               ctx.seq[r], ctx.timeout_dev, n, slot_bytes, scale_off, stages,
+                               ar_flags);
           }
           AFF_HIP_CHECK(hipGetLastError());
         }
@@ -1132,23 +1848,84 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
         hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, true, true>), dim3(nb),
                            dim3(256), 0, (hipStream_t)ctx.stream[r], in[r], push,
                            (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
-                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r,
+                           ar_flags);
       else
         hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, true, false>), dim3(nb),
                            dim3(256), 0, (hipStream_t)ctx.stream[r], in[r], push,
                            (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
-                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r,
+                           ar_flags);
     } else {
       if (cache_regs)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, false, true>), dim3(nb),
                            dim3(256), 0, (hipStream_t)ctx.stream[r], in[r], push,
                            (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
-                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r,
+                           ar_flags);
       else
         hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_ar_fp8_kernel<NPEER, false, false>), dim3(nb),
                            dim3(256), 0, (hipStream_t)ctx.stream[r], in[r], push,
                            (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
-                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r);
+                           ctx.timeout_dev, n, slot_bytes, peer_bytes, scale_off, (int)r,
+                           ar_flags);
+    }
+    AFF_HIP_CHECK(hipGetLastError());
+  }
+}
+
+void tp_launch_coded(TpContext& ctx, float* const* in, float* const* out, int n, int nb,
+                     size_t slot_bytes, size_t base_off) {
+  const uint32_t ar_flags = tp_ar_flags_cfg();
+  const int n_groups = (n + kTpCodedGroup - 1) / kTpCodedGroup;
+  const int gw = (n_groups + nb - 1) / nb;
+  const bool cache_regs = (gw <= 8 * 4 * kTpCodedRegCacheGroups);
+  if (tp_ar_staged_enabled() && (size_t)n * sizeof(float) >= kTpStagedMinBytes) {
+    const int stages = std::min(tp_ar_fp8_stages_cfg(), gw);
+    if (stages >= 2) {
+      const bool cache_stage = tp_ar_staged_cache_enabled();
+      for (size_t r = 0; r < 2; ++r) {
+        TpPush8<1> push{};
+        const size_t q = 1u - r;
+        push.base[0] = (unsigned char*)ctx.scratch[q];
+        push.flags[0] = ctx.flags[q];
+        push.wake[0] = ctx.flags[q] + kTpFlagStride;
+        set_device(ctx.dev[r]);
+        if (cache_stage) {
+          hipLaunchKernelGGL((tp_ar_coded_staged_kernel<true>), dim3(nb), dim3(256), 0,
+                             (hipStream_t)ctx.stream[r], in[r], push,
+                             (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r],
+                             ctx.seq[r], ctx.timeout_dev, n, slot_bytes, base_off, stages,
+                             ar_flags);
+        } else {
+          hipLaunchKernelGGL((tp_ar_coded_staged_kernel<false>), dim3(nb), dim3(256), 0,
+                             (hipStream_t)ctx.stream[r], in[r], push,
+                             (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r],
+                             ctx.seq[r], ctx.timeout_dev, n, slot_bytes, base_off, stages,
+                             ar_flags);
+        }
+        AFF_HIP_CHECK(hipGetLastError());
+      }
+      return;
+    }
+  }
+  for (size_t r = 0; r < 2; ++r) {
+    TpPush8<1> push{};
+    const size_t q = 1u - r;
+    push.base[0] = (unsigned char*)ctx.scratch[q];
+    push.flags[0] = ctx.flags[q];
+    push.wake[0] = ctx.flags[q] + kTpFlagStride;
+    set_device(ctx.dev[r]);
+    if (cache_regs) {
+      hipLaunchKernelGGL((tp_ar_coded_kernel<true>), dim3(nb), dim3(256), 0,
+                         (hipStream_t)ctx.stream[r], in[r], push,
+                         (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                         ctx.timeout_dev, n, slot_bytes, base_off, ar_flags);
+    } else {
+      hipLaunchKernelGGL((tp_ar_coded_kernel<false>), dim3(nb), dim3(256), 0,
+                         (hipStream_t)ctx.stream[r], in[r], push,
+                         (const unsigned char*)ctx.scratch[r], out[r], ctx.flags[r], ctx.seq[r],
+                         ctx.timeout_dev, n, slot_bytes, base_off, ar_flags);
     }
     AFF_HIP_CHECK(hipGetLastError());
   }
@@ -1169,8 +1946,41 @@ void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n
     }
     return;
   }
-  if (mode == TpReduce::Auto)
-    mode = (n * sizeof(float) >= kTpFp8MinBytes) ? TpReduce::Fp8 : TpReduce::Exact;
+  if (mode == TpReduce::Auto) {
+    const char* env_mode = std::getenv("AFF_TP_AR_MODE");
+    if (env_mode && std::strcmp(env_mode, "exact") == 0) {
+      mode = TpReduce::Exact;
+    } else if (n * sizeof(float) >= kTpFp8MinBytes) {
+      if (env_mode && std::strcmp(env_mode, "fp8") == 0) {
+        mode = TpReduce::Fp8;
+      } else if (env_mode && std::strcmp(env_mode, "coded") == 0) {
+        mode = (ctx.ranks == 2) ? TpReduce::Coded : TpReduce::Fp8;
+      } else {
+        mode = (ctx.ranks == 2 && tp_ar_coded_enabled()) ? TpReduce::Coded : TpReduce::Fp8;
+      }
+    } else {
+      mode = TpReduce::Exact;
+    }
+  }
+  if (mode == TpReduce::Coded && ctx.ranks != 2) {
+    mode = TpReduce::Fp8;
+  }
+
+  if (mode == TpReduce::Coded) {
+    const size_t n_groups = (n + kTpCodedGroup - 1u) / kTpCodedGroup;
+    const size_t base_off = n_groups * 128u;
+    const size_t need_bytes = base_off + n_groups;
+    const size_t slot_bytes = ctx.max_floats * sizeof(float);
+    if (need_bytes <= slot_bytes) {
+      const int nn = (int)n;
+      int nb = (int)((n_groups + 31u) / 32u);
+      nb = std::max(1, std::min(nb, kTpMaxBlocks));
+      tp_sync_on_grid_change(ctx, nb);
+      tp_launch_coded(ctx, in, out, nn, nb, slot_bytes, base_off);
+      return;
+    }
+    mode = TpReduce::Exact;
+  }
 
   if (mode == TpReduce::Fp8) {
     const int nn = (int)n;
@@ -1225,18 +2035,63 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
                            uint32_t n_hc, uint32_t nb, uint32_t live, bool has_control,
                            int zb, float* const tap[kTpMaxRanks],
                            uint32_t b_lo, uint32_t n_keep, uint32_t row0,
-                           uint32_t rows_cap, uint32_t row_stride, uint32_t slot_off) {
+                           uint32_t rows_cap, uint32_t row_stride, uint32_t slot_off,
+                           const float* const pre_in[kTpMaxRanks],
+                           float* const out_cur[kTpMaxRanks],
+                           float* const out_part[kTpMaxRanks],
+                           uint32_t* out_npart,
+                           const void* const pf_ptr0[kTpMaxRanks],
+                           size_t pf_bytes0,
+                           const void* const pf_ptr1[kTpMaxRanks],
+                           size_t pf_bytes1,
+                           uint32_t pf_blocks) {
   if (!ctx.ready || ctx.ranks != 2 || !n_embd || !nb || !live || live > nb) return false;
   if (has_control && n_hc != 1u && n_hc != 2u && n_hc != 4u && n_hc != 8u) return false;
   const size_t live_elems = (size_t)n_embd * live;
   if (live_elems > ctx.max_floats) return false;
 
-  const size_t n4 = (live_elems + 3u) / 4u;
-  const int blk = std::max(1, std::min(kTpMaxBlocks, (int)((n4 + kTpWordsPerBlock - 1u) / kTpWordsPerBlock)));
-  tp_sync_on_grid_change(ctx, blk);
+  const bool has_pre_collapse =
+      pre_in && pre_in[0] && pre_in[1] &&
+      out_cur && out_cur[0] && out_cur[1] &&
+      out_part && out_part[0] && out_part[1] &&
+      has_control && nb == 16u;
+  const bool reg_form_env = tp_ar_reg_form_enabled();
+  const int max_ar_blk = has_pre_collapse ? kTpHcnMaxBlocks : kTpMaxBlocks;
+  int ar_blk;
+  if (reg_form_env && live <= 16u) {
+    ar_blk = std::max(1, std::min(max_ar_blk,
+                                  (int)((live_elems + 256u * 8u - 1u) / (256u * 8u))));
+  } else {
+    const size_t n4 = (live_elems + 3u) / 4u;
+    ar_blk = std::max(1, std::min(max_ar_blk,
+                                  (int)((n4 + kTpWordsPerBlock - 1u) / kTpWordsPerBlock)));
+  }
+  if (out_npart) *out_npart = has_pre_collapse ? (uint32_t)ar_blk : 0u;
+  tp_sync_on_grid_change(ctx, ar_blk);
+
   constexpr uint32_t nt = 256u;
+  constexpr uint32_t kRegCap = 12u;
+  const uint32_t d_per_blk_raw = (n_embd + (uint32_t)ar_blk - 1u) / (uint32_t)ar_blk;
+  const uint32_t d_per_blk_reg = (d_per_blk_raw + 3u) & ~3u;
+  const bool use_reg_form =
+      reg_form_env && ((size_t)d_per_blk_reg * live <= (size_t)nt * kRegCap);
   const bool has_tap = tap && tap[0] && tap[1] && n_keep > 0;
   const bool live_one = (live == 1u);
+  const uint32_t ar_flags = tp_ar_flags_cfg();
+  const size_t max_pf_bytes = (pf_blocks > 0u) ? tp_ar_prefetch_max_bytes() : 0u;
+
+  auto clamp_pf = [](const void* p, size_t bytes, size_t budget,
+                     const uint4*& out_p, size_t& out_n16) {
+    out_p = nullptr;
+    out_n16 = 0u;
+    if (!p || bytes < 16u || budget < 16u) return;
+    const size_t cap = std::min(bytes, budget);
+    const uintptr_t addr = (uintptr_t)p;
+    const size_t mis = (16u - (addr & 15u)) & 15u;
+    if (cap <= mis) return;
+    out_p = (const uint4*)(addr + mis);
+    out_n16 = (cap - mis) >> 4;
+  };
 
   for (size_t r = 0; r < 2; ++r) {
     const size_t q = 1u - r;
@@ -1246,36 +2101,63 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
     unsigned int* const mf = ctx.flags[r];
     unsigned int* const pw = ctx.flags[q] + kTpFlagStride;
     float* const tap_r = has_tap ? tap[r] : nullptr;
+    const float* const pre_r = has_pre_collapse ? pre_in[r] : nullptr;
+    float* const cur_r = has_pre_collapse ? out_cur[r] : nullptr;
+    float* const part_r = has_pre_collapse ? out_part[r] : nullptr;
+
+    const uint4* pf_p0_r = nullptr;
+    const uint4* pf_p1_r = nullptr;
+    size_t pf_n16_0_r = 0u, pf_n16_1_r = 0u;
+    if (max_pf_bytes >= 16u && (pf_bytes0 > 0u || pf_bytes1 > 0u)) {
+      clamp_pf(pf_ptr0 ? pf_ptr0[r] : nullptr, pf_bytes0, max_pf_bytes, pf_p0_r, pf_n16_0_r);
+      const size_t used = pf_n16_0_r << 4;
+      const size_t rem_budget = (used < max_pf_bytes) ? (max_pf_bytes - used) : 0u;
+      clamp_pf(pf_ptr1 ? pf_ptr1[r] : nullptr, pf_bytes1, rem_budget, pf_p1_r, pf_n16_1_r);
+    }
+    const uint32_t pf_blk_r = (pf_n16_0_r > 0u || pf_n16_1_r > 0u) ? pf_blocks : 0u;
+    const uint32_t launch_blk = (uint32_t)ar_blk + pf_blk_r;
+
     set_device(ctx.dev[r]);
     const hipStream_t st = (hipStream_t)ctx.stream[r];
-#define AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_)                                                     \
-  hipLaunchKernelGGL((tp_ar_batch_hc_expand_kernel<NH_, TAP_, CTL_, ONE_>), dim3(blk), dim3(nt),  \
-                     0, st, out_hc[r], block[r], hc ? hc[r] : nullptr,                            \
-                     post ? post[r] : nullptr, comb ? comb[r] : nullptr, n_embd, nb, live, zb,   \
-                     tap_r, b_lo, n_keep, row0, rows_cap, row_stride, slot_off, ps, ms, pf, mf,  \
-                     pw, ctx.seq[r], ctx.timeout_dev, ctx.max_floats)
-#define AFF_TP_BHC_CTL(NH_, TAP_, ONE_)                                                           \
+#define AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, REG_)                                         \
+  hipLaunchKernelGGL((tp_ar_batch_hc_expand_kernel<NH_, TAP_, CTL_, ONE_, PRE_, REG_>),           \
+                     dim3(launch_blk), dim3(nt), 0, st, out_hc[r], block[r],                      \
+                     hc ? hc[r] : nullptr, post ? post[r] : nullptr, comb ? comb[r] : nullptr,    \
+                     n_embd, nb, live, zb, tap_r, b_lo, n_keep, row0, rows_cap, row_stride,       \
+                     slot_off, ps, ms, pf, mf, pw, ctx.seq[r], ctx.timeout_dev, ctx.max_floats,   \
+                     (uint32_t)ar_blk, ar_flags, pre_r, cur_r, part_r, pf_p0_r, pf_n16_0_r,       \
+                     pf_p1_r, pf_n16_1_r, pf_blk_r)
+#define AFF_TP_BHC_REG(NH_, TAP_, CTL_, ONE_, PRE_)                                               \
   do {                                                                                            \
-    if (has_control) AFF_TP_BHC_EXP(NH_, TAP_, true, ONE_);                                       \
-    else             AFF_TP_BHC_EXP(NH_, TAP_, false, ONE_);                                      \
+    if (use_reg_form) AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, true);                          \
+    else              AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, false);                         \
+  } while (0)
+#define AFF_TP_BHC_PRE(NH_, TAP_, ONE_)                                                           \
+  do {                                                                                            \
+    if (has_pre_collapse) AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, true);                            \
+    else                  AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, false);                           \
   } while (0)
 #define AFF_TP_BHC_TAP(NH_, ONE_)                                                                 \
   do {                                                                                            \
-    if (has_tap) AFF_TP_BHC_CTL(NH_, true, ONE_);                                                 \
-    else         AFF_TP_BHC_CTL(NH_, false, ONE_);                                                \
+    if (has_tap) AFF_TP_BHC_PRE(NH_, true, ONE_);                                                 \
+    else         AFF_TP_BHC_PRE(NH_, false, ONE_);                                                \
   } while (0)
 #define AFF_TP_BHC_ONE(NH_)                                                                       \
   do {                                                                                            \
     if (live_one) AFF_TP_BHC_TAP(NH_, true);                                                      \
     else          AFF_TP_BHC_TAP(NH_, false);                                                     \
   } while (0)
-    if (!has_control || n_hc == 4u) AFF_TP_BHC_ONE(4u);
-    else if (n_hc == 8u)            AFF_TP_BHC_ONE(8u);
-    else if (n_hc == 2u)            AFF_TP_BHC_ONE(2u);
-    else                            AFF_TP_BHC_ONE(1u);
+    if (!has_control) {
+      if (live_one) AFF_TP_BHC_REG(4u, false, false, true, false);
+      else          AFF_TP_BHC_REG(4u, false, false, false, false);
+    } else if (n_hc == 4u) AFF_TP_BHC_ONE(4u);
+    else if (n_hc == 8u)   AFF_TP_BHC_ONE(8u);
+    else if (n_hc == 2u)   AFF_TP_BHC_ONE(2u);
+    else                   AFF_TP_BHC_ONE(1u);
 #undef AFF_TP_BHC_ONE
 #undef AFF_TP_BHC_TAP
-#undef AFF_TP_BHC_CTL
+#undef AFF_TP_BHC_PRE
+#undef AFF_TP_BHC_REG
 #undef AFF_TP_BHC_EXP
     AFF_HIP_CHECK(hipGetLastError());
   }

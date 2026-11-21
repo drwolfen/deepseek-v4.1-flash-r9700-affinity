@@ -408,14 +408,14 @@ __device__ __forceinline__ void hist_scan(uint32_t* h, uint32_t* s_b, uint32_t* 
   for (uint32_t off = 1; off < 256u; off <<= 1) {
     uint32_t add = 0;
     if (tid + off < 256u) add = h[tid + off];
-    __syncthreads();
+    lds_barrier();
     if (tid < 256u) h[tid] += add;
-    __syncthreads();
+    lds_barrier();
   }
   if (tid == 0) { *s_b = 0; *s_any = 0; }
-  __syncthreads();
+  lds_barrier();
   if (tid < 256u && h[tid] >= need) { atomicMax(s_b, tid); atomicExch(s_any, 1u); }
-  __syncthreads();
+  lds_barrier();
   const uint32_t bb = *s_b;
   *b = bb;
   // No bucket reaching `need` cannot happen — the total is at least k at the first pass and at
@@ -455,7 +455,7 @@ __device__ __forceinline__ void compact_row(const uint8_t* __restrict__ row, uin
                                             uint32_t* s_wc, uint32_t* s_base) {
   const uint32_t lane = tid & 31u, wave = tid >> 5;
   if (tid == 0) *s_base = 0;
-  __syncthreads();
+  lds_barrier();
   for (uint32_t i0 = 0; i0 < n; i0 += kTopkThr) {
     const uint32_t i = i0 + tid;
     const bool a = (i < n) && row[i] != 0;
@@ -463,18 +463,18 @@ __device__ __forceinline__ void compact_row(const uint8_t* __restrict__ row, uin
     const uint32_t mask_lt = (lane == 0) ? 0u : ((1u << lane) - 1u);
     const uint32_t wr = (uint32_t)__popc(bm & mask_lt);
     if (lane == 0) s_wc[wave] = (uint32_t)__popc(bm);
-    __syncthreads();
+    lds_barrier();
     uint32_t off = 0;
     for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
     const uint32_t p = *s_base + off + wr;
     if (a && p < cap) adm[p] = i;
-    __syncthreads();
+    lds_barrier();
     if (tid == 0) {
       uint32_t s = 0;
       for (uint32_t w = 0; w < kTopkWaves; ++w) s += s_wc[w];
       *s_base += s;
     }
-    __syncthreads();
+    lds_barrier();
   }
 }
 
@@ -485,7 +485,7 @@ __device__ __forceinline__ void compact_admitted(const float* __restrict__ sc, u
                                                  uint32_t* s_base) {
   const uint32_t lane = tid & 31u, wave = tid >> 5;
   if (tid == 0) *s_base = 0;
-  __syncthreads();
+  lds_barrier();
   for (uint32_t i0 = 0; i0 < n; i0 += kTopkThr) {
     const uint32_t i = i0 + tid;
     bool a = false;
@@ -497,18 +497,18 @@ __device__ __forceinline__ void compact_admitted(const float* __restrict__ sc, u
     const uint32_t mask_lt = (lane == 0) ? 0u : ((1u << lane) - 1u);
     const uint32_t wr = (uint32_t)__popc(bm & mask_lt);
     if (lane == 0) s_wc[wave] = (uint32_t)__popc(bm);
-    __syncthreads();
+    lds_barrier();
     uint32_t off = 0;
     for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
     const uint32_t p = *s_base + off + wr;
     if (a && p < cap) adm[p] = i;
-    __syncthreads();
+    lds_barrier();
     if (tid == 0) {
       uint32_t s = 0;
       for (uint32_t w = 0; w < kTopkWaves; ++w) s += s_wc[w];
       *s_base += s;
     }
-    __syncthreads();
+    lds_barrier();
   }
 }
 
@@ -641,13 +641,13 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
     return;
   }
   if (tid == 0) { s_prefix = 0; s_need = k; s_gt = 0; }
-  __syncthreads();
+  lds_barrier();
 
   // Narrow the key eight bits at a time. Vectorized 16-byte uint4 loads (8 floats per thread slot).
   const uint32_t T8 = n_keys >> 3;
   for (int sh = 24; sh >= 0; sh -= 8) {
     if (tid < 256u) s_hist[tid] = 0;
-    __syncthreads();
+    lds_barrier();
     const uint32_t pre = s_prefix, msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
     for (uint32_t i = tid; i < T8; i += kTopkThr) {
       const uint4 v0 = ((const uint4*)sc)[2 * i + 0];
@@ -666,7 +666,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
       const uint32_t key = mono(sc[i]);
       hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
     }
-    __syncthreads();
+    lds_barrier();
     uint32_t b = 0, acc = 0;
     hist_scan(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
     if (sh == 24 && !s_any) {
@@ -682,12 +682,12 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
       s_need -= acc;
       s_prefix = pre | (b << sh);
     }
-    __syncthreads();
+    lds_barrier();
   }
 
   const uint32_t T = s_prefix, need = s_need;
   if (tid == 0) s_nt = 0;
-  __syncthreads();
+  lds_barrier();
   // Vectorized marking pass. Ties are collected only among finite keys (key > KEY_NEG_INF).
   for (uint32_t i = tid; i < T8; i += kTopkThr) {
     const uint4 v0 = ((const uint4*)sc)[2 * i + 0];
@@ -731,7 +731,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
     }
   } else if (adm) {
     tie_cutoff_excl(s_tie, s_nt, need, tid, sc, n_keys, T, &s_tie_end);
-    __syncthreads();
+    lds_barrier();
     compact_admitted(sc, n_keys, T, s_tie_end, tid, adm + (size_t)t * adm_stride, adm_stride,
                      s_wc, &s_base);
     if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
@@ -781,7 +781,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
   if (n_keys <= k) return;
 
   if (tid < kTopkHist) s_h[tid] = 0;
-  __syncthreads();
+  lds_barrier();
   const uint32_t pre = (sh == 24) ? 0u : g_s[0];
   const uint32_t msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
   const uint32_t per = (n_keys + gridDim.x - 1u) / gridDim.x;
@@ -791,22 +791,35 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
     const uint32_t key = mono(sc[i]);
     hist_add(s_h, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
   }
-  __syncthreads();
+  lds_barrier();
   if (tid < kTopkHist && s_h[tid]) atomicAdd(&g_h[tid], s_h[tid]);
-  // Every thread fences its own stores, then the barrier orders all of them before the arrival
-  // count below — which is what makes "I am the last" mean "every block's counts are visible".
+  // Every thread drains its own global stores/atomics, then the barrier orders all of them before
+  // the release arrival count below — making "I am the last" mean "every block's counts landed".
+#ifdef __HIP_DEVICE_COMPILE__
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
   __threadfence();
-  __syncthreads();
-  if (tid == 0) s_last = (atomicAdd(&g_s[3], 1u) == gridDim.x - 1u) ? 1u : 0u;
-  __syncthreads();
+#endif
+  lds_barrier();
+  if (tid == 0) {
+    s_last = (__hip_atomic_fetch_add(&g_s[3], 1u, __ATOMIC_RELEASE,
+                                     __HIP_MEMORY_SCOPE_AGENT) == gridDim.x - 1u)
+                 ? 1u
+                 : 0u;
+  }
+  lds_barrier();
   if (!s_last) return;
 
   // The acquire half of the same fence: everyone else's counts are in L2, and this block's own view
   // of those lines has to be thrown away before it reads them back as plain loads.
+#ifdef __HIP_DEVICE_COMPILE__
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
   __threadfence();
+#endif
   const uint32_t need = (sh == 24) ? k : g_s[1];
   if (tid < kTopkHist) { s_h[tid] = g_h[tid]; g_h[tid] = 0; }   // zeroed for the next pass
-  __syncthreads();
+  lds_barrier();
   uint32_t b = 0, acc = 0;
   hist_scan(s_h, &s_b, &s_any, need, tid, &b, &acc);
   if (tid == 0) {
@@ -886,7 +899,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
   const uint32_t nt = g_t[0];
   const uint32_t nc = nt < kTieCap ? nt : kTieCap;
   for (uint32_t i = tid; i < nc; i += kTopkThr) s_tie[i] = g_t[1u + i];
-  __syncthreads();
+  lds_barrier();
   const uint32_t T = state[(size_t)t * 4u];
   const uint32_t need = state[(size_t)t * 4u + 1u];
   if (row) {
@@ -899,7 +912,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
     }
   } else {
     if (adm) tie_cutoff_excl(s_tie, nt, need, tid, sc, n_keys, T, &s_tie_end);
-    __syncthreads();
+    lds_barrier();
     if (tid == 0) g_t[0] = 0;                          // back to empty for the next call
     if (adm) {
       compact_admitted(sc, n_keys, T, s_tie_end, tid, adm + (size_t)t * adm_stride, adm_stride,
@@ -958,7 +971,7 @@ __global__ __launch_bounds__(128) void idx_rope_qat_kernel(float* __restrict__ q
   // of two different approximations. Uniform across the block, as the __syncthreads() below needs.
   if (HADAMARD) {
     r[i] = v;
-    __syncthreads();
+    lds_barrier();
     // 128-wide Hadamard: 64 butterflies a stage, one per thread below 64.
     for (uint32_t stride = 1; stride < kIdxDim; stride <<= 1) {
       float a = 0.0f, b = 0.0f;
@@ -968,9 +981,9 @@ __global__ __launch_bounds__(128) void idx_rope_qat_kernel(float* __restrict__ q
         ia = base + off; ib = base + stride + off;
         a = r[ia]; b = r[ib];
       }
-      __syncthreads();
+      lds_barrier();
       if (i < kIdxDim / 2u) { r[ia] = a + b; r[ib] = a - b; }
-      __syncthreads();
+      lds_barrier();
     }
     v = r[i] * 0.08838834764831845f;            // 1/sqrt(128)
   }

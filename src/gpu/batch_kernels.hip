@@ -759,14 +759,18 @@ __device__ __forceinline__ void gemm_fp8_body(
   // prefill (NT == 8u) registers and occupancy are completely untouched.
   if constexpr (NT == 1u) {
     if (split_active && Ctr) {
+#ifdef __HIP_DEVICE_COMPILE__
+      asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
       __threadfence();
-      __syncthreads();
+#endif
+      aff::lds_barrier();
       __shared__ unsigned int s_arrived;
       if (tid == 0u) {
-        s_arrived = __hip_atomic_fetch_add(&Ctr[tile_id], 1u, __ATOMIC_ACQ_REL,
+        s_arrived = __hip_atomic_fetch_add(&Ctr[tile_id], 1u, __ATOMIC_RELEASE,
                                            __HIP_MEMORY_SCOPE_AGENT);
       }
-      __syncthreads();
+      aff::lds_barrier();
       if (s_arrived + 1u == gridDim.z) {
         if (tid == 0u) {
           __hip_atomic_store(&Ctr[tile_id], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -1143,6 +1147,314 @@ __global__ __launch_bounds__(kWThreads) void batch_gemm_multi_kernel(GemmJobsArg
                                           nb, sc_cols, J.xoff[j], J.woff[j],
                                           (blockIdx.x - tbeg) * (kWWaves / NW * MT * 16), kbeg,
                                           kend);
+}
+
+// ---- lossless 12.25-bit bf16x12 packing & bit-identical decode kernels -------------------------
+
+__device__ __forceinline__ uint32_t wave_reduce_max_u32(uint32_t v) {
+  v = max(v, aff::dpp_xor_lane<16u>(v));
+  v = max(v, aff::dpp_xor_lane<8u>(v));
+  v = max(v, aff::dpp_xor_lane<4u>(v));
+  v = max(v, aff::dpp_xor_lane<2u>(v));
+  v = max(v, aff::dpp_xor_lane<1u>(v));
+  return v;
+}
+
+__device__ __forceinline__ uint16_t bf16x12_esc_lookup(
+    uint32_t grow, uint32_t col, const uint32_t* __restrict__ esc_off,
+    const uint16_t* __restrict__ esc_col, const uint16_t* __restrict__ esc_val) {
+  if (!esc_off || !esc_col || !esc_val) return 0u;
+  uint32_t lo = esc_off[grow];
+  uint32_t hi = esc_off[grow + 1u];
+  const uint16_t target = (uint16_t)col;
+  while (lo < hi) {
+    const uint32_t mid = lo + ((hi - lo) >> 1);
+    const uint16_t mc = esc_col[mid];
+    if (mc < target) lo = mid + 1u;
+    else if (mc > target) hi = mid;
+    else return esc_val[mid];
+  }
+  return 0u;
+}
+
+__device__ __forceinline__ void bf16x12_decode8_u16(
+    uint2 sm8, uint32_t e4, uint32_t mexp, uint32_t grow, uint32_t col0,
+    const uint32_t* __restrict__ esc_off, const uint16_t* __restrict__ esc_col,
+    const uint16_t* __restrict__ esc_val, uint16_t (&out_u16)[8]) {
+  uint32_t esc_mask = 0u;
+#pragma unroll
+  for (uint32_t j = 0; j < 8u; ++j) {
+    const uint32_t word = (j < 4u) ? sm8.x : sm8.y;
+    const uint32_t sm = (word >> (8u * (j & 3u))) & 0xFFu;
+    const uint32_t delta = (e4 >> (4u * j)) & 0x0Fu;
+    if ((delta == 15u) && ((sm & 0x7Fu) != 0u)) esc_mask |= (1u << j);
+    const uint32_t exp_bits = (delta < 15u) ? ((mexp - delta) << 7) : 0u;
+    out_u16[j] = (uint16_t)(((sm & 0x80u) << 8) | exp_bits | (sm & 0x7Fu));
+  }
+  if (__builtin_expect(esc_mask != 0u, 0)) {
+#pragma unroll
+    for (uint32_t j = 0; j < 8u; ++j) {
+      if (esc_mask & (1u << j)) {
+        out_u16[j] = bf16x12_esc_lookup(grow, col0 + j, esc_off, esc_col, esc_val);
+      }
+    }
+  }
+}
+
+constexpr uint32_t kB12PackThreads = 256;
+constexpr uint32_t kB12PackWaves = kB12PackThreads / kWave;
+
+__global__ __launch_bounds__(kB12PackThreads) void pack_bf16x12_kernel(
+    const uint16_t* __restrict__ src_bf16, uint8_t* __restrict__ b12_sm,
+    uint8_t* __restrict__ b12_exp4, uint8_t* __restrict__ b12_mexp, uint64_t total_blocks) {
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint64_t wave_stride = (uint64_t)gridDim.x * kB12PackWaves;
+  for (uint64_t blk = ((uint64_t)blockIdx.x * kB12PackWaves) + (threadIdx.x >> 5);
+       blk < total_blocks; blk += wave_stride) {
+    const uint16_t u = src_bf16[blk * 32u + lane];
+    const uint32_t e = (u >> 7) & 0xFFu;
+    const uint32_t mant = u & 0x7Fu;
+    const uint32_t norm_e = (e >= 1u && e <= 254u) ? e : 0u;
+    const uint32_t max_exp = wave_reduce_max_u32(norm_e);
+
+    const bool is_zero = (e == 0u && mant == 0u);
+    const bool is_esc = (e == 0u && mant != 0u) || (e == 255u) ||
+                        (e != 0u && (max_exp - e) >= 15u);
+    uint32_t sm;
+    uint32_t delta;
+    if (is_zero) {
+      sm = (u >> 8) & 0x80u;
+      delta = 15u;
+    } else if (is_esc) {
+      sm = 0x01u;
+      delta = 15u;
+    } else {
+      sm = ((u >> 8) & 0x80u) | mant;
+      delta = max_exp - e;
+    }
+
+    b12_sm[blk * 32u + lane] = (uint8_t)sm;
+    const uint32_t partner = aff::dpp_xor_lane<1u>(delta);
+    if ((lane & 1u) == 0u) {
+      b12_exp4[blk * 16u + (lane >> 1)] = (uint8_t)(delta | (partner << 4));
+    }
+    if (lane == 0u) {
+      b12_mexp[blk] = (uint8_t)max_exp;
+    }
+  }
+}
+
+constexpr uint32_t kB12MvWaves = 8;
+constexpr uint32_t kB12MvThreads = kB12MvWaves * kWave;
+
+template <uint32_t T>
+__global__ __launch_bounds__(kB12MvThreads) void matvec_bf16x12_multix_kernel(
+    const uint8_t* __restrict__ b12_sm, const uint8_t* __restrict__ b12_exp4,
+    const uint8_t* __restrict__ b12_mexp, const uint32_t* __restrict__ esc_off,
+    const uint16_t* __restrict__ esc_col, const uint16_t* __restrict__ esc_val,
+    const float* __restrict__ x, float* __restrict__ out, uint32_t rows, uint32_t cols,
+    uint32_t out_col_stride, int out_token_major) {
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t wave = threadIdx.x >> 5;
+  const uint32_t m_cols = cols >> 5;
+  const uint32_t e4_cols = cols >> 1;
+  for (uint32_t row = blockIdx.x * kB12MvWaves + wave; row < rows;
+       row += gridDim.x * kB12MvWaves) {
+    const uint8_t* smrow = b12_sm + (size_t)row * cols;
+    const uint8_t* e4row = b12_exp4 + (size_t)row * e4_cols;
+    const uint8_t* mrow = b12_mexp + (size_t)row * m_cols;
+    float a0[T], a1[T], a2[T], a3[T];
+#pragma unroll
+    for (uint32_t t = 0; t < T; ++t) { a0[t] = 0.0f; a1[t] = 0.0f; a2[t] = 0.0f; a3[t] = 0.0f; }
+    for (uint32_t c = lane * 8u; c < cols; c += 256u) {
+      const uint2 sm8 = *(const uint2*)(smrow + c);
+      const uint32_t e4 = *(const uint32_t*)(e4row + (c >> 1));
+      const uint32_t mexp = (uint32_t)mrow[c >> 5];
+      uint16_t wu[8];
+      bf16x12_decode8_u16(sm8, e4, mexp, row, c, esc_off, esc_col, esc_val, wu);
+      const float w0 = __uint_as_float((uint32_t)wu[0] << 16);
+      const float w1 = __uint_as_float((uint32_t)wu[1] << 16);
+      const float w2 = __uint_as_float((uint32_t)wu[2] << 16);
+      const float w3 = __uint_as_float((uint32_t)wu[3] << 16);
+      const float w4 = __uint_as_float((uint32_t)wu[4] << 16);
+      const float w5 = __uint_as_float((uint32_t)wu[5] << 16);
+      const float w6 = __uint_as_float((uint32_t)wu[6] << 16);
+      const float w7 = __uint_as_float((uint32_t)wu[7] << 16);
+#pragma unroll
+      for (uint32_t t = 0; t < T; ++t) {
+        const float* xv = x + (size_t)t * cols + c;
+        const float4 xa = *(const float4*)(xv);
+        const float4 xb = *(const float4*)(xv + 4);
+        a0[t] = fmaf(w0, xa.x, a0[t]);
+        a0[t] = fmaf(w1, xa.y, a0[t]);
+        a1[t] = fmaf(w2, xa.z, a1[t]);
+        a1[t] = fmaf(w3, xa.w, a1[t]);
+        a2[t] = fmaf(w4, xb.x, a2[t]);
+        a2[t] = fmaf(w5, xb.y, a2[t]);
+        a3[t] = fmaf(w6, xb.z, a3[t]);
+        a3[t] = fmaf(w7, xb.w, a3[t]);
+      }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < T; ++t) {
+      const float v = aff::wave_reduce_add_dpp((a0[t] + a1[t]) + (a2[t] + a3[t]));
+      if (lane == 0u) {
+        if (out_token_major)
+          out[(size_t)t * rows + row] = v;
+        else
+          out[(size_t)row * out_col_stride + t] = v;
+      }
+    }
+  }
+}
+
+template <bool Full, uint32_t MT, uint32_t NT, uint32_t NW>
+__device__ __forceinline__ void gemm_bf16x12_body(
+    const uint8_t* __restrict__ b12_sm, const uint8_t* __restrict__ b12_exp4,
+    const uint8_t* __restrict__ b12_mexp, const uint32_t* __restrict__ esc_off,
+    const uint16_t* __restrict__ esc_col, const uint16_t* __restrict__ esc_val,
+    const float* __restrict__ X, float* __restrict__ Y, uint32_t rows, uint32_t cols,
+    uint32_t nb, uint32_t w_row_off, uint32_t m0, uint32_t kbeg, uint32_t kend) {
+  constexpr uint32_t kMW = kWWaves / NW;
+  constexpr uint32_t kMExt = kMW * MT * 16;
+  constexpr uint32_t kNExt = NW * NT * 16;
+  __shared__ uint16_t s_a[kMExt * kWLdsRow];
+  __shared__ uint16_t s_b[kNExt * kWLdsRow];
+
+  const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+  const uint32_t n0 = blockIdx.y * kNExt;
+  const uint32_t wm = (wave / NW) * (MT * 16), wn = (wave % NW) * (NT * 16);
+
+  wmma::f8v acc[MT][NT];
+#pragma unroll
+  for (uint32_t i = 0; i < MT; ++i)
+#pragma unroll
+    for (uint32_t j = 0; j < NT; ++j) acc[i][j] = wmma::acc_zero();
+
+  const uint32_t sm = tid >> 1, sh = (tid & 1u) * 32;
+  constexpr uint32_t kBTG = kNExt / 4;
+  constexpr uint32_t kBThreads = kBTG * (kWK / 8);
+  const uint32_t bt = (tid % kBTG) * 4, bk = (tid / kBTG) * 8;
+  const bool b_stager = kBThreads == kWThreads || tid < kBThreads;
+
+  for (uint32_t c0 = kbeg; c0 < kend; c0 += kWK) {
+    aff::lds_barrier();
+
+    {
+      const uint32_t grow = w_row_off + m0 + sm;
+      const bool live = Full || ((m0 + sm) < rows && (c0 + sh + 32u) <= cols);
+      uint16_t* dst = s_a + sm * kWLdsRow;
+      if (live) {
+        const uint32_t mexp =
+            (uint32_t)b12_mexp[(size_t)grow * (cols >> 5) + ((c0 + sh) >> 5)];
+        const uint4 e4 =
+            *(const uint4*)(b12_exp4 + (size_t)grow * (cols >> 1) + ((c0 + sh) >> 1));
+        const uint32_t e4w[4] = {e4.x, e4.y, e4.z, e4.w};
+        const uint2* sm_src = (const uint2*)(b12_sm + (size_t)grow * cols + c0 + sh);
+#pragma unroll
+        for (uint32_t gi = 0; gi < 4u; ++gi) {
+          const uint2 sm8 = sm_src[gi];
+          uint16_t wu[8];
+          bf16x12_decode8_u16(sm8, e4w[gi], mexp, grow, c0 + sh + gi * 8u, esc_off, esc_col,
+                              esc_val, wu);
+          const uint4 g4 = make_uint4(
+              (uint32_t)wu[0] | ((uint32_t)wu[1] << 16),
+              (uint32_t)wu[2] | ((uint32_t)wu[3] << 16),
+              (uint32_t)wu[4] | ((uint32_t)wu[5] << 16),
+              (uint32_t)wu[6] | ((uint32_t)wu[7] << 16));
+          const uint32_t k = sh + gi * 8u;
+          *(uint4*)(dst + ((((k >> 3) ^ (sm & 7u))) << 3)) = g4;
+        }
+      } else {
+        const uint4 z4 = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+        for (uint32_t gi = 0; gi < 4u; ++gi) {
+          const uint32_t k = sh + gi * 8u;
+          *(uint4*)(dst + ((((k >> 3) ^ (sm & 7u))) << 3)) = z4;
+        }
+      }
+    }
+
+    if (b_stager) {
+      const size_t xo = (size_t)(c0 + bk) * nb + n0 + bt;
+      const bool vec = Full || ((nb & 3u) == 0 && n0 + bt + 4 <= nb && c0 + bk + 8 <= cols);
+      uint16_t h[8][4];
+      const float* xb = X + xo;
+      float f[8][4];
+      if (vec) {
+#pragma unroll
+        for (uint32_t kk = 0; kk < 8; ++kk) {
+          const float4 v = *(const float4*)(xb + (size_t)kk * nb);
+          f[kk][0] = v.x; f[kk][1] = v.y; f[kk][2] = v.z; f[kk][3] = v.w;
+        }
+      } else {
+#pragma unroll
+        for (uint32_t kk = 0; kk < 8; ++kk)
+#pragma unroll
+          for (uint32_t tt = 0; tt < 4; ++tt) {
+            const bool in = (n0 + bt + tt) < nb && (c0 + bk + kk) < cols;
+            f[kk][tt] = in ? xb[(size_t)kk * nb + tt] : 0.0f;
+          }
+      }
+#pragma unroll
+      for (uint32_t kk = 0; kk < 8; ++kk)
+#pragma unroll
+        for (uint32_t tt = 0; tt < 4; ++tt) h[kk][tt] = wmma::f32_to_bf16(f[kk][tt]);
+#pragma unroll
+      for (uint32_t tt = 0; tt < 4; ++tt) {
+        const uint32_t row = bt + tt;
+        uint32_t d[4];
+#pragma unroll
+        for (uint32_t q = 0; q < 4; ++q)
+          d[q] = (uint32_t)h[q * 2][tt] | ((uint32_t)h[q * 2 + 1][tt] << 16);
+        *(uint4*)(s_b + row * kWLdsRow + ((((bk >> 3) ^ (row & 7u))) << 3)) =
+            make_uint4(d[0], d[1], d[2], d[3]);
+      }
+    }
+    aff::lds_barrier();
+
+#pragma unroll
+    for (uint32_t ks = 0; ks < kWK; ks += wmma::kK) {
+      wmma::s8v af[MT], bf[NT];
+#pragma unroll
+      for (uint32_t i = 0; i < MT; ++i) af[i] = load_frag(s_a, wm + i * 16, ks, lane);
+#pragma unroll
+      for (uint32_t j = 0; j < NT; ++j) bf[j] = load_frag(s_b, wn + j * 16, ks, lane);
+#pragma unroll
+      for (uint32_t i = 0; i < MT; ++i)
+#pragma unroll
+        for (uint32_t j = 0; j < NT; ++j) acc[i][j] = wmma::mma_bf16(af[i], bf[j], acc[i][j]);
+    }
+  }
+
+  const uint32_t c = wmma::frag_c(lane);
+#pragma unroll
+  for (uint32_t i = 0; i < MT; ++i)
+#pragma unroll
+    for (uint32_t j = 0; j < NT; ++j) {
+      const uint32_t col = n0 + wn + j * 16 + c;
+      if (!Full && col >= nb) continue;
+      const uint32_t rb = m0 + wm + i * 16;
+#pragma unroll
+      for (uint32_t t = 0; t < 8; ++t) {
+        const uint32_t r = rb + wmma::acc_row(lane, t);
+        if (Full || r < rows) Y[(size_t)r * nb + col] = acc[i][j][t];
+      }
+    }
+}
+
+template <bool Full, uint32_t MT = kWMTiles, uint32_t NT = kWNTiles, uint32_t NW = 2>
+__global__ __launch_bounds__(kWThreads) void batch_gemm_bf16x12_kernel(
+    const uint8_t* __restrict__ b12_sm, const uint8_t* __restrict__ b12_exp4,
+    const uint8_t* __restrict__ b12_mexp, const uint32_t* __restrict__ esc_off,
+    const uint16_t* __restrict__ esc_col, const uint16_t* __restrict__ esc_val,
+    const float* __restrict__ X, float* __restrict__ Y, uint32_t rows, uint32_t cols,
+    uint32_t nb, uint32_t w_row_off, uint32_t ck) {
+  const uint32_t kbeg = ck ? blockIdx.z * ck : 0u;
+  const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
+  gemm_bf16x12_body<Full, MT, NT, NW>(b12_sm, b12_exp4, b12_mexp, esc_off, esc_col, esc_val, X,
+                                      Y + (size_t)blockIdx.z * rows * nb, rows, cols, nb,
+                                      w_row_off, blockIdx.x * (kWWaves / NW * MT * 16), kbeg, kend);
 }
 
 // ---- the f32 GEMM, as three bf16 WMMA passes ---------------------------------------------------
@@ -2343,13 +2655,14 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_kernel(const float* __re
                                                                uint8_t* __restrict__ q8,
                                                                float* __restrict__ qs,
                                                                uint32_t n_embd, float rms_eps,
-                                                               float* __restrict__ norm_tm) {
+                                                               float* __restrict__ norm_tm,
+                                                               uint32_t n_part = kHcnChunks) {
   __shared__ float s_inv[NB];
   __shared__ float s_wmax[2][4][NB];
   const uint32_t tid = threadIdx.x;
   if (tid < NB) {
     float tot = 0.0f;
-    for (uint32_t c = 0; c < kHcnChunks; ++c) tot += part[(size_t)c * NB + tid];
+    for (uint32_t c = 0; c < n_part; ++c) tot += part[(size_t)c * NB + tid];
     s_inv[tid] = rsqrtf(tot / (float)n_embd + rms_eps);
   }
   aff::lds_barrier();
@@ -2836,7 +3149,7 @@ __global__ __launch_bounds__(kArgmaxThr) void batch_argmax_kernel(const float* _
         sv[threadIdx.x] = ov; si[threadIdx.x] = oi;
       }
     }
-    __syncthreads();
+    aff::lds_barrier();
   }
   if (!threadIdx.x) { out[b] = sv[0]; out[(size_t)nb + b] = (float)(row0 + si[0]); }
 }
@@ -2880,7 +3193,7 @@ __global__ __launch_bounds__(kMarkovThr) void markov_step_kernel(
   for (uint32_t i = threadIdx.x; i < rank; i += kMarkovThr)
     s_e[i] = wmma::bf16_to_f32(w1[(size_t)token * rank + i]);
   if (!threadIdx.x) s_best = 0ull;
-  __syncthreads();
+  aff::lds_barrier();
 
   // ONE WAVE per row, not one thread. A thread owning a whole `rank`-wide row reads 512 contiguous
   // bytes, but the 32 threads of a wave then sit on 32 rows 512 bytes apart, so every load
@@ -3891,6 +4204,58 @@ void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float*
               part2, nw, norm, (uint8_t*)nullptr, (float*)nullptr, n_embd, rms_eps, norm_tm);
 }
 
+void batch_hc_norm_v41_only_hip(const float* cur, const float* mix, const float* scale,
+                                const float* base, const float* nw, float* pre, float* post,
+                                float* comb, float* norm, float* part, uint8_t* q8, float* qs,
+                                uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t n_part,
+                                uint32_t iters, float hc_eps, float rms_eps, void* stream) {
+  if (nb != kNarrowTok || !part) {
+    aff::ui::fatal("batch_hc_norm_v41_only: nb=%u is not the %u-column arena\n", nb,
+                   kNarrowTok);
+    std::abort();
+  }
+  if (n_part == 0u || n_part > kHcnChunks) {
+    aff::ui::fatal("batch_hc_norm_v41_only: invalid n_part=%u (max %u)\n", n_part, kHcnChunks);
+    std::abort();
+  }
+  constexpr uint32_t NB = kNarrowTok;
+  const hipStream_t st = (hipStream_t)stream;
+  const dim3 t(kHcnThreads);
+  const uint32_t nblk = (n_embd + kHcnThreads - 1) / kHcnThreads;
+  float* const part2 = part + (size_t)kHcnChunks * NB;
+#define AFF_HCN_V41_ONLY(NH)                                                                      \
+  AFF_BLAUNCH((hcn_norm_v41_kernel<NB, NH>), dim3(nblk), t, 0, st, cur, part2, part, mix,         \
+              scale, base, pre, post, comb, nw, norm, q8, qs, n_embd, (uint64_t)n_embd * NH,      \
+              n_part, iters, hc_eps, rms_eps)
+  if (n_hc == 1)      { AFF_HCN_V41_ONLY(1); }
+  else if (n_hc == 2) { AFF_HCN_V41_ONLY(2); }
+  else if (n_hc == 4) { AFF_HCN_V41_ONLY(4); }
+  else if (n_hc == 8) { AFF_HCN_V41_ONLY(8); }
+  else { aff::ui::fatal("batch_hc_norm_v41_only: n_hc=%u\n", n_hc); std::abort(); }
+#undef AFF_HCN_V41_ONLY
+}
+
+void batch_hc_head_norm_only_hip(const float* cur, const float* nw, float* norm, float* norm_tm,
+                                 float* part, uint32_t n_embd, uint32_t nb, uint32_t n_part,
+                                 float rms_eps, void* stream) {
+  if (nb != kNarrowTok || !part) {
+    aff::ui::fatal("batch_hc_head_norm_only: nb=%u is not the %u-column arena\n", nb,
+                   kNarrowTok);
+    std::abort();
+  }
+  if (n_part == 0u || n_part > kHcnChunks) {
+    aff::ui::fatal("batch_hc_head_norm_only: invalid n_part=%u (max %u)\n", n_part, kHcnChunks);
+    std::abort();
+  }
+  constexpr uint32_t NB = kNarrowTok;
+  const hipStream_t st = (hipStream_t)stream;
+  const dim3 t(kHcnThreads);
+  float* const part2 = part + (size_t)kHcnChunks * NB;
+  AFF_BLAUNCH((hcn_norm_kernel<NB>), dim3((n_embd + kHcnThreads - 1) / kHcnThreads), t, 0, st,
+              cur, part2, nw, norm, (uint8_t*)nullptr, (float*)nullptr, n_embd, rms_eps, norm_tm,
+              n_part);
+}
+
 void batch_hc_expand_hip(uint16_t* out_hc, float* block, const uint16_t* hc,
                          const float* post,
                          const float* comb, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
@@ -4387,6 +4752,136 @@ bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float
   return true;
 }
 
+void build_bf16x12_esc_host(const uint16_t* bf16_rows, uint32_t nrows, uint32_t cols,
+                            std::vector<uint32_t>& esc_off, std::vector<uint16_t>& esc_col,
+                            std::vector<uint16_t>& esc_val) {
+  esc_off.assign((size_t)nrows + 1u, 0u);
+  esc_col.clear();
+  esc_val.clear();
+  if (!bf16_rows || !nrows || !cols) return;
+  if ((cols % 32u) != 0u || cols > 65536u) {
+    aff::ui::fatal("build_bf16x12_esc_host: invalid cols=%u (must be <= 65536 and multiple of 32)\n",
+                   cols);
+    std::abort();
+  }
+  for (uint32_t r = 0; r < nrows; ++r) {
+    const uint16_t* row = bf16_rows + (size_t)r * cols;
+    for (uint32_t c0 = 0; c0 < cols; c0 += 32u) {
+      uint32_t max_exp = 0u;
+      for (uint32_t k = 0; k < 32u; ++k) {
+        const uint32_t u = row[c0 + k];
+        const uint32_t e = (u >> 7) & 0xFFu;
+        if (e >= 1u && e <= 254u && e > max_exp) max_exp = e;
+      }
+      for (uint32_t k = 0; k < 32u; ++k) {
+        const uint16_t u = row[c0 + k];
+        const uint32_t e = (u >> 7) & 0xFFu;
+        const uint32_t mant = u & 0x7Fu;
+        const bool is_esc = (e == 0u && mant != 0u) || (e == 255u) ||
+                            (e != 0u && (max_exp - e) >= 15u);
+        if (is_esc) {
+          esc_col.push_back((uint16_t)(c0 + k));
+          esc_val.push_back(u);
+        }
+      }
+    }
+    esc_off[(size_t)r + 1u] = (uint32_t)esc_col.size();
+  }
+}
+
+void pack_bf16x12_hip(const uint16_t* src_bf16, uint8_t* b12_sm, uint8_t* b12_exp4,
+                      uint8_t* b12_mexp, uint32_t nrows, uint32_t cols, void* stream) {
+  if (!nrows || !cols) return;
+  if ((cols % 32u) != 0u) {
+    aff::ui::fatal("pack_bf16x12: cols=%u must be a multiple of 32\n", cols);
+    std::abort();
+  }
+  if (!src_bf16 || !b12_sm || !b12_exp4 || !b12_mexp) return;
+  const uint64_t total_blocks = (uint64_t)nrows * (cols / 32u);
+  const uint64_t need_grid = (total_blocks + kB12PackWaves - 1u) / kB12PackWaves;
+  const uint32_t blk =
+      aff::safe_grid_blocks((uint32_t)std::min<uint64_t>(need_grid, 65535u), kB12PackWaves);
+  AFF_BLAUNCH(pack_bf16x12_kernel, dim3(blk), dim3(kB12PackThreads), 0, (hipStream_t)stream,
+              src_bf16, b12_sm, b12_exp4, b12_mexp, total_blocks);
+}
+
+bool matvec_bf16x12_multix_hip(const uint8_t* b12_sm, const uint8_t* b12_exp4,
+                               const uint8_t* b12_mexp, const uint32_t* esc_off,
+                               const uint16_t* esc_col, const uint16_t* esc_val,
+                               const float* x_tm, float* out, uint32_t rows, uint32_t cols,
+                               uint32_t nt, uint32_t out_col_stride, int out_token_major,
+                               void* stream) {
+  if (!b12_sm || !b12_exp4 || !b12_mexp || !x_tm || !out || !rows || (cols % 256u) != 0u ||
+      !nt || nt > 8u)
+    return false;
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (rows + kB12MvWaves - 1u) / kB12MvWaves), kB12MvWaves);
+#define AFF_B12_MX(T)                                                                              \
+  case T:                                                                                          \
+    AFF_BLAUNCH((matvec_bf16x12_multix_kernel<T>), dim3(blocks), dim3(kB12MvThreads), 0,           \
+                (hipStream_t)stream, b12_sm, b12_exp4, b12_mexp, esc_off, esc_col, esc_val, x_tm,  \
+                out, rows, cols, out_col_stride, out_token_major);                                 \
+    break
+  switch (nt) {
+    AFF_B12_MX(1); AFF_B12_MX(2); AFF_B12_MX(3); AFF_B12_MX(4);
+    AFF_B12_MX(5); AFF_B12_MX(6); AFF_B12_MX(7); AFF_B12_MX(8);
+    default: return false;
+  }
+#undef AFF_B12_MX
+  return true;
+}
+
+void batch_gemm_bf16x12_hip(const uint8_t* b12_sm, const uint8_t* b12_exp4,
+                            const uint8_t* b12_mexp, const uint32_t* esc_off,
+                            const uint16_t* esc_col, const uint16_t* esc_val, const float* X,
+                            float* Y, uint32_t rows, uint32_t cols, uint32_t nb,
+                            uint32_t w_row_off, void* stream) {
+  if (!rows || !nb || !cols) return;
+  if ((cols % 32u) != 0u) {
+    aff::ui::fatal("batch_gemm_bf16x12: cols=%u must be a multiple of 32\n", cols);
+    std::abort();
+  }
+  if (!b12_sm || !b12_exp4 || !b12_mexp || !X || !Y) return;
+  const hipStream_t st = (hipStream_t)stream;
+  const uint32_t wn_eff = nb <= kNarrowN ? kNarrowN : kWN;
+  const uint32_t gx = (rows + kWM - 1u) / kWM, gy = (nb + wn_eff - 1u) / wn_eff;
+  uint32_t ksplit = 1u;
+  float* ws = nullptr;
+  if (gx * gy < kSplitTarget && cols >= 512u) {
+    const uint32_t want = (kSplitTarget + gx * gy - 1u) / (gx * gy);
+    uint32_t ck = ((cols / want) + 127u) / 128u * 128u;
+    if (ck < 128u) ck = 128u;
+    uint32_t k2 = (cols + ck - 1u) / ck;
+    if (k2 > kSplitThinCap && (uint64_t)rows * nb < 8192u) k2 = kSplitThinCap;
+    if (k2 > 1u) {
+      ws = splitk_buf((size_t)k2 * rows * nb, st);
+      if (ws) ksplit = k2;
+    }
+  }
+  uint32_t ck = ksplit > 1u ? ((cols + ksplit - 1u) / ksplit + 127u) / 128u * 128u : 0u;
+  if (ck) ksplit = (cols + ck - 1u) / ck;
+  if (ksplit < 2u) { ck = 0u; ksplit = 1u; ws = nullptr; }
+  const dim3 grid(gx, gy, ksplit);
+  const bool full = (rows % kWM == 0u) && (nb % wn_eff == 0u) && (cols % kWK == 0u);
+  const bool narrow = wn_eff == kNarrowN;
+  float* const dst = ksplit > 1u ? ws : Y;
+#define AFF_B12_GEMM_G(f, mt, nt, nw)                                                              \
+  AFF_BLAUNCH((batch_gemm_bf16x12_kernel<f, mt, nt, nw>), grid, dim3(kWThreads), 0, st, b12_sm,    \
+              b12_exp4, b12_mexp, esc_off, esc_col, esc_val, X, dst, rows, cols, nb, w_row_off, ck)
+#define AFF_B12_GEMM_W(f)                                                                          \
+  do {                                                                                             \
+    if (narrow) AFF_B12_GEMM_G(f, 1, 1, 1); else AFF_B12_GEMM_G(f, kWMTiles, kWNTiles, 2);         \
+  } while (0)
+  if (full) AFF_B12_GEMM_W(true); else AFF_B12_GEMM_W(false);
+#undef AFF_B12_GEMM_W
+#undef AFF_B12_GEMM_G
+  if (ksplit > 1u) {
+    const size_t n = (size_t)rows * nb;
+    AFF_BLAUNCH(splitk_reduce_kernel, dim3((uint32_t)((n + 255u) / 256u)), dim3(256), 0, st, ws, Y,
+                rows, nb, ksplit);
+  }
+}
+
 // ------------------------------------------------------------------------------------------------
 // Wave 2 Phase 2B: Host-pinned UVA gather & Hyper-Connection refresh
 // ------------------------------------------------------------------------------------------------
@@ -4476,15 +4971,18 @@ __device__ __forceinline__ void hc_role_wait(uint32_t* __restrict__ sync, uint32
       __builtin_amdgcn_s_sleep(1);
       if (wall_clock64() - t0 > 50000000ull) break; // 0.5s timeout protection
     }
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     if (__hip_atomic_fetch_add(&sync[2], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u == nb_all) {
       __hip_atomic_store(&sync[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(&sync[1], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(&sync[2], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   }
-  __syncthreads();
+  aff::lds_barrier();
+#ifdef __HIP_DEVICE_COMPILE__
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
+  __threadfence();
+#endif
 }
 
 // Fused decode kernel A+B (Radiance c896a87 & 222cbe7)
@@ -4503,7 +5001,7 @@ __global__ __launch_bounds__(256) void hc_read_fused_v2_kernel(
     s_ticket = sync ? __hip_atomic_fetch_add(&sync[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
                     : blockIdx.x;
   }
-  __syncthreads();
+  aff::lds_barrier();
   const uint32_t ticket = s_ticket;
 
   if (ticket < na) {
@@ -4521,7 +5019,11 @@ __global__ __launch_bounds__(256) void hc_read_fused_v2_kernel(
         s_lds[i & 511u] = acc;
       }
     }
+#ifdef __HIP_DEVICE_COMPILE__
+    asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
     __threadfence();
+#endif
     if (threadIdx.x == 0 && sync) {
       __hip_atomic_fetch_add(&sync[1], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
     }
@@ -4571,11 +5073,18 @@ __global__ __launch_bounds__(256) void hc_chained_decode_kernel(
 
   // Chained synchronization: thread 0 acquires slot
   if (sync && tid == 0) {
-    while (__hip_atomic_load(&sync[0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < (uint32_t)blockIdx.x) {
+    while (__hip_atomic_load(&sync[0], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (uint32_t)blockIdx.x) {
       __builtin_amdgcn_s_sleep(1);
     }
   }
-  __syncthreads();
+  aff::lds_barrier();
+  if (sync) {
+#ifdef __HIP_DEVICE_COMPILE__
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
+    __threadfence();
+#endif
+  }
 
   for (uint32_t r = 0; r < (uint32_t)rows; ++r) {
     for (uint32_t i = blockIdx.x * blockDim.x + tid; i < (uint32_t)n; i += gridDim.x * blockDim.x) {
@@ -4598,7 +5107,7 @@ __global__ __launch_bounds__(256) void hc_chained_decode_kernel(
     }
   }
 
-  __syncthreads();
+  aff::lds_barrier();
   if (sync && tid == 0) {
     __hip_atomic_fetch_add(&sync[0], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   }

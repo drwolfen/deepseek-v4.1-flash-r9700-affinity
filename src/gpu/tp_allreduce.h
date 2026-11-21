@@ -44,7 +44,8 @@ namespace aff {
 //
 //   Exact — f32 across the wire.
 //   Fp8   — block-scaled e4m3, ~3.9x fewer bytes (1 B/elem + one f32 scale per 128).
-//   Auto  — Fp8 only above kTpFp8MinBytes, Exact below.
+//   Coded — lossless 12.125-bit exponent-delta coded bf16 (TP2 only; raw 16-bit fallback).
+//   Auto  — Fp8 (or Coded when AFF_TP_AR_CODED=1 at TP2) above kTpFp8MinBytes, Exact below.
 //
 // Small exchanges are LATENCY-bound — the time barely moves with size against a fixed floor — so
 // shrinking the payload has almost nothing to shrink. FP8 pays from `kTpFp8MinBytes` up and
@@ -52,11 +53,13 @@ namespace aff {
 //
 // The decode-path exchange is below it, so Auto leaves it Exact. FP8 is for prefill and for any
 // batch above one.
-enum class TpReduce { Exact, Fp8, Auto };
+enum class TpReduce { Exact, Fp8, Coded, Auto };
 constexpr size_t kTpFp8MinBytes = 128 * 1024;
 constexpr int kTpFp8Group = 128;            // elements sharing one f32 scale
+constexpr int kTpCodedGroup = 64;           // elements sharing one bf16 exponent base
 
 constexpr int kTpMaxBlocks = 64;
+constexpr int kTpHcnMaxBlocks = 32;         // b_hcp partial-sum row bound for fused R4 collapse
 // 16-byte words per block. Below this a message is latency-bound and extra blocks only add flag
 // traffic; the whole point at 16 KiB is to use ONE block and pay the handshake once.
 constexpr int kTpWordsPerBlock = 1400;
@@ -196,8 +199,9 @@ bool tp_fold_prepare(TpContext* ctx, size_t floats, std::string* err);
 void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n,
                    TpReduce mode = TpReduce::Auto);
 
-// Fused 2-rank exact FP32 all-reduce + batch HC post/expand (+ optional DSpark tap) over live
-// tokens [0, live) using ctx.scratch (0 B extra VRAM) and zeroing `block` across all [0, nb).
+// Fused 2-rank exact FP32 all-reduce + batch HC post/expand (+ optional DSpark tap, optional V4.1
+// pre_in collapse+sq, and optional side-band weight prefetch) over live tokens [0, live) using
+// ctx.scratch (0 B extra VRAM) and zeroing `block` across all [0, nb).
 bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
                            float* const block[kTpMaxRanks],
                            const uint16_t* const hc[kTpMaxRanks],
@@ -207,7 +211,16 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
                            int zb = 1, float* const tap[kTpMaxRanks] = nullptr,
                            uint32_t b_lo = 0, uint32_t n_keep = 0, uint32_t row0 = 0,
                            uint32_t rows_cap = 0, uint32_t row_stride = 0,
-                           uint32_t slot_off = 0);
+                           uint32_t slot_off = 0,
+                           const float* const pre_in[kTpMaxRanks] = nullptr,
+                           float* const out_cur[kTpMaxRanks] = nullptr,
+                           float* const out_part[kTpMaxRanks] = nullptr,
+                           uint32_t* out_npart = nullptr,
+                           const void* const pf_ptr0[kTpMaxRanks] = nullptr,
+                           size_t pf_bytes0 = 0,
+                           const void* const pf_ptr1[kTpMaxRanks] = nullptr,
+                           size_t pf_bytes1 = 0,
+                           uint32_t pf_blocks = 0);
 
 // Blocks until both ranks' streams are drained.
 void tp_sync(TpContext& ctx);

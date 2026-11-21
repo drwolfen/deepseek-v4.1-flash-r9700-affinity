@@ -38,15 +38,14 @@ __global__ __launch_bounds__(kThreads) void digest_kernel(const uint8_t* __restr
   for (size_t i = nw * 4 + threadIdx.x; i < n; i += kThreads)
     h ^= mixv((uint64_t)i * 0x9e3779b97f4a7c15ull, (uint64_t)p[i]);
   red[threadIdx.x] = h;
-  __syncthreads();
+  lds_barrier();
   for (uint32_t s = kThreads / 2; s; s >>= 1) {
     if (threadIdx.x < s) red[threadIdx.x] ^= red[threadIdx.x + s];
-    __syncthreads();
+    lds_barrier();
   }
   if (!threadIdx.x) {
     *out = red[0] ? red[0] : 1ull;                   // 0 stays "never written"
     if (stamp) {
-      __threadfence_system();
       __hip_atomic_store(stamp, mark, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
   }
@@ -68,10 +67,10 @@ __global__ __launch_bounds__(kThreads) void l2_kernel(const float* __restrict__ 
   double a = 0;
   for (size_t i = threadIdx.x; i < n; i += kThreads) a += (double)p[i] * (double)p[i];
   red[threadIdx.x] = a;
-  __syncthreads();
+  lds_barrier();
   for (uint32_t s = kThreads / 2; s; s >>= 1) {
     if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-    __syncthreads();
+    lds_barrier();
   }
   if (!threadIdx.x) *out = red[0];
 }

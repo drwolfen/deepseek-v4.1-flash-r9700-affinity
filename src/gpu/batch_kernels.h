@@ -32,6 +32,7 @@
 #include "engine/ops.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace aff {
 
@@ -314,6 +315,16 @@ void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float*
                               float* norm_tm, float* part, uint32_t n_embd, uint32_t n_hc,
                               uint32_t nb, float hc_eps, float rms_eps, void* stream, const float* pre_in);
 
+// Norm-only helpers for pre-collapsed V4.1 AR+Expand+Collapse (`cur` and `part` already computed).
+void batch_hc_norm_v41_only_hip(const float* cur, const float* mix, const float* scale,
+                                const float* base, const float* nw, float* pre, float* post,
+                                float* comb, float* norm, float* part, uint8_t* q8, float* qs,
+                                uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t n_part,
+                                uint32_t iters, float hc_eps, float rms_eps, void* stream);
+void batch_hc_head_norm_only_hip(const float* cur, const float* nw, float* norm, float* norm_tm,
+                                 float* part, uint32_t n_embd, uint32_t nb, uint32_t n_part,
+                                 float rms_eps, void* stream);
+
 // out_hc[dst][d][b] = block[d][b]*post[dst][b] + sum_src comb[dst + src*n_hc][b] * hc[src][d][b]
 //
 // `zero_block` leaves `block` zeroed on the way out. Both of these visit every element of the arena
@@ -451,6 +462,25 @@ void quantize_bf16_to_w4_g128_hip(const uint16_t* src, uint8_t* w4, uint16_t* sc
 bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float* x_tm,
                           float* out, uint32_t rows, uint32_t cols, uint32_t nt,
                           uint32_t out_col_stride, int out_token_major, void* stream);
+
+// Lossless 12.25-bit bf16x12 (32-elem K-block SoA + host CSR escapes) packing and bit-identical
+// decode kernels.
+void build_bf16x12_esc_host(const uint16_t* bf16_rows, uint32_t nrows, uint32_t cols,
+                            std::vector<uint32_t>& esc_off, std::vector<uint16_t>& esc_col,
+                            std::vector<uint16_t>& esc_val);
+void pack_bf16x12_hip(const uint16_t* src_bf16, uint8_t* b12_sm, uint8_t* b12_exp4,
+                      uint8_t* b12_mexp, uint32_t nrows, uint32_t cols, void* stream);
+bool matvec_bf16x12_multix_hip(const uint8_t* b12_sm, const uint8_t* b12_exp4,
+                               const uint8_t* b12_mexp, const uint32_t* esc_off,
+                               const uint16_t* esc_col, const uint16_t* esc_val,
+                               const float* x_tm, float* out, uint32_t rows, uint32_t cols,
+                               uint32_t nt, uint32_t out_col_stride, int out_token_major,
+                               void* stream);
+void batch_gemm_bf16x12_hip(const uint8_t* b12_sm, const uint8_t* b12_exp4,
+                            const uint8_t* b12_mexp, const uint32_t* esc_off,
+                            const uint16_t* esc_col, const uint16_t* esc_val, const float* X,
+                            float* Y, uint32_t rows, uint32_t cols, uint32_t nb,
+                            uint32_t w_row_off, void* stream);
 
 // Host-Pinned / UVA embed_tokens gather (Radiance 1c10454 / AFF_EMBED_HOST). Read-only loads.
 void embed_tokens_gather_hip(const uint16_t* embed_table, const uint32_t* token_ids,
