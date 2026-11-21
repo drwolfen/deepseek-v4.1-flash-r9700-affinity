@@ -2297,9 +2297,24 @@ int main(int argc, char** argv) {
           if (c.first == nx) { ++c.second; found = true; break; }
         if (!found) cont.push_back({nx, 1u});
       }
-      if (occurrences >= need)
-        for (const auto& c : cont)
-          if (c.second >= 2) out.push_back(c.first);
+      if (occurrences >= need) {
+        auto in_prompt = [&](uint32_t nx) -> bool {
+          if (gen_start_pos <= ng) return false;
+          const uint32_t k0 = hist[end - ng];
+          for (size_t i = 0; i + ng < gen_start_pos; ++i) {
+            if (hist[i] != k0 || hist[i + ng] != nx) continue;
+            bool same = true;
+            for (size_t k = 1; k < ng; ++k)
+              if (hist[i + k] != hist[end - ng + k]) { same = false; break; }
+            if (same) return true;
+          }
+          return false;
+        };
+        for (const auto& c : cont) {
+          const size_t req_c = (dry_gen_only && in_prompt(c.first)) ? (need * 2) : need;
+          if (c.second >= req_c) out.push_back(c.first);
+        }
+      }
       static const bool dry_dbg = std::getenv("AFF_DRY_DEBUG") != nullptr;
       if (dry_dbg)
         aff::ui::err("dry: hist %zu ng %zu occ %u cont %zu kept %zu delta %.1f\n", hist.size(), ng,

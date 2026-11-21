@@ -20,7 +20,7 @@ struct SamplerConfig {
   float    dry_delta = 0.0f;
   uint32_t dry_ngram = 8;
   uint32_t dry_window = 512;
-  uint32_t dry_min_repeats = 2;
+  uint32_t dry_min_repeats = 4;
   uint64_t seed = 0;
 };
 
