@@ -610,7 +610,8 @@ public:
     // is the lightning indexer's only input and is copied back only when it asks.
     bool (*attn_qkv)(void* ctx, int32_t qa, int32_t qb, int32_t qnorm, int32_t kv, int32_t kvnorm,
                      uint64_t hidden, uint64_t qr, uint32_t n_head, uint32_t width, uint32_t n_rot,
-                     RopeDerived rope, float eps, float* qrnorm_host) = nullptr;
+                     RopeDerived rope, float eps, float* qrnorm_host,
+                     bool allow_q_e4m3) = nullptr;
     // Batched matvecs over an activation the chunk already has in VRAM, results token-major on the
     // host. `src` is 0 for the sublayer norm and 1 for the query path's qr_norm. This is what the
     // compressor and the lightning indexer use: their pooling and their top-k are sequential in

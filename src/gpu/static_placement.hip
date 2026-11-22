@@ -223,6 +223,12 @@ StaticPlacement::~StaticPlacement() {
     (void)hipSetDevice(devs_[0]);
     if (d_imat_w13_) { (void)hipFree(d_imat_w13_); d_imat_w13_ = nullptr; }
     if (d_imat_cnt_) { (void)hipFree(d_imat_cnt_); d_imat_cnt_ = nullptr; }
+    if (act_dev_head_) { (void)hipFree(act_dev_head_); act_dev_head_ = nullptr; }
+  }
+  if (act_ring_) {
+    (void)hipHostFree(act_ring_);
+    act_ring_ = nullptr;
+    act_dev_ = nullptr;
   }
   if (pool_registered_ && pool_ && pool_->base())
     (void)hipHostUnregister(const_cast<uint8_t*>(pool_->base()));
@@ -448,8 +454,16 @@ bool StaticPlacement::act_alloc() {
   std::memset(h, 0, sizeof(ActRing));
   void* d = nullptr;
   if (hipHostGetDevicePointer(&d, h, 0) != hipSuccess) { (void)hipHostFree(h); return false; }
+  uint64_t* dh = nullptr;
+  if (hipMalloc(&dh, sizeof(uint64_t)) != hipSuccess) { (void)hipHostFree(h); return false; }
+  if (hipMemset(dh, 0, sizeof(uint64_t)) != hipSuccess) {
+    (void)hipFree(dh);
+    (void)hipHostFree(h);
+    return false;
+  }
   act_ring_ = (ActRing*)h;
   act_dev_ = (ActRing*)d;
+  act_dev_head_ = dh;
   return true;
 }
 
@@ -542,8 +556,17 @@ uint32_t StaticPlacement::act_drain() {
     // this replaces built it in order of first appearance in `sel` and the comment was simply
     // wrong; `observe` credits each expert once and is order-free, so heat is unaffected either way,
     // and `Demand` now drains its admissions in the order it documents.
-    for (uint32_t e = 0; e < n_expert_ && e < kActExperts; ++e)
-      if (R.counts[e]) { distinct.push_back(e); cnts.push_back(R.counts[e]); }
+    if (R.mode == 1u) {
+      const uint32_t nz = std::min<uint32_t>(R.count, kActExperts);
+      for (uint32_t k = 0; k < nz; ++k) {
+        const uint32_t e = R.entries[k].exp;
+        const uint32_t c = R.entries[k].cnt;
+        if (e < n_expert_ && c) { distinct.push_back(e); cnts.push_back(c); }
+      }
+    } else {
+      for (uint32_t e = 0; e < n_expert_ && e < kActExperts; ++e)
+        if (R.counts[e]) { distinct.push_back(e); cnts.push_back(R.counts[e]); }
+    }
     heat_.observe(layer, distinct.data(), (uint32_t)distinct.size(), cnts.data());
     if (ecfg_.strategy == PlacementEngineConfig::Strategy::Demand) {
       static thread_local std::vector<uint32_t> missing;
@@ -1957,8 +1980,14 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
           const char* s = std::getenv("AFF_PREFILL_FREEZE_PLC");
           return !s || !*s || std::strcmp(s, "0") != 0;
         }();
+        static const bool act_ring_v2 = [] {
+          const char* s = std::getenv("AFF_ACT_RING_V2");
+          return !s || !*s || std::strcmp(s, "0") != 0;
+        }();
         const bool freeze_plc = prefill_freeze_plc && nb_tok > 16u;
         A.act = (!freeze_plc && dv == 0) ? act_dev_ : nullptr;
+        A.act_head = (A.act && act_ring_v2) ? act_dev_head_ : nullptr;
+        A.sparse_act = act_ring_v2;
         A.shard = shard_;
         A.bg = (uint16_t*)bg_[dv]; A.bu = (uint16_t*)bu_[dv]; A.bydn = (uint16_t*)bydn_[dv];
         A.tile_cap = cap;
@@ -2213,6 +2242,10 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       // packs them tight and slices with a prefix, the device puts each class in a fixed region so
       // the host can name the base without seeing the routing — and this is the ONE place where
       // that has to stop mattering, because this is where the bits get computed.
+      static const bool fuse_gu_launch = [] {
+        const char* s = std::getenv("AFF_MOE_FUSE_GU_LAUNCH");
+        return !s || !*s || std::strcmp(s, "0") != 0;
+      }();
       { AFF_XTRACE((int)dv, 8, hyb);
       if (plan_on && pref_cap_ && d_pref_slab_[dv] && d_pref_src_[dv]) {
         moe_prefetch_pack_hip(d_pref_slab_[dv], d_pref_src_[dv], plan_st_[dv],
@@ -2220,22 +2253,34 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       }
       for (uint32_t b = 4; b < 8; ++b) {
         if (!GRP.n[b]) continue;
-        expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
-                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true,
-                             /*allow_recon=*/!plan_on);
-        expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], q8_ptr,
-                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true,
-                             /*allow_recon=*/!plan_on);
+        if (fuse_gu_launch) {
+          expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                               qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true,
+                               /*allow_recon=*/!plan_on, GRP.base[b][1]);
+        } else {
+          expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                               qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true,
+                               /*allow_recon=*/!plan_on);
+          expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                               qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, hyb, /*y_bf16=*/true,
+                               /*allow_recon=*/!plan_on);
+        }
       } }
       { AFF_XTRACE((int)dv, 3, st);
       for (uint32_t b = 0; b < 4; ++b) {
         if (!GRP.n[b]) continue;
-        expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
-                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true,
-                             /*allow_recon=*/!plan_on);
-        expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], q8_ptr,
-                             qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true,
-                             /*allow_recon=*/!plan_on);
+        if (fuse_gu_launch) {
+          expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                               qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true,
+                               /*allow_recon=*/!plan_on, GRP.base[b][1]);
+        } else {
+          expert_gemm_wmma_hip(GRP.base[b][0], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                               qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true,
+                               /*allow_recon=*/!plan_on);
+          expert_gemm_wmma_hip(GRP.base[b][1], GRP.n[b], GRP.max_nt[b], q8_ptr,
+                               qs_ptr, I.d_cb[dv], inter, hidden, 1.0f, st, /*y_bf16=*/true,
+                               /*allow_recon=*/!plan_on);
+        }
       } }
       if (split) {
         // AFF_MOE_SINGLE_JOIN (#983, #984):

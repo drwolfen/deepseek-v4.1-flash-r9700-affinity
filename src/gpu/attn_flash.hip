@@ -157,7 +157,8 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     const float* __restrict__ sinks, float* __restrict__ out, uint32_t b0, uint32_t pos0,
     uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head, float scale,
     int q_bf16, float* __restrict__ part_o, float* __restrict__ part_ml, uint32_t part_tok,
-    const uint32_t* __restrict__ adm, uint32_t adm_stride, uint32_t raw_floor) {
+    const uint32_t* __restrict__ adm, uint32_t adm_stride, uint32_t raw_floor,
+    const float* __restrict__ q_scales) {
 
   constexpr uint32_t NH = NT * 16u;                   // query heads a block
 
@@ -218,6 +219,20 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
   for (uint32_t sb = 0; sb < NT; ++sb) {
     const uint32_t hh = sb * 16u + tid / kQTh, seg = (tid % kQTh) * kQD;
     const size_t qo = qoff + (size_t)hh * kW + seg;
+    if (q_scales) {
+      const uint8_t* src8 = (const uint8_t*)qp + qo;
+      uint8_t* dst = s_q + hh * kQLd + seg;
+#pragma unroll
+      for (uint32_t i = 0; i < kQD / 16u; ++i)
+        *(uint4*)(dst + i * 16u) = *(const uint4*)(src8 + i * 16u);
+      if (tid < 16u) {
+        const uint32_t hd = sb * 16u + tid;
+        s_qs[hd] = q_scales[(size_t)(b0 + tk) * n_head + (h0 + hd)];
+        s_m[hd] = sink0 ? sinks[h0 + hd] : kNeg;
+        s_l[hd] = sink0 ? 1.0f : 0.0f;
+      }
+      continue;
+    }
     float4 v[kQV];
     float a = 0.0f;
     // q_bf16 is uniform across the launch. Q is 8.4 MB a launch at prefill's shape and this
@@ -646,7 +661,7 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
                           uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head,
                           float scale, void* stream, bool q_bf16, const FlashSplit* split,
                           uint32_t n_comp_hint, const uint32_t* adm, uint32_t adm_stride,
-                          uint32_t raw_floor) {
+                          uint32_t raw_floor, const float* q_scales) {
   if (!n || !n_head) return;
   hipStream_t st = (hipStream_t)stream;
   const uint8_t* r8 = (const uint8_t*)raw;
@@ -689,7 +704,7 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
 #define AFF_LAUNCH(T, S, M)                                                                      \
   hipLaunchKernelGGL((flash_kernel<T, S, M>), g, b, 0, st, q, r8, c8, allowed, n_comp_v, n_comp1,  \
                      sinks, out, b0, pos0, sliding, ring, max_comp, n_head, scale, q_bf16 ? 1 : 0, \
-                     po, pm, ptok, adm, adm_stride, raw_floor)
+                     po, pm, ptok, adm, adm_stride, raw_floor, q_scales)
 #define AFF_PICK(T)                                                    \
   do {                                                                 \
     if (sinks && allowed)  AFF_LAUNCH(T, true, true);                  \

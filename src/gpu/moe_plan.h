@@ -81,10 +81,20 @@ struct MoePlanStatus {
 constexpr uint32_t kActExperts = 512;
 constexpr uint32_t kActSlots = 64;
 
+struct ActEntry {
+  uint16_t exp;
+  uint16_t cnt;
+};
+
 struct ActRecord {
   uint32_t layer;
-  uint32_t pad[3];                    // keeps `counts` 16-byte aligned
-  uint32_t counts[kActExperts];       // slots per expert, 0 = not routed to
+  uint32_t mode;   // 0 = dense counts[], 1 = sparse entries[0..count)
+  uint32_t count;  // mode==1: number of non-zero entries written
+  uint32_t pad;
+  union {
+    uint32_t counts[kActExperts];     // slots per expert, 0 = not routed to
+    ActEntry entries[kActExperts];    // sorted ascending by exp when mode == 1
+  };
 };
 
 // `head` is on its own line and published last: the record's bytes are written, then a system-scope
@@ -163,6 +173,8 @@ struct MoePlanArgs {
   // The activation ring, or null. One card writes it — the two select the same experts, so a ring
   // per card would carry every dispatch twice with identical contents.
   ActRing* act = nullptr;
+  uint64_t* act_head = nullptr;
+  bool sparse_act = true;
 
   // ---- the tile records' constants ---------------------------------------------------------------
   ExpertShardLayout shard{};

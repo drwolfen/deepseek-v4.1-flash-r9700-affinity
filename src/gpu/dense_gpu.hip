@@ -12,6 +12,7 @@
 #include "gpu/indexer_gpu.h"
 #include "gpu/batch_kernels.h"
 #include "gpu/hip_common.h"
+#include "gpu/wmma.h"
 #include "gpu/device_math.h"
 #include "gpu/tp_allreduce.h"
 #include "gpu/keepalive.h"
@@ -416,6 +417,9 @@ struct DenseGpu::Impl {
     // host waiting on any of them. `h_ids` is the single readback at the end of the block.
     uint32_t* b_ids = nullptr;  uint32_t* h_ids = nullptr;
     uint64_t* b_mpeer = nullptr;
+    uint64_t* b_mk_fg = nullptr;
+    unsigned int* b_mk_flag = nullptr;
+    bool b_qtm_e4m3 = false;
     hipEvent_t ev_mk[kNarrowTok] = {};
     // The TARGET's head does the same exchange, once a block instead of once a step: `b_apeer` holds
     // the other cards' [2][nb] argmax planes, `b_hids` the combined winner per position and `h_hids`
@@ -562,6 +566,7 @@ struct DenseGpu::Impl {
   uint16_t* d_embed_uva = nullptr;
   size_t embed_bytes = 0;
   uint32_t embed_n_embd = 0;
+  uint32_t mk_seq = 0;
   ihipStream_t* const* streams() {
     for (size_t r = 0; r < dev.size(); ++r) sp[r] = (ihipStream_t*)dev[r].stream;
     return sp;
@@ -607,6 +612,60 @@ inline bool mtp_proj_fp8_enabled() {
   return !v || !*v || std::strcmp(v, "0") != 0;
 }
 
+inline bool markov_w2_fp8_enabled() {
+  const char* v = std::getenv("AFF_MARKOV_W2_FP8");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool markov_w1_uva_enabled() {
+  const char* v = std::getenv("AFF_MARKOV_W1_UVA");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool markov_p2p_spin_enabled() {
+  const char* v = std::getenv("AFF_MARKOV_P2P_SPIN");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool head_sample_bf16_enabled() {
+  const char* v = std::getenv("AFF_HEAD_SAMPLE_BF16");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool flash_q_e4m3_enabled() {
+  const char* v = std::getenv("AFF_FLASH_Q_E4M3");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline uint32_t lmhead_fp8_max_t_cfg() {
+  const char* v = std::getenv("AFF_LMHEAD_FP8_MAX_T");
+  if (!v || !*v) return 16u;
+  const int t = std::atoi(v);
+  if (t <= 1) return 1u;
+  return t > 16 ? 16u : (uint32_t)t;
+}
+
+inline float* b_qtm_qscales(uint16_t* b_qtm, uint32_t nh, uint32_t width, uint32_t nb) {
+  const size_t q8_bytes = (size_t)nh * width * nb;
+  const size_t aligned = (q8_bytes + 15u) & ~size_t(15u);
+  return reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(b_qtm) + aligned);
+}
+
+static bool launch_fp8_g128_head(const uint8_t* fp8, const uint16_t* sc, const float* x_tm,
+                                 float* y, uint32_t nr_rows, uint32_t cols, uint32_t nt,
+                                 uint32_t out_ld, int out_tm, hipStream_t st) {
+  if (!fp8 || !sc || (cols % 256u) != 0u || !nt) return false;
+  const uint32_t max_t = lmhead_fp8_max_t_cfg();
+  for (uint32_t t0 = 0u; t0 < nt; t0 += max_t) {
+    const uint32_t chunk = std::min<uint32_t>(max_t, nt - t0);
+    float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
+    if (!matvec_fp8_g128_multix_hip(fp8, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols,
+                                    chunk, out_ld, out_tm, st))
+      return false;
+  }
+  return true;
+}
+
 inline bool prefetch_beside_enabled() {
   const char* v = std::getenv("AFF_PREFETCH_BESIDE");
   return v && *v && std::strcmp(v, "0") != 0;
@@ -621,7 +680,9 @@ inline uint32_t prefetch_blocks_cfg() {
 
 template <typename ShardT>
 inline void free_shard_bufs(ShardT& sh) {
-  if (sh.data)        { (void)hipFree(sh.data);        sh.data = nullptr; }
+  if (sh.data && !sh.is_uva) { (void)hipFree(sh.data); }
+  sh.data = nullptr;
+  sh.is_uva = false;
   if (sh.scales)      { (void)hipFree(sh.scales);      sh.scales = nullptr; }
   if (sh.fp8_data)    { (void)hipFree(sh.fp8_data);    sh.fp8_data = nullptr; }
   if (sh.fp8_scales)  { (void)hipFree(sh.fp8_scales);  sh.fp8_scales = nullptr; }
@@ -653,9 +714,11 @@ DenseGpu::~DenseGpu() {
       D.d_hc, D.d_hc_next, D.d_pre, D.d_pre_prev, D.d_post, D.d_comb, D.d_mix, D.d_cur, D.d_norm, D.d_block,
       D.a_q, D.a_out, D.d_rlog,
       D.b_mix, D.b_pre, D.b_pre_prev, D.b_post, D.b_comb, D.b_cur, D.b_norm, D.b_block,
-      D.b_conf, D.b_hcp, D.b_emb, D.b_q, D.b_hinv, D.b_kv, D.b_qr, D.b_g, D.b_u, D.b_y, D.b_tm,
+      D.b_hcp, D.b_emb, D.b_q, D.b_hinv, D.b_kv, D.b_qr, D.b_g, D.b_u, D.b_y, D.b_tm,
       D.b_head, D.b_amx, D.b_dxt, D.b_dx, D.b_dm};
-    // b_htm and b_heads are deliberately absent: they alias b_q and b_qtm.
+    // b_conf aliases b_ids; b_htm and b_heads alias b_q and b_qtm.
+    D.b_conf = nullptr;
+    D.h_conf = nullptr;
     for (float* p : bufs) if (p) (void)hipFree(p);
     for (uint16_t* p : {D.b_hc, D.b_hc_next, D.b_qtm}) if (p) (void)hipFree(p);
     for (float* p : {D.e_in, D.e_out, D.e_stage}) if (p) (void)hipFree(p);
@@ -676,9 +739,10 @@ DenseGpu::~DenseGpu() {
     for (uint32_t* q : {D.a_adm, D.a_admn, D.b_adm, D.b_admn}) if (q) (void)hipFree(q);
     if (D.b_mbest) (void)hipFree(D.b_mbest);
     if (D.b_mpeer) (void)hipFree(D.b_mpeer);
+    if (D.b_mk_fg) (void)hipFree(D.b_mk_fg);
+    if (D.b_mk_flag) (void)hipFree(D.b_mk_flag);
     if (D.b_ids) (void)hipFree(D.b_ids);
     if (D.h_ids) (void)hipHostFree(D.h_ids);
-    if (D.h_conf) (void)hipHostFree(D.h_conf);
     for (hipEvent_t& e : D.ev_mk) if (e) (void)hipEventDestroy(e);
     if (D.ev_amx) (void)hipEventDestroy(D.ev_amx);
     if (D.b_apeer) (void)hipFree(D.b_apeer);
@@ -710,8 +774,12 @@ DenseGpu::~DenseGpu() {
     if (D.sstream) (void)hipStreamDestroy(D.sstream);
     if (D.stream) (void)hipStreamDestroy(D.stream);
   }
-  for (void* p : {smp_q_, smp_u_, smp_out_}) if (p) (void)hipFree(p);
-  for (void* p : {smp_h_q_, smp_h_u_, smp_h_out_}) if (p) (void)hipHostFree(p);
+  for (Entry& e : ent_) {
+    if (e.uva_host) { (void)hipHostFree(e.uva_host); e.uva_host = nullptr; }
+  }
+  if (!impl_->dev.empty()) (void)hipSetDevice(impl_->dev[0].id);
+  for (void* p : {smp_ctrl_, smp_out_}) if (p) (void)hipFree(p);
+  for (void* p : {smp_h_ctrl_, smp_h_out_}) if (p) (void)hipHostFree(p);
   delete impl_;
   impl_ = nullptr;
 }
@@ -1020,7 +1088,8 @@ DenseGpu::Split DenseGpu::split_for(const char* name) {
   // card would hold it. w2 is a [vocab][rank] head whose band must match the vocabulary head's, and
   // those are different tensors with no reason to agree on a boundary; replicated, each card slices
   // w2 by the head's own band. 66 MB a card each.
-  if (!std::strcmp(s, "mtp_markov_w1") || !std::strcmp(s, "mtp_markov_w2")) return Split::Rep;
+  if (!std::strcmp(s, "mtp_markov_w1")) return Split::Rep;
+  if (!std::strcmp(s, "mtp_markov_w2")) return Split::Row;
   return Split::Row;
 }
 
@@ -1065,6 +1134,10 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
       (void)hipSetDevice(impl_->dev[k].id);
       free_shard_bufs(e.sh[k]);
     }
+    if (e.uva_host) {
+      (void)hipHostFree(e.uva_host);
+      e.uva_host = nullptr;
+    }
   };
 
   const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
@@ -1073,6 +1146,23 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
   const bool want_w4_head = (d_int4 && *d_int4 && std::strcmp(d_int4, "0") != 0) || lmhead_int4_only;
   const bool lmhead_fp8 = lmhead_fp8_enabled();
   const bool lmhead_bf16x12 = lmhead_bf16x12_enabled();
+  const bool want_w1_uva =
+      markov_w1_uva_enabled() && !std::strcmp(s_leaf, "mtp_markov_w1") && quant == AFF_BF16 &&
+      e.split == Split::Rep;
+  const bool want_w2_fp8 =
+      markov_w2_fp8_enabled() && !std::strcmp(s_leaf, "mtp_markov_w2") && quant == AFF_BF16 &&
+      (cols % 128) == 0;
+  if (want_w1_uva) {
+    const uint64_t full_bytes = rows * cols * elem;
+    void* uh = nullptr;
+    if (hipHostMalloc(&uh, full_bytes, hipHostMallocMapped | hipHostMallocPortable) == hipSuccess &&
+        uh != nullptr) {
+      std::memcpy(uh, host, full_bytes);
+      e.uva_host = uh;
+    } else {
+      aff::ui::err("dense-gpu: %s hipHostMalloc UVA failed, falling back to VRAM\n", name);
+    }
+  }
 
   uint64_t placed = 0;
   for (size_t d = 0; d < R; ++d) {
@@ -1103,6 +1193,7 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
                            (s.ncols % 256) == 0;
     const bool is_w4_chunked_output = want_w4_head && lmhead_int4_only && is_output;
     const bool is_fp8_output = lmhead_fp8 && !lmhead_int4_only && is_output && (s.ncols % 128) == 0;
+    const bool is_fp8_markov_w2 = want_w2_fp8 && (s.ncols % 128) == 0;
     const bool is_b12_output = lmhead_bf16x12 && !lmhead_int4_only && !is_fp8_output && is_output &&
                                s.ncols <= 65536;
     const char* b12_env = std::getenv("AFF_LMHEAD_BF16X12");
@@ -1115,7 +1206,21 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
     size_t freeb = 0, totalb = 0;
     AFF_HIP_CHECK(hipMemGetInfo(&freeb, &totalb));
 
-    if (is_b12_output) {
+    if (e.uva_host) {
+      void* dptr = nullptr;
+      if (hipHostGetDevicePointer(&dptr, e.uva_host, 0) != hipSuccess || !dptr) {
+        rollback_shards(d);
+        return -1;
+      }
+      s.data = dptr;
+      s.data_bytes = 0;
+      s.is_uva = true;
+      freed_bf16 = true;
+      if (d == 0) {
+        aff::ui::err("dense-gpu: %s mapped via UVA host RAM (%.1f MiB, 0 MiB VRAM/card)\n",
+                     name, nbytes / 1048576.0);
+      }
+    } else if (is_b12_output) {
       std::vector<uint32_t> esc_off;
       std::vector<uint16_t> esc_col, esc_val;
       build_bf16x12_esc_host((const uint16_t*)host + s.row0 * cols, (uint32_t)s.nrows,
@@ -1184,11 +1289,12 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
       aff::ui::err("dense-gpu: packed %s shard %zu to bf16x12 (%.1f MiB vs %.1f MiB bf16, esc=%u%s)\n",
                    name, d, b12_bytes / 1048576.0, nbytes / 1048576.0, s.b12_n_esc,
                    want_w4_head ? " + int4_g128" : "");
-    } else if (is_fp8_output) {
+    } else if (is_fp8_output || is_fp8_markov_w2) {
+      const bool want_w4_here = want_w4_head && is_output;
       const uint64_t fp8_bytes = s.nrows * s.ncols;
       const uint64_t fp8s_bytes = s.nrows * (s.ncols / 128) * sizeof(uint16_t);
-      const uint64_t w4_bytes = want_w4_head ? s.nrows * (s.ncols / 2) : 0ull;
-      const uint64_t w4s_bytes = want_w4_head ? s.nrows * (s.ncols / 128) * sizeof(uint16_t) : 0ull;
+      const uint64_t w4_bytes = want_w4_here ? s.nrows * (s.ncols / 2) : 0ull;
+      const uint64_t w4s_bytes = want_w4_here ? s.nrows * (s.ncols / 128) * sizeof(uint16_t) : 0ull;
       constexpr uint64_t kChunkRows = 1024;
       const uint64_t chunk_bytes = std::min<uint64_t>(kChunkRows, s.nrows) * s.ncols * elem;
       const uint64_t need_bytes = fp8_bytes + fp8s_bytes + w4_bytes + w4s_bytes + chunk_bytes;
@@ -1203,7 +1309,7 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
       const bool ok_alloc =
           hipMalloc(&s.fp8_data, fp8_bytes) == hipSuccess &&
           hipMalloc((void**)&s.fp8_scales, fp8s_bytes) == hipSuccess &&
-          (!want_w4_head || (hipMalloc((void**)&s.w4_data, w4_bytes) == hipSuccess &&
+          (!want_w4_here || (hipMalloc((void**)&s.w4_data, w4_bytes) == hipSuccess &&
                              hipMalloc((void**)&s.w4_scales, w4s_bytes) == hipSuccess)) &&
           hipMalloc((void**)&d_chunk, chunk_bytes) == hipSuccess;
       if (!ok_alloc) {
@@ -1217,7 +1323,7 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
                                 cur_r * s.ncols * elem, hipMemcpyHostToDevice));
         quantize_bf16_to_fp8_g128_hip(d_chunk, static_cast<uint8_t*>(s.fp8_data), s.fp8_scales,
                                       (uint32_t)cur_r, (uint32_t)s.ncols, (uint32_t)r, nullptr);
-        if (want_w4_head) {
+        if (want_w4_here) {
           quantize_bf16_to_w4_g128_hip(d_chunk, s.w4_data + r * (s.ncols / 2),
                                        s.w4_scales + r * (s.ncols / 128),
                                        (uint32_t)cur_r, (uint32_t)s.ncols, nullptr);
@@ -1232,7 +1338,7 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
       placed += fp8_tot + w4_bytes + w4s_bytes;
       aff::ui::err("dense-gpu: chunked-quantised %s shard %zu to fp8_g128 (%.1f MiB vs %.1f MiB bf16%s)\n",
                    name, d, fp8_tot / 1048576.0, nbytes / 1048576.0,
-                   want_w4_head ? " + int4_g128" : "");
+                   want_w4_here ? " + int4_g128" : "");
     } else if (is_w4_chunked_output) {
       // Radiance 2ec647c: chunked staging trim (CH = 1024) avoids 1.3 GiB peak VRAM allocation
       const uint64_t w4_bytes = s.nrows * (s.ncols / 2);
@@ -2444,6 +2550,23 @@ __global__ __launch_bounds__(256) void head_unpack_tm_kernel(const float* __rest
   if (r >= nr) return;
   const float v = (ld_src == 1u) ? src[(size_t)pos * nr + r] : src[(size_t)r * ld_src + pos];
   dst[(size_t)pos * vocab + (r0 + r)] = v;
+}
+
+__global__ __launch_bounds__(256) void head_pack_tm_bf16_kernel(const float* __restrict__ src,
+                                                                uint16_t* __restrict__ dst,
+                                                                uint32_t nr, uint32_t ld_src) {
+  const uint32_t r = blockIdx.x * 256u + threadIdx.x;
+  const uint32_t pos = blockIdx.y;
+  if (r < nr) dst[(size_t)pos * nr + r] = wmma::f32_to_bf16(src[(size_t)r * ld_src + pos]);
+}
+
+__global__ __launch_bounds__(256) void head_unpack_tm_bf16_kernel(const uint16_t* __restrict__ src,
+                                                                  float* __restrict__ dst,
+                                                                  uint32_t nr, uint32_t r0,
+                                                                  uint32_t vocab) {
+  const uint32_t r = blockIdx.x * 256u + threadIdx.x;
+  const uint32_t pos = blockIdx.y;
+  if (r < nr) dst[(size_t)pos * vocab + (r0 + r)] = wmma::bf16_to_f32(src[(size_t)pos * nr + r]);
 }
 
 __global__ __launch_bounds__(256) void draft_transpose_pad_kernel(const float* __restrict__ src,
@@ -4111,7 +4234,6 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       {&D.b_mix, nout, "mix"},
       {&D.b_pre, n_hc, "pre"}, {&D.b_pre_prev, n_hc, "pre prev"}, {&D.b_post, n_hc, "post"}, {&D.b_comb, (uint64_t)n_hc * n_hc, "comb"},
       {&D.b_cur, n_embd, "cur"}, {&D.b_norm, n_embd, "norm"}, {&D.b_block, n_embd, "block"},
-      {&D.b_conf, 1, "dspark confidence"},
       // Rows, not tokens: TWO [kHcnChunks][nb] planes and the loop below multiplies by nb. Two,
       // because the expand kernel reads one to re-derive the gates and writes the other.
       {&D.b_hcp, 2 * kHcnChunks, "hc partials"},
@@ -4264,18 +4386,31 @@ bool DenseGpu::draft_init(uint32_t n_embd, uint32_t tap_in, uint32_t vocab, uint
       AFF_HIP_CHECK(hipMemset(*a.p, 0, a.rows * kNarrowTok * sizeof(float)));
       bytes += a.rows * kNarrowTok * sizeof(float);
     }
-    if (!hip_try(hipMalloc(&D.b_mbest, sizeof(uint64_t)), "markov best", err)) return false;
+    if (!hip_try(hipMalloc(&D.b_mbest, (size_t)kNarrowTok * sizeof(uint64_t)), "markov best", err))
+      return false;
     if (!hip_try(hipMalloc(&D.b_mpeer, (kMaxRanks - 1) * sizeof(uint64_t)), "markov peer keys", err))
       return false;
-    if (!hip_try(hipMalloc(&D.b_ids, (size_t)(kNarrowTok + 1) * sizeof(uint32_t)),
+    if (impl_->dev.size() > 1u) {
+      const size_t fg_cnt = 2u * kNarrowTok * (kMaxRanks - 1u);
+      if (!hip_try(hipExtMallocWithFlags((void**)&D.b_mk_fg, fg_cnt * sizeof(uint64_t),
+                                         hipDeviceMallocFinegrained),
+                   "markov p2p fg", err))
+        return false;
+      if (!hip_try(hipExtMallocWithFlags((void**)&D.b_mk_flag, fg_cnt * sizeof(unsigned int),
+                                         hipDeviceMallocFinegrained),
+                   "markov p2p flag", err))
+        return false;
+      AFF_HIP_CHECK(hipMemset(D.b_mk_fg, 0, fg_cnt * sizeof(uint64_t)));
+      AFF_HIP_CHECK(hipMemset(D.b_mk_flag, 0, fg_cnt * sizeof(unsigned int)));
+    }
+    if (!hip_try(hipMalloc(&D.b_ids, (size_t)(2u * kNarrowTok + 4u) * sizeof(uint32_t)),
                  "markov id chain", err))
       return false;
-    if (!hip_try(hipHostMalloc(&D.h_ids, (size_t)kNarrowTok * sizeof(uint32_t),
+    if (!hip_try(hipHostMalloc(&D.h_ids, (size_t)(2u * kNarrowTok + 4u) * sizeof(uint32_t),
                                hipHostMallocDefault), "markov ids readback", err))
       return false;
-    if (!hip_try(hipHostMalloc(&D.h_conf, (size_t)kNarrowTok * sizeof(float),
-                               hipHostMallocDefault), "dspark confidence readback", err))
-      return false;
+    D.b_conf = reinterpret_cast<float*>(D.b_ids + kNarrowTok + 4u);
+    D.h_conf = reinterpret_cast<float*>(D.h_ids + kNarrowTok + 4u);
     for (hipEvent_t& e : D.ev_mk)
       if (!hip_try(hipEventCreateWithFlags(&e, hipEventDisableTiming), "markov event", err))
         return false;
@@ -4779,7 +4914,8 @@ bool DenseGpu::batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint
 
 bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv, int32_t kvnorm,
                               uint64_t hidden, uint64_t qr, uint32_t n_head, uint32_t width,
-                              uint32_t n_rot, RopeDerived rope, float eps, float* qrnorm_host) {
+                              uint32_t n_rot, RopeDerived rope, float eps, float* qrnorm_host,
+                              bool allow_q_e4m3) {
   if (!b_nb_) return false;
   AFF_TRACE(22);
   if (qa < 0 || qb < 0 || kv < 0 || qnorm < 0 || kvnorm < 0) return false;
@@ -4789,8 +4925,14 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
   for (size_t d = 0; d < impl_->dev.size(); ++d)
     if (B.sh[d].row0 % width || B.sh[d].nrows % width) return false;
 
+  const bool use_q_e4m3 = allow_q_e4m3 && attn_ok_ && no_qrms_ && a_dt_ == KvDtype::FP8R &&
+                          a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u &&
+                          width == kFlashWidth && (n_rot % 64u) == 0u &&
+                          flash_q_e4m3_enabled();
+
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
+    D.b_qtm_e4m3 = false;
     const uint64_t nq = B.sh[d].nrows;
     const uint32_t nh = (uint32_t)(nq / width);
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -4853,9 +4995,17 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
       // Per-head RMS, the rope tail and the dim-major -> token-major transpose attention needs, in
       // two passes over b_q rather than five. b_q is left unscaled: this transpose was its only
       // reader, and b_q is b_htm, which mqa_attend overwrites next.
-      if (!batch_head_rms_rope_tr_hip(D.b_q, D.b_qtm, D.b_hinv, nh, width, n_rot, b_pos0_, rope,
-                                      eps, b_nb_, D.stream, !no_qrms_))
+      const size_t q8_aligned = (((size_t)nh * width * b_nb_) + 15u) & ~size_t(15u);
+      const size_t q8_need = q8_aligned + (size_t)nh * b_nb_ * sizeof(float);
+      if (use_q_e4m3 && q8_need <= D.b_q_floats * sizeof(uint16_t) &&
+          batch_head_rope_q8_tr_hip(D.b_q, reinterpret_cast<uint8_t*>(D.b_qtm),
+                                    b_qtm_qscales(D.b_qtm, nh, width, b_nb_), nh, width, n_rot,
+                                    b_pos0_, rope, b_nb_, D.stream)) {
+        D.b_qtm_e4m3 = true;
+      } else if (!batch_head_rms_rope_tr_hip(D.b_q, D.b_qtm, D.b_hinv, nh, width, n_rot, b_pos0_,
+                                             rope, eps, b_nb_, D.stream, !no_qrms_)) {
         return false;
+      }
       batch_rms_norm_rope_hip(ykv, D.vec[kvnorm], D.b_kv, width, n_rot, b_pos0_, rope, eps, b_nb_,
                               D.stream);
     }
@@ -6020,7 +6170,8 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
       const uint32_t max_live_comp = (pos0 + n) / 4u;
       if (max_live_comp < comp_split_hint) comp_split_hint = max_live_comp;
     }
-    if (flash)
+    if (flash) {
+      const float* q_sc = D.b_qtm_e4m3 ? b_qtm_qscales(D.b_qtm, a_hpr_, a_width_, b_nb_) : nullptr;
       mqa_attend_flash_hip(D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][kvl(layer)],
                            gather ? nullptr
                                   : (dev_mask ? D.b_allow + (size_t)b0 * a_maxcomp_
@@ -6028,9 +6179,10 @@ bool DenseGpu::batch_attend(uint32_t layer, uint32_t b0, uint32_t n, uint32_t po
                            gather ? D.b_admn + b0 : D.b_ncomp, /*n_comp1=*/0u, D.a_sink[layer],
                            D.b_htm, b0, n, b_nb_, pos0,
                            a_sliding_, a_ring_, a_maxcomp_, a_hpr_, scale, D.stream,
-                           /*q_bf16=*/true, &D.fsplit, comp_split_hint,
-                           gather ? D.b_adm + (size_t)b0 * kAdmCap : nullptr, kAdmCap, raw_floor);
-    else
+                           /*q_bf16=*/!D.b_qtm_e4m3, &D.fsplit, comp_split_hint,
+                           gather ? D.b_adm + (size_t)b0 * kAdmCap : nullptr, kAdmCap, raw_floor,
+                           q_sc);
+    } else
       mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw_s[slot_][layer], D.a_comp_s[slot_][kvl(layer)],
                            dev_mask ? D.b_allow + (size_t)b0 * a_maxcomp_
                                     : ((allowed && n_comp_max) ? D.b_allow : nullptr),
@@ -7118,21 +7270,9 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     }
     return true;
   };
-  static auto launch_fp8_g128_head = [](const uint8_t* fp8, const uint16_t* sc, const float* x_tm,
-                                        float* y, uint32_t nr_rows, uint32_t cols, uint32_t nt,
-                                        uint32_t out_ld, int out_tm, hipStream_t st) -> bool {
-    if (!fp8 || !sc || (cols % 256) != 0 || !nt) return false;
-    for (uint32_t t0 = 0; t0 < nt; t0 += 8u) {
-      const uint32_t chunk = std::min<uint32_t>(8u, nt - t0);
-      float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
-      if (!matvec_fp8_g128_multix_hip(fp8, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols,
-                                      chunk, out_ld, out_tm, st))
-        return false;
-    }
-    return true;
-  };
   Impl::Dev& D0 = impl_->dev[0];
   bool pack_tm = (R > 1u) && (n < b_nb_) && D0.b_q && (D0.b_q_floats >= (size_t)vocab * n);
+  const bool hs_bf16 = pack_tm && head_sample_bf16_enabled();
   uint64_t r0_band[kMaxRanks] = {};
   uint64_t nr_band[kMaxRanks] = {};
   float* peer_src[kMaxRanks] = {};
@@ -7198,9 +7338,16 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
                      D.stream);
     }
     if (pack_tm && d > 0) {
-      hipLaunchKernelGGL(head_pack_tm_kernel,
-                         dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D.stream,
-                         D.b_head + (size_t)r0 * b_nb_, peer_src[d], (uint32_t)nr, b_nb_);
+      if (hs_bf16) {
+        hipLaunchKernelGGL(head_pack_tm_bf16_kernel,
+                           dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D.stream,
+                           D.b_head + (size_t)r0 * b_nb_, reinterpret_cast<uint16_t*>(peer_src[d]),
+                           (uint32_t)nr, b_nb_);
+      } else {
+        hipLaunchKernelGGL(head_pack_tm_kernel,
+                           dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D.stream,
+                           D.b_head + (size_t)r0 * b_nb_, peer_src[d], (uint32_t)nr, b_nb_);
+      }
       AFF_HIP_CHECK(hipGetLastError());
     }
     if (d > 0 && D.ev_amx) AFF_HIP_CHECK(hipEventRecord(D.ev_amx, D.stream));
@@ -7222,16 +7369,25 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     if (!nr) continue;
     Impl::Dev& Pd = impl_->dev[d];
     if (Pd.ev_amx) AFF_HIP_CHECK(hipStreamWaitEvent(D0.stream, Pd.ev_amx, 0));
-    const size_t c_bytes = pack_tm ? ((size_t)nr * n * sizeof(float))
-                                   : ((size_t)nr * b_nb_ * sizeof(float));
-    const float* c_src = pack_tm ? peer_src[d] : (Pd.b_head + (size_t)r0 * b_nb_);
+    const size_t c_bytes = hs_bf16 ? ((size_t)nr * n * sizeof(uint16_t))
+                                   : (pack_tm ? ((size_t)nr * n * sizeof(float))
+                                              : ((size_t)nr * b_nb_ * sizeof(float)));
+    const void* c_src = pack_tm ? (const void*)peer_src[d]
+                                : (const void*)(Pd.b_head + (size_t)r0 * b_nb_);
     AFF_HIP_CHECK(hipMemcpyPeerAsync(D0.b_head + (size_t)r0 * b_nb_, D0.id, c_src, Pd.id,
                                      c_bytes, D0.stream));
     if (pack_tm) {
-      hipLaunchKernelGGL(head_unpack_tm_kernel,
-                         dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D0.stream,
-                         D0.b_head + (size_t)r0 * b_nb_, D0.b_q, (uint32_t)nr, 1u,
-                         (uint32_t)r0, (uint32_t)vocab);
+      if (hs_bf16) {
+        hipLaunchKernelGGL(head_unpack_tm_bf16_kernel,
+                           dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D0.stream,
+                           reinterpret_cast<const uint16_t*>(D0.b_head + (size_t)r0 * b_nb_),
+                           D0.b_q, (uint32_t)nr, (uint32_t)r0, (uint32_t)vocab);
+      } else {
+        hipLaunchKernelGGL(head_unpack_tm_kernel,
+                           dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D0.stream,
+                           D0.b_head + (size_t)r0 * b_nb_, D0.b_q, (uint32_t)nr, 1u,
+                           (uint32_t)r0, (uint32_t)vocab);
+      }
       AFF_HIP_CHECK(hipGetLastError());
     }
   }
@@ -7239,29 +7395,29 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
   const uint32_t smp_row_stride = pack_tm ? 1u : b_nb_;
   const uint32_t smp_col_stride = pack_tm ? (uint32_t)vocab : 1u;
 
+  struct SmpCtrlBuf {
+    uint32_t query[kNarrowTok];
+    float u[2u * kNarrowTok];
+    uint32_t tail[2u * kPenaltyCap];
+  };
   if (!smp_cap_ || smp_cap_ < n) {
-    for (void** p : {(void**)&smp_q_, (void**)&smp_u_, (void**)&smp_out_})
+    for (void** p : {(void**)&smp_ctrl_, (void**)&smp_out_})
       if (*p) { (void)hipFree(*p); *p = nullptr; }
-    for (void** p : {(void**)&smp_h_q_, (void**)&smp_h_u_, (void**)&smp_h_out_})
+    for (void** p : {(void**)&smp_h_ctrl_, (void**)&smp_h_out_})
       if (*p) { (void)hipHostFree(*p); *p = nullptr; }
-    if (hipMalloc(&smp_q_, (size_t)kNarrowTok * sizeof(uint32_t)) != hipSuccess) return false;
-    if (hipMalloc(&smp_u_, (size_t)2 * kNarrowTok * sizeof(float)) != hipSuccess) return false;
+    if (hipMalloc(&smp_ctrl_, sizeof(SmpCtrlBuf)) != hipSuccess) return false;
     if (hipMalloc(&smp_out_, (size_t)kNarrowTok * sizeof(SpecDraw)) != hipSuccess) return false;
-    if (hipMalloc(&smp_hist_, (size_t)kPenaltyCap * sizeof(uint32_t)) != hipSuccess) return false;
-    if (hipMalloc(&smp_dry_, (size_t)kPenaltyCap * sizeof(uint32_t)) != hipSuccess) return false;
-    if (hipHostMalloc(&smp_h_q_, (size_t)kNarrowTok * sizeof(uint32_t), hipHostMallocDefault) != hipSuccess) return false;
-    if (hipHostMalloc(&smp_h_u_, (size_t)2 * kNarrowTok * sizeof(float), hipHostMallocDefault) != hipSuccess) return false;
-    if (hipHostMalloc(&smp_h_out_, (size_t)kNarrowTok * sizeof(SpecDraw), hipHostMallocDefault) != hipSuccess) return false;
-    if (hipHostMalloc(&smp_h_hist_, (size_t)kPenaltyCap * sizeof(uint32_t), hipHostMallocDefault) != hipSuccess) return false;
-    if (hipHostMalloc(&smp_h_dry_, (size_t)kPenaltyCap * sizeof(uint32_t), hipHostMallocDefault) != hipSuccess) return false;
+    if (hipHostMalloc(&smp_h_ctrl_, sizeof(SmpCtrlBuf), hipHostMallocDefault) != hipSuccess)
+      return false;
+    if (hipHostMalloc(&smp_h_out_, (size_t)kNarrowTok * sizeof(SpecDraw), hipHostMallocDefault) !=
+        hipSuccess)
+      return false;
     smp_cap_ = kNarrowTok;
   }
-  std::memcpy(smp_h_q_, query, (size_t)n * sizeof(uint32_t));
-  std::memcpy(smp_h_u_, u, (size_t)2 * n * sizeof(float));
-  AFF_HIP_CHECK(hipMemcpyAsync(smp_q_, smp_h_q_, (size_t)n * sizeof(uint32_t), hipMemcpyHostToDevice,
-                               D0.stream));
-  AFF_HIP_CHECK(hipMemcpyAsync(smp_u_, smp_h_u_, (size_t)2 * n * sizeof(float), hipMemcpyHostToDevice,
-                               D0.stream));
+  auto* const h_ctrl = reinterpret_cast<SmpCtrlBuf*>(smp_h_ctrl_);
+  auto* const d_ctrl = reinterpret_cast<SmpCtrlBuf*>(smp_ctrl_);
+  std::memcpy(h_ctrl->query, query, (size_t)n * sizeof(uint32_t));
+  std::memcpy(h_ctrl->u, u, (size_t)2u * n * sizeof(float));
   // ---- the repetition window -------------------------------------------------------------------
   //
   // Deduplicated here rather than in the kernel: a window in which one token appears eight times
@@ -7276,36 +7432,37 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
       if (id >= vocab) continue;
       bool seen = false;
       for (uint32_t j = 0; j < n_pen; ++j)
-        if (smp_h_hist_[j] == id) { seen = true; break; }
-      if (!seen) smp_h_hist_[n_pen++] = id;
-    }
-    if (n_pen) {
-      AFF_HIP_CHECK(hipMemcpyAsync(smp_hist_, smp_h_hist_, (size_t)n_pen * sizeof(uint32_t),
-                                   hipMemcpyHostToDevice, D0.stream));
-      if (!apply_repeat_penalty_hip(logits_plane, (uint32_t)vocab, n, smp_row_stride,
-                                    smp_col_stride, (const uint32_t*)smp_hist_, n_pen,
-                                    repeat_penalty, D0.stream))
-        return no("the repetition penalty refused the plane");
+        if (h_ctrl->tail[j] == id) { seen = true; break; }
+      if (!seen) h_ctrl->tail[n_pen++] = id;
     }
   }
   // ---- DRY ------------------------------------------------------------------------------------
   //
   // The host has already decided which ids continue a repeated n-gram, and deduplicated them
   // because it collected them by scanning. All that is left is a bounded copy and a subtract.
+  uint32_t n_dry = 0;
   if (dry_delta > 0.0f && dry_ids && n_dry_ids) {
-    const uint32_t n_dry = n_dry_ids > kPenaltyCap ? kPenaltyCap : n_dry_ids;
-    std::memcpy(smp_h_dry_, dry_ids, (size_t)n_dry * sizeof(uint32_t));
-    AFF_HIP_CHECK(hipMemcpyAsync(smp_dry_, smp_h_dry_, (size_t)n_dry * sizeof(uint32_t),
-                                 hipMemcpyHostToDevice, D0.stream));
+    n_dry = n_dry_ids > kPenaltyCap ? kPenaltyCap : n_dry_ids;
+    std::memcpy(h_ctrl->tail + n_pen, dry_ids, (size_t)n_dry * sizeof(uint32_t));
+  }
+  const size_t tail_off = (size_t)((const uint8_t*)h_ctrl->tail - (const uint8_t*)h_ctrl);
+  const size_t ctrl_bytes = tail_off + (size_t)(n_pen + n_dry) * sizeof(uint32_t);
+  AFF_HIP_CHECK(hipMemcpyAsync(smp_ctrl_, smp_h_ctrl_, ctrl_bytes, hipMemcpyHostToDevice, D0.stream));
+  if (n_pen) {
+    if (!apply_repeat_penalty_hip(logits_plane, (uint32_t)vocab, n, smp_row_stride,
+                                  smp_col_stride, d_ctrl->tail, n_pen,
+                                  repeat_penalty, D0.stream))
+      return no("the repetition penalty refused the plane");
+  }
+  if (n_dry) {
     if (!apply_dry_penalty_hip(logits_plane, (uint32_t)vocab, n, smp_row_stride, smp_col_stride,
-                               (const uint32_t*)smp_dry_, n_dry, dry_delta, D0.stream))
+                               d_ctrl->tail + n_pen, n_dry, dry_delta, D0.stream))
       return no("the DRY penalty refused the plane");
   }
   SampleParams sp;
   sp.temperature = temperature; sp.top_p = top_p; sp.top_k = top_k; sp.min_p = min_p;
   if (!batch_sample_hip(logits_plane, (uint32_t)vocab, n, smp_row_stride, smp_col_stride,
-                        (const uint32_t*)smp_q_, (const float*)smp_u_, sp, (SpecDraw*)smp_out_,
-                        D0.stream))
+                        d_ctrl->query, d_ctrl->u, sp, (SpecDraw*)smp_out_, D0.stream))
     return no("batch_sample_hip refused the plane");
   AFF_HIP_CHECK(hipMemcpyAsync(smp_h_out_, smp_out_, (size_t)n * sizeof(SpecDraw),
                                hipMemcpyDeviceToHost, D0.stream));
@@ -7341,19 +7498,6 @@ bool DenseGpu::batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n
       float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
       if (!matvec_w4_multix_hip(w4, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols, chunk,
                                 out_ld, out_tm, st))
-        return false;
-    }
-    return true;
-  };
-  static auto launch_fp8_g128_head = [](const uint8_t* fp8, const uint16_t* sc, const float* x_tm,
-                                        float* y, uint32_t nr_rows, uint32_t cols, uint32_t nt,
-                                        uint32_t out_ld, int out_tm, hipStream_t st) -> bool {
-    if (!fp8 || !sc || (cols % 256) != 0 || !nt) return false;
-    for (uint32_t t0 = 0; t0 < nt; t0 += 8u) {
-      const uint32_t chunk = std::min<uint32_t>(8u, nt - t0);
-      float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
-      if (!matvec_fp8_g128_multix_hip(fp8, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols,
-                                      chunk, out_ld, out_tm, st))
         return false;
     }
     return true;
@@ -7738,9 +7882,7 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
   const Entry& W1 = ent_[h_w1];
   const Entry& W2 = ent_[h_w2];
   if (H.split == Split::Col || H.cols != n_embd) return false;
-  // Both replicated, so each card can slice w2 by whatever band its own head produced. split_for
-  // says so; a Row split here would silently score the wrong rows.
-  if (W1.split != Split::Rep || W2.split != Split::Rep) return false;
+  if (W1.split != Split::Rep || (W2.split != Split::Row && W2.split != Split::Rep)) return false;
   if (W1.cols != rank || W2.cols != rank || W1.quant != AFF_BF16 || W2.quant != AFF_BF16)
     return false;
   const size_t R = impl_->dev.size();
@@ -7781,15 +7923,11 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
           return false;
       } else if (!H.sh[d].data && H.sh[d].fp8_data && H.sh[d].fp8_scales && (n_embd % 256) == 0) {
         const uint64_t off = r0[d] - H.sh[d].row0;
-        for (uint32_t t0 = 0; t0 < n; t0 += 8u) {
-          const uint32_t chunk = std::min<uint32_t>(8u, n - t0);
-          if (!matvec_fp8_g128_multix_hip(
-                  static_cast<const uint8_t*>(H.sh[d].fp8_data) + off * n_embd,
-                  H.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb + (size_t)t0 * n_embd,
-                  D.b_head + (size_t)t0 * nr[d], (uint32_t)nr[d], (uint32_t)n_embd, chunk,
-                  (uint32_t)nr[d], /*out_token_major=*/1, D.stream))
-            return false;
-        }
+        if (!launch_fp8_g128_head(static_cast<const uint8_t*>(H.sh[d].fp8_data) + off * n_embd,
+                                  H.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb, D.b_head,
+                                  (uint32_t)nr[d], (uint32_t)n_embd, n, (uint32_t)nr[d],
+                                  /*out_token_major=*/1, D.stream))
+          return false;
       } else if (!H.sh[d].data && H.sh[d].b12_sm && (n_embd % 256) == 0) {
         const uint64_t off = r0[d] - H.sh[d].row0;
         if (!matvec_bf16x12_multix_hip(
@@ -7819,16 +7957,11 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
       }
     } else if (!H.sh[d].data && H.sh[d].fp8_data && H.sh[d].fp8_scales && (n_embd % 256) == 0) {
       const uint64_t off = r0[d] - H.sh[d].row0;
-      for (uint32_t t0 = 0; t0 < n; t0 += 8u) {
-        const uint32_t chunk = std::min<uint32_t>(8u, n - t0);
-        if (!matvec_fp8_g128_multix_hip(
-                static_cast<const uint8_t*>(H.sh[d].fp8_data) + off * n_embd,
-                H.sh[d].fp8_scales + off * (n_embd / 128),
-                D.b_emb + (size_t)t0 * n_embd, D.b_head + t0,
-                (uint32_t)nr[d], (uint32_t)n_embd, chunk, kNarrowTok,
-                /*out_token_major=*/0, D.stream))
-          return false;
-      }
+      if (!launch_fp8_g128_head(static_cast<const uint8_t*>(H.sh[d].fp8_data) + off * n_embd,
+                                H.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb, D.b_head,
+                                (uint32_t)nr[d], (uint32_t)n_embd, n, kNarrowTok,
+                                /*out_token_major=*/0, D.stream))
+        return false;
     } else if (!H.sh[d].data && H.sh[d].b12_sm) {
       const uint64_t off = r0[d] - H.sh[d].row0;
       batch_gemm_bf16x12_hip(H.sh[d].b12_sm, H.sh[d].b12_exp4, H.sh[d].b12_mexp,
@@ -7857,6 +7990,20 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
   //
   // Ordering is events, not waits: a card records after its step and the others' streams wait on
   // that record. `hipStreamWaitEvent` blocks the STREAM, never the thread issuing it.
+  size_t active_ranks[kMaxRanks] = {};
+  size_t n_active = 0;
+  for (size_t d = 0; d < R; ++d) {
+    if (!nr[d]) continue;
+    if (W2.split == Split::Row &&
+        (r0[d] < W2.sh[d].row0 || r0[d] + nr[d] > W2.sh[d].row0 + W2.sh[d].nrows))
+      return false;
+    active_ranks[n_active++] = d;
+  }
+  bool have_p2p_fg = (n_active > 1u) && markov_p2p_spin_enabled();
+  for (size_t ai = 0; ai < n_active && have_p2p_fg; ++ai) {
+    const Impl::Dev& D = impl_->dev[active_ranks[ai]];
+    if (!D.b_mk_fg || !D.b_mk_flag) have_p2p_fg = false;
+  }
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     if (!D.b_ids || !D.b_mpeer || !D.tok.ready()) return false;
@@ -7869,54 +8016,103 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
     std::memcpy(pin, &first_id, sizeof(uint32_t));
     AFF_HIP_CHECK(hipMemcpyAsync(D.b_ids, pin, sizeof(uint32_t), hipMemcpyHostToDevice, D.stream));
     AFF_HIP_CHECK(D.tok.done(ts, D.stream));
+    if (have_p2p_fg && nr[d]) {
+      AFF_HIP_CHECK(hipMemsetAsync(D.b_mbest, 0, (size_t)n * sizeof(uint64_t), D.stream));
+    }
   }
   for (uint32_t i = 0; i < n; ++i) {
-    for (size_t d = 0; d < R; ++d) {
-      if (!nr[d]) continue;
+    for (size_t ai = 0; ai < n_active; ++ai) {
+      const size_t d = active_ranks[ai];
       Impl::Dev& D = impl_->dev[d];
       AFF_HIP_CHECK(hipSetDevice(D.id));
-      markov_step_hip((const uint16_t*)W1.sh[d].data, (const uint16_t*)W2.sh[d].data, D.b_ids,
-                      D.b_head, D.b_mbest, (uint32_t)nr[d], (uint32_t)r0[d], rank, kNarrowTok, i,
-                      D.stream, mx ? 1 : 0);
-      AFF_HIP_CHECK(hipEventRecord(D.ev_mk[i], D.stream));
-    }
-    for (size_t d = 0; d < R; ++d) {
-      if (!nr[d]) continue;
-      Impl::Dev& D = impl_->dev[d];
-      AFF_HIP_CHECK(hipSetDevice(D.id));
-      // Every OTHER card that produced a key, pulled into this card's staging array. A card with no
-      // band of its own contributes nothing, and a fold over no peers is the identity — which is
-      // also the whole of the single-card path.
-      uint32_t staged = 0;
-      for (size_t o = 0; o < R; ++o) {
-        if (o == d || !nr[o]) continue;
-        Impl::Dev& P = impl_->dev[o];
-        AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, P.ev_mk[i], 0));
-        AFF_HIP_CHECK(hipMemcpyPeerAsync(D.b_mpeer + staged, D.id, P.b_mbest, P.id,
-                                         sizeof(uint64_t), D.stream));
-        ++staged;
+      uint64_t* const best_ptr = have_p2p_fg ? (D.b_mbest + i) : D.b_mbest;
+      const bool reset_best = !have_p2p_fg;
+      const uint64_t w2_rel_row = (W2.split == Split::Row) ? (r0[d] - W2.sh[d].row0) : r0[d];
+      if (!W2.sh[d].data && W2.sh[d].fp8_data && W2.sh[d].fp8_scales) {
+        markov_step_fp8_g128_hip(
+            (const uint16_t*)W1.sh[d].data,
+            static_cast<const uint8_t*>(W2.sh[d].fp8_data) + w2_rel_row * rank,
+            W2.sh[d].fp8_scales + w2_rel_row * (rank / 128u), D.b_ids, D.b_head, best_ptr,
+            (uint32_t)nr[d], (uint32_t)r0[d], rank, kNarrowTok, i, D.stream, mx ? 1 : 0,
+            reset_best);
+      } else {
+        markov_step_hip((const uint16_t*)W1.sh[d].data,
+                        (const uint16_t*)W2.sh[d].data + w2_rel_row * rank, D.b_ids, D.b_head,
+                        best_ptr, (uint32_t)nr[d], (uint32_t)r0[d], rank, kNarrowTok, i, D.stream,
+                        mx ? 1 : 0, reset_best, /*w2_sharded=*/1);
       }
-      markov_combine_hip(D.b_mbest, D.b_mpeer, staged, D.b_ids, i, D.stream);
+      if (!have_p2p_fg && n_active > 1u) AFF_HIP_CHECK(hipEventRecord(D.ev_mk[i], D.stream));
+    }
+    if (have_p2p_fg) {
+      const uint32_t tag = ++impl_->mk_seq;
+      const uint32_t slot = tag % (2u * kNarrowTok);
+      const size_t peer_stride = kMaxRanks - 1u;
+      for (size_t ai = 0; ai < n_active; ++ai) {
+        const size_t d = active_ranks[ai];
+        Impl::Dev& D = impl_->dev[d];
+        AFF_HIP_CHECK(hipSetDevice(D.id));
+        const bool last_step = (i + 1u == n);
+        const bool is_head_rank = (ai == 0u);
+        MarkovP2PTargets targets{};
+        uint32_t push_n = 0u;
+        if (!last_step || !is_head_rank) {
+          for (size_t ao = 0; ao < n_active; ++ao) {
+            if (ao == ai) continue;
+            if (last_step && ao != 0u) continue;
+            const size_t o = active_ranks[ao];
+            Impl::Dev& P = impl_->dev[o];
+            const size_t peer_slot_in_o = (ai < ao) ? ai : (ai - 1u);
+            targets.fg[push_n] = P.b_mk_fg + (size_t)slot * peer_stride + peer_slot_in_o;
+            targets.flag[push_n] = P.b_mk_flag + (size_t)slot * peer_stride + peer_slot_in_o;
+            ++push_n;
+          }
+        }
+        const bool skip_wait = last_step && !is_head_rank;
+        const uint32_t wait_n = skip_wait ? 0u : (uint32_t)(n_active - 1u);
+        markov_combine_p2p_hip(D.b_mbest + i, targets, D.b_mk_fg + (size_t)slot * peer_stride,
+                               D.b_mk_flag + (size_t)slot * peer_stride, D.b_ids, i, tag, push_n,
+                               wait_n, !skip_wait, D.stream);
+      }
+    } else {
+      for (size_t ai = 0; ai < n_active; ++ai) {
+        if (i + 1u == n && ai != 0u) continue;
+        const size_t d = active_ranks[ai];
+        Impl::Dev& D = impl_->dev[d];
+        AFF_HIP_CHECK(hipSetDevice(D.id));
+        uint32_t staged = 0;
+        for (size_t ao = 0; ao < n_active; ++ao) {
+          if (ao == ai) continue;
+          Impl::Dev& P = impl_->dev[active_ranks[ao]];
+          AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, P.ev_mk[i], 0));
+          AFF_HIP_CHECK(hipMemcpyPeerAsync(D.b_mpeer + staged, D.id, P.b_mbest, P.id,
+                                           sizeof(uint64_t), D.stream));
+          ++staged;
+        }
+        markov_combine_hip(D.b_mbest, D.b_mpeer, staged, D.b_ids, i, D.stream);
+      }
     }
   }
-  // ONE readback for the whole block (ids + optional DSpark confidence together in 1 drain).
+  // ONE readback for the whole block (ids + optional DSpark confidence together in 1 D2H blit).
   // `b_ids[0]` is the input token, so the block's proposals are the n words after it.
+  const size_t head_r = n_active ? active_ranks[0] : 0u;
   bool do_conf = conf_out != nullptr && conf_cw >= 0 && (size_t)conf_cw < n_vec_ &&
                  W1.quant == AFF_BF16 && W1.cols == rank;
   {
-    Impl::Dev& D = impl_->dev[0];
+    Impl::Dev& D = impl_->dev[head_r];
     if (do_conf && (!D.b_conf || !D.b_cur || !D.b_ids || !D.h_conf)) do_conf = false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
     if (do_conf) {
-      dspark_confidence_hip(D.vec[conf_cw], (const uint16_t*)W1.sh[0].data, D.b_cur, D.b_ids,
+      dspark_confidence_hip(D.vec[conf_cw], (const uint16_t*)W1.sh[head_r].data, D.b_cur, D.b_ids,
                             D.b_conf, n, (uint32_t)n_embd, rank, kNarrowTok, D.stream);
-      AFF_HIP_CHECK(hipMemcpyAsync(D.h_conf, D.b_conf, (size_t)n * sizeof(float),
+      AFF_HIP_CHECK(hipMemcpyAsync(D.h_ids + 1u, D.b_ids + 1u,
+                                   (size_t)(kNarrowTok + 3u + n) * sizeof(uint32_t),
+                                   hipMemcpyDeviceToHost, D.stream));
+    } else {
+      AFF_HIP_CHECK(hipMemcpyAsync(D.h_ids + 1u, D.b_ids + 1u, (size_t)n * sizeof(uint32_t),
                                    hipMemcpyDeviceToHost, D.stream));
     }
-    AFF_HIP_CHECK(hipMemcpyAsync(D.h_ids, D.b_ids + 1, (size_t)n * sizeof(uint32_t),
-                                 hipMemcpyDeviceToHost, D.stream));
     AFF_DRAIN_AT(D, aff::BlockSite::DraftHead);
-    std::memcpy(ids, D.h_ids, (size_t)n * sizeof(uint32_t));
+    std::memcpy(ids, D.h_ids + 1u, (size_t)n * sizeof(uint32_t));
     if (do_conf) std::memcpy(conf_out, D.h_conf, (size_t)n * sizeof(float));
   }
   if (conf_ok) *conf_ok = do_conf;
@@ -7960,9 +8156,9 @@ Model::BatchOps DenseGpu::batch_ops() {
   };
   o.attn_qkv = [](void* c, int32_t qa, int32_t qb, int32_t qn, int32_t kv, int32_t kvn,
                   uint64_t hid, uint64_t qr, uint32_t nh, uint32_t w, uint32_t nr, RopeDerived rp,
-                  float eps, float* qo) {
+                  float eps, float* qo, bool allow_q_e4m3) {
     return static_cast<DenseGpu*>(c)->batch_attn_qkv(qa, qb, qn, kv, kvn, hid, qr, nh, w, nr, rp,
-                                                     eps, qo);
+                                                     eps, qo, allow_q_e4m3);
   };
   o.mv_host = [](void* c, int src, const int32_t* h, const uint64_t* r, uint64_t cols, uint32_t n,
                  float* const* y) {

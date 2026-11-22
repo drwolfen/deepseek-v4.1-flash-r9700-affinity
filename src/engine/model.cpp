@@ -2059,7 +2059,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
 
       const RopeDerived rd = rope_derive(w.rope, ROT);
       if (!bops_.attn_qkv(bops_.ctx, w.wq_a.gpu, w.wq_b.gpu, w.q_norm_gpu, w.wkv.gpu, w.kv_norm_gpu,
-                          E, QR, NH, W, ROT, rd, cfg_.rms_eps, nullptr))
+                          E, QR, NH, W, ROT, rd, cfg_.rms_eps, nullptr, true))
         return false;
       AFF_PH(attn_proj);
 
@@ -2800,7 +2800,7 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
                       nullptr))
       return false;
     if (!bops_.attn_qkv(bops_.ctx, w.wq_a.gpu, w.wq_b.gpu, w.q_norm_gpu, w.wkv.gpu, w.kv_norm_gpu,
-                        E, QR, NH, W, ROT, rd, cfg_.rms_eps, nullptr))
+                        E, QR, NH, W, ROT, rd, cfg_.rms_eps, nullptr, false))
       return false;
     // The block's own KV, at its own positions. It overwrites whatever the LAST block drafted
     // there, which is exactly right: those positions were either accepted — and then the loop

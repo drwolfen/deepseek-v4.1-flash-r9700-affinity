@@ -407,23 +407,63 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
   // planned. The slot is chosen from the head the kernel is ABOUT to publish, which is safe because
   // one workgroup writes this and dispatches are ordered on the stream.
   if (a.act) {
-    // Read ONCE. `head` is in pinned host memory, so every thread reading it is a separate uncached
-    // PCIe round trip for the same word — the same trap the placement table's host mirror exists to
-    // avoid, in the other direction.
     __shared__ unsigned long long s_head;
-    if (!threadIdx.x) s_head = a.act->head;
-    __syncthreads();
-    const unsigned long long h = s_head;
-    ActRecord* const rec = &a.act->slot[h % kActSlots];
-    for (uint32_t e = threadIdx.x; e < kActExperts; e += kPlanThreads)
-      rec->counts[e] = e < NE ? L.counts[e] : 0u;
-    __syncthreads();
+    __shared__ uint32_t s_wpop[16];
+    __shared__ uint32_t s_woff[16];
     if (!threadIdx.x) {
-      rec->layer = a.layer;
-      // System scope: the reader is the CPU, and a device-scope fence would leave the record in a
-      // cache the host cannot see while the head says it is there.
-      __threadfence_system();
-      a.act->head = h + 1ull;
+      s_head = a.act_head ? *a.act_head : a.act->head;
+      if (a.act_head) *a.act_head = s_head + 1ull;
+    }
+    const uint32_t n_act = (NE < kActExperts) ? NE : kActExperts;
+    if (a.sparse_act) {
+      const uint32_t nw = (n_act + 31u) >> 5;
+      const uint32_t lane = threadIdx.x & 31u;
+      const uint32_t wave = threadIdx.x >> 5;
+      const uint32_t cnt = (threadIdx.x < n_act) ? L.counts[threadIdx.x] : 0u;
+      const uint64_t mask = (uint64_t)__ballot(cnt > 0u) & 0xFFFFFFFFull;
+      if (wave < nw && lane == 0u) s_wpop[wave] = (uint32_t)__popcll(mask);
+      __syncthreads();
+      const unsigned long long h = s_head;
+      ActRecord* const rec = &a.act->slot[h % kActSlots];
+      if (!threadIdx.x) {
+        uint32_t run = 0u;
+        for (uint32_t w = 0u; w < nw; ++w) {
+          s_woff[w] = run;
+          run += s_wpop[w];
+        }
+        rec->layer = a.layer;
+        rec->mode = 1u;
+        rec->count = run;
+        rec->pad = 0u;
+      }
+      __syncthreads();
+      if (cnt > 0u) {
+        const uint32_t pos = s_woff[wave] + (uint32_t)__popcll(mask & ((1ull << lane) - 1ull));
+        rec->entries[pos].exp = (uint16_t)threadIdx.x;
+        rec->entries[pos].cnt = (uint16_t)(cnt > 65535u ? 65535u : cnt);
+      }
+      __syncthreads();
+      if (!threadIdx.x) {
+        __threadfence_system();
+        a.act->head = h + 1ull;
+      }
+    } else {
+      __syncthreads();
+      const unsigned long long h = s_head;
+      ActRecord* const rec = &a.act->slot[h % kActSlots];
+      for (uint32_t e = threadIdx.x; e < kActExperts; e += kPlanThreads)
+        rec->counts[e] = e < NE ? L.counts[e] : 0u;
+      __syncthreads();
+      if (!threadIdx.x) {
+        rec->layer = a.layer;
+        rec->mode = 0u;
+        rec->count = n_act;
+        rec->pad = 0u;
+        // System scope: the reader is the CPU, and a device-scope fence would leave the record in a
+        // cache the host cannot see while the head says it is there.
+        __threadfence_system();
+        a.act->head = h + 1ull;
+      }
     }
   }
   if (!threadIdx.x) {

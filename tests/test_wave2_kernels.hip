@@ -1,3 +1,4 @@
+#include "gpu/attn_flash.h"
 #include "gpu/batch_kernels.h"
 #include "gpu/expert_kernel_hip.h"
 #include "gpu/tp_allreduce.h"
@@ -828,7 +829,10 @@ int main() {
 
       const char* prev_v41 = std::getenv("AFF_V41_HC_FUSED");
       std::string prev_v41_val = prev_v41 ? prev_v41 : "";
+      const char* prev_bf16 = std::getenv("AFF_AR_HC_BF16");
+      std::string prev_bf16_val = prev_bf16 ? prev_bf16 : "";
       setenv("AFF_V41_HC_FUSED", "1", 1);
+      setenv("AFF_AR_HC_BF16", "0", 1);
 
       for (const FuseCase& fc : fcases) {
         const size_t nh_hc = (size_t)fc.nh * E * nb;
@@ -1064,6 +1068,8 @@ int main() {
 
       if (prev_v41) setenv("AFF_V41_HC_FUSED", prev_v41_val.c_str(), 1);
       else unsetenv("AFF_V41_HC_FUSED");
+      if (prev_bf16) setenv("AFF_AR_HC_BF16", prev_bf16_val.c_str(), 1);
+      else unsetenv("AFF_AR_HC_BF16");
 
       for (int r = 0; r < 2; ++r) {
         assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
@@ -1836,6 +1842,410 @@ int main() {
       }
     }
     std::printf("PASS: F8 2-wide batch_rms_norm_q8 + hcn_norm_kernel + hcn_norm_v41_kernel parity\n");
+  }
+
+  // 15. W2-1: markov_step_fp8_g128_hip + w2_sharded + reset_best parity
+  {
+    const uint32_t rows = 2048u, rank = 256u, nb = 16u, row0 = 1024u, vocab_sub = 4096u;
+    std::vector<uint16_t> h_w1((size_t)vocab_sub * rank);
+    std::vector<uint16_t> h_w2((size_t)rows * rank);
+    std::vector<float> h_logits_dm((size_t)rows * nb);
+    std::vector<float> h_logits_tm((size_t)nb * rows);
+    for (size_t i = 0; i < h_w1.size(); ++i)
+      h_w1[i] = f32_to_bf16_cpu(0.35f * std::sin((float)(i % 199u) * 0.031f));
+    for (size_t i = 0; i < h_w2.size(); ++i)
+      h_w2[i] = f32_to_bf16_cpu(0.45f * std::cos((float)(i % 251u) * 0.027f));
+    for (uint32_t r = 0; r < rows; ++r) {
+      for (uint32_t c = 0; c < nb; ++c) {
+        const float v = std::sin((float)r * 0.017f + (float)c * 0.41f) * 2.5f;
+        h_logits_dm[(size_t)r * nb + c] = v;
+        h_logits_tm[(size_t)c * rows + r] = v;
+      }
+    }
+    uint16_t *d_w1 = nullptr, *d_w2 = nullptr, *d_w2_sc = nullptr;
+    uint8_t* d_w2_fp8 = nullptr;
+    float *d_ldm = nullptr, *d_ltm = nullptr;
+    uint32_t* d_ids = nullptr;
+    uint64_t *d_best_bf = nullptr, *d_best_fp8 = nullptr;
+    assert(hipMalloc(&d_w1, h_w1.size() * 2u) == hipSuccess);
+    assert(hipMalloc(&d_w2, h_w2.size() * 2u) == hipSuccess);
+    assert(hipMalloc(&d_w2_fp8, (size_t)rows * rank) == hipSuccess);
+    assert(hipMalloc(&d_w2_sc, (size_t)rows * (rank >> 7) * 2u) == hipSuccess);
+    assert(hipMalloc(&d_ldm, h_logits_dm.size() * 4u) == hipSuccess);
+    assert(hipMalloc(&d_ltm, h_logits_tm.size() * 4u) == hipSuccess);
+    assert(hipMalloc(&d_ids, nb * 4u) == hipSuccess);
+    assert(hipMalloc(&d_best_bf, 8u) == hipSuccess);
+    assert(hipMalloc(&d_best_fp8, 8u) == hipSuccess);
+
+    assert(hipMemcpy(d_w1, h_w1.data(), h_w1.size() * 2u, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_w2, h_w2.data(), h_w2.size() * 2u, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_ldm, h_logits_dm.data(), h_logits_dm.size() * 4u, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_ltm, h_logits_tm.data(), h_logits_tm.size() * 4u, hipMemcpyHostToDevice) == hipSuccess);
+    std::vector<uint32_t> h_ids(nb, 123u);
+    h_ids[1] = 777u;
+    assert(hipMemcpy(d_ids, h_ids.data(), nb * 4u, hipMemcpyHostToDevice) == hipSuccess);
+
+    quantize_bf16_to_fp8_g128_hip(d_w2, d_w2_fp8, d_w2_sc, rows, rank, 0u, nullptr);
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    std::vector<uint8_t> h_fp8((size_t)rows * rank);
+    std::vector<uint16_t> h_sc((size_t)rows * (rank >> 7));
+    assert(hipMemcpy(h_fp8.data(), d_w2_fp8, h_fp8.size(), hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(h_sc.data(), d_w2_sc, h_sc.size() * 2u, hipMemcpyDeviceToHost) == hipSuccess);
+
+    for (int tm : {0, 1}) {
+      const float* lg = tm ? d_ltm : d_ldm;
+      const uint32_t col = (uint32_t)tm;
+      markov_step_hip(d_w1, d_w2, d_ids, lg, d_best_bf, rows, row0, rank, nb, col, nullptr, tm,
+                      true, 1);
+      markov_step_fp8_g128_hip(d_w1, d_w2_fp8, d_w2_sc, d_ids, lg, d_best_fp8, rows, row0, rank,
+                               nb, col, nullptr, tm, true);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      uint64_t b_bf = 0, b_fp8 = 0;
+      assert(hipMemcpy(&b_bf, d_best_bf, 8u, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(&b_fp8, d_best_fp8, 8u, hipMemcpyDeviceToHost) == hipSuccess);
+      const uint32_t id_bf = ~(uint32_t)(b_bf & 0xffffffffu);
+      const uint32_t id_fp8 = ~(uint32_t)(b_fp8 & 0xffffffffu);
+      assert(id_bf >= row0 && id_bf < row0 + rows);
+      assert(id_fp8 >= row0 && id_fp8 < row0 + rows);
+
+      // Verify FP8 winner against CPU quantized dot + logits
+      const uint32_t tok = h_ids[col];
+      float best_v = -1e30f;
+      uint32_t best_r = 0u;
+      for (uint32_t r = 0; r < rows; ++r) {
+        double acc = 0.0;
+        for (uint32_t c = 0; c < rank; ++c) {
+          const float s = bf16_to_f32_cpu(h_sc[(size_t)r * (rank >> 7) + (c >> 7)]);
+          acc += (double)bf16_to_f32_cpu(h_w1[(size_t)tok * rank + c]) *
+                 (double)(e4m3_to_f32_cpu(h_fp8[(size_t)r * rank + c]) * s);
+        }
+        const float tot = h_logits_dm[(size_t)r * nb + col] + (float)acc;
+        if (tot > best_v) { best_v = tot; best_r = row0 + r; }
+      }
+      assert(id_fp8 == best_r);
+
+      // Verify reset_best = false preserves existing higher key after pre-clearing to 0
+      assert(hipMemset(d_best_fp8, 0, 8u) == hipSuccess);
+      markov_step_fp8_g128_hip(d_w1, d_w2_fp8, d_w2_sc, d_ids, lg, d_best_fp8, rows, row0, rank,
+                               nb, col, nullptr, tm, false);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      uint64_t b_fp8_noclear = 0;
+      assert(hipMemcpy(&b_fp8_noclear, d_best_fp8, 8u, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(b_fp8_noclear == b_fp8);
+    }
+    for (void* p : {(void*)d_w1, (void*)d_w2, (void*)d_w2_fp8, (void*)d_w2_sc, (void*)d_ldm,
+                    (void*)d_ltm, (void*)d_ids, (void*)d_best_bf, (void*)d_best_fp8})
+      (void)hipFree(p);
+    std::printf("PASS: W2-1 markov_step_fp8_g128_hip + w2_sharded + reset_best parity\n");
+  }
+
+  // 16. W2-4: matvec_fp8_g128_multix_hip T=9, 13, 16 parity vs T<=8 chunked
+  {
+    const uint32_t rows = 512u, cols = 512u;
+    std::vector<uint16_t> h_wbf16((size_t)rows * cols);
+    for (size_t i = 0; i < h_wbf16.size(); ++i)
+      h_wbf16[i] = f32_to_bf16_cpu(std::sin((float)(i % 389u) * 0.043f) * 1.9f);
+    uint16_t* d_wbf16 = nullptr;
+    uint8_t* d_fp8 = nullptr;
+    uint16_t* d_sc = nullptr;
+    float *d_x = nullptr, *d_y_ref = nullptr, *d_y_got = nullptr;
+    assert(hipMalloc(&d_wbf16, h_wbf16.size() * 2u) == hipSuccess);
+    assert(hipMalloc(&d_fp8, (size_t)rows * cols) == hipSuccess);
+    assert(hipMalloc(&d_sc, (size_t)rows * (cols >> 7) * 2u) == hipSuccess);
+    assert(hipMalloc(&d_x, (size_t)16u * cols * 4u) == hipSuccess);
+    assert(hipMalloc(&d_y_ref, (size_t)rows * 16u * 4u) == hipSuccess);
+    assert(hipMalloc(&d_y_got, (size_t)rows * 16u * 4u) == hipSuccess);
+    assert(hipMemcpy(d_wbf16, h_wbf16.data(), h_wbf16.size() * 2u, hipMemcpyHostToDevice) == hipSuccess);
+    quantize_bf16_to_fp8_g128_hip(d_wbf16, d_fp8, d_sc, rows, cols, 0u, nullptr);
+
+    std::vector<float> h_x((size_t)16u * cols);
+    for (size_t i = 0; i < h_x.size(); ++i)
+      h_x[i] = std::cos((float)(i % 277u) * 0.029f) * 1.4f;
+    assert(hipMemcpy(d_x, h_x.data(), h_x.size() * 4u, hipMemcpyHostToDevice) == hipSuccess);
+
+    for (uint32_t T : {9u, 13u, 16u}) {
+      for (int tm : {0, 1}) {
+        const uint32_t out_ld = tm ? rows : 16u;
+        assert(matvec_fp8_g128_multix_hip(d_fp8, d_sc, d_x, d_y_ref, rows, cols, 8u, out_ld, tm, nullptr));
+        float* dst2 = tm ? (d_y_ref + (size_t)8u * out_ld) : (d_y_ref + 8u);
+        assert(matvec_fp8_g128_multix_hip(d_fp8, d_sc, d_x + (size_t)8u * cols, dst2, rows, cols,
+                                          T - 8u, out_ld, tm, nullptr));
+        assert(matvec_fp8_g128_multix_hip(d_fp8, d_sc, d_x, d_y_got, rows, cols, T, out_ld, tm, nullptr));
+        assert(hipDeviceSynchronize() == hipSuccess);
+
+        std::vector<float> y_ref((size_t)rows * 16u), y_got((size_t)rows * 16u);
+        assert(hipMemcpy(y_ref.data(), d_y_ref, y_ref.size() * 4u, hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(y_got.data(), d_y_got, y_got.size() * 4u, hipMemcpyDeviceToHost) == hipSuccess);
+        float max_diff = 0.0f;
+        for (uint32_t t = 0; t < T; ++t) {
+          for (uint32_t r = 0; r < rows; ++r) {
+            const size_t idx = tm ? ((size_t)t * rows + r) : ((size_t)r * out_ld + t);
+            max_diff = std::max(max_diff, std::fabs(y_got[idx] - y_ref[idx]));
+          }
+        }
+        assert(max_diff < 1e-5f);
+      }
+    }
+    for (void* p : {(void*)d_wbf16, (void*)d_fp8, (void*)d_sc, (void*)d_x, (void*)d_y_ref, (void*)d_y_got})
+      (void)hipFree(p);
+    std::printf("PASS: W2-4 matvec_fp8_g128_multix_hip T=9,13,16 parity\n");
+  }
+
+  // 17. W2-9: batch_head_rope_q8_tr_hip + flash_kernel direct E4M3 Q path vs BF16 Q path
+  {
+    const uint32_t n_head = 32u, head_dim = kFlashWidth, n_rot = 64u, sliding = 64u, ring = 64u;
+    const RopeDerived rope{1.0f, 0.9f, 0.0f, 0.0f, 0.0f};
+    const float scale = 1.0f / std::sqrt((float)head_dim);
+    std::vector<uint8_t> h_raw((size_t)ring * kFlashRowBytes);
+    std::vector<float> k_row(head_dim);
+    for (uint32_t p = 0; p < ring; ++p) {
+      for (uint32_t d = 0; d < head_dim; ++d)
+        k_row[d] = std::sin((float)(p * 17u + d) * 0.023f) * 1.5f;
+      kv_encode_fp8r_row(k_row.data(), h_raw.data() + (size_t)p * kFlashRowBytes);
+    }
+    std::vector<float> h_sinks(n_head);
+    for (uint32_t h = 0; h < n_head; ++h) h_sinks[h] = -0.2f + 0.05f * (float)h;
+    uint8_t* d_raw = nullptr;
+    float* d_sinks = nullptr;
+    assert(hipMalloc(&d_raw, h_raw.size()) == hipSuccess);
+    assert(hipMalloc(&d_sinks, h_sinks.size() * 4u) == hipSuccess);
+    assert(hipMemcpy(d_raw, h_raw.data(), h_raw.size(), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_sinks, h_sinks.data(), h_sinks.size() * 4u, hipMemcpyHostToDevice) == hipSuccess);
+
+    for (uint32_t nb : {6u, 32u}) {
+      const uint32_t n = n_head * head_dim;
+      std::vector<float> h_q((size_t)n * nb), h_q_f32_tm((size_t)nb * n);
+      for (size_t i = 0; i < h_q.size(); ++i)
+        h_q[i] = std::cos((float)(i % 499u) * 0.019f) * 2.2f;
+      for (uint32_t d = 0; d < n; ++d)
+        for (uint32_t t = 0; t < nb; ++t)
+          h_q_f32_tm[(size_t)t * n + d] = h_q[(size_t)d * nb + t];
+
+      float *d_q = nullptr, *d_q_f32_tm = nullptr, *d_qs = nullptr, *d_o_ref = nullptr,
+            *d_o_got = nullptr;
+      uint16_t* d_qtm = nullptr;
+      uint8_t* d_q8 = nullptr;
+      assert(hipMalloc(&d_q, h_q.size() * 4u) == hipSuccess);
+      assert(hipMalloc(&d_q_f32_tm, h_q_f32_tm.size() * 4u) == hipSuccess);
+      assert(hipMalloc(&d_qtm, (size_t)nb * n * 2u) == hipSuccess);
+      assert(hipMalloc(&d_q8, (size_t)nb * n) == hipSuccess);
+      assert(hipMalloc(&d_qs, (size_t)nb * n_head * 4u) == hipSuccess);
+      assert(hipMalloc(&d_o_ref, (size_t)nb * n * 4u) == hipSuccess);
+      assert(hipMalloc(&d_o_got, (size_t)nb * n * 4u) == hipSuccess);
+      assert(hipMemcpy(d_q, h_q.data(), h_q.size() * 4u, hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_q_f32_tm, h_q_f32_tm.data(), h_q_f32_tm.size() * 4u,
+                       hipMemcpyHostToDevice) == hipSuccess);
+
+      std::vector<float> o_ref((size_t)nb * n), o_got((size_t)nb * n);
+
+      // 17a: n_rot=0 bit-exact parity against direct F32 flash_kernel
+      mqa_attend_flash_hip(d_q_f32_tm, d_raw, nullptr, nullptr, nullptr, 0u, d_sinks, d_o_ref, 0u,
+                           nb, nb, 32u, sliding, ring, 0u, n_head, scale, nullptr,
+                           /*q_bf16=*/false, nullptr, 0u, nullptr, 0u, 0u, nullptr);
+      assert(batch_head_rope_q8_tr_hip(d_q, d_q8, d_qs, n_head, head_dim, /*n_rot=*/0u, 32u, rope,
+                                       nb, nullptr));
+      mqa_attend_flash_hip(d_q8, d_raw, nullptr, nullptr, nullptr, 0u, d_sinks, d_o_got, 0u, nb,
+                           nb, 32u, sliding, ring, 0u, n_head, scale, nullptr, /*q_bf16=*/false,
+                           nullptr, 0u, nullptr, 0u, 0u, d_qs);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      assert(hipMemcpy(o_ref.data(), d_o_ref, o_ref.size() * 4u, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(o_got.data(), d_o_got, o_got.size() * 4u, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(std::memcmp(o_got.data(), o_ref.data(), o_ref.size() * 4u) == 0);
+
+      // 17b & 17c: n_rot=64 element-wise Q RoPE+E4M3 parity & end-to-end flash consistency vs BF16 Q
+      assert(batch_head_rms_rope_tr_hip(d_q, d_qtm, nullptr, n_head, head_dim, n_rot, 32u, rope,
+                                        1e-6f, nb, nullptr, /*qrms=*/false));
+      mqa_attend_flash_hip(d_qtm, d_raw, nullptr, nullptr, nullptr, 0u, d_sinks, d_o_ref, 0u, nb,
+                           nb, 32u, sliding, ring, 0u, n_head, scale, nullptr, /*q_bf16=*/true,
+                           nullptr, 0u, nullptr, 0u, 0u, nullptr);
+
+      assert(batch_head_rope_q8_tr_hip(d_q, d_q8, d_qs, n_head, head_dim, n_rot, 32u, rope, nb,
+                                       nullptr));
+      mqa_attend_flash_hip(d_q8, d_raw, nullptr, nullptr, nullptr, 0u, d_sinks, d_o_got, 0u, nb,
+                           nb, 32u, sliding, ring, 0u, n_head, scale, nullptr, /*q_bf16=*/false,
+                           nullptr, 0u, nullptr, 0u, 0u, d_qs);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      std::vector<uint16_t> h_qtm((size_t)nb * n);
+      std::vector<uint8_t> h_q8((size_t)nb * n);
+      std::vector<float> h_qs((size_t)nb * n_head);
+      assert(hipMemcpy(h_qtm.data(), d_qtm, h_qtm.size() * 2u, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_q8.data(), d_q8, h_q8.size(), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_qs.data(), d_qs, h_qs.size() * 4u, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(o_ref.data(), d_o_ref, o_ref.size() * 4u, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(o_got.data(), d_o_got, o_got.size() * 4u, hipMemcpyDeviceToHost) == hipSuccess);
+
+      for (uint32_t t = 0; t < nb; ++t) {
+        for (uint32_t h = 0; h < n_head; ++h) {
+          float amax_bf16 = 0.0f;
+          for (uint32_t d = 0; d < head_dim; ++d) {
+            const float rv = bf16_to_f32_cpu(h_qtm[((size_t)t * n_head + h) * head_dim + d]);
+            amax_bf16 = std::max(amax_bf16, std::fabs(rv));
+          }
+          const float sc = h_qs[(size_t)t * n_head + h];
+          const float exp_sc = amax_bf16 * (1.0f / 448.0f);
+          assert(std::fabs(sc - exp_sc) <= 0.01f * exp_sc + 1e-6f);
+          for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t idx = ((size_t)t * n_head + h) * head_dim + d;
+            const float ref_v = bf16_to_f32_cpu(h_qtm[idx]);
+            const float got_v = e4m3_to_f32_cpu(h_q8[idx]) * sc;
+            assert(std::fabs(got_v - ref_v) <= 0.08f * std::fabs(ref_v) + 0.02f * amax_bf16);
+          }
+        }
+      }
+
+      float max_diff = 0.0f;
+      for (size_t i = 0; i < o_ref.size(); ++i)
+        max_diff = std::max(max_diff, std::fabs(o_got[i] - o_ref[i]));
+      assert(max_diff < 1e-1f);
+
+      for (void* p : {(void*)d_q, (void*)d_q_f32_tm, (void*)d_qtm, (void*)d_q8, (void*)d_qs,
+                      (void*)d_o_ref, (void*)d_o_got})
+        (void)hipFree(p);
+    }
+    (void)hipFree(d_raw);
+    (void)hipFree(d_sinks);
+    std::printf("PASS: W2-9 batch_head_rope_q8_tr_hip + flash_kernel E4M3 Q parity\n");
+  }
+
+  // 18. W2-8: Narrow batch_rms_norm_hip + fused MoE gate+up expert_gemm_wmma_hip tiles2
+  {
+    const uint32_t dim = 5120u;
+    std::vector<float> h_w32(dim);
+    std::vector<uint16_t> h_wbf16(dim);
+    for (uint32_t i = 0; i < dim; ++i) {
+      h_w32[i] = 0.7f + 0.4f * std::sin((float)i * 0.011f);
+      h_wbf16[i] = f32_to_bf16_cpu(h_w32[i]);
+    }
+    float* d_w32 = nullptr;
+    uint16_t* d_wbf16 = nullptr;
+    assert(hipMalloc(&d_w32, (size_t)dim * 4u) == hipSuccess);
+    assert(hipMalloc(&d_wbf16, (size_t)dim * 2u) == hipSuccess);
+    assert(hipMemcpy(d_w32, h_w32.data(), (size_t)dim * 4u, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_wbf16, h_wbf16.data(), (size_t)dim * 2u, hipMemcpyHostToDevice) == hipSuccess);
+
+    for (uint32_t nb : {1u, 5u, 6u, 16u}) {
+      std::vector<float> h_x((size_t)dim * nb);
+      for (size_t i = 0; i < h_x.size(); ++i)
+        h_x[i] = std::cos((float)(i % 613u) * 0.037f) * 2.0f;
+      float *d_x = nullptr, *d_out = nullptr;
+      assert(hipMalloc(&d_x, h_x.size() * 4u) == hipSuccess);
+      assert(hipMalloc(&d_out, h_x.size() * 4u) == hipSuccess);
+      assert(hipMemcpy(d_x, h_x.data(), h_x.size() * 4u, hipMemcpyHostToDevice) == hipSuccess);
+
+      for (int use_bf16 : {0, 1}) {
+        batch_rms_norm_hip(d_x, use_bf16 ? nullptr : d_w32, use_bf16 ? d_wbf16 : nullptr, d_out,
+                           dim, nb, 1e-6f, nullptr);
+        assert(hipDeviceSynchronize() == hipSuccess);
+        std::vector<float> h_got(h_x.size());
+        assert(hipMemcpy(h_got.data(), d_out, h_got.size() * 4u, hipMemcpyDeviceToHost) == hipSuccess);
+        float max_diff = 0.0f;
+        for (uint32_t b = 0; b < nb; ++b) {
+          double ss = 0.0;
+          for (uint32_t d = 0; d < dim; ++d) {
+            const float v = h_x[(size_t)d * nb + b];
+            ss += (double)v * (double)v;
+          }
+          const float inv = (float)(1.0 / std::sqrt(ss / (double)dim + 1e-6));
+          for (uint32_t d = 0; d < dim; ++d) {
+            const float wv = use_bf16 ? bf16_to_f32_cpu(h_wbf16[d]) : h_w32[d];
+            const float ref = h_x[(size_t)d * nb + b] * inv * wv;
+            max_diff = std::max(max_diff, std::fabs(h_got[(size_t)d * nb + b] - ref));
+          }
+        }
+        assert(max_diff < 1e-5f);
+      }
+      (void)hipFree(d_x);
+      (void)hipFree(d_out);
+    }
+    (void)hipFree(d_w32);
+    (void)hipFree(d_wbf16);
+
+    // Fused gate+up expert_gemm_wmma_hip tiles2 bit-identical parity
+    expert_set_plane_layout_colgroup(true);
+    expert_set_wire_format(6u);
+    expert_set_recon_tiles(0u);
+    const uint32_t rows = 128u, cols = 256u, nt = 6u;
+    const size_t code_bytes = (size_t)rows * (cols / 2u * 5u / 8u);
+    const size_t field_bytes = (size_t)rows * (cols / 16u * 6u / 8u);
+    std::vector<uint8_t> h_code0(code_bytes, 0x3Au), h_code1(code_bytes, 0x51u);
+    std::vector<uint8_t> h_fld0(field_bytes, 0x12u), h_fld1(field_bytes, 0x24u);
+    std::vector<uint16_t> h_rs0(rows), h_rs1(rows);
+    for (uint32_t r = 0; r < rows; ++r) {
+      h_rs0[r] = f32_to_bf16_cpu(0.5f + 0.005f * (float)r);
+      h_rs1[r] = f32_to_bf16_cpu(0.4f + 0.004f * (float)(rows - 1u - r));
+    }
+    std::vector<uint8_t> h_x8((size_t)nt * cols);
+    for (size_t i = 0; i < h_x8.size(); ++i) h_x8[i] = (uint8_t)(0x30u + (i % 7u));
+    std::vector<float> h_xs((size_t)nt * (cols >> 7), 0.25f);
+    std::vector<uint32_t> h_cb(2048u, 0x38383838u);  // 4x E4M3 1.0f
+
+    uint8_t *d_c0 = nullptr, *d_c1 = nullptr, *d_f0 = nullptr, *d_f1 = nullptr, *d_x8 = nullptr;
+    uint16_t *d_r0 = nullptr, *d_r1 = nullptr;
+    float *d_xs = nullptr, *d_cb = nullptr;
+    void *d_yg_ref = nullptr, *d_yu_ref = nullptr, *d_yg_got = nullptr, *d_yu_got = nullptr;
+    ExpertTile *d_t0 = nullptr, *d_t1 = nullptr;
+    assert(hipMalloc(&d_c0, code_bytes) == hipSuccess);
+    assert(hipMalloc(&d_c1, code_bytes) == hipSuccess);
+    assert(hipMalloc(&d_f0, field_bytes) == hipSuccess);
+    assert(hipMalloc(&d_f1, field_bytes) == hipSuccess);
+    assert(hipMalloc(&d_r0, rows * 2u) == hipSuccess);
+    assert(hipMalloc(&d_r1, rows * 2u) == hipSuccess);
+    assert(hipMalloc(&d_x8, h_x8.size()) == hipSuccess);
+    assert(hipMalloc(&d_xs, h_xs.size() * 4u) == hipSuccess);
+    assert(hipMalloc(&d_cb, h_cb.size() * 4u) == hipSuccess);
+    assert(hipMalloc(&d_yg_ref, (size_t)rows * nt * 4u) == hipSuccess);
+    assert(hipMalloc(&d_yu_ref, (size_t)rows * nt * 4u) == hipSuccess);
+    assert(hipMalloc(&d_yg_got, (size_t)rows * nt * 4u) == hipSuccess);
+    assert(hipMalloc(&d_yu_got, (size_t)rows * nt * 4u) == hipSuccess);
+    assert(hipMalloc(&d_t0, 2u * sizeof(ExpertTile)) == hipSuccess);
+    assert(hipMalloc(&d_t1, 2u * sizeof(ExpertTile)) == hipSuccess);
+
+    assert(hipMemcpy(d_c0, h_code0.data(), code_bytes, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_c1, h_code1.data(), code_bytes, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_f0, h_fld0.data(), field_bytes, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_f1, h_fld1.data(), field_bytes, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_r0, h_rs0.data(), rows * 2u, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_r1, h_rs1.data(), rows * 2u, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_x8, h_x8.data(), h_x8.size(), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_xs, h_xs.data(), h_xs.size() * 4u, hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_cb, h_cb.data(), h_cb.size() * 4u, hipMemcpyHostToDevice) == hipSuccess);
+
+    for (bool y_bf16 : {false, true}) {
+      ExpertTile ht0[2]{};
+      ExpertTile ht1[2]{};
+      ht0[0] = {d_c0, d_f0, d_r0, nullptr, d_yg_ref, nt, nt};
+      ht0[1].nt = 0u;
+      ht1[0] = {d_c1, d_f1, d_r1, nullptr, d_yu_ref, nt, nt};
+      ht1[1].nt = 0u;
+      assert(hipMemcpy(d_t0, ht0, sizeof(ht0), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_t1, ht1, sizeof(ht1), hipMemcpyHostToDevice) == hipSuccess);
+      expert_gemm_wmma_hip(d_t0, 2u, nt, d_x8, d_xs, d_cb, rows, cols, 1.0f, nullptr, y_bf16, false);
+      expert_gemm_wmma_hip(d_t1, 2u, nt, d_x8, d_xs, d_cb, rows, cols, 1.0f, nullptr, y_bf16, false);
+
+      ht0[0].y = d_yg_got;
+      ht1[0].y = d_yu_got;
+      assert(hipMemcpy(d_t0, ht0, sizeof(ht0), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_t1, ht1, sizeof(ht1), hipMemcpyHostToDevice) == hipSuccess);
+      expert_gemm_wmma_hip(d_t0, 2u, nt, d_x8, d_xs, d_cb, rows, cols, 1.0f, nullptr, y_bf16,
+                           false, d_t1);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      const size_t yb = (size_t)rows * nt * (y_bf16 ? 2u : 4u);
+      std::vector<uint8_t> g_r(yb), u_r(yb), g_g(yb), u_g(yb);
+      assert(hipMemcpy(g_r.data(), d_yg_ref, yb, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(u_r.data(), d_yu_ref, yb, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(g_g.data(), d_yg_got, yb, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(u_g.data(), d_yu_got, yb, hipMemcpyDeviceToHost) == hipSuccess);
+      assert(std::memcmp(g_r.data(), g_g.data(), yb) == 0);
+      assert(std::memcmp(u_r.data(), u_g.data(), yb) == 0);
+    }
+    for (void* p : {(void*)d_c0, (void*)d_c1, (void*)d_f0, (void*)d_f1, (void*)d_r0, (void*)d_r1,
+                    (void*)d_x8, (void*)d_xs, (void*)d_cb, d_yg_ref, d_yu_ref, d_yg_got, d_yu_got,
+                    (void*)d_t0, (void*)d_t1})
+      (void)hipFree(p);
+    std::printf("PASS: W2-8 narrow batch_rms_norm_hip + fused MoE gate+up parity\n");
   }
 
   std::printf("ALL WAVE 2 PHASE 2B KERNEL TESTS PASSED.\n");

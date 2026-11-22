@@ -1104,7 +1104,7 @@ __global__ __launch_bounds__(256) void tp_ar_coded_staged_kernel(
 // pre_in collapse+sq, and side-band Infinity Cache prefetch) over live tokens [0, live) using
 // ctx.scratch (0 B extra VRAM) and zeroing `block` across all [0, nb).
 template <uint32_t NH, bool HasTap, bool HasControl, bool LiveOne, bool HasPreCollapse,
-          bool RegForm>
+          bool RegForm, bool Bf16Wire = false>
 __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
     uint16_t* __restrict__ out_hc, float* __restrict__ block, const uint16_t* __restrict__ hc,
     const float* __restrict__ post, const float* __restrict__ comb, uint32_t n_embd, uint32_t nb,
@@ -1179,6 +1179,8 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
 
   float* const ps = peer_scratch + (size_t)slot * slot_floats;
   const float* const ms = my_scratch + (size_t)slot * slot_floats;
+  uint16_t* const ps16 = reinterpret_cast<uint16_t*>(ps);
+  const uint16_t* const ms16 = reinterpret_cast<const uint16_t*>(ms);
 
   const uint32_t d_per_blk_raw = (n_embd + ar_blk - 1u) / ar_blk;
   const uint32_t d_per_blk = RegForm ? ((d_per_blk_raw + 3u) & ~3u) : d_per_blk_raw;
@@ -1208,16 +1210,35 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
       if (off + 3u < blk_elems) {
         if (vec_blk) {
           const float4 b4 = *(const float4*)(block + (size_t)d_g * nb + tok_g);
-          r_blk[g * 4u + 0u] = b4.x;
-          r_blk[g * 4u + 1u] = b4.y;
-          r_blk[g * 4u + 2u] = b4.z;
-          r_blk[g * 4u + 3u] = b4.w;
-          *(float4*)(ps + idx0 + off) = b4;
+          if constexpr (Bf16Wire) {
+            const uint16_t h0 = wmma::f32_to_bf16(b4.x);
+            const uint16_t h1 = wmma::f32_to_bf16(b4.y);
+            const uint16_t h2 = wmma::f32_to_bf16(b4.z);
+            const uint16_t h3 = wmma::f32_to_bf16(b4.w);
+            r_blk[g * 4u + 0u] = wmma::bf16_to_f32(h0);
+            r_blk[g * 4u + 1u] = wmma::bf16_to_f32(h1);
+            r_blk[g * 4u + 2u] = wmma::bf16_to_f32(h2);
+            r_blk[g * 4u + 3u] = wmma::bf16_to_f32(h3);
+            *(uint2*)(ps16 + idx0 + off) =
+                make_uint2((uint32_t)h0 | ((uint32_t)h1 << 16),
+                           (uint32_t)h2 | ((uint32_t)h3 << 16));
+          } else {
+            r_blk[g * 4u + 0u] = b4.x;
+            r_blk[g * 4u + 1u] = b4.y;
+            r_blk[g * 4u + 2u] = b4.z;
+            r_blk[g * 4u + 3u] = b4.w;
+            *(float4*)(ps + idx0 + off) = b4;
+          }
         } else {
           uint32_t d = d_g, tok = tok_g;
 #pragma unroll
           for (uint32_t j = 0u; j < 4u; ++j) {
-            r_blk[g * 4u + j] = block[(size_t)d * nb + tok];
+            const float val = block[(size_t)d * nb + tok];
+            if constexpr (Bf16Wire) {
+              r_blk[g * 4u + j] = wmma::bf16_to_f32(wmma::f32_to_bf16(val));
+            } else {
+              r_blk[g * 4u + j] = val;
+            }
             if constexpr (!LiveOne) {
               ++tok;
               if (tok == live) { tok = 0u; ++d; }
@@ -1225,9 +1246,19 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
               ++d;
             }
           }
-          *(float4*)(ps + idx0 + off) =
-              make_float4(r_blk[g * 4u + 0u], r_blk[g * 4u + 1u],
-                          r_blk[g * 4u + 2u], r_blk[g * 4u + 3u]);
+          if constexpr (Bf16Wire) {
+            const uint16_t h0 = wmma::f32_to_bf16(r_blk[g * 4u + 0u]);
+            const uint16_t h1 = wmma::f32_to_bf16(r_blk[g * 4u + 1u]);
+            const uint16_t h2 = wmma::f32_to_bf16(r_blk[g * 4u + 2u]);
+            const uint16_t h3 = wmma::f32_to_bf16(r_blk[g * 4u + 3u]);
+            *(uint2*)(ps16 + idx0 + off) =
+                make_uint2((uint32_t)h0 | ((uint32_t)h1 << 16),
+                           (uint32_t)h2 | ((uint32_t)h3 << 16));
+          } else {
+            *(float4*)(ps + idx0 + off) =
+                make_float4(r_blk[g * 4u + 0u], r_blk[g * 4u + 1u],
+                            r_blk[g * 4u + 2u], r_blk[g * 4u + 3u]);
+          }
         }
       } else if (off < blk_elems) {
         uint32_t d = d_g, tok = tok_g;
@@ -1235,8 +1266,14 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
         for (uint32_t j = 0u; j < 4u; ++j) {
           if (off + j < blk_elems) {
             const float val = block[(size_t)d * nb + tok];
-            r_blk[g * 4u + j] = val;
-            ps[idx0 + off + j] = val;
+            if constexpr (Bf16Wire) {
+              const uint16_t h = wmma::f32_to_bf16(val);
+              r_blk[g * 4u + j] = wmma::bf16_to_f32(h);
+              ps16[idx0 + off + j] = h;
+            } else {
+              r_blk[g * 4u + j] = val;
+              ps[idx0 + off + j] = val;
+            }
           }
           if constexpr (!LiveOne) {
             ++tok;
@@ -1259,7 +1296,9 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
     const uint32_t step_tok = LiveOne ? 0u : (nt - step_d * live);
     uint32_t d = d0_t, tok = tok0_t;
     for (size_t idx = idx0 + tid; idx < idx1; idx += nt) {
-      ps[idx] = block[(size_t)d * nb + tok];
+      const float val = block[(size_t)d * nb + tok];
+      if constexpr (Bf16Wire) ps16[idx] = wmma::f32_to_bf16(val);
+      else                    ps[idx] = val;
       if constexpr (!LiveOne) {
         tok += step_tok;
         d += step_d;
@@ -1342,8 +1381,20 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
     for (uint32_t g = 0u; g < kRegChunks; ++g) {
       const size_t off = (size_t)g * (nt * 4u) + (size_t)tid * 4u;
       if (off + 3u < blk_elems) {
-        const float4 m4 = *(const float4*)(ms + idx0 + off);
-        const float m_arr[4] = {m4.x, m4.y, m4.z, m4.w};
+        float m_arr[4];
+        if constexpr (Bf16Wire) {
+          const uint2 m2 = *(const uint2*)(ms16 + idx0 + off);
+          m_arr[0] = wmma::bf16_to_f32((uint16_t)(m2.x & 0xFFFFu));
+          m_arr[1] = wmma::bf16_to_f32((uint16_t)(m2.x >> 16));
+          m_arr[2] = wmma::bf16_to_f32((uint16_t)(m2.y & 0xFFFFu));
+          m_arr[3] = wmma::bf16_to_f32((uint16_t)(m2.y >> 16));
+        } else {
+          const float4 m4 = *(const float4*)(ms + idx0 + off);
+          m_arr[0] = m4.x;
+          m_arr[1] = m4.y;
+          m_arr[2] = m4.z;
+          m_arr[3] = m4.w;
+        }
         uint32_t d = d_g, tok = tok_g;
 #pragma unroll
         for (uint32_t j = 0u; j < 4u; ++j) {
@@ -1360,7 +1411,8 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
 #pragma unroll
         for (uint32_t j = 0u; j < 4u; ++j) {
           if (off + j < blk_elems) {
-            process_elem(d, tok, r_blk[g * 4u + j] + ms[idx0 + off + j]);
+            const float mv = Bf16Wire ? wmma::bf16_to_f32(ms16[idx0 + off + j]) : ms[idx0 + off + j];
+            process_elem(d, tok, r_blk[g * 4u + j] + mv);
           }
           if constexpr (!LiveOne) {
             ++tok;
@@ -1383,7 +1435,10 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
     const uint32_t step_tok = LiveOne ? 0u : (nt - step_d * eff_live);
     uint32_t d = d0_t, tok = tok0_t;
     for (size_t idx = idx0 + tid; idx < idx1; idx += nt) {
-      const float bv = block[(size_t)d * nb + tok] + ms[idx];
+      const float loc = block[(size_t)d * nb + tok];
+      const float bv = Bf16Wire
+          ? (wmma::bf16_to_f32(wmma::f32_to_bf16(loc)) + wmma::bf16_to_f32(ms16[idx]))
+          : (loc + ms[idx]);
       process_elem(d, tok, bv);
       if constexpr (!LiveOne) {
         tok += step_tok;
@@ -1714,6 +1769,11 @@ static inline bool tp_ar_wake_store_enabled() {
 static inline bool tp_ar_reg_form_enabled() {
   const char* v = std::getenv("AFF_AR_REG_FORM");
   return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+static inline bool tp_ar_hc_bf16_enabled() {
+  const char* v = std::getenv("AFF_AR_HC_BF16");
+  return v && *v && std::strcmp(v, "0") != 0;
 }
 
 static inline bool tp_ar_coded_enabled() {
@@ -2110,6 +2170,8 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
     out_n16 = (cap - mis) >> 4;
   };
 
+  const bool use_bf16_wire = tp_ar_hc_bf16_enabled() && (!has_control || n_hc == 4u);
+
   for (size_t r = 0; r < 2; ++r) {
     const size_t q = 1u - r;
     float* const ps = ctx.scratch[q];
@@ -2136,41 +2198,49 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
 
     set_device(ctx.dev[r]);
     const hipStream_t st = (hipStream_t)ctx.stream[r];
-#define AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, REG_)                                         \
-  hipLaunchKernelGGL((tp_ar_batch_hc_expand_kernel<NH_, TAP_, CTL_, ONE_, PRE_, REG_>),           \
+#define AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, REG_, BF16_)                                  \
+  hipLaunchKernelGGL((tp_ar_batch_hc_expand_kernel<NH_, TAP_, CTL_, ONE_, PRE_, REG_, BF16_>),    \
                      dim3(launch_blk), dim3(nt), 0, st, out_hc[r], block[r],                      \
                      hc ? hc[r] : nullptr, post ? post[r] : nullptr, comb ? comb[r] : nullptr,    \
                      n_embd, nb, live, zb, tap_r, b_lo, n_keep, row0, rows_cap, row_stride,       \
                      slot_off, ps, ms, pf, mf, pw, ctx.seq[r], ctx.timeout_dev, ctx.max_floats,   \
                      (uint32_t)ar_blk, ar_flags, pre_r, cur_r, part_r, pf_p0_r, pf_n16_0_r,       \
                      pf_p1_r, pf_n16_1_r, pf_blk_r)
-#define AFF_TP_BHC_REG(NH_, TAP_, CTL_, ONE_, PRE_)                                               \
+#define AFF_TP_BHC_REG(NH_, TAP_, CTL_, ONE_, PRE_, BF16_)                                        \
   do {                                                                                            \
-    if (use_reg_form) AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, true);                          \
-    else              AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, false);                         \
+    if (use_reg_form) AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, true, BF16_);                   \
+    else              AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, false, BF16_);                  \
   } while (0)
-#define AFF_TP_BHC_PRE(NH_, TAP_, ONE_)                                                           \
+#define AFF_TP_BHC_PRE(NH_, TAP_, ONE_, BF16_)                                                    \
   do {                                                                                            \
-    if (has_pre_collapse) AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, true);                            \
-    else                  AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, false);                           \
+    if (has_pre_collapse) AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, true, BF16_);                     \
+    else                  AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, false, BF16_);                    \
   } while (0)
-#define AFF_TP_BHC_TAP(NH_, ONE_)                                                                 \
+#define AFF_TP_BHC_TAP(NH_, ONE_, BF16_)                                                          \
   do {                                                                                            \
-    if (has_tap) AFF_TP_BHC_PRE(NH_, true, ONE_);                                                 \
-    else         AFF_TP_BHC_PRE(NH_, false, ONE_);                                                \
+    if (has_tap) AFF_TP_BHC_PRE(NH_, true, ONE_, BF16_);                                          \
+    else         AFF_TP_BHC_PRE(NH_, false, ONE_, BF16_);                                         \
   } while (0)
-#define AFF_TP_BHC_ONE(NH_)                                                                       \
+#define AFF_TP_BHC_ONE(NH_, BF16_)                                                                \
   do {                                                                                            \
-    if (live_one) AFF_TP_BHC_TAP(NH_, true);                                                      \
-    else          AFF_TP_BHC_TAP(NH_, false);                                                     \
+    if (live_one) AFF_TP_BHC_TAP(NH_, true, BF16_);                                               \
+    else          AFF_TP_BHC_TAP(NH_, false, BF16_);                                              \
   } while (0)
     if (!has_control) {
-      if (live_one) AFF_TP_BHC_REG(4u, false, false, true, false);
-      else          AFF_TP_BHC_REG(4u, false, false, false, false);
-    } else if (n_hc == 4u) AFF_TP_BHC_ONE(4u);
-    else if (n_hc == 8u)   AFF_TP_BHC_ONE(8u);
-    else if (n_hc == 2u)   AFF_TP_BHC_ONE(2u);
-    else                   AFF_TP_BHC_ONE(1u);
+      if (use_bf16_wire) {
+        if (live_one) AFF_TP_BHC_REG(4u, false, false, true, false, true);
+        else          AFF_TP_BHC_REG(4u, false, false, false, false, true);
+      } else {
+        if (live_one) AFF_TP_BHC_REG(4u, false, false, true, false, false);
+        else          AFF_TP_BHC_REG(4u, false, false, false, false, false);
+      }
+    } else if (n_hc == 4u) {
+      if (use_bf16_wire) AFF_TP_BHC_ONE(4u, true);
+      else               AFF_TP_BHC_ONE(4u, false);
+    }
+    else if (n_hc == 8u)   AFF_TP_BHC_ONE(8u, false);
+    else if (n_hc == 2u)   AFF_TP_BHC_ONE(2u, false);
+    else                   AFF_TP_BHC_ONE(1u, false);
 #undef AFF_TP_BHC_ONE
 #undef AFF_TP_BHC_TAP
 #undef AFF_TP_BHC_PRE

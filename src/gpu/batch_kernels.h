@@ -228,6 +228,12 @@ bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint3
                                 uint32_t head_dim, uint32_t n_rot, uint32_t pos0, RopeDerived rope,
                                 float eps, uint32_t nb, void* stream, bool qrms = true);
 
+// Direct E4M3 emission + RoPE tail + transpose [n_head * head_dim][nb] f32 -> [nb][n_head * head_dim]
+// E4M3 with per-(token, head) scale [nb][n_head] when head_dim == 512 and (n_rot % 64) == 0.
+bool batch_head_rope_q8_tr_hip(const float* x, uint8_t* dst_q8, float* dst_qs,
+                               uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+                               uint32_t pos0, RopeDerived rope, uint32_t nb, void* stream);
+
 // Learned RMS then the RoPE tail — the KV path.
 void batch_rms_norm_rope_hip(const float* x, const float* w, float* out, uint32_t n, uint32_t n_rot,
                              uint32_t pos0, RopeDerived rope, float eps, uint32_t nb, void* stream);
@@ -401,12 +407,21 @@ void batch_argmax_hip(const float* y, float* out, uint32_t rows, uint32_t nb, ui
 // `w1` and `w2` are both [vocab][rank] bf16 and REPLICATED, so `row0`/`rows` slice w2 to whatever
 // band the vocabulary head produced. Only column `col` of `logits` is read: dim-major [rows][nb]
 // when a GEMM wrote it, token-major [nb][rows] when the multi-x matvec did — say which with
-// `logits_token_major`. `best` is one uint64 of device scratch, owned by the caller and zeroed here;
-// it holds this card's band's packed (value, ABSOLUTE row) maximum.
+// `logits_token_major`. `best` is one uint64 of device scratch, owned by the caller and zeroed when
+// `reset_best` is true; it holds this card's band's packed (value, ABSOLUTE row) maximum.
 void markov_step_hip(const uint16_t* w1, const uint16_t* w2, const uint32_t* ids,
                      const float* logits, uint64_t* best, uint32_t rows, uint32_t row0,
                      uint32_t rank, uint32_t nb, uint32_t col, void* stream,
-                     int logits_token_major = 0);
+                     int logits_token_major = 0, bool reset_best = true, int w2_sharded = 0);
+
+// FP8 g128 quantized `mtp_markov_w2` variant (`w2_fp8` local rows [rows][rank], `w2_scales`
+// [rows][rank/128] bf16). Global tie-break still uses `row0 + r`.
+void markov_step_fp8_g128_hip(const uint16_t* w1, const uint8_t* w2_fp8,
+                              const uint16_t* w2_scales, const uint32_t* ids,
+                              const float* logits, uint64_t* best, uint32_t rows,
+                              uint32_t row0, uint32_t rank, uint32_t nb, uint32_t col,
+                              void* stream, int logits_token_major = 0,
+                              bool reset_best = true);
 
 // The cross-card half of one step: `own` is this card's packed key and `peers` the other cards',
 // staged contiguously; the largest wins, which is the same "higher value, then lower id" the host
@@ -414,6 +429,19 @@ void markov_step_hip(const uint16_t* w1, const uint16_t* w2, const uint32_t* ids
 // step will read it. npeer == 0 is the identity.
 void markov_combine_hip(const uint64_t* own, const uint64_t* peers, uint32_t npeer, uint32_t* ids,
                         uint32_t col, void* stream);
+
+constexpr uint32_t kMarkovMaxPeers = 7;
+
+struct MarkovP2PTargets {
+  uint64_t* fg[kMarkovMaxPeers] = {};
+  unsigned int* flag[kMarkovMaxPeers] = {};
+};
+
+// Fine-grained P2P push+spin Markov combine (eliminates per-step peer memcpy and event waits).
+void markov_combine_p2p_hip(const uint64_t* own, const MarkovP2PTargets& targets,
+                            const uint64_t* wait_fg, const unsigned int* wait_flag,
+                            uint32_t* ids, uint32_t col, uint32_t tag,
+                            uint32_t push_n, uint32_t wait_n, bool write_id, void* stream);
 
 // The DSpark confidence head: one fp32 score a drafted token, from the block's UN-NORMED collapsed
 // hidden (dim-major [n_embd][nb], the same plane `collapse_pre` leaves in b_cur) and the Markov

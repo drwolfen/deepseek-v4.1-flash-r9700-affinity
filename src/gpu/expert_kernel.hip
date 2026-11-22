@@ -382,7 +382,8 @@ __attribute__((amdgpu_waves_per_eu((expert_gemm_min_waves<NT, MT, FMT, TR>()),
 __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     const ExpertTile* __restrict__ tiles, const uint8_t* __restrict__ x8,
     const float* __restrict__ xs, const float* __restrict__ cb,
-    float wscale, uint32_t rows, uint32_t cols, int y_bf16) {
+    float wscale, uint32_t rows, uint32_t cols, int y_bf16,
+    const ExpertTile* __restrict__ tiles2 = nullptr) {
   constexpr uint32_t kEM = kEWaves * MT * 16;     // weight rows a block owns
   // Threads that cooperate on ONE row of the weight, and how many 16-column blocks each decodes.
   // At MT=2 the block owns 128 rows and there is one thread per row decoding all four; at MT=1 it
@@ -390,7 +391,7 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   constexpr uint32_t kETPR = kEThreads / kEM;
   constexpr uint32_t kEBPT = (kEK / 16) / kETPR;
   static_assert(kEThreads % kEM == 0 && (kEK / 16) % kETPR == 0, "A staging does not divide");
-  const ExpertTile tile = tiles[blockIdx.y];
+  const ExpertTile tile = (tiles2 && blockIdx.z) ? tiles2[blockIdx.y] : tiles[blockIdx.y];
   // AN EMPTY TILE IS A PAD, AND IT COSTS A RETURN.
   //
   // The grid's y extent is the number of tiles, which is a fact about ROUTING — how many distinct
@@ -3377,7 +3378,7 @@ uint32_t expert_recon_tiles() {
 void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t max_nt,
                           const uint8_t* x8, const float* xs, const float* cb, uint32_t rows,
                           uint32_t cols, float wscale, void* stream, bool y_bf16,
-                          bool allow_recon) {
+                          bool allow_recon, const ExpertTile* tiles2) {
   if (!n_tiles) return;
   const uint32_t ntiles = (max_nt + 15) / 16;
   static const bool recon_devplan = [] {
@@ -3396,12 +3397,14 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
   for (uint32_t t0 = 0; t0 < n_tiles; t0 += step) {
     const uint32_t chunk_tiles = std::min<uint32_t>(step, n_tiles - t0);
     const ExpertTile* cur_tiles = tiles + t0;
+    const ExpertTile* cur_tiles2 = tiles2 ? (tiles2 + t0) : nullptr;
 #define AFF_EW1(NTV, MTV, FV, TRV)                                                                \
   do {                                                                                             \
   hipLaunchKernelGGL((expert_gemm_wmma_kernel<NTV, MTV, FV, TRV>),                                 \
-                     dim3((rows + kEWaves * MTV * 16 - 1) / (kEWaves * MTV * 16), chunk_tiles),    \
+                     dim3((rows + kEWaves * MTV * 16 - 1) / (kEWaves * MTV * 16), chunk_tiles,     \
+                          cur_tiles2 ? 2u : 1u),                                                   \
                      dim3(kEThreads), 0, (hipStream_t)stream, cur_tiles, x8, xs, cb, wscale, rows, \
-                     cols, y_bf16 ? 1 : 0); AFF_HIP_CHECK(hipGetLastError());                      \
+                     cols, y_bf16 ? 1 : 0, cur_tiles2); AFF_HIP_CHECK(hipGetLastError());          \
   } while (0)
 // The plane layout and the wire format are INDEPENDENT, and both `tr` branches carry every format
 // on purpose: dispatching `tr` first and falling through to kFmtPair16 would read the shipped

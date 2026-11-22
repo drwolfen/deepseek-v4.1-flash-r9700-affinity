@@ -569,6 +569,7 @@ private:
   // new pinned allocation is budgeted rather than assumed small.
   struct ActRing* act_ring_ = nullptr;       // host address
   struct ActRing* act_dev_ = nullptr;        // the same memory as the card addresses it
+  uint64_t* act_dev_head_ = nullptr;         // device-resident ring head (zero PCIe read)
   uint64_t act_tail_ = 0, act_drop_ = 0, act_seen_ = 0;
   bool act_alloc();
   // Consume everything the cards have published and give it to heat. Returns how many records it

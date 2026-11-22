@@ -2669,6 +2669,75 @@ __global__ __launch_bounds__(kTokTile * kTileRows) void batch_head_scale_rope_tr
   }
 }
 
+__global__ __launch_bounds__(256) void batch_head_rope_q8_tr_kernel(
+    const float* __restrict__ x, uint8_t* __restrict__ dst_q8, float* __restrict__ dst_qs,
+    uint32_t n_head, uint32_t n_rot, uint32_t pos0, float freq_scale, float theta_scale,
+    float ext_factor, float lo, float hi, uint32_t nb) {
+  constexpr uint32_t kHD = 512u;
+  constexpr uint32_t kTileTok = 8u;
+  constexpr uint32_t kTileLd = 516u;
+  __shared__ __align__(16) float s_tile[kTileTok][kTileLd];
+
+  const uint32_t tid = threadIdx.x;
+  const uint32_t bx = blockIdx.x * kTileTok;
+  const uint32_t h = blockIdx.y;
+  const uint32_t n = n_head * kHD;
+
+  const uint32_t tx = tid & 7u;
+  const uint32_t ty = tid >> 3;
+  const uint32_t tok = bx + tx;
+  const size_t h_base = (size_t)h * kHD;
+  for (uint32_t d0 = 0u; d0 < kHD; d0 += 32u) {
+    const uint32_t d = d0 + ty;
+    s_tile[tx][d] = (tok < nb) ? x[(h_base + d) * nb + tok] : 0.0f;
+  }
+  aff::lds_barrier();
+
+  const uint32_t ro = kHD - n_rot;
+  if (tok < nb) {
+    for (uint32_t p = ty; p < (n_rot >> 1); p += 32u) {
+      float c, sn;
+      rope_cs(p, pos0 + tok, freq_scale, theta_scale, ext_factor, lo, hi, 1.0f, &c, &sn);
+      const float x0 = s_tile[tx][ro + 2u * p];
+      const float x1 = s_tile[tx][ro + 2u * p + 1u];
+      s_tile[tx][ro + 2u * p]      = x0 * c - x1 * sn;
+      s_tile[tx][ro + 2u * p + 1u] = x0 * sn + x1 * c;
+    }
+  }
+  aff::lds_barrier();
+
+  const uint32_t w = tid >> 5;
+  const uint32_t lane = tid & 31u;
+  const uint32_t wtok = bx + w;
+  if (wtok >= nb) return;
+
+  float4 v[4];
+  float a = 0.0f;
+#pragma unroll
+  for (uint32_t q = 0u; q < 4u; ++q) {
+    v[q] = *(const float4*)&s_tile[w][q * 128u + lane * 4u];
+    a = fmaxf(fmaxf(fabsf(v[q].x), fabsf(v[q].y)),
+              fmaxf(fmaxf(fabsf(v[q].z), fabsf(v[q].w)), a));
+  }
+  const float amax = aff::wave_reduce_max_dpp(a);
+  const float sc = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
+  const float inv = 1.0f / sc;
+
+  uint8_t* const out_row = dst_q8 + (size_t)wtok * n + h_base;
+#pragma unroll
+  for (uint32_t q = 0u; q < 4u; ++q) {
+    const float v0 = fminf(fmaxf(v[q].x * inv, -448.0f), 448.0f);
+    const float v1 = fminf(fmaxf(v[q].y * inv, -448.0f), 448.0f);
+    const float v2 = fminf(fmaxf(v[q].z * inv, -448.0f), 448.0f);
+    const float v3 = fminf(fmaxf(v[q].w * inv, -448.0f), 448.0f);
+    int pk = 0;
+    pk = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, pk, false);
+    pk = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pk, true);
+    *(uint32_t*)(out_row + q * 128u + lane * 4u) = (uint32_t)pk;
+  }
+  if (lane == 0u) dst_qs[(size_t)wtok * n_head + h] = sc;
+}
+
 // ---- hyper-connections ------------------------------------------------------------------------
 //
 // The same arithmetic as hc_fused_kernel, restriped. That kernel is one block for the whole model
@@ -3712,8 +3781,8 @@ __device__ __forceinline__ uint64_t markov_key(float v, uint32_t row) {
 __global__ __launch_bounds__(kMarkovThr) void markov_step_kernel(
     const uint16_t* __restrict__ w1, const uint16_t* __restrict__ w2,
     const uint32_t* __restrict__ ids, const float* __restrict__ logits,
-    unsigned long long* __restrict__ best, uint32_t rows, uint32_t row0, uint32_t rank,
-    uint32_t nb, uint32_t col, uint32_t l_rs, uint32_t l_cs) {
+    unsigned long long* __restrict__ best, uint32_t rows, uint32_t row0, uint32_t w2_row0,
+    uint32_t rank, uint32_t nb, uint32_t col, uint32_t l_rs, uint32_t l_cs) {
   __shared__ float s_e[kMarkovRankMax];
   __shared__ unsigned long long s_best;
   // Step `col`'s input token is step `col-1`'s winner, and it is read HERE rather than passed as a
@@ -3738,7 +3807,7 @@ __global__ __launch_bounds__(kMarkovThr) void markov_step_kernel(
   const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
   const uint32_t r = blockIdx.x * (kMarkovThr / kWave) + wave;
   if (r < rows) {
-    const uint16_t* row = w2 + (size_t)(row0 + r) * rank;
+    const uint16_t* row = w2 + (size_t)(w2_row0 + r) * rank;
     float acc = 0.0f;
     for (uint32_t i = lane * 8; i < rank; i += kWave * 8) {
       const uint4 v = *(const uint4*)(row + i);
@@ -3784,6 +3853,87 @@ __global__ void markov_combine_kernel(const unsigned long long* __restrict__ a,
     k = k > kb ? k : kb;
   }
   ids[col + 1] = ~(uint32_t)(k & 0xffffffffu);
+}
+
+__global__ __launch_bounds__(kMarkovThr) void markov_step_fp8_g128_kernel(
+    const uint16_t* __restrict__ w1, const uint8_t* __restrict__ w2_fp8,
+    const uint16_t* __restrict__ w2_scales, const uint32_t* __restrict__ ids,
+    const float* __restrict__ logits, unsigned long long* __restrict__ best, uint32_t rows,
+    uint32_t row0, uint32_t rank, uint32_t col, uint32_t l_rs, uint32_t l_cs) {
+  __shared__ float s_e[kMarkovRankMax];
+  __shared__ unsigned long long s_best;
+  const uint32_t token = ids[col];
+  for (uint32_t i = threadIdx.x; i < rank; i += kMarkovThr)
+    s_e[i] = wmma::bf16_to_f32(w1[(size_t)token * rank + i]);
+  if (!threadIdx.x) s_best = 0ull;
+  aff::lds_barrier();
+
+  const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+  const uint32_t r = blockIdx.x * (kMarkovThr / kWave) + wave;
+  if (r < rows) {
+    const uint32_t sc_cols = rank >> 7;
+    const uint8_t* wrow = w2_fp8 + (size_t)r * rank;
+    const uint16_t* srow = w2_scales + (size_t)r * sc_cols;
+    float acc = 0.0f;
+    for (uint32_t g = 0u; g < sc_cols; ++g) {
+      const float sc = wmma::bf16_to_f32(srow[g]);
+      const uint32_t c = g * 128u + lane * 4u;
+      const uint32_t pk = *(const uint32_t*)(wrow + c);
+      const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(pk);
+      const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(pk);
+      const float dot = (d01.x * s_e[c] + d01.y * s_e[c + 1u]) +
+                        (d23.x * s_e[c + 2u] + d23.y * s_e[c + 3u]);
+      acc = fmaf(dot, sc, acc);
+    }
+    acc = aff::wave_reduce_add_dpp(acc);
+    if (!lane)
+      atomicMax(&s_best, (unsigned long long)markov_key(
+                             logits[(size_t)r * l_rs + (size_t)col * l_cs] + acc, row0 + r));
+  }
+  aff::lds_barrier();
+  if (!threadIdx.x && s_best) atomicMax(best, s_best);
+}
+
+__global__ __launch_bounds__(32) void markov_combine_p2p_kernel(
+    const unsigned long long* __restrict__ own, MarkovP2PTargets targets,
+    const unsigned long long* __restrict__ wait_fg, const unsigned int* __restrict__ wait_flag,
+    uint32_t* __restrict__ ids, uint32_t col, uint32_t tag, uint32_t push_n, uint32_t wait_n,
+    int write_id) {
+  if (threadIdx.x) return;
+  const unsigned long long my_best = *own;
+  for (uint32_t j = 0u; j < push_n; ++j) *targets.fg[j] = my_best;
+  if (push_n) {
+    asm volatile("s_wait_storecnt 0x0" ::: "memory");
+    for (uint32_t j = 0u; j < push_n; ++j) {
+      __hip_atomic_store(targets.flag[j], tag, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+  }
+  unsigned long long best = my_best;
+  if (wait_n) {
+    constexpr unsigned long long kMarkovSpinMax = 1ull << 32;
+    for (uint32_t j = 0u; j < wait_n; ++j) {
+      unsigned long long z = 0;
+      unsigned int v = __hip_atomic_load(&wait_flag[j], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      if ((int)(v - tag) < 0) {
+        do {
+#ifdef __HIP_DEVICE_COMPILE__
+          __builtin_amdgcn_s_sleep(1);
+#endif
+          v = __hip_atomic_load(&wait_flag[j], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        } while ((int)(v - tag) < 0 && ++z <= kMarkovSpinMax);
+      }
+    }
+#ifdef __HIP_DEVICE_COMPILE__
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#else
+    asm volatile("" ::: "memory");
+#endif
+    for (uint32_t j = 0u; j < wait_n; ++j) {
+      const unsigned long long v = wait_fg[j];
+      if (v > best) best = v;
+    }
+  }
+  if (write_id) ids[col + 1u] = ~(uint32_t)(best & 0xffffffffu);
 }
 
 // The two cards' per-position argmaxes, combined without either plane coming back to the host.
@@ -4513,6 +4663,15 @@ void batch_splitk_release_hip(void* stream) {
 
 void batch_rms_norm_hip(const float* x, const float* w32, const uint16_t* wbf16, float* out,
                         uint32_t n, uint32_t nb, float eps, void* stream) {
+  static const bool narrow_norm = [] {
+    const char* s = std::getenv("AFF_NARROW_RMS_NORM");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  if (narrow_norm && nb > 0u && nb <= kNarrowTok && (n % 2u) == 0u) {
+    AFF_BLAUNCH(batch_rms_norm_q8_kernel, dim3(nb), dim3(kRmsQThr), 0, (hipStream_t)stream, x, w32,
+                wbf16, out, (uint8_t*)nullptr, (float*)nullptr, n, nb, eps);
+    return;
+  }
   AFF_BLAUNCH(batch_rms_norm_kernel, dim3((nb + kBlkTok - 1) / kBlkTok), dim3(kBlkThreads),
                      0, (hipStream_t)stream, x, w32, wbf16, out, n, nb, eps);
 }
@@ -4538,6 +4697,20 @@ void batch_rms_norm_rope_hip(const float* x, const float* w, float* out, uint32_
                 dim3(kBlkThreads), 0, (hipStream_t)stream, x, w, out, n, nb, eps, n_rot, pos0,
                 r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi);
   }
+}
+
+bool batch_head_rope_q8_tr_hip(const float* x, uint8_t* dst_q8, float* dst_qs, uint32_t n_head,
+                               uint32_t head_dim, uint32_t n_rot, uint32_t pos0, RopeDerived r,
+                               uint32_t nb, void* stream) {
+  if (!x || !dst_q8 || !dst_qs || !n_head || !nb || head_dim != 512u || (n_rot % 64u) != 0u ||
+      n_rot > head_dim)
+    return false;
+  constexpr uint32_t kTileTok = 8u;
+  const dim3 grid((nb + kTileTok - 1u) / kTileTok, n_head);
+  AFF_BLAUNCH(batch_head_rope_q8_tr_kernel, grid, dim3(256u), 0, (hipStream_t)stream, x, dst_q8,
+              dst_qs, n_head, n_rot, pos0, r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi,
+              nb);
+  return true;
 }
 
 bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint32_t n_head,
@@ -5284,18 +5457,50 @@ void batch_argmax_hip(const float* y, float* out, uint32_t rows, uint32_t nb, ui
 void markov_step_hip(const uint16_t* w1, const uint16_t* w2, const uint32_t* ids,
                      const float* logits, uint64_t* best, uint32_t rows, uint32_t row0,
                      uint32_t rank, uint32_t nb, uint32_t col, void* stream,
-                     int logits_token_major) {
+                     int logits_token_major, bool reset_best, int w2_sharded) {
   if (!rows || !best || rank > kMarkovRankMax) return;
   const uint32_t l_rs = logits_token_major ? 1u : nb;
   const uint32_t l_cs = logits_token_major ? rows : 1u;
+  const uint32_t w2_row0 = w2_sharded ? 0u : row0;
   // The grid-wide maximum lands here; it has to start at "nothing", which is 0 because markov_key
   // maps every finite logit to a strictly positive key.
   auto* b64 = (unsigned long long*)best;
-  AFF_HIP_CHECK(hipMemsetAsync(b64, 0, sizeof(unsigned long long), (hipStream_t)stream));
+  if (reset_best) {
+    AFF_HIP_CHECK(hipMemsetAsync(b64, 0, sizeof(unsigned long long), (hipStream_t)stream));
+  }
   AFF_BLAUNCH(markov_step_kernel,
               dim3((rows + (kMarkovThr / kWave) - 1) / (kMarkovThr / kWave)), dim3(kMarkovThr), 0,
-              (hipStream_t)stream, w1, w2, ids, logits, b64, rows, row0, rank, nb, col, l_rs,
-              l_cs);
+              (hipStream_t)stream, w1, w2, ids, logits, b64, rows, row0, w2_row0, rank, nb, col,
+              l_rs, l_cs);
+}
+
+void markov_step_fp8_g128_hip(const uint16_t* w1, const uint8_t* w2_fp8,
+                              const uint16_t* w2_scales, const uint32_t* ids,
+                              const float* logits, uint64_t* best, uint32_t rows,
+                              uint32_t row0, uint32_t rank, uint32_t nb, uint32_t col,
+                              void* stream, int logits_token_major, bool reset_best) {
+  if (!rows || !best || !w1 || !w2_fp8 || !w2_scales || !ids || !logits ||
+      rank > kMarkovRankMax || (rank % 128u) != 0u)
+    return;
+  const uint32_t l_rs = logits_token_major ? 1u : nb;
+  const uint32_t l_cs = logits_token_major ? rows : 1u;
+  auto* b64 = (unsigned long long*)best;
+  if (reset_best) {
+    AFF_HIP_CHECK(hipMemsetAsync(b64, 0, sizeof(unsigned long long), (hipStream_t)stream));
+  }
+  AFF_BLAUNCH(markov_step_fp8_g128_kernel,
+              dim3((rows + (kMarkovThr / kWave) - 1) / (kMarkovThr / kWave)), dim3(kMarkovThr), 0,
+              (hipStream_t)stream, w1, w2_fp8, w2_scales, ids, logits, b64, rows, row0, rank, col,
+              l_rs, l_cs);
+}
+
+void markov_combine_p2p_hip(const uint64_t* own, const MarkovP2PTargets& targets,
+                            const uint64_t* wait_fg, const unsigned int* wait_flag,
+                            uint32_t* ids, uint32_t col, uint32_t tag,
+                            uint32_t push_n, uint32_t wait_n, bool write_id, void* stream) {
+  AFF_BLAUNCH(markov_combine_p2p_kernel, dim3(1), dim3(32), 0, (hipStream_t)stream,
+              (const unsigned long long*)own, targets, (const unsigned long long*)wait_fg,
+              wait_flag, ids, col, tag, push_n, wait_n, write_id ? 1 : 0);
 }
 
 void markov_combine_hip(const uint64_t* own, const uint64_t* peers, uint32_t npeer, uint32_t* ids,
@@ -5533,7 +5738,7 @@ void quantize_bf16_to_fp8_g128_hip(const uint16_t* w_bf16, uint8_t* fp8_data,
 }
 
 struct Fp8G128XPtrs {
-  const float* p[8];
+  const float* p[16];
 };
 
 constexpr uint32_t kFp8G128Waves = 8;
@@ -5588,7 +5793,7 @@ bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_sca
                                 const float* const* x_ptrs, float* y, uint32_t rows, uint32_t cols,
                                 uint32_t T, uint32_t y_stride, bool out_token_major, void* stream) {
   if (!fp8_data || !fp8_scales_bf16 || !x_ptrs || !y || !rows || (cols % 128u) != 0u || !T ||
-      T > 8u)
+      T > 16u)
     return false;
   Fp8G128XPtrs xp{};
   for (uint32_t t = 0; t < T; ++t) {
@@ -5604,8 +5809,10 @@ bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_sca
                 (hipStream_t)stream, fp8_data, fp8_scales_bf16, xp, y, rows, cols, y_stride, tm);  \
     break
   switch (T) {
-    AFF_FP8_G128_MX(1); AFF_FP8_G128_MX(2); AFF_FP8_G128_MX(3); AFF_FP8_G128_MX(4);
-    AFF_FP8_G128_MX(5); AFF_FP8_G128_MX(6); AFF_FP8_G128_MX(7); AFF_FP8_G128_MX(8);
+    AFF_FP8_G128_MX(1);  AFF_FP8_G128_MX(2);  AFF_FP8_G128_MX(3);  AFF_FP8_G128_MX(4);
+    AFF_FP8_G128_MX(5);  AFF_FP8_G128_MX(6);  AFF_FP8_G128_MX(7);  AFF_FP8_G128_MX(8);
+    AFF_FP8_G128_MX(9);  AFF_FP8_G128_MX(10); AFF_FP8_G128_MX(11); AFF_FP8_G128_MX(12);
+    AFF_FP8_G128_MX(13); AFF_FP8_G128_MX(14); AFF_FP8_G128_MX(15); AFF_FP8_G128_MX(16);
     default: return false;
   }
 #undef AFF_FP8_G128_MX
@@ -5616,8 +5823,8 @@ bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_sca
                                 const float* x_tm, float* y, uint32_t rows, uint32_t cols,
                                 uint32_t nt, uint32_t out_col_stride, int out_token_major,
                                 void* stream) {
-  if (!x_tm || !nt || nt > 8u) return false;
-  const float* ptrs[8];
+  if (!x_tm || !nt || nt > 16u) return false;
+  const float* ptrs[16];
   for (uint32_t t = 0; t < nt; ++t) ptrs[t] = x_tm + (size_t)t * cols;
   return matvec_fp8_g128_multix_hip(fp8_data, fp8_scales_bf16, ptrs, y, rows, cols, nt,
                                     out_col_stride, out_token_major != 0, stream);

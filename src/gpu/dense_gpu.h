@@ -348,9 +348,11 @@ private:
     uint16_t* b12_esc_val = nullptr;
     uint32_t  b12_n_esc = 0;
     uint64_t data_bytes = 0, scales_bytes = 0;   // amdnas-fixes weight-verify: sizes for the read-back digest
+    bool is_uva = false;
   };
   struct Entry {
     Shard sh[kMaxRanks];
+    void* uva_host = nullptr;
     uint32_t quant = 0;
     uint64_t rows = 0, cols = 0;
     Split split = Split::Row;
@@ -614,7 +616,8 @@ private:
                         float* norm_host);
   bool     batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv, int32_t kvnorm,
                           uint64_t hidden, uint64_t qr, uint32_t n_head, uint32_t width,
-                          uint32_t n_rot, RopeDerived rope, float eps, float* qrnorm_host);
+                          uint32_t n_rot, RopeDerived rope, float eps, float* qrnorm_host,
+                          bool allow_q_e4m3 = false);
   bool     batch_mv_host(int src, const int32_t* h, const uint64_t* rows, uint64_t cols, uint32_t n,
                          float* const* y);
   bool     batch_kv_commit(uint32_t layer, uint32_t b0, uint32_t n, uint32_t pos0, uint32_t width,
@@ -717,18 +720,10 @@ private:
   // The same head, sampled. The vocabulary is Row-split, so a nucleus over one card's band is not a
   // nucleus: the peer's half is gathered first and the draw happens over the whole distribution.
   // Scratch for the sampler's small transfers, sized once at the block width.
-  void*    smp_q_ = nullptr;
-  void*    smp_u_ = nullptr;
+  void*    smp_ctrl_ = nullptr;
   void*    smp_out_ = nullptr;
-  void*    smp_h_q_ = nullptr;
-  void*    smp_h_u_ = nullptr;
+  void*    smp_h_ctrl_ = nullptr;
   void*    smp_h_out_ = nullptr;
-  // Repetition penalty: the deduplicated window, staged on the host and copied as ids.
-  void*    smp_hist_ = nullptr;
-  uint32_t* smp_h_hist_ = nullptr;
-  // DRY: the host's continuation ids, already deduplicated there.
-  void*    smp_dry_ = nullptr;
-  uint32_t* smp_h_dry_ = nullptr;
   uint32_t smp_cap_ = 0;
   bool     batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
                              const uint32_t* query, const float* u, float temperature, float top_p,
