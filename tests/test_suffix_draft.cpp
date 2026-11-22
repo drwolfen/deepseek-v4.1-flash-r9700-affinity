@@ -324,43 +324,50 @@ void test_high_load_resize_stability() {
 void test_suffix_gate_prose_backoff() {
   SuffixGate gate;
   // Prose DSpark runs strongly (~3.8 accepted in 120 ms -> utility 4.8/120 = 0.040 tok/ms).
-  // A medium-length 4-token prose collision (n=8, expect=6.0, sfx_cost=156 ms):
-  // initial eff_expect=5.4 -> sfx_u=6.4/156=0.0410 < 0.040*1.05=0.0420 -> rejected immediately.
-  SuffixDraftIndex::Proposal weak_hit{/*n=*/8, /*match_len=*/4, /*score=*/0.55f, /*expect=*/6.0f};
-  REQUIRE(!gate.should_preempt(weak_hit, 4, 2.0f, true, 3.8f, 120.0f, 156.0f, 1.05f));
+  // Bare 4-token (min_match) and cold 5-token collisions are rejected immediately under DSpark
+  // with 0 wasted probes.
+  SuffixDraftIndex::Proposal bare_4{/*n=*/12, /*match_len=*/4, /*score=*/0.80f, /*expect=*/12.0f};
+  SuffixDraftIndex::Proposal cold_5{/*n=*/12, /*match_len=*/5, /*score=*/0.80f, /*expect=*/12.0f};
+  REQUIRE(!gate.should_preempt(bare_4, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  REQUIRE(!gate.should_preempt(cold_5, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
 
-  // A long 12-token chance collision initially exceeds DSpark utility (11.8/204 = 0.0578 >= 0.0420),
-  // probes once, gets only 1 accepted token (k=1 of 12), dropping acc_ema and arming cooldown=2.
-  SuffixDraftIndex::Proposal chance_hit{/*n=*/12, /*match_len=*/4, /*score=*/0.80f, /*expect=*/12.0f};
-  REQUIRE(gate.should_preempt(chance_hit, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  // A cold 6-token (min_match + 2) collision exceeds DSpark utility (11.8/204 = 0.0578 >= 0.0420),
+  // probes once, gets only 1 accepted token (k=1 of 12), dropping acc_ema < 0.60 and arming cooldown=2.
+  SuffixDraftIndex::Proposal chance_6{/*n=*/12, /*match_len=*/6, /*score=*/0.80f, /*expect=*/12.0f};
+  REQUIRE(gate.should_preempt(chance_6, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
   gate.observe(12, 1);
   REQUIRE(gate.acc_ema < 0.60f);
   REQUIRE(gate.cooldown == 2);
 
-  // Next 2 short-match hits are suppressed by cooldown without decrementing below 0.
-  REQUIRE(!gate.should_preempt(chance_hit, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
-  REQUIRE(!gate.should_preempt(chance_hit, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  // Next 2 calls (even with match_len=6 or 7) do NOT break cooldown because acc_ema < 0.65f,
+  // decrementing cooldown down to 0.
+  SuffixDraftIndex::Proposal chance_7{/*n=*/12, /*match_len=*/7, /*score=*/0.80f, /*expect=*/12.0f};
+  REQUIRE(!gate.should_preempt(chance_6, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  REQUIRE(!gate.should_preempt(chance_7, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
   REQUIRE(gate.cooldown == 0);
 
   // Even after cooldown clears, acc_ema ~ 0.53 -> sfx_u=(1+6.39)/204=0.0362 < 0.0420 -> stays DSpark.
-  REQUIRE(!gate.should_preempt(chance_hit, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  REQUIRE(!gate.should_preempt(chance_6, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
 
   std::printf("PASS: test_suffix_gate_prose_backoff\n");
 }
 
 void test_suffix_gate_code_edit_burst() {
   SuffixGate gate;
-  // Simulate an earlier miss putting gate into cooldown.
-  gate.observe(6, 1);
-  REQUIRE(gate.cooldown == 2);
-
-  // A long exact code match (match_len >= min_match+2 && n >= min_match+2) breaks out of cooldown.
   SuffixDraftIndex::Proposal code_long{/*n=*/12, /*match_len=*/7, /*score=*/1.0f, /*expect=*/12.0f};
-  gate.acc_ema = 0.90f;
-  REQUIRE(gate.should_preempt(code_long, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
-  REQUIRE(gate.cooldown == 0);
 
-  // Full acceptance bursts maintain high acc_ema >= 0.90 and keep cooldown at 0.
+  // Fresh gate enters immediately on a long exact match (match_len=7 >= min_match+2).
+  REQUIRE(gate.should_preempt(code_long, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+
+  // Cooldown breakout works when acc_ema >= 0.65f (simulate miss starting from high EMA).
+  SuffixGate gate_cd;
+  gate_cd.observe(6, 1);
+  REQUIRE(gate_cd.cooldown == 2);
+  gate_cd.acc_ema = 0.90f;
+  REQUIRE(gate_cd.should_preempt(code_long, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  REQUIRE(gate_cd.cooldown == 0);
+
+  // Full acceptance bursts maintain high acc_ema >= 0.95 and keep cooldown at 0.
   for (int i = 0; i < 4; ++i) {
     gate.observe(12, 12);
     REQUIRE(gate.cooldown == 0);
@@ -368,6 +375,13 @@ void test_suffix_gate_code_edit_burst() {
     REQUIRE(gate.should_preempt(code_long, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
   }
   REQUIRE(gate.acc_ema >= 0.95f);
+
+  // In a proven streak (steps > 0, miss_streak == 0, acc_ema >= 0.80f), match_len=5 is accepted
+  // while bare match_len=4 is still rejected under dspark_active=true.
+  SuffixDraftIndex::Proposal streak_5{/*n=*/12, /*match_len=*/5, /*score=*/1.0f, /*expect=*/12.0f};
+  SuffixDraftIndex::Proposal bare_4{/*n=*/12, /*match_len=*/4, /*score=*/1.0f, /*expect=*/12.0f};
+  REQUIRE(gate.should_preempt(streak_5, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  REQUIRE(!gate.should_preempt(bare_4, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
 
   std::printf("PASS: test_suffix_gate_code_edit_burst\n");
 }

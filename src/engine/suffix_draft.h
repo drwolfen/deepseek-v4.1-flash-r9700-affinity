@@ -387,8 +387,20 @@ struct SuffixGate {
                       bool dspark_active, float dspark_exp_acc, float dspark_cost_ms,
                       float sfx_cost_ms, float min_gain = 1.05f) noexcept {
     if (prop.n < min_match || prop.expect < min_expect) return false;
+    if (dspark_active) {
+      // Never let bare 4-token (min_match) or cold 5-token collisions preempt GPU DSpark;
+      // require a strong exact anchor (>= min_match + 2) to enter suffix mode, or
+      // >= min_match + 1 once a proven high-acceptance streak is active.
+      const int req_match = (steps > 0 && miss_streak == 0 && acc_ema >= 0.80f)
+                                ? (min_match + 1)
+                                : (min_match + 2);
+      if (prop.match_len < req_match) {
+        if (cooldown > 0) --cooldown;
+        return false;
+      }
+    }
     if (cooldown > 0) {
-      if (prop.match_len >= min_match + 2 && prop.n >= min_match + 2) {
+      if (prop.match_len >= min_match + 2 && prop.n >= min_match + 2 && acc_ema >= 0.65f) {
         cooldown = 0;
       } else {
         --cooldown;
