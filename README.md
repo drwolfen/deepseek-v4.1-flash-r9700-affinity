@@ -14,28 +14,31 @@ This repository captures the full stack: engine source (RDNA 4 HIP kernels + hos
 - **1017 revision:** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-1017-UNCENSORED-affinity-2.875bpw)
 - **Legacy 0925 revision:** [huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw](https://huggingface.co/Muoniolalusta/DeepSeek-V4.1-Flash-UNCENSORED-affinity-2.875bpw)
 
-**Documentation & Release Links:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v5.5.0`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v5.5.0) | **Benchmark Reports:** [**`v5.5.0 Radiance Ports`**](docs/v5.5.0-radiance-port-benchmark.md) · [**`v5.4.0 Optimization & Engine Assessment`**](docs/v5.4.0-optimization-and-engine-assessment.md) · [**`v5.3.0 HIP Optimization`**](docs/v5.3.0-hip-kernel-optimization-benchmark.md) · [**`v5.2.0 Optimization`**](docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md) · [**`v5.1.0 & MoonMath-1017`**](docs/benchmarks/2026-11-16-v5.1-and-moonmath-1017-bakeoff.md) · [**`v5.0.0 & Radiance v2.1`**](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md)
+**Documentation & Release Links:** [**`CHANGELOG.md`**](CHANGELOG.md) | **Latest Release:** [**`v5.6.0`**](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/releases/tag/v5.6.0) | **Benchmark Reports:** [**`v5.6.0 FP8 E4M3 Optimization`**](docs/v5.6.0-fp8-e4m3-benchmark.md) · [**`v5.5.0 Radiance Ports`**](docs/v5.5.0-radiance-port-benchmark.md) · [**`v5.4.0 Optimization & Engine Assessment`**](docs/v5.4.0-optimization-and-engine-assessment.md) · [**`v5.3.0 HIP Optimization`**](docs/v5.3.0-hip-kernel-optimization-benchmark.md) · [**`v5.2.0 Optimization`**](docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md) · [**`v5.1.0 & MoonMath-1017`**](docs/benchmarks/2026-11-16-v5.1-and-moonmath-1017-bakeoff.md) · [**`v5.0.0 & Radiance v2.1`**](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md)
 
 ---
 
 ## Table of Contents
 
-1. [Release Highlights (Waves 0–8)](#release-highlights-waves-08)
+1. [Release Highlights (Waves 0–9)](#release-highlights-waves-09)
 2. [Architecture, Memory Topology & Hardware Platform](#architecture-memory-topology--hardware-platform)
-3. [What's New in `v5.5.0`: Radiance Wave 8 Ports (`R1–R7`)](#whats-new-in-v550-radiance-wave-8-ports-r1r7)
-4. [What's New in `v5.4.0`: `gfx1201` Stabilization, Zero-D2H Pool & Agentic Fixes](#whats-new-in-v540-gfx1201-stabilization-zero-d2h-pool--agentic-fixes)
-5. [What's New in `v5.3.0`: RDNA 4 (`gfx1201`) HIP Kernel Deep Dive](#whats-new-in-v530-rdna-4-gfx1201-hip-kernel-deep-dive)
-6. [v5.3.0 3-Arm Paired Benchmark & ROCm 10.1 vs 10.2 Evaluation](#v530-3-arm-paired-benchmark--rocm-101-vs-102-evaluation)
-7. [Measured Performance Progression (Waves 0–8)](#measured-performance-progression-waves-08)
-8. [Wave 4 Bake-Off: `affinity` vs `StillDeadcode/radiance v2.1.0`](#wave-4-bake-off-affinity-vs-stilldeadcoderadiance-v210)
-9. [Rework and Patches (`v1.0.0` → `v5.5.0`)](#rework-and-patches-v100--v550)
-10. [Production Safety Invariants & Environment Variable Reference](#production-safety-invariants--environment-variable-reference)
-11. [Build, Test, Deploy & Rollback Guide](#build-test-deploy--rollback-guide)
-12. [Credits](#credits)
+3. [What's New in `v5.6.0`: Wave 9 FP8 E4M3 Native Conversions (`F1–F8`), NUMA `SYS_NICE` & Effort 75](#whats-new-in-v560-wave-9-fp8-e4m3-native-conversions-f1f8-numa-sys_nice--effort-75)
+4. [What's New in `v5.5.0`: Radiance Wave 8 Ports (`R1–R7`)](#whats-new-in-v550-radiance-wave-8-ports-r1r7)
+5. [What's New in `v5.4.0`: `gfx1201` Stabilization, Zero-D2H Pool & Agentic Fixes](#whats-new-in-v540-gfx1201-stabilization-zero-d2h-pool--agentic-fixes)
+6. [What's New in `v5.3.0`: RDNA 4 (`gfx1201`) HIP Kernel Deep Dive](#whats-new-in-v530-rdna-4-gfx1201-hip-kernel-deep-dive)
+7. [v5.3.0 3-Arm Paired Benchmark & ROCm 10.1 vs 10.2 Evaluation](#v530-3-arm-paired-benchmark--rocm-101-vs-102-evaluation)
+8. [Measured Performance Progression (Waves 0–9)](#measured-performance-progression-waves-09)
+9. [Wave 4 Bake-Off: `affinity` vs `StillDeadcode/radiance v2.1.0`](#wave-4-bake-off-affinity-vs-stilldeadcoderadiance-v210)
+10. [Rework and Patches (`v1.0.0` → `v5.6.0`)](#rework-and-patches-v100--v560)
+11. [Production Safety Invariants & Environment Variable Reference](#production-safety-invariants--environment-variable-reference)
+12. [Build, Test, Deploy & Rollback Guide](#build-test-deploy--rollback-guide)
+13. [Credits](#credits)
 
 ---
 
-## Release Highlights (Waves 0–8)
+## Release Highlights (Waves 0–9)
+
+- **v5.6.0** (`6383b19..54692df`): Wave 9 converts remaining hot dense, Engram, attention-output, all-reduce, and target LM head stages onto native `gfx1201` hardware FP8 E4M3 (`F1–F8`), enables NUMA Node 0 `host_pool` page pinning via `--cap-add SYS_NICE` (`47,804,160 / 47,804,160` = `100.0%` on Node 0; `Engram` spills safely to Node 1 at `0.00 pgscank/s`), and sets `--default-effort 75` in deploy manifests: `idx_wq_b` FP8 (`F1`: `AFF_IDX_WQB_FP8=1`), grouped `attn_out_a` direct FP8 (`F2`: `AFF_ATTN_OUT_A_FP8=1`, `b_attn_out` **`-25.2%`**), `mtp_main_proj` FP8 (`F3`: `AFF_MTP_PROJ_FP8=1`), packed TP=2 E4M3 all-reduce (`F4`), raw MXFP8 Engram H2D + on-GPU requant (`F5`: `AFF_ENGRAM_RAW_H2D=1`, `11` VGPRs / `16` occ), group-128 E4M3 target LM head (`F6`: `AFF_LMHEAD_FP8=1` default ON, `320.6 MiB/shard`, `b_mv_host` **`-36.9%`** / host wait **`-86%`**, **`3,644` resident experts**, `+27` vs `v5.5.0`, `+51` vs `v5.4.0`), hardware `e4m3_enc` + `[7.5*2^-9, 8*2^-9)` subnormal carry fix (`F7`), and 2-wide norm-quant + uniform `AFF_O_FP8_QDQ=1` (`F8`). Paired cold-start NUMA-local benchmarks improve `p4k tg2` **`+5.1%`** (`17.21`), `l4k` **`+4.1% pp1` / `+6.8% tg1` / `+3.4% tg2`** (`45.65`), `l16k` **`+3.0% pp1` / `+8.1% tg1` / `+8.4% tg2`** (`43.81`), `l64k` **`+3.6% pp1` / `+2.7% pp2` / `+12.1% tg2`** (`44.47`), `code_edit tg2` **`+3.7%`** (`41.50`), `step_c` 4-prompt DSpark **`+2.0%`** (`19.70`), and `step_d turn4_100k_cached` **`+16.7%`** (`22.74`, `0.914 s` TTFT). Verified **`673` `gfx1201` kernels (`0` scratch, `0` VGPR spill)**, **`15/15` `aff_gpu` & `27/27` `aff_format` `-ffp-contract=off`**, **`16/16` full `ctest` (`11/11` CPU + `5/5` GPU)**, F3/F5/F6/F7 gates, cross-version `pcache` restore (`0x733de762fee543e6`), `--default-effort 75` smoke (`req00=0.43 s`, `25.43 tok/s` math, `16.40 tok/s` tool call, `0` aborts), and `3.105–3.400 s` KFD release. See [`docs/v5.6.0-fp8-e4m3-benchmark.md`](docs/v5.6.0-fp8-e4m3-benchmark.md).
 
 - **v5.5.0** (`e9279b1..55de363`): Ports seven Radiance Wave 8 optimizations (`R1–R7`) onto `v5.4.0` while keeping target numerics bit-exact (`-ffp-contract=off`, prefix-cache fingerprint `0x733de762fee543e6` preserved): pure-LDS `lds_barrier()` + `s_wait_storecnt`/agent fences (`R1`), register-buffered `RegForm` + early wake store AR (`R3`: `AFF_AR_REG_FORM=1`, `AFF_AR_WAKE_STORE=1`), pre-collapsed AR+V4.1 RMSNorm fusion (`R4`: `AFF_FUSE_AR_RMSNORM=1`), lossless 12.25-bit `bf16x12` target LM head (`R5`: `AFF_LMHEAD_BF16X12=1`, **`3,617` resident experts**, `+24` vs `v5.4.0`), CPU incremental `SuffixDraftIndex` speculative drafter ahead of DSpark (`R6`: `AFF_DRAFT_SUFFIX=1`, `AFF_DRAFT_DEPTH_STOP=1`), and evidence-locked opt-in flags `AFF_TP_AR_CODED=0` (`R2`: `-54.8%` KL vs FP32 at `~2.5%` 64K PP cost) and `AFF_PREFETCH_BESIDE=0` (`R7`: `-15.5%..-33.2%`). Stage B2 paired benchmarks achieve **43.16 tok/s (`+25.5%`)** @ `l4k`, **44.55 tok/s (`+31.9%`)** @ `l16k`, **43.70 tok/s (`+36.2%`)** @ `l64k`, **40.27 tok/s (`+43.1%`)** @ `code_edit`, **`+0.4%` to `+15.3%`** 4-prompt DSpark, and **`+45.9%` `turn3` / `+43.6%` `turn4`** on `80K -> 123K` multi-turn. Verified **`599` `gfx1201` kernels (`0` scratch, `0` VGPR spill)**, **`11/11` CPU `ctest` + `5/5` GPU + fallback-OFF + `64/64` static-placement parity PASS**, `DRY 3/3`, `</think>` `653/653` restored, `64`-block stride verified at `64K`/`80K`, and `3.298 s` KFD release. See [`docs/v5.5.0-radiance-port-benchmark.md`](docs/v5.5.0-radiance-port-benchmark.md).
 
@@ -66,7 +69,7 @@ This repository captures the full stack: engine source (RDNA 4 HIP kernels + hos
 | PCIe Interconnect | GPUs negotiate **Gen5 ×16**, switched host/peer uplink runs at **Gen3 ×16 (8.0 GT/s)** |
 | Host OS | **Ubuntu 24.04.5 LTS** (Noble Numbat), kernel 7.0 |
 | Container Base | **ROCm `10.1.0-full`** (`docker.io/rocm/dev-ubuntu-24.04:10.1.0-full`, `gfx1201`) |
-| Image Tag | `deepseek-affinity:v5.5.0` |
+| Image Tag | `deepseek-affinity:v5.6.0` |
 | Serving Topology | OpenAI-compatible HTTP/SSE container on `:8000` (with optional local reverse proxy on `:8080`) |
 
 ### DeepSeek-V4.1-Flash Memory & Placement Architecture
@@ -77,19 +80,36 @@ DeepSeek-V4.1-Flash uses 40 layers, 384 routed experts (top-6 active per token),
 |---|---|---|
 | **Dense Weights** | TP=2 sharded across both GPUs (`506` tensors; LM head BF16, DSpark head `int4_g128` `162.7 MiB/card`) | `10.01 GiB` total (`4,870 MiB/card` weights + `160 MiB` HIP ctx/staging) |
 | **Routed MoE Experts (GPU)** | 2-way shards (`6.08 MiB/shard`), demand placement with `32` shadow slots (`0.00 GiB` D2H); card-1 asymmetric bonus slab (`+30`) | **`3,563` resident slots** (`42.3 GiB` VRAM, `23.2%` residency) |
-| **Routed MoE Experts (Host Pool)** | Immutable zero-D2H 2 MiB THP host pool (`AFF_POOL_FULL=1`), PCIe DMA read-in-place (`8/32 WGPs` contiguous SE0 `0x000000ff`) | **`15,360` experts pinned in `182.4 GiB` RAM** (`100%` 2 MiB pages, `0` on SSD tier) |
+| **Routed MoE Experts (Host Pool)** | Immutable zero-D2H 2 MiB THP host pool (`AFF_POOL_FULL=1`, `--cap-add SYS_NICE` -> `MPOL_PREFERRED` Node 0), PCIe DMA read-in-place (`8/32 WGPs` contiguous SE0 `0x000000ff`) | **`15,360` experts pinned in `182.4 GiB` RAM** (`47,804,160 / 47,804,160` = `100.0%` Node 0, `0` on SSD tier) |
 | **DSpark Speculative Drafter** | 3 blocks, block width 5, taps `[37, 38, 39]`, `384/384` draft experts resident | `5.22 GiB` (`2,446 MiB` draft expert slab + `480 MiB` dense + `4 MiB` arena per card) |
 | **KV Cache & Prefill Arena** | Virtual span `327,680` positions reserved / `262,144` backed; `2816`-token batched prefill arena | `348 MiB/card` KV (`0.66 GiB` total) + `1,102 MiB/card` prefill + `442 MiB/card` compressor/indexer |
-| **Engram Tables & ViT** | `32`-layer BF16 DeepSeek ViT on CPU; `188.8 GiB` Engram n-gram tables host-mmapped (`AFF_ENGRAM_WARM=1`) | `74 MiB/card` GPU + OS page cache mmap |
+| **Engram Tables & ViT** | `32`-layer BF16 DeepSeek ViT on CPU; `188.8 GiB` Engram n-gram tables host-mmapped (`AFF_ENGRAM_WARM=1`, spills safely to Node 1 at `0.00 pgscank/s`) | `74 MiB/card` GPU + OS page cache mmap |
 | **Persistent Prefix Cache** | Multi-slot NVMe state-only delta checkpoints (`AFF_PCACHE_DELTA=1`, async batched I/O) | `64.0 GiB` configured (`512`-tok blocks, `60,505` block slots, `1,793` checkpoint slots) |
 | **Total Card & Host Totals** | `[383, 384] MiB` slab headroom (`gpu_headroom_mib=384`) | **`32,000+ MiB`** per card · **`182.4 GiB`** immutable THP host pool |
 
-> **`v5.5.0` residency delta:** Lossless 12.25-bit `bf16x12` target LM head packing (`AFF_LMHEAD_BF16X12=1`) frees output-plane VRAM and increases live GPU-resident MoE slots from `3,593` (`v5.4.0`) to **`3,617`** (`+24` experts).
+> **`v5.5.0` & `v5.6.0` residency deltas:** `v5.5.0` lossless `bf16x12` target LM head packing raised live GPU-resident MoE slots from `3,593` (`v5.4.0`) to `3,617` (`+24`). `v5.6.0` group-128 E4M3 target LM head packing (`AFF_LMHEAD_FP8=1`, `320.6` vs `483.6 MiB/shard`) increases live residency to **`3,644` experts** (**`+27`** vs `v5.5.0`, **`+51`** vs `v5.4.0`).
 
 ### Minimum RAM Floor
 
 - **~200 GiB RAM** (`--host-pool-mib 200000`) is recommended for the default zero-D2H `AFF_POOL_FULL=1` full immutable pool (`182.4 GiB` pinned for all `15,360` experts + OS headroom). Hosts with tighter RAM can set `AFF_POOL_FULL=0` (~`160 GiB` floor, pinning only non-resident experts at `140–143 GiB`).
 - Below that threshold, demand-paged experts spill to the SSD staging tier (4 slots / `48.6 MiB`) and generation collapses toward SSD read latency (~8 tok/s instead of ~22–48 tok/s).
+
+---
+
+## What's New in `v5.6.0`: Wave 9 FP8 E4M3 Native Conversions (`F1–F8`), NUMA `SYS_NICE` & Effort 75
+
+`v5.6.0` converts remaining hot dense, Engram, attention-output, all-reduce, and target LM head stages onto native `gfx1201` hardware FP8 E4M3 (`F1–F8`), adds `--cap-add SYS_NICE` for NUMA Node 0 `host_pool` page pinning, and sets `--default-effort 75` in deploy manifests while preserving `-ffp-contract=off` (`15/15` `aff_gpu` & `27/27` `aff_format`) and cross-version prefix-cache fingerprint `0x733de762fee543e6`. Full gates, kernel traces, paired benchmarks, and bimodal boot notes are in [`docs/v5.6.0-fp8-e4m3-benchmark.md`](docs/v5.6.0-fp8-e4m3-benchmark.md).
+
+- **`F1` Sparse Indexer `idx_wq_b` FP8 (`AFF_IDX_WQB_FP8=1`, `baf61cd`)**: Preserves preshuffled FP8 weights on `idx_wq_b` (`(cols % 128) == 0`) and dispatches `batch_quant_tm_fp8_hip` + `batch_gemm_fp8_hip` across `indexer_one` and `batch_indexer_q`.
+- **`F2` Grouped Block-32 `attn_out_a` Direct FP8 Path (`AFF_ATTN_OUT_A_FP8=1`, `b1e65c4`, `baf61cd`)**: `batch_attn_out_prep_fp8_hip` converts `[nb][ng * group_dim]` F32 heads to BF16 in LDS, applies inverse RoPE, quantizes per-32 UE8M0, and feeds `batch_gemm_fp8_grouped_b32_hip` (`ps` preserved on `attn_out_a`); cuts `b_attn_out` from `211.71` to **`158.40–159.55 us/call`** (**`-25.2%`**).
+- **`F3` DSpark `mtp_main_proj` FP8 Quantized Tap (`AFF_MTP_PROJ_FP8=1`, `b1e65c4`, `baf61cd`)**: `batch_quant_tm_fp8_hip(..., n_live)` zeroes padded rows `tok >= n_live` (`0x00` E4M3, `1.0f` scale) so `draft_mtp_proj` feeds `batch_gemm_fp8_hip(..., ps=true)` directly without `draft_transpose_pad_kernel` (`64/64` exact parity, `4.27 vs 4.27 tok/blk`).
+- **`F4` Packed Hardware E4M3 TP=2 All-Reduce (`6383b19`)**: Uses clamped 4-byte `pack4_e4m3` (`v_cvt_pk_fp8_f32`) and `e4m3_decode_pk` in `tp_ar_fp8_kernel` and `tp_ar_fp8_staged_kernel` while preserving ascending rank accumulation order.
+- **`F5` Raw MXFP8 Engram H2D + On-GPU Requant (`AFF_ENGRAM_RAW_H2D=1`, `b1e65c4`, `baf61cd`)**: `EngramTables::gather_mxfp8` streams raw MXFP8 rows over H2D (`raw_mxfp8_stride()`) and `engram_mxfp8_requant_fp8_hip` (`11` VGPRs, `16` occ) requantizes on device (`64/64` parity, `--max-layers 15` `129,280/129,280` `rmse=0.0`).
+- **`F6` Group-128 FP8 E4M3 Target LM Head (`AFF_LMHEAD_FP8=1`, `b1e65c4`, `baf61cd`, `54692df`)**: Chunk-quantizes (`quantize_bf16_to_fp8_g128_hip`, `320.6 MiB/shard` vs `483.6 MiB/shard` `bf16x12`) and executes via `matvec_fp8_g128_multix_hip`; cuts `b_mv_host` `77.29 -> 48.74–48.99 us/call` (**`-36.9%`**, host wait `119.89 -> 17.22 ms`, **`-86%`**), passes logits/KL gates (`top1_match=True`, `cos_sim=0.999905`, `kl_ref_cmp=0.001601 <= 0.005`, `DRY 3/3`), expands residency **`+27` (`3,617 -> 3,644` live)**, and is promoted to default ON in `54692df`.
+- **`F7` Hardware `e4m3_enc` & Subnormal Carry Fix (`6383b19`)**: Uses `v_cvt_pk_fp8_f32` in `device_math.h` `e4m3_enc` (with clamped `e4m3_enc_sw` fallback) and fixes the `[7.5*2^-9, 8*2^-9)` subnormal carry `0x08` across `device_math.h`, `attention_gpu.hip`, and `attn_flash.hip`; cross-version `pcache` restore from `v5.5.0` passes (`3,584/4,026`, `7/7` blocks, `0` warnings).
+- **`F8` 2-Wide Norm-Quant & Uniform `AFF_O_FP8_QDQ=1` (`b1e65c4`, `baf61cd`)**: Uses 2-wide `cvt_pk_fp8_f32` in `batch_rms_norm_q8_kernel`, `hcn_norm_kernel`, and `hcn_norm_v41_kernel`, and defaults `o_fp8_qdq_enabled()` (`AFF_O_FP8_QDQ=1`) ON across both `attn_out` and `batch_attn_out`.
+- **NUMA Node 0 `SYS_NICE` & Effort 75 (`2abc33f`, `54692df`)**: `--cap-add SYS_NICE` unlocks `SYS_mbind(MPOL_PREFERRED -> node 0)` (`rc=0`, `47,804,160 / 47,804,160` = `100.0%` of `host_pool` on Node 0 alongside both R9700 GPUs; `Engram` safely spills to Node 1 at `0.00 pgscank/s`); deploy manifests default `--default-effort 75` (`eff75_smoke`: `req00=0.43 s`, math `25.43 tok/s`, JSON `tool_calls` `16.40 tok/s`, `0` aborts, `kfd_release_s=3.105 s`).
+- **Paired Cold-Start NUMA-Local Results (`--default-effort 60`, ZERO `AFF_LMHEAD_FP8` override)**: vs NUMA `v5.5.0`, `v5.6.0-rc2` improves `p4k tg2` **`+5.1%`** (`17.21`), `l4k` **`+4.1% pp1` / `+6.8% tg1` / `+3.4% tg2`** (`45.65`), `l16k` **`+3.0% pp1` / `+8.1% tg1` / `+8.4% tg2`** (`43.81`), `l64k` **`+3.6% pp1` / `+2.7% pp2` / `+12.1% tg2`** (`44.47`), `code_edit tg2` **`+3.7%`** (`41.50`), `step_c` 4-prompt DSpark **`+2.0%`** (`19.70`), and `step_d turn4_100k_cached` **`+16.7%`** (`22.74`, `0.914 s` TTFT); **`673` `gfx1201` kernels (`0` scratch, `0` VGPR spill)** and **`16/16` full `ctest` (`11/11` CPU + `5/5` GPU)** PASS.
 
 ---
 
@@ -252,9 +272,9 @@ All 3 arms ran back-to-back in an isolated single-tenant GPU window with identic
 
 ---
 
-## Measured Performance Progression (Waves 0–8)
+## Measured Performance Progression (Waves 0–9)
 
-Full historical methodology and charts are in [`docs/v5.5.0-radiance-port-benchmark.md`](docs/v5.5.0-radiance-port-benchmark.md), [`docs/v5.4.0-optimization-and-engine-assessment.md`](docs/v5.4.0-optimization-and-engine-assessment.md), [`docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md`](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md), and [`docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md`](docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md).
+Full historical methodology and charts are in [`docs/v5.6.0-fp8-e4m3-benchmark.md`](docs/v5.6.0-fp8-e4m3-benchmark.md), [`docs/v5.5.0-radiance-port-benchmark.md`](docs/v5.5.0-radiance-port-benchmark.md), [`docs/v5.4.0-optimization-and-engine-assessment.md`](docs/v5.4.0-optimization-and-engine-assessment.md), [`docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md`](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md), and [`docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md`](docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md).
 
 ### Progression Summary Table
 
@@ -273,6 +293,7 @@ Full historical methodology and charts are in [`docs/v5.5.0-radiance-port-benchm
 | **Wave 6 (v5.3.0 HIP Opt)** | `e1f6be3` | **41.68–42.23 tok/s** (`+43.8%` `tg1`) | **21.33 tok/s** (4p DSpark, `+34.9%`) | **1,348.7 tok/s** cold (`+5.4%`) | **3,517** | **0/20 (0%)** | **13/13 CPU + 5/5 GPU + 2/2 FB PASS** |
 | **Wave 7 (v5.4.0 Stabilized + Opt)** | `b2ab8d3` | **45.81–48.24 tok/s** warm (`+10.1%` @64K vs FAST `v5.3.0`) | **22.70 tok/s** (4p DSpark, `+9.1%` / `+15.2%`) | **1,409.0 tok/s** cold (`45.3 s`, `+4.3%`) | **3,563 (+76 clean; 3,593 live)** | **0/20 + 3/3 DRY PASS** | **14/14 CPU + 5/5 GPU + 3/3 Func PASS** |
 | **Wave 8 (v5.5.0 Radiance Ports)** | `55de363` | **40.27–44.55 tok/s** warm `tg2` (**+25.5%..+43.1%** vs paired `v5.4.0`) | **+0.4%..+15.3%** (4p DSpark) | **`+45.9%` `turn3` / `+43.6%` `turn4`** (80K->123K) | **3,617 (+24 vs `v5.4.0`)** | **0/20 + 3/3 DRY PASS** | **11/11 CPU + 5/5 GPU + 64/64 Parity PASS** |
+| **Wave 9 (v5.6.0 FP8 E4M3)** | `54692df` | **41.50–45.65 tok/s** warm `tg2` (**+3.4%..+12.1%** vs NUMA `v5.5.0`) | **19.70 tok/s** (4p DSpark, **+2.0%**) | **1,454.9 tok/s** cold (`+3.6%`) / **+16.7%** `turn4` | **3,644 (+27 vs `v5.5.0`)** | **0/20 + 3/3 DRY PASS** | **16/16 ctest + F3/F5/F6/F7 + 673 ELF PASS** |
 
 ### Wave 3 / Wave 4 Long-Context Sparse Indexer (`v5.0.0`)
 
@@ -313,11 +334,25 @@ Offline evaluation of upstream `StillDeadcode/radiance v2.1.0` (`2a2b756`) on RO
 
 ---
 
-## Rework and Patches (`v1.0.0` → `v5.5.0`)
+## Rework and Patches (`v1.0.0` → `v5.6.0`)
 
 > **Every commit below is traceable.** Click any short SHA to inspect its full diff on GitHub.
 
 All historical branches are unified on `main`.
+
+### v5.6.0 Patches (Wave 9 — FP8 E4M3 Conversions F1–F8, NUMA `SYS_NICE` & Effort 75)
+
+| Patch / Commit | Change | Measured Effect / Purpose |
+|---|---|---|
+| [`baf61cd`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/baf61cd) | **F1 — Sparse indexer `idx_wq_b` FP8**: `AFF_IDX_WQB_FP8=1` preserves preshuffled FP8 weights and runs `batch_quant_tm_fp8_hip` + `batch_gemm_fp8_hip` in `indexer_one` / `batch_indexer_q` | Eliminates BF16 fallback in sparse indexer `wq_b` projection |
+| [`b1e65c4`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/b1e65c4), [`baf61cd`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/baf61cd), [`2abc33f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2abc33f) | **F2 — Grouped b32 `attn_out_a` FP8**: `AFF_ATTN_OUT_A_FP8=1`, `batch_attn_out_prep_fp8_hip`, `batch_gemm_fp8_grouped_b32_hip`, `test_wave2_kernels` Test 11 | **`-25.2%` `b_attn_out`** (`211.71 -> 158.40–159.55 us/call`) |
+| [`b1e65c4`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/b1e65c4), [`baf61cd`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/baf61cd), [`2abc33f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2abc33f) | **F3 — DSpark `mtp_main_proj` FP8**: `AFF_MTP_PROJ_FP8=1`, `batch_quant_tm_fp8_hip(..., n_live)` tail zeroing, Test 12 | Skips `draft_transpose_pad_kernel`; **`64/64` exact parity** (`4.27 vs 4.27`) |
+| [`6383b19`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/6383b19), [`2abc33f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2abc33f) | **F4 — Packed hardware E4M3 TP=2 all-reduce**: `pack4_e4m3` + `e4m3_decode_pk` in `tp_allreduce.hip` + `test_gpu_ports` Test 24 | Hardware packed FP8 conversion with ascending rank accumulation preserved |
+| [`b1e65c4`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/b1e65c4), [`baf61cd`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/baf61cd), [`2abc33f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2abc33f) | **F5 — Raw MXFP8 Engram H2D + GPU requant**: `EngramTables::gather_mxfp8`, `engram_mxfp8_requant_fp8_hip` (`11` VGPRs, `16` occ), `AFF_ENGRAM_RAW_H2D=1`, Test 25 | Eliminates CPU F32 Engram dequant; **`64/64` parity** + `129,280/129,280` `rmse=0.0` |
+| [`b1e65c4`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/b1e65c4), [`baf61cd`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/baf61cd), [`2abc33f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2abc33f), [`54692df`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/54692df) | **F6 — Group-128 FP8 E4M3 target LM head**: `quantize_bf16_to_fp8_g128_hip`, `matvec_fp8_g128_multix_hip`, `AFF_LMHEAD_FP8=1` promoted default ON, Test 13 | **`320.6` vs `483.6 MiB/shard`**, **`+27` experts (`3,644` live)**, **`-36.9%` `b_mv_host`** (host wait `-86%`), `cos_sim=0.999905`, `kl=0.001601` |
+| [`6383b19`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/6383b19), [`2abc33f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2abc33f) | **F7 — Hardware `e4m3_enc` & subnormal carry fix**: `v_cvt_pk_fp8_f32` / clamped `e4m3_enc_sw` + `[7.5*2^-9, 8*2^-9)` `0x08` carry in `device_math.h`, `attention_gpu.hip`, `attn_flash.hip` + Test 23 | Aligns host/device E4M3 boundary rounding; cross-version `pcache` restore **`3,584/4,026`** |
+| [`b1e65c4`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/b1e65c4), [`baf61cd`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/baf61cd), [`2abc33f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2abc33f) | **F8 — 2-wide norm-quant & uniform `AFF_O_FP8_QDQ=1`**: 2-wide `cvt_pk_fp8_f32` in `batch_rms_norm_q8_kernel`, `hcn_norm_kernel`, `hcn_norm_v41_kernel` + `o_fp8_qdq_enabled()` default ON + Test 14 | Halves FP8 quant conversion instructions across norm-quant kernels; unifies `attn_out` QDQ |
+| [`2abc33f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2abc33f), [`54692df`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/54692df) | **NUMA `SYS_NICE` & `--default-effort 75`**: `--cap-add SYS_NICE` unlocks `SYS_mbind(MPOL_PREFERRED -> node 0)`; `VERSION=5.6.0`, deploy effort `75` | **`100.0%` (`47,804,160 / 47,804,160`)** `host_pool` on Node 0 (`Engram` spills cleanly to Node 1, `0.00 pgscank/s`) |
 
 ### v5.5.0 Patches (Wave 8 — Radiance Ports R1–R7)
 
@@ -401,7 +436,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) and [`THIRD_PARTY.md`](THIRD_PARTY.md) for fu
 
 | Invariant / Flag | Setting | Reason |
 |---|---|---|
-| Target LM Head | **BF16 / lossless `bf16x12`** (`AFF_LMHEAD_INT4=0`, `AFF_LMHEAD_BF16X12=1`) | Never enable `AFF_LMHEAD_INT4=1` on target model (degrades perplexity and draft acceptance). Lossless `bf16x12` is bit-identical to BF16. Draft head uses `AFF_DRAFT_HEAD_INT4=1`. |
+| Target LM Head | **Group-128 FP8 E4M3** (`AFF_LMHEAD_FP8=1`, `AFF_LMHEAD_INT4=0`) | Never enable `AFF_LMHEAD_INT4=1` on target model (degrades perplexity and draft acceptance). Default `AFF_LMHEAD_FP8=1` (`cos_sim=0.999905`, `kl_ref_cmp=0.001601 <= 0.005`) supersedes `AFF_LMHEAD_BF16X12=1` (bit-exact BF16 fallback when `AFF_LMHEAD_FP8=0`). Draft head uses `AFF_DRAFT_HEAD_INT4=1`. |
 | Micro-Batch Sizing | `AFF_EQUAL_UBATCH=0` | Rejected: adds kernel overhead without reducing chunk count. |
 | Device Prefetch Ring | `AFF_PREFETCH_RING=0` | Rejected: consumes 8–12 resident expert slots without PCIe 3.0 throughput gain. |
 | Side-Band Prefetch Beside AR | `AFF_PREFETCH_BESIDE=0` | Opt-in disabled by default: regressed `-15.5%` to `-33.2%` on dual R9700 PCIe 3.0 x16. |
@@ -441,6 +476,19 @@ See [`CHANGELOG.md`](CHANGELOG.md) and [`THIRD_PARTY.md`](THIRD_PARTY.md) for fu
 | `AFF_ATTN_LOOKAHEAD` | `0` | Disabled decode KV lookahead |
 | `AFF_PCACHE_DELTA` | `1` | State-only persistent prefix cache delta checkpoints |
 
+### `v5.6.0` Wave 9 FP8 E4M3 & NUMA Controls (`F1–F8`)
+
+| Variable / Flag | Default Behavior | Description |
+|---|---|---|
+| `AFF_IDX_WQB_FP8` | Enabled (`1`, `"0"` disables) | Preserves preshuffled FP8 weights on `idx_wq_b` (`(cols % 128) == 0`) and dispatches `batch_quant_tm_fp8_hip` + `batch_gemm_fp8_hip` in `indexer_one` and `batch_indexer_q` (`F1`) |
+| `AFF_ATTN_OUT_A_FP8` | Enabled (`1`, `"0"` disables) | Enables `batch_attn_out_prep_fp8_hip` + `batch_gemm_fp8_grouped_b32_hip` on preshuffled `attn_out_a` when `AFF_O_FP8_QDQ=1` (`F2`, `-25.2%` `b_attn_out`) |
+| `AFF_MTP_PROJ_FP8` | Enabled (`1`, `"0"` disables) | Preserves preshuffled FP8 on `mtp_main_proj` and quantizes live rows via `batch_quant_tm_fp8_hip(..., n_live)` ahead of `batch_gemm_fp8_hip` (`F3`) |
+| `AFF_ENGRAM_RAW_H2D` | Enabled (`1`, `"0"` disables) | Streams raw MXFP8 rows via `EngramTables::gather_mxfp8` and requantizes on GPU (`engram_mxfp8_requant_fp8_hip`, `11` VGPRs / `16` occ; requires `AFF_ENGRAM_FP8=1`, `F5`) |
+| `AFF_LMHEAD_FP8` | Enabled (`1`, `"0"` disables) | Chunk-quantizes target `output` to group-128 E4M3 (`quantize_bf16_to_fp8_g128_hip` + `matvec_fp8_g128_multix_hip`; `320.6` vs `483.6 MiB/shard`, `+27` experts: `3,617 -> 3,644` live; supersedes `AFF_LMHEAD_BF16X12` when `AFF_LMHEAD_INT4=0`, `F6`) |
+| `AFF_O_FP8_QDQ` | Enabled (`1`, `"0"` disables) | Uniformly defaults `o_fp8_qdq_enabled()` ON across both single-token `attn_out` and batched `batch_attn_out` (`F8`) |
+| `--cap-add SYS_NICE` | Enabled in `deploy/` | Docker capability permitting `SYS_mbind(MPOL_PREFERRED -> node 0)` (`rc=0`), pinning `100.0%` of `host_pool` pages on Node 0 alongside both R9700 GPUs while `Engram` spills cleanly to Node 1 |
+| `--default-effort 75` | Default in `deploy/` | Sets DeepSeek V4.1's native high reasoning effort default in [`deploy/run.sh`](deploy/run.sh) and [`deploy/deepseek-v41-affinity.service`](deploy/deepseek-v41-affinity.service) |
+
 ### `v5.5.0` Radiance Port Toggles (`R1–R7`)
 
 | Variable | Default Behavior | Description |
@@ -450,7 +498,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) and [`THIRD_PARTY.md`](THIRD_PARTY.md) for fu
 | `AFF_AR_FAST_REL` | Disabled (`0`, `"1"` enables) | Uses relaxed system atomic stores when publishing TP=2 peer flags (`tp_allreduce.hip`) |
 | `AFF_TP_AR_CODED` | Disabled (`0`, `"1"` enables) | Opt-in lossless 12.125-bit exponent-delta coded BF16 TP=2 all-reduce above `128 KiB` (`-54.8%` KL vs FP32 at `~2.5%` 64K PP cost; also selectable via `AFF_TP_AR_MODE=coded\|fp8\|exact`) |
 | `AFF_FUSE_AR_RMSNORM` | Enabled (`1`, `"0"` disables) | Fuses V4.1 `collapse+sq` pre-RMSNorm reduction (`HasPreCollapse`) into `tp_ar_batch_hc_expand_kernel` for `nb=16` narrow batches |
-| `AFF_LMHEAD_BF16X12` | Enabled (`1`, `"0"` disables) | Packs target `output` weight in lossless 12.25-bit 32-col SoA + host CSR escape tables (`+24` resident experts: `3,593 -> 3,617`; ignored when `AFF_LMHEAD_INT4=1`) |
+| `AFF_LMHEAD_BF16X12` | Enabled (`1`, `"0"` disables) | Packs target `output` weight in lossless 12.25-bit 32-col SoA + host CSR escape tables (`+24` resident experts in `v5.5.0`; superseded in `v5.6.0` when `AFF_LMHEAD_FP8=1` and ignored when `AFF_LMHEAD_INT4=1`) |
 | `AFF_DRAFT_SUFFIX` | Enabled (`1`, `"0"` disables) | Enables CPU incremental `SuffixDraftIndex` speculative drafter ahead of `dspark_draft` |
 | `AFF_DRAFT_SUFFIX_MIN_MATCH` | `4` (clamped `1..12`) | Minimum trailing suffix match length (`L..L+3` checked longest-first) |
 | `AFF_DRAFT_SUFFIX_MIN_SCORE` | `0.35` | Minimum cumulative empirical transition probability `D` to extend suffix draft |
@@ -497,9 +545,9 @@ Default production toolchain is **`docker.io/rocm/dev-ubuntu-24.04:10.1.0-full`*
 ```sh
 SHORT_SHA=$(git rev-parse --short HEAD)
 docker build -f Dockerfile \
-  --build-arg AFF_VERSION=v5.5.0 \
+  --build-arg AFF_VERSION=v5.6.0 \
   --build-arg AFF_GIT_SHA="$SHORT_SHA" \
-  -t deepseek-affinity:v5.5.0 .
+  -t deepseek-affinity:v5.6.0 .
 ```
 
 Optional ROCm `10.2.0-full` comparison build:
@@ -507,9 +555,9 @@ Optional ROCm `10.2.0-full` comparison build:
 ```sh
 docker build -f Dockerfile \
   --build-arg BASE_IMAGE=docker.io/rocm/dev-ubuntu-24.04:10.2.0-full \
-  --build-arg AFF_VERSION=v5.5.0 \
+  --build-arg AFF_VERSION=v5.6.0 \
   --build-arg AFF_GIT_SHA="$SHORT_SHA" \
-  -t deepseek-affinity:v5.5.0-rocm10.2 .
+  -t deepseek-affinity:v5.6.0-rocm10.2 .
 ```
 
 ### Verification Commands
@@ -517,19 +565,19 @@ docker build -f Dockerfile \
 CPU tests + ELF link audit (no GPU required, `11/11` CPU `ctest`):
 
 ```sh
-docker run --rm --security-opt label=disable --entrypoint bash deepseek-affinity:v5.5.0 -c '
+docker run --rm --security-opt label=disable --entrypoint bash deepseek-affinity:v5.6.0 -c '
   ldd /usr/local/bin/affinity | grep -i "not found" && exit 1 || true
   ctest --test-dir /opt/affinity-src/build -E "^(gpu_ports|moe_recon_tiles|test_v41_indexer|wave2_kernels|prefetch_ring)$" --output-on-failure
 '
 ```
 
-GPU kernel test suites (`5/5` binaries, requires exclusive GPU access):
+GPU kernel test suites (`5/5` binaries, `16/16` full `ctest`, requires exclusive GPU access):
 
 ```sh
 for t in test_gpu_ports test_moe_recon_tiles test_v41_indexer test_wave2_kernels test_prefetch_ring; do
   docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
     --security-opt label=disable --entrypoint "" -e HSA_ENABLE_COREDUMP=0 \
-    deepseek-affinity:v5.5.0 "/opt/affinity-src/build/$t"
+    deepseek-affinity:v5.6.0 "/opt/affinity-src/build/$t"
 done
 ```
 
@@ -540,6 +588,7 @@ Run via [`deploy/run.sh`](deploy/run.sh) or systemd unit [`deploy/deepseek-v41-a
 ```sh
 docker run --name deepseek-affinity \
   --security-opt label=disable \
+  --cap-add SYS_NICE \
   --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
   --cpuset-cpus=0-23,48-71 \
   -e AFF_ENGRAM_WARM=1 -e AFF_SPEC_BACKOFF=2 -e AFF_ADAPTIVE_WIDTH=1 \
@@ -553,7 +602,7 @@ docker run --name deepseek-affinity \
   -e AFF_DRAFT_SKIP_MASKED=1 -e AFF_ATTN_LOOKAHEAD=0 -e AFF_PCACHE_DELTA=1 \
   -p 8000:8000 \
   -v /models:/models \
-  deepseek-affinity:v5.5.0 \
+  deepseek-affinity:v5.6.0 \
     -m /models/DeepSeek-V4.1-Flash-1017-MoonMath-aff/model-moonmath-1017.aff \
     --tokenizer /models/LLM-Models/DeepSeek-V4.1-Flash-1017-MoonMath-FP8/tokenizer.json \
     --host 0.0.0.0 --port 8000 \
@@ -573,7 +622,7 @@ docker run --name deepseek-affinity \
     --placement-hysteresis 1.6 --placement-min-gain 3.0 \
     --placement-save /models/DeepSeek-V4.1-Flash-1017-MoonMath-aff/placement.affprof \
     --prefill-chunk-size 2816 \
-    --default-effort 60 \
+    --default-effort 75 \
     --repeat-penalty 1.1 --repeat-last-n 96 --dry-delta 40 \
     --max-tokens-floor 0
 ```
@@ -582,14 +631,14 @@ Health check:
 
 ```sh
 curl -sS http://127.0.0.1:8000/health
-# {"status":"ok","version":"v5.5.0","git_sha":"...","resident_experts":3617,"free_vram_mib":[...]}
+# {"status":"ok","version":"v5.6.0","git_sha":"...","resident_experts":3644,"free_vram_mib":[...]}
 ```
 
-### Rollback to `v5.4.0`
+### Rollback to `v5.5.0`
 
 ```sh
 systemctl --user stop deepseek-v41-affinity.service && \
-cp ~/.config/systemd/user/deepseek-v41-affinity.service.bak-v5.4.0 ~/.config/systemd/user/deepseek-v41-affinity.service && \
+cp ~/.config/systemd/user/deepseek-v41-affinity.service.bak-v5.5.0 ~/.config/systemd/user/deepseek-v41-affinity.service && \
 systemctl --user daemon-reload && \
 systemctl --user start deepseek-v41-affinity.service
 ```
