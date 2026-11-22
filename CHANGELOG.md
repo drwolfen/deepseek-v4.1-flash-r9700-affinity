@@ -6,6 +6,34 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [5.6.2] — 2026-11-22 — "DSpark bug fixes, shared FP8 LM head (+55 experts to 3,699) & Wave 10A quick wins"
+
+Wave 10A maintenance and performance release (`1676e05`). Fixes multi-`n_expert` router bias overwrite (`BUG-1`), draft router `mmap` over-read and per-call banding (`BUG-2`), `~DenseGpu()` interior-pointer / pinned-memory cleanup, dynamic per-block repeat penalty (`BUG-5`), think-scoped DRY prompt protection (`BUG-6`), and short-scale mantra/novelty `ThinkingBudget` breakers (`BUG-7`), while shipping five Wave 10A quick wins (`C4` shared FP8 LM head, `C1` Rank-0 router, `A1` fixed narrow `ar_blk=32`, `B4` `e4m3_decode_pk` + `AFF_DRAFT_ATTN_NHB=2`, `D1` `AFF_ADAPTIVE_COST_RESCALE=1`) that grow live GPU-resident experts by **`+55` (`3,644 -> 3,699`)** and push `l4k`/`l64k` warm decode to **`50.04 / 51.52 tok/s`**. Preserves `-ffp-contract=off` (`33/33`), `0` scratch / `0` VGPR spill (`673` `gfx1201` kernels), and `pcache` fingerprint `0x733de762fee543e6`.
+
+### Added & Changed
+- **Router & Teardown Fixes (`BUG-1`, `BUG-2`, `~DenseGpu()` in `src/engine/model.cpp`, `src/gpu/dense_gpu.h`, `src/gpu/dense_gpu.hip`)**:
+  - `router_scratch()` now sizes `D.b_rbias` with uniform `r_bias_stride = std::max(r_max_expert_, n_expert)` and `batch_router_topk()` checks `n_expert <= D.r_bias_stride`, stopping draft stages (`n_expert=128`) from overwriting target layers 13/14 biases (`n_expert=384`).
+  - `bind_layer_common()` uses `ffn_gate_inp` row count (`ne`) instead of `cfg.n_expert` (fixing `2.50 MiB` draft `mmap` over-read), and `reg_router`/`router`/`batch_router` compute `router_band()` per call with dynamically grown `D.d_rlog` (`d_rlog_cap`).
+  - `~DenseGpu()` and `idx_grow()` avoid freeing interior aliases (`b_rwt`/`b_rn` in `b_rsel`, `h_rwt`/`h_rn` in `h_rsel`), add `b_conf`/`b_hcp` frees, and use `hipHostFree` on `hi_w`/`hi_nc`/`hi_ncb`.
+- **Repetition, DRY & Mantra Loop Guards (`BUG-5`, `BUG-6`, `BUG-7` in `src/engine/thinking_budget.h`, `tools/affinity.cpp`)**:
+  - Added per-block `refresh_penalty_ids()` (`AFF_REPEAT_PENALTY_DYNAMIC=1`) exempting `eos`, `think_marker_ids`, and DSML `dry_exempt_ids`.
+  - Restricted DRY's `2x` prompt-verbatim threshold to post-`</think>` (`!in_think`).
+  - Added `short_low_novelty` bigram diversity breaking (`AFF_THINK_SHORT_NOVELTY_WINDOW=128`, `MIN_TOKENS=160`, `MIN=0.20`), tuned `AFF_THINK_SHORT_LOOP_SPAN=16`, `REPEATS=3`, `WINDOW=1024`, `AFF_THINK_NOVELTY_WINDOW=512`, `MIN_TOKENS=1024`, `MIN=0.28`, and set `AFF_THINK_FREEZE_DISTINCT=56`.
+- **Shared FP8 LM Head (`C4`) & Wave 10A Quick Wins (`C1`, `A1`, `B4`, `D1`)**:
+  - Removed `-e AFF_DRAFT_HEAD_INT4=1` from `deploy/{deepseek-v41-affinity.service,run.sh}` so DSpark `draft_head` shares `AFF_LMHEAD_FP8=1` (`320.6 MiB/shard`), and enabled `AFF_ROUTER_RANK0_ONLY=1` (`C1`, removing Rank-1 `D.router` and unused `D.rbias` allocations) -> **`3,699` live resident experts (`+55` vs `v5.6.1`)** at `[354, 354]` MiB free VRAM.
+  - Enabled `AFF_AR_FIXED_BLK=32` (`A1` in `src/gpu/tp_allreduce.hip`) for narrow `RegForm` batches (`nb <= 16 && live <= 16`) to avoid `tp_sync_on_grid_change` host stream syncs across DSpark↔Verify width changes.
+  - Switched `attend_body<DT==4>` (`src/gpu/attention_gpu.hip`) to `2x e4m3_decode_pk` (`aff_f32x2`) and defaulted `AFF_DRAFT_ATTN_NHB=2` (`B4`) for `flat_n != 0 && n <= 8 && n_head >= 16`.
+  - Enabled `AFF_ADAPTIVE_COST_RESCALE=1` (`D1` in `tools/affinity.cpp`) to proportionally rescale adjacent `cost_ema` buckets.
+  - Empirically withheld `PCIe #5` (`D.ncomp` skip / `D.inc` ring) and `StageRing::fit` 4x shrink hysteresis after server benchmarking showed `-2%..-4.6%` prefill & decode regressions under `GPU_MAX_HW_QUEUES=1`.
+  - Bumped `VERSION`, `CMakeLists.txt`, `Dockerfile`, and `deploy/` image tag to `5.6.2`.
+
+### Performance & Verification
+- **Clean Cold-Start NUMA-Local Suite (`v5.6.2` `1676e05`, `--default-effort 60`, `N0=100%`)**:
+  - `l64k` (`63,863`): **`51.52 tok/s`** warm `tg2` (**`+10.1%`** vs `v5.6.1` `46.81`), `47.79` cold `tg1`, `1,405.8` `pp1` (`45.4 s`), `2,585.5` `pp2` (`24.7 s`).
+  - `l4k` (`4,031`): **`50.04 tok/s`** `tg2` (**`+7.7%`** vs `v5.6.1` `46.48`), `28.52` `tg1`, `634.2` `pp1`; `l16k` (`16,104`): **`49.75 tok/s`** `tg2` (`+7.0%` vs `v5.6.1` `46.48`), `45.16` `tg1`, `1,298.5` `pp1`.
+  - `p4k` (`NGEN=16`): **`21.24 tok/s`** `tg2` (**`+16.5%`** vs `v5.6.1` `18.23`); `code_edit` (`NGEN=256`): **`43.75 tok/s`** `tg2` (`8.00 tok/blk`); `step_c` 4-prompt DSpark: `19.90 tok/s` clean (`23.48 tok/s` / `75.13%` acc / `3.200 tok/blk` in `arm5a_nhb2` ablation).
+- **Audits & Tests**: **`11/11` CPU `ctest`** (incl. `thinking_budget` Scenario 7), **`5/5` GPU binaries** (incl. `test_gpu_ports` Tests 26–28), **`33/33` `-ffp-contract=off`**, **`673` `affinity` / `672` `test_gpu_ports` kernels (`0` scratch / `0` VGPR spill)**, **`9/9` fast `DT==4` `mqa_attend*` ISA `>=2x v_cvt_pk_f32_fp8`**, `N0=47,804,160 (100.0%)`, `resident_experts=3,699`, `DRY 3/3`, `test_a_stride` (`33,792/35,144`), `test_b_think_ckpt` (`1,480/1,596`), `probe_bug567` `all_pass=true`, cross-version `pcache` (`3,584/4,030`, `0x733de762fee543e6`, `0` warnings), `0` `hipError`, `kfd_release_s=3.387 s`.
+
 ## [5.6.1] — 2026-11-22 — "Dynamic DSpark-aware SuffixGate: pure-DSpark reasoning speed + 8 tok/blk code edits"
 
 Wave 9.1 follow-up release (`3f29dbf`, `cfcbb18`). Fixes false-positive 4-token prose preemption in `SuffixDraftIndex` (`R6`) via a live utility-, anchor-length-, and acceptance-aware `SuffixGate` (`AFF_DRAFT_SUFFIX_DYNAMIC=1`, `AFF_DRAFT_SUFFIX_GAIN=1.05`) without touching GPU kernels (`673` kernels, `0` scratch, `0` VGPR spill) or `pcache` fingerprint `0x733de762fee543e6`.
