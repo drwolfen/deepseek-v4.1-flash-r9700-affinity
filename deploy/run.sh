@@ -12,6 +12,7 @@ NAME=${NAME:-deepseek-affinity}
 
 exec docker run --rm --name "$NAME" \
   --security-opt label=disable \
+  --cap-add SYS_NICE \
   --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host \
   --cpuset-cpus=0-23,48-71 \
   -e AFF_ENGRAM_WARM=1 \

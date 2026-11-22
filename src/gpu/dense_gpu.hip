@@ -586,7 +586,7 @@ inline bool lmhead_bf16x12_enabled() {
 
 inline bool lmhead_fp8_enabled() {
   const char* v = std::getenv("AFF_LMHEAD_FP8");
-  return v && *v && std::strcmp(v, "0") != 0;
+  return !v || !*v || std::strcmp(v, "0") != 0;
 }
 
 inline bool idx_wqb_fp8_enabled() {
@@ -1106,7 +1106,9 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
     const bool is_fp8_output = lmhead_fp8 && !lmhead_int4_only && is_output && (s.ncols % 128) == 0;
     const bool is_b12_output = lmhead_bf16x12 && !lmhead_int4_only && !is_fp8_output && is_output &&
                                s.ncols <= 65536;
-    if (d == 0 && is_fp8_output && lmhead_bf16x12 && s.ncols <= 65536) {
+    const char* b12_env = std::getenv("AFF_LMHEAD_BF16X12");
+    if (d == 0 && is_fp8_output && b12_env && *b12_env && std::strcmp(b12_env, "0") != 0 &&
+        s.ncols <= 65536) {
       aff::ui::err("dense-gpu: AFF_LMHEAD_FP8=1 supersedes AFF_LMHEAD_BF16X12 on %s\n", name);
     }
     bool freed_bf16 = false;
