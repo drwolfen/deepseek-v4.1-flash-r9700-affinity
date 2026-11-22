@@ -6,6 +6,28 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [5.5.0] — 2026-11-22 — "Radiance Wave 8 ports: pure-LDS barriers, bf16x12 LM head, pre-collapsed AR & SuffixDecoding"
+
+Wave 8 production release (`e9279b1..55de363`). Ports seven RDNA 4 (`gfx1201`) and speculative-decoding optimizations (`R1–R7`) from Radiance while keeping target model numerics bit-exact (`-ffp-contract=off`, prefix-cache fingerprint `0x733de762fee543e6` preserved) and expanding GPU-resident MoE slots to **`3,617`** (`+24` vs `v5.4.0`).
+
+### Added & Changed
+- **Pure-LDS Barriers & Store-Wait/Agent Fences (`R1`, `e9279b1`)**: Replaced global-draining `__syncthreads()` and heavy `__threadfence()` calls with `aff::lds_barrier()`, `s_wait_storecnt 0x0`, and agent-scoped acquire/release fences across `indexer_gpu.hip`, `batch_kernels.hip`, `digest.hip`, `dense_gpu.hip`, and `tp_allreduce.hip`.
+- **Register-Form AR+HC Expand & Early Wake Store (`R3`, `e9279b1`)**: Enabled `AFF_AR_REG_FORM=1` (register buffering up to `12` `block` elements across peer sync) and `AFF_AR_WAKE_STORE=1` (early peer wake store at kernel entry), with `AFF_AR_FAST_REL=0` default.
+- **Pre-Collapsed AR + V4.1 RMSNorm Fusion (`R4`, `e9279b1`, `2df7638`)**: Enabled `AFF_FUSE_AR_RMSNORM=1` (`HasPreCollapse` in `tp_ar_batch_hc_expand_kernel` for `nb=16` narrow batches + `batch_hc_norm_v41_only_hip` / `batch_hc_head_norm_only_hip`), skipping redundant `hcn_v41_collapse_sq_kernel` launches.
+- **Lossless 12.25-bit `bf16x12` Target LM Head (`R5`, `e9279b1`, `2df7638`)**: Enabled `AFF_LMHEAD_BF16X12=1` (32-col K-block SoA `b12_sm`/`b12_exp4`/`b12_mexp` + host CSR escape table for `±0.0`/subnormals/`±Inf`/wide-span exponents) with bit-identical `matvec_bf16x12_multix_hip` and `batch_gemm_bf16x12_hip` kernels, growing resident MoE slots from `3,593` to **`3,617` (+24)**.
+- **Incremental SuffixDecoding Drafter & Depth Stop (`R6`, `27d1402`)**: Added `src/engine/suffix_draft.h` (`AFF_DRAFT_SUFFIX=1`, `MIN_MATCH=4`, `MIN_SCORE=0.35`, `MAX=12`, `MIN_EXPECT=2.0`) ahead of `dspark_draft` for zero-GPU-cost speculative proposals (`<=15` tokens) plus `AFF_DRAFT_DEPTH_STOP=1`.
+- **Opt-In Ablated Features Locked Off (`R2`, `R7`, `e9279b1`, `2df7638`)**: Kept `AFF_TP_AR_CODED=0` (`-54.8%` KL vs FP32 at `~2.5%` 64K prefill cost; opt-in via `AFF_TP_AR_CODED=1` or `AFF_TP_AR_MODE=coded`) and `AFF_PREFETCH_BESIDE=0` (`AFF_PREFETCH_MB=8`, `AFF_PREFETCH_BLOCKS=16`; `-15.5%..-33.2%` when enabled).
+
+### Performance & Verification
+- **Stage B2 Paired Benchmark (`v5.4.0` vs `v5.5.0-rc1`, `--default-effort 60`)**:
+  - `l4k` warm `tg2`: `34.40 -> 43.16 tok/s` (**`+25.5%`**).
+  - `l16k` warm `tg2`: `33.77 -> 44.55 tok/s` (**`+31.9%`**).
+  - `l64k` warm `tg2`: `32.08 -> 43.70 tok/s` (**`+36.2%`**).
+  - `code_edit` warm `tg2`: `28.15 -> 40.27 tok/s` (**`+43.1%`**).
+  - **4-Prompt `temp=0.0` DSpark**: **`+0.4%` to `+15.3%`** across prompts.
+  - **Multi-Turn `80K -> 123K`**: **`+45.9%`** on `turn3` and **`+43.6%`** on `turn4`.
+- **ELF, Tests & Reliability**: **`599`** `gfx1201` kernels with **`0` scratch bytes** and **`0` VGPR spill** (`8` unused `NH=8, HasControl=true, LiveOne=true` `tp_ar_batch_hc_expand_kernel` instances spill SGPR->VGPR keeping `scratch=0`; V4.1 `NH=4` has `0` spill), **`11/11` CPU `ctest`** + **`5/5` GPU binaries** + fallback-OFF matrix + **`64/64` static-placement parity** PASS, **`DRY 3/3`**, **`</think>` checkpoint `653/653` restored**, **`64`-block (`33,792`-tok) stride** verified at `64K`/`80K`, KFD release **`3.298 s`**, prefix-cache fingerprint `0x733de762fee543e6` preserved.
+
 ## [5.4.0] — 2026-11-21 — "RDNA 4 gfx1201 queue/SE-mask stabilization, zero-D2H host pool & agentic serving optimizations"
 
 Wave 7 production release (`9f44992..b2ab8d3`). Eliminates RDNA 4 (`gfx1201`) KFD multi-queue / multi-SE decode bimodal slowdown (`GPU_MAX_HW_QUEUES=1` + single-SE `0.25` contiguous CU mask), removes all placement D2H traffic (`AFF_POOL_FULL=1`), expands resident MoE slots to `3,563` clean (`3,593` live production with card-1 bonus slab), adds chunk-aligned stride & `</think>` prefix-cache checkpoints, hardens DRY/ThinkingBudget behavior, and speeds up MoE/dense/indexer/Engram kernels.
