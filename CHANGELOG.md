@@ -6,6 +6,24 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [5.6.1] — 2026-11-22 — "Dynamic DSpark-aware SuffixGate: pure-DSpark reasoning speed + 8 tok/blk code edits"
+
+Wave 9.1 follow-up release (`3f29dbf`, `cfcbb18`). Fixes false-positive 4-token prose preemption in `SuffixDraftIndex` (`R6`) via a live utility-, anchor-length-, and acceptance-aware `SuffixGate` (`AFF_DRAFT_SUFFIX_DYNAMIC=1`, `AFF_DRAFT_SUFFIX_GAIN=1.05`) without touching GPU kernels (`673` kernels, `0` scratch, `0` VGPR spill) or `pcache` fingerprint `0x733de762fee543e6`.
+
+### Added & Changed
+- **Dynamic DSpark-Aware `SuffixGate` (`3f29dbf`, `cfcbb18` in `src/engine/suffix_draft.h`, `tools/affinity.cpp`)**:
+  - Added `AFF_DRAFT_SUFFIX_DYNAMIC=1` (default ON; `"0"` restores static `R6` gating) and `AFF_DRAFT_SUFFIX_GAIN=1.05` (minimum utility gain over GPU DSpark).
+  - Under active GPU DSpark, compares effective suffix utility `(1 + expect * acc_ema) / cost_ema[prop_nd + 1]` against live DSpark utility `(1 + dspark_exp_acc) / cost_ema[B + 1] * sfx_gain`, enforces an anchor-length guard (`>= min_match + 2` cold / `>= min_match + 1` once `steps > 0 && miss_streak == 0 && acc_ema >= 0.80f`) so 4-token and cold 5-token prose collisions never waste verify blocks, tracks empirical suffix `acc_ema` (`0.55 / 0.45` blend), and arms exponential miss cooldown (`2, 4, 8, 16`) with `acc_ema >= 0.65f` breakout protection.
+  - Added 3 unit tests in `tests/test_suffix_draft.cpp` (`test_suffix_gate_prose_backoff`, `test_suffix_gate_code_edit_burst`, `test_suffix_gate_no_dspark`; `10/10` subtests PASS).
+  - Bumped `VERSION`, `CMakeLists.txt`, `Dockerfile`, and `deploy/{deepseek-v41-affinity.service,run.sh}` image tag to `5.6.1`.
+
+### Performance & Verification
+- **4-Arm Cold-Start NUMA-Local Benchmark (`v5.6.1` `cfcbb18` `Arm 4` vs `v5.6.0` / `v5.4.0` FAST, `--default-effort 60`, `N0=100%`)**:
+  - `step_c` 4-prompt DSpark (`temp=0.0`): **`23.59 tok/s`** mean (`79.35%` acc, **`3.605 tok/blk`** — matches pure DSpark `23.63`, **`+19.7%`** vs `v5.6.0` `19.70` and **`+3.9%`** vs `v5.4.0` FAST `22.70`; `logic_puzzle` **`22.93 tok/s`** / `77.5%`, `cpp_bug` **`23.36 tok/s`**).
+  - `code_edit.txt` (`NGEN=256`): **`43.51 tok/s`** warm `tg2` (`99.6%` acc, **`8.00 tok/blk`** — **`+9.8%`** vs pure DSpark `39.62` and **`+4.8%`** vs `v5.6.0` `41.50`).
+  - `p4k` `tg2`: **`18.23 tok/s`** (`+5.9%` vs `v5.6.0`); `l4k`: `pp1 647.8 / tg2 46.48` (`102.4 ms/blk`); `l16k`: `pp1 1,349.5 / tg2 46.48` (`99.8 ms/blk`, `+6.1%` vs `v5.6.0`); `l64k`: `pp1 1,452.5 / tg1 45.85 / tg2 46.81` (`99.8 ms/blk`, beats `v5.4.0` `46.73` and `v5.6.0` `44.47`).
+- **Diagnostics & Audits**: Documented `sar -B` / `mincore` Engram page-cache confounder (`1.7%` residency under advisory `MADV_WILLNEED` causing `+15–22 ms/blk` during `kswapd`-evicted cold boots); verified `--kv-size 327680 --kv-commit 262144` remains optimal under `--default-effort 75`; **`11/11` CPU `ctest`**, **`15/15` `aff_gpu` & `18/18` `aff_format+engine` `-ffp-contract=off`**, **`673` `gfx1201` kernels (`0` scratch, `0` VGPR spill)**, `N0=47,804,160 (100.0%)`, `resident_experts=3,644`, `0` `hipError`, `kfd_release_s=3.314 s`, and `pcache` `0x733de762fee543e6`.
+
 ## [5.6.0] — 2026-11-22 — "Wave 9 FP8 E4M3 native conversions, +27 resident experts, NUMA SYS_NICE & effort 75"
 
 Wave 9 production release (`6383b19..54692df`). Converts remaining hot dense, Engram, attention-output, all-reduce, and target LM head stages onto native `gfx1201` hardware FP8 E4M3 (`F1–F8`), unlocks NUMA Node 0 `host_pool` page pinning via `--cap-add SYS_NICE`, adopts `--default-effort 75` in deploy manifests, and expands live GPU-resident MoE capacity to **`3,644`** (`+27` vs `v5.5.0`, `+51` vs `v5.4.0`) while preserving `-ffp-contract=off` (`15/15` `aff_gpu` & `27/27` `aff_format`) and prefix-cache fingerprint `0x733de762fee543e6`.
