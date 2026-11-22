@@ -27,11 +27,11 @@
 
 #include "gpu/tp_allreduce.h"
 #include "gpu/dense_gpu.h"        // kMaxRanks, asserted equal to kTpMaxRanks in tp_init
+#include "gpu/device_math.h"
 #include "gpu/hip_common.h"
 #include "gpu/wmma.h"
 
 #include "ui/log.h"
-#include <hip/hip_fp8.h>
 #include <algorithm>
 
 #include <cstdio>
@@ -294,9 +294,20 @@ __global__ __launch_bounds__(256) void tp_ar_kernel(const float4* __restrict__ i
 //
 // Scratch layout per slot: [ e4m3 bytes | ... | f32 scales ], scales at a fixed offset so both
 // ranks agree without exchanging metadata.
-__device__ __forceinline__ unsigned char f2e4m3(float v) { __hip_fp8_e4m3 q(v); return q.__x; }
-__device__ __forceinline__ float e4m3_2f(unsigned char b) {
-  __hip_fp8_e4m3 q; q.__x = b; return (float)q;
+__device__ __forceinline__ uint32_t pack4_e4m3(float a, float b, float c, float d) {
+  const float c0 = fminf(448.0f, fmaxf(-448.0f, a));
+  const float c1 = fminf(448.0f, fmaxf(-448.0f, b));
+  const float c2 = fminf(448.0f, fmaxf(-448.0f, c));
+  const float c3 = fminf(448.0f, fmaxf(-448.0f, d));
+#if __has_builtin(__builtin_amdgcn_cvt_pk_fp8_f32)
+  int pk = 0;
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, pk, false);
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, pk, true);
+  return (uint32_t)pk;
+#else
+  return (uint32_t)aff::e4m3_enc_sw(c0) | ((uint32_t)aff::e4m3_enc_sw(c1) << 8) |
+         ((uint32_t)aff::e4m3_enc_sw(c2) << 16) | ((uint32_t)aff::e4m3_enc_sw(c3) << 24);
+#endif
 }
 
 template <int NPEER>
@@ -378,12 +389,7 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_kernel(const float* __restrict_
       #pragma unroll
       for (int j = 0; j < NPEER; ++j) if (lane == 0) p_scale[j][g] = scale;
 
-      uint32_t pk = 0u;
-      #pragma unroll
-      for (int i = 0; i < kPerLane; ++i) {
-        const unsigned char q = (base_idx + i < n) ? f2e4m3(v[i] * inv) : 0u;
-        pk |= (uint32_t)q << (8 * i);
-      }
+      const uint32_t pk = pack4_e4m3(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv);
       if (base_idx + (kPerLane - 1) < n) {
         #pragma unroll
         for (int j = 0; j < NPEER; ++j) *(uint32_t*)(pb[j] + base_idx) = pk;
@@ -461,29 +467,7 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_kernel(const float* __restrict_
 
       float mine_scale;
       uint32_t pk = 0u;
-      if constexpr (CACHE_REGS) {
-        if (gi < kTpFp8RegCacheGroups) {
-          mine_scale = reg_sc[gi];
-          pk = reg_pk[gi];
-        } else {
-          float v[kPerLane];
-          float amax = 0.0f;
-          #pragma unroll
-          for (int i = 0; i < kPerLane; ++i) {
-            const int idx = base_idx + i;
-            v[i] = (idx < n) ? in[idx] : 0.0f;
-            amax = fmaxf(amax, fabsf(v[i]));
-          }
-          amax = aff::wave_reduce_max_dpp(amax);
-          mine_scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
-          const float mine_inv = 1.0f / mine_scale;
-          #pragma unroll
-          for (int i = 0; i < kPerLane; ++i) {
-            const unsigned char q = (base_idx + i < n) ? f2e4m3(v[i] * mine_inv) : 0u;
-            pk |= (uint32_t)q << (8 * i);
-          }
-        }
-      } else {
+      auto quant_local = [&]() {
         float v[kPerLane];
         float amax = 0.0f;
         #pragma unroll
@@ -495,48 +479,73 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_kernel(const float* __restrict_
         amax = aff::wave_reduce_max_dpp(amax);
         mine_scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
         const float mine_inv = 1.0f / mine_scale;
-        #pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-          const unsigned char q = (base_idx + i < n) ? f2e4m3(v[i] * mine_inv) : 0u;
-          pk |= (uint32_t)q << (8 * i);
+        pk = pack4_e4m3(v[0] * mine_inv, v[1] * mine_inv, v[2] * mine_inv, v[3] * mine_inv);
+      };
+      if constexpr (CACHE_REGS) {
+        if (gi < kTpFp8RegCacheGroups) {
+          mine_scale = reg_sc[gi];
+          pk = reg_pk[gi];
+        } else {
+          quant_local();
         }
+      } else {
+        quant_local();
       }
 
       if (base_idx + (kPerLane - 1) < n) {
         uint32_t peer_pk[NPEER];
         #pragma unroll
         for (int j = 0; j < NPEER; ++j) peer_pk[j] = *(const uint32_t*)(mb[j] + base_idx);
-        #pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-          const float mine = e4m3_2f((unsigned char)(pk >> (8 * i))) * mine_scale;
-          if constexpr (NPEER == 1) {
-            out[base_idx + i] = mine + e4m3_2f((unsigned char)(peer_pk[0] >> (8 * i))) * sc[0];
-          } else {
-            float acc = 0.0f;
-            #pragma unroll
-            for (int p = 0; p <= NPEER; ++p) {
-              if (p == own) { acc += mine; continue; }
+        if constexpr (NPEER == 1) {
+          const aff::aff_f32x2 m0 = aff::e4m3_decode_pk<false>(pk);
+          const aff::aff_f32x2 m1 = aff::e4m3_decode_pk<true>(pk);
+          const aff::aff_f32x2 p0 = aff::e4m3_decode_pk<false>(peer_pk[0]);
+          const aff::aff_f32x2 p1 = aff::e4m3_decode_pk<true>(peer_pk[0]);
+          out[base_idx + 0] = m0.x * mine_scale + p0.x * sc[0];
+          out[base_idx + 1] = m0.y * mine_scale + p0.y * sc[0];
+          out[base_idx + 2] = m1.x * mine_scale + p1.x * sc[0];
+          out[base_idx + 3] = m1.y * mine_scale + p1.y * sc[0];
+        } else {
+          float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+          #pragma unroll
+          for (int p = 0; p <= NPEER; ++p) {
+            uint32_t q;
+            float s_val;
+            if (p == own) {
+              q = pk;
+              s_val = mine_scale;
+            } else {
               const int j = p < own ? p : p - 1;
-              acc += e4m3_2f((unsigned char)(peer_pk[j] >> (8 * i))) * sc[j];
+              q = peer_pk[j];
+              s_val = sc[j];
             }
-            out[base_idx + i] = acc;
+            const aff::aff_f32x2 d0 = aff::e4m3_decode_pk<false>(q);
+            const aff::aff_f32x2 d1 = aff::e4m3_decode_pk<true>(q);
+            acc0 += d0.x * s_val;
+            acc1 += d0.y * s_val;
+            acc2 += d1.x * s_val;
+            acc3 += d1.y * s_val;
           }
+          out[base_idx + 0] = acc0;
+          out[base_idx + 1] = acc1;
+          out[base_idx + 2] = acc2;
+          out[base_idx + 3] = acc3;
         }
       } else {
         #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
           const int idx = base_idx + i;
           if (idx < n) {
-            const float mine = e4m3_2f((unsigned char)(pk >> (8 * i))) * mine_scale;
+            const float mine = aff::e4m3_decode((pk >> (8 * i)) & 0xFFu) * mine_scale;
             if constexpr (NPEER == 1) {
-              out[idx] = mine + e4m3_2f(mb[0][idx]) * sc[0];
+              out[idx] = mine + aff::e4m3_decode(mb[0][idx]) * sc[0];
             } else {
               float acc = 0.0f;
               #pragma unroll
               for (int p = 0; p <= NPEER; ++p) {
                 if (p == own) { acc += mine; continue; }
                 const int j = p < own ? p : p - 1;
-                acc += e4m3_2f(mb[j][idx]) * sc[j];
+                acc += aff::e4m3_decode(mb[j][idx]) * sc[j];
               }
               out[idx] = acc;
             }
@@ -606,12 +615,7 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_staged_kernel(const float* __re
     mine_scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
     const float inv = 1.0f / mine_scale;
     if (write_peer && lane == 0) p_scale0[g] = mine_scale;
-    pk = 0u;
-#pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-      const unsigned char q = (base_idx + i < n) ? f2e4m3(v[i] * inv) : 0u;
-      pk |= (uint32_t)q << (8 * i);
-    }
+    pk = pack4_e4m3(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv);
     if (write_peer) {
       if (base_idx + (kPerLane - 1) < n) {
         *(uint32_t*)(pb0 + base_idx) = pk;
@@ -689,19 +693,21 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_staged_kernel(const float* __re
 
       if (base_idx + (kPerLane - 1) < n) {
         const uint32_t peer_pk = *(const uint32_t*)(mb0 + base_idx);
-#pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-          const float mine = e4m3_2f((unsigned char)(pk >> (8 * i))) * mine_scale;
-          const float peer = e4m3_2f((unsigned char)(peer_pk >> (8 * i))) * peer_scale;
-          out[base_idx + i] = mine + peer;
-        }
+        const aff::aff_f32x2 m0 = aff::e4m3_decode_pk<false>(pk);
+        const aff::aff_f32x2 m1 = aff::e4m3_decode_pk<true>(pk);
+        const aff::aff_f32x2 p0 = aff::e4m3_decode_pk<false>(peer_pk);
+        const aff::aff_f32x2 p1 = aff::e4m3_decode_pk<true>(peer_pk);
+        out[base_idx + 0] = m0.x * mine_scale + p0.x * peer_scale;
+        out[base_idx + 1] = m0.y * mine_scale + p0.y * peer_scale;
+        out[base_idx + 2] = m1.x * mine_scale + p1.x * peer_scale;
+        out[base_idx + 3] = m1.y * mine_scale + p1.y * peer_scale;
       } else {
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
           const int idx = base_idx + i;
           if (idx < n) {
-            const float mine = e4m3_2f((unsigned char)(pk >> (8 * i))) * mine_scale;
-            out[idx] = mine + e4m3_2f(mb0[idx]) * peer_scale;
+            const float mine = aff::e4m3_decode((pk >> (8 * i)) & 0xFFu) * mine_scale;
+            out[idx] = mine + aff::e4m3_decode(mb0[idx]) * peer_scale;
           }
         }
       }

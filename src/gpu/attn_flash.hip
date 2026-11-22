@@ -597,8 +597,7 @@ void kv_encode_fp8r_row(const float* src, uint8_t* dst) {
       b = (uint8_t)(sign | ((uint32_t)(e + 7) << 3) | mm);
     } else {
       uint32_t mm = (uint32_t)std::lrintf(m * 512.0f);
-      if (mm > 7u) mm = 7u;
-      b = (uint8_t)(sign | mm);
+      b = (mm >= 8u) ? (uint8_t)(sign | 0x08u) : (uint8_t)(sign | mm);
     }
     dst[i] = b;
   }

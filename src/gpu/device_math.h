@@ -94,7 +94,7 @@ __device__ __forceinline__ aff_f32x2 e4m3_decode_pk(uint32_t q) {
 
 // f32 -> E4M3 byte, the mirror of attention_gpu.hip's host e4m3_encode. Written out rather than
 // shared with the host copy because the host one uses libm and this one must not.
-__device__ __forceinline__ uint8_t e4m3_enc(float f) {
+__device__ __forceinline__ uint8_t e4m3_enc_sw(float f) {
   const uint32_t sign = (__float_as_uint(f) >> 24) & 0x80u;
   float a = fabsf(f);
   if (!(a > 0.0f)) return (uint8_t)sign;
@@ -111,8 +111,19 @@ __device__ __forceinline__ uint8_t e4m3_enc(float f) {
   // rintf, not `+ 0.5f`: the host uses lrintf, and round-half-up against round-half-even disagrees
   // on exact halves. Two encoders for one format only stay one format if they round alike.
   uint32_t mm = (uint32_t)rintf(a * 512.0f);        // subnormal: m * 2^-9
-  if (mm > 7u) mm = 7u;
+  if (mm >= 8u) return (uint8_t)(sign | 0x08u);
   return (uint8_t)(sign | mm);
+}
+
+// Clamped f32 -> E4M3 byte in ONE gfx1201 instruction (v_cvt_pk_fp8_f32), falling back to
+// e4m3_enc_sw when the builtin is unavailable.
+__device__ __forceinline__ uint8_t e4m3_enc(float f) {
+#if __has_builtin(__builtin_amdgcn_cvt_pk_fp8_f32)
+  const float c = fminf(448.0f, fmaxf(-448.0f, f));
+  return (uint8_t)((uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(c, 0.0f, 0, false) & 0xFFu);
+#else
+  return e4m3_enc_sw(f);
+#endif
 }
 
 // Nearest of {0, .5, 1, 1.5, 2, 3, 4, 6}, ties to the EVEN TABLE INDEX — the rule

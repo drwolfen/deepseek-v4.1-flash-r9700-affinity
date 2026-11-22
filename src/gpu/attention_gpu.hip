@@ -70,7 +70,7 @@ static inline uint8_t e4m3_encode(float f) {
     return (uint8_t)(sign | ((uint32_t)(e + 7) << 3) | mm);
   }
   uint32_t mm = (uint32_t)std::lrintf(a * 512.0f);       // subnormal: m * 2^-9
-  if (mm > 7u) mm = 7u;
+  if (mm >= 8u) return (uint8_t)(sign | 0x08u);
   return (uint8_t)(sign | mm);
 }
 
