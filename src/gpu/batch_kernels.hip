@@ -867,6 +867,358 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_multi_kernel(
       ck ? total : 0u, tile_id);
 }
 
+// Grouped W8A8 FP8 WMMA with per-32 UE8M0 activation scales (`Sx`: [ng][nb][group_dim >> 5])
+// folded every 2 K=16 WMMA steps (`b32 = 0 .. FK/32 - 1`) and 128x128 UE8M0 weight scales (`Ws`).
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u>
+__device__ __forceinline__ void gemm_fp8_grouped_b32_body(
+    const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Ws, const uint8_t* __restrict__ Xp,
+    const uint8_t* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
+    unsigned int* __restrict__ Ctr, uint32_t rank, uint32_t cols, uint32_t nb, uint32_t sc_cols,
+    uint32_t sx_cols, uint32_t w_row_off, uint32_t bx, uint32_t by, uint32_t kbeg, uint32_t kend,
+    uint32_t ws_rows, uint32_t tile_id) {
+  static_assert(MTW == 1u || (NT == 8u && MW == 8u && FK == 64u),
+                "4x2 prefill wave layout applies only to 8x8x64");
+  constexpr uint32_t kMWaves = (MTW == 2u) ? 4u : MW;
+  constexpr uint32_t kNWaves = (MTW == 2u) ? 2u : 1u;
+  constexpr uint32_t kMWTiles = MTW;
+  constexpr uint32_t kNWTiles = (MTW == 2u) ? 4u : NT;
+  constexpr uint32_t FN = kNWaves * kNWTiles * 16u;
+  constexpr uint32_t FM = kMWaves * kMWTiles * 16u;
+  constexpr uint32_t kNG = FK / 64u;
+  constexpr uint32_t kFolds32 = FK / 32u;
+  constexpr uint32_t kFolds128 = (FK + 127u) / 128u;
+  static_assert(FN <= MW * kWave, "FN exceeds block threads for Sx load");
+  static_assert(kFolds32 == 2u || kFolds32 == 4u || kFolds32 == 8u,
+                "kFolds32 must be 2, 4, or 8");
+
+  alignas(16) __shared__ uint8_t s_b[FN * (FK + 8u)];
+  alignas(16) __shared__ uint8_t s_a[PS ? 1 : FM * (FK + 8u)];
+  __shared__ uint32_t s_ws[Full ? 1 : 2][kFolds128];
+  alignas(8) __shared__ uint8_t s_sx[FN][kFolds32];
+
+  const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1u);
+  const uint32_t wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+  const uint32_t m0 = bx * FM;
+  const uint32_t n0 = by * FN;
+  const uint32_t wm = (MTW == 2u) ? (wave % kMWaves) * (kMWTiles * 16u) : wave * (kMWTiles * 16u);
+  const uint32_t wn = (MTW == 2u) ? (wave / kMWaves) * (kNWTiles * 16u) : 0u;
+
+  wmma::f8v raw[kMWTiles][kNWTiles], out[kMWTiles][kNWTiles];
+#pragma unroll
+  for (uint32_t i = 0; i < kMWTiles; ++i)
+#pragma unroll
+    for (uint32_t j = 0; j < kNWTiles; ++j) {
+      raw[i][j] = wmma::acc_zero();
+      out[i][j] = wmma::acc_zero();
+    }
+
+  const uint32_t sn = tid >> 1, sk = (tid & 1u) * 32u;
+  const uint32_t ktiles = cols >> 4;
+  const uint32_t rt0 = (w_row_off + m0 + wm) >> 4;
+  const uint32_t srow0 = (w_row_off + m0) >> 7;
+  const uint32_t srow1 = Full ? srow0 : ((w_row_off + min(m0 + FM - 1u, rank - 1u)) >> 7);
+  const uint32_t fc = wmma::frag_c(lane);
+  const uint32_t am = tid >> 1;
+
+  const uint8_t* bsrc = Xp + (size_t)(n0 + sn) * cols + sk;
+  const uint8_t* asrc = Wp + (size_t)(w_row_off + m0 + am) * cols + sk;
+  const bool b_row = sn < FN && (Full || (n0 + sn) < nb);
+  const bool a_row = !PS && (Full || (m0 + am) < rank);
+
+  using sx_word_t = std::conditional_t<kFolds32 == 8u, uint64_t,
+                    std::conditional_t<kFolds32 == 4u, uint32_t, uint16_t>>;
+  constexpr sx_word_t kSxPad =
+      (kFolds32 == 8u) ? (sx_word_t)0x7F7F7F7F7F7F7F7Full
+                       : ((kFolds32 == 4u) ? (sx_word_t)0x7F7F7F7Fu : (sx_word_t)0x7F7Fu);
+  const uint32_t sx_tok = n0 + tid;
+  const bool sx_live = (tid < FN) && (Full || sx_tok < nb);
+
+  auto load_sx_tile = [&](uint32_t k_off) __attribute__((always_inline)) -> sx_word_t {
+    if (!sx_live) return kSxPad;
+    const uint32_t kb32 = k_off >> 5;
+    const uint8_t* p = Sx + (size_t)sx_tok * sx_cols + kb32;
+    if constexpr (Full) {
+      return *(const sx_word_t*)p;
+    } else {
+      if ((kb32 + kFolds32) <= sx_cols && (((uintptr_t)p & (sizeof(sx_word_t) - 1u)) == 0u)) {
+        return *(const sx_word_t*)p;
+      }
+      sx_word_t acc_w = kSxPad;
+#pragma unroll
+      for (uint32_t f = 0; f < kFolds32; ++f) {
+        if (kb32 + f < sx_cols) {
+          const sx_word_t mask = (sx_word_t)0xFFu << (f * 8u);
+          acc_w = (acc_w & ~mask) | ((sx_word_t)p[f] << (f * 8u));
+        }
+      }
+      return acc_w;
+    }
+  };
+
+  Stage8Reg pb[kNG], pa[kNG];
+#pragma unroll
+  for (uint32_t g = 0; g < kNG; ++g) {
+    const uint32_t o = kbeg + g * 64u;
+    pb[g] = stage8_load(bsrc + o, b_row && (Full || o + sk + 32u <= cols));
+    if constexpr (!PS) pa[g] = stage8_load(asrc + o, a_row && (Full || o + sk + 32u <= cols));
+  }
+  uint32_t pws0 = 0u, pws1 = 0u;
+  if (tid < kFolds128) {
+    const uint32_t kb0 = (kbeg >> 7) + tid;
+    if (Full || kb0 < sc_cols) {
+      pws0 = Ws[(size_t)srow0 * sc_cols + kb0];
+      if constexpr (!Full) pws1 = (srow1 != srow0) ? Ws[(size_t)srow1 * sc_cols + kb0] : pws0;
+    }
+  }
+  sx_word_t psx = load_sx_tile(kbeg);
+
+  for (uint32_t c0 = kbeg; c0 < kend; c0 += FK) {
+    aff::lds_barrier();
+#pragma unroll
+    for (uint32_t g = 0; g < kNG; ++g) {
+      if (sn < FN) stage8_store<FK>(s_b, sn, sk + g * 64u, pb[g]);
+      if constexpr (!PS) stage8_store<FK>(s_a, am, sk + g * 64u, pa[g]);
+    }
+    if (tid < kFolds128) {
+      s_ws[0][tid] = pws0;
+      if constexpr (!Full) s_ws[1][tid] = pws1;
+    }
+    if (tid < FN) *(sx_word_t*)(&s_sx[tid][0]) = psx;
+    aff::lds_barrier();
+
+    if constexpr (Full && MTW == 2u) {
+      const uint32_t c1 = min(c0 + FK, kend - FK);
+#pragma unroll
+      for (uint32_t g = 0; g < kNG; ++g) {
+        const uint32_t o = c1 + g * 64u;
+        pb[g] = stage8_load(bsrc + o, true);
+        if constexpr (!PS) pa[g] = stage8_load(asrc + o, true);
+      }
+      if (tid < kFolds128) {
+        const uint32_t kb1 = (c1 >> 7) + tid;
+        pws0 = Ws[(size_t)srow0 * sc_cols + kb1];
+      }
+      psx = load_sx_tile(c1);
+    } else {
+      const uint32_t c1 = c0 + FK;
+      if (c1 < kend) {
+#pragma unroll
+        for (uint32_t g = 0; g < kNG; ++g) {
+          const uint32_t o = c1 + g * 64u;
+          const bool live = Full || (o + sk + 32u <= cols);
+          if (sn < FN) pb[g] = stage8_load(bsrc + o, b_row && live);
+          if constexpr (!PS) pa[g] = stage8_load(asrc + o, a_row && live);
+        }
+        if (tid < kFolds128) {
+          const uint32_t kb1 = (c1 >> 7) + tid;
+          if (Full || kb1 < sc_cols) {
+            pws0 = Ws[(size_t)srow0 * sc_cols + kb1];
+            if constexpr (!Full) pws1 = (srow1 != srow0) ? Ws[(size_t)srow1 * sc_cols + kb1] : pws0;
+          } else {
+            pws0 = 0u;
+            pws1 = 0u;
+          }
+        }
+        psx = load_sx_tile(c1);
+      }
+    }
+
+    constexpr uint32_t kKT = FK / wmma::kK;
+    wmma::i2v apf[PS ? kMWTiles : 1][PS ? kKT : 1];
+    if constexpr (PS) {
+#pragma unroll
+      for (uint32_t t = 0; t < kKT; ++t)
+#pragma unroll
+        for (uint32_t i = 0; i < kMWTiles; ++i) {
+          if (Full || ((m0 + wm + i * 16u) < rank && (c0 + t * wmma::kK) < kend)) {
+            apf[i][t] = load_frag8_ps(Wp, rt0 + i, (c0 + t * wmma::kK) >> 4, ktiles, lane);
+          } else {
+            apf[i][t][0] = 0;
+            apf[i][t][1] = 0;
+          }
+        }
+    }
+
+    auto run_b32 = [&](uint32_t b32) __attribute__((always_inline)) {
+      const uint32_t ks0 = b32 * 32u;
+      if (!Full && (c0 + ks0) >= kend) return;
+      {
+        wmma::i2v af[kMWTiles], bf[kNWTiles];
+#pragma unroll
+        for (uint32_t i = 0; i < kMWTiles; ++i)
+          af[i] = PS ? apf[i][b32 * 2u] : load_frag8<FK>(s_a, wm + i * 16u, ks0, lane);
+#pragma unroll
+        for (uint32_t j = 0; j < kNWTiles; ++j)
+          bf[j] = load_frag8<FK>(s_b, wn + j * 16u, ks0, lane);
+#pragma unroll
+        for (uint32_t i = 0; i < kMWTiles; ++i)
+#pragma unroll
+          for (uint32_t j = 0; j < kNWTiles; ++j)
+            raw[i][j] = wmma::mma_fp8(af[i], bf[j], wmma::acc_zero());
+      }
+      if (Full || (c0 + ks0 + 16u) < kend) {
+        wmma::i2v af[kMWTiles], bf[kNWTiles];
+#pragma unroll
+        for (uint32_t i = 0; i < kMWTiles; ++i)
+          af[i] = PS ? apf[i][b32 * 2u + 1u] : load_frag8<FK>(s_a, wm + i * 16u, ks0 + 16u, lane);
+#pragma unroll
+        for (uint32_t j = 0; j < kNWTiles; ++j)
+          bf[j] = load_frag8<FK>(s_b, wn + j * 16u, ks0 + 16u, lane);
+#pragma unroll
+        for (uint32_t i = 0; i < kMWTiles; ++i)
+#pragma unroll
+          for (uint32_t j = 0; j < kNWTiles; ++j)
+            raw[i][j] = wmma::mma_fp8(af[i], bf[j], raw[i][j]);
+      }
+      if constexpr (Full || kMWTiles == 1u) {
+        const uint32_t r_ws = Full ? 0u : min(1u, ((w_row_off + m0 + wm) >> 7) - srow0);
+        const uint32_t e_w = s_ws[r_ws][b32 >> 2];
+        const float ws = __uint_as_float(e_w << 23);
+#pragma unroll
+        for (uint32_t j = 0; j < kNWTiles; ++j) {
+          const uint32_t sx_u8 = s_sx[wn + j * 16u + fc][b32];
+          const float sx = __uint_as_float((uint32_t)sx_u8 << 23);
+          const float s = ws * sx;
+#pragma unroll
+          for (uint32_t i = 0; i < kMWTiles; ++i)
+#pragma unroll
+            for (uint32_t t = 0; t < 8u; ++t) out[i][j][t] = fmaf(raw[i][j][t], s, out[i][j][t]);
+        }
+      } else {
+#pragma unroll
+        for (uint32_t i = 0; i < kMWTiles; ++i) {
+          const uint32_t r_ws = min(1u, ((w_row_off + m0 + wm + i * 16u) >> 7) - srow0);
+          const uint32_t e_w = s_ws[r_ws][b32 >> 2];
+          const float ws = __uint_as_float(e_w << 23);
+#pragma unroll
+          for (uint32_t j = 0; j < kNWTiles; ++j) {
+            const uint32_t sx_u8 = s_sx[wn + j * 16u + fc][b32];
+            const float sx = __uint_as_float((uint32_t)sx_u8 << 23);
+            const float s = ws * sx;
+#pragma unroll
+            for (uint32_t t = 0; t < 8u; ++t) out[i][j][t] = fmaf(raw[i][j][t], s, out[i][j][t]);
+          }
+        }
+      }
+    };
+    if constexpr (MTW == 2u && !PS) {
+#pragma unroll 1
+      for (uint32_t b32 = 0; b32 < kFolds32; ++b32) run_b32(b32);
+    } else {
+#pragma unroll
+      for (uint32_t b32 = 0; b32 < kFolds32; ++b32) run_b32(b32);
+    }
+  }
+
+  const bool split_active = (ws_rows != 0u);
+  float* const dst_y = split_active ? (Y + (size_t)blockIdx.z * ws_rows * nb) : Y;
+  const uint32_t c = wmma::frag_c(lane);
+#pragma unroll
+  for (uint32_t i = 0; i < kMWTiles; ++i)
+#pragma unroll
+    for (uint32_t j = 0; j < kNWTiles; ++j) {
+      const uint32_t col = n0 + wn + j * 16u + c;
+      if (!Full && col >= nb) continue;
+      const uint32_t rb = m0 + wm + i * 16u;
+#pragma unroll
+      for (uint32_t t = 0; t < 8u; ++t) {
+        const uint32_t r = rb + wmma::acc_row(lane, t);
+        if (!Full && r >= rank) continue;
+        dst_y[(size_t)r * nb + col] = out[i][j][t];
+      }
+    }
+
+  if constexpr (NT == 1u) {
+    if (split_active && Ctr) {
+#ifdef __HIP_DEVICE_COMPILE__
+      asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
+      __threadfence();
+#endif
+      aff::lds_barrier();
+      __shared__ unsigned int s_arrived;
+      if (tid == 0u) {
+        s_arrived = __hip_atomic_fetch_add(&Ctr[tile_id], 1u, __ATOMIC_RELEASE,
+                                           __HIP_MEMORY_SCOPE_AGENT);
+      }
+      aff::lds_barrier();
+      if (s_arrived + 1u == gridDim.z) {
+        if (tid == 0u) {
+          __hip_atomic_store(&Ctr[tile_id], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+#ifdef __HIP_DEVICE_COMPILE__
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
+        __threadfence();
+#endif
+        const uint32_t rlo = m0, rhi = min(m0 + FM, rank);
+        const uint32_t clo = n0, chi = min(n0 + FN, nb);
+        const uint32_t ncols = chi - clo;
+        if (rlo < rhi && clo < chi) {
+          const size_t plane = (size_t)ws_rows * nb;
+          const uint32_t ksplit = gridDim.z;
+          const uint32_t total_el = (rhi - rlo) * ncols;
+          for (uint32_t idx = tid; idx < total_el; idx += MW * kWave) {
+            const uint32_t r = rlo + idx / ncols;
+            const uint32_t col = clo + idx % ncols;
+            const size_t o = (size_t)r * nb + col;
+            const float* __restrict__ p = Y + o;
+            constexpr uint32_t U = 8;
+            float acc = 0.0f;
+            uint32_t z = 0;
+            for (; z + U <= ksplit; z += U) {
+              float v[U];
+#pragma unroll
+              for (uint32_t u = 0; u < U; ++u) v[u] = p[(size_t)(z + u) * plane];
+#pragma unroll
+              for (uint32_t u = 0; u < U; ++u) acc += v[u];
+            }
+            for (; z < ksplit; ++z) acc += p[(size_t)z * plane];
+            FinalY[o] = acc;
+          }
+        }
+      }
+    }
+  }
+}
+
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u>
+#ifdef __HIP_DEVICE_COMPILE__
+__attribute__((amdgpu_waves_per_eu((NT == 8u && MW == 8u && FK == 64u) ? 8 : 1,
+                                   (NT == 8u && MW == 8u && FK == 64u) ? 8 : 16)))
+#endif
+__global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_grouped_b32_kernel(
+    const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Ws, const uint8_t* __restrict__ Xp,
+    const uint8_t* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
+    unsigned int* __restrict__ Ctr, uint32_t ng, uint32_t rank, uint32_t cols, uint32_t nb,
+    uint32_t sc_cols, uint32_t sx_cols, uint32_t m_tiles_per_grp, uint32_t ck) {
+  uint32_t lin_bx = blockIdx.x, by = blockIdx.y;
+  if constexpr (MTW == 2u) {
+    constexpr uint32_t kGroupM = 8u;
+    if (gridDim.x > kGroupM && gridDim.y > 1u) {
+      const uint32_t per = kGroupM * gridDim.y;
+      const uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x;
+      const uint32_t first = (lin / per) * kGroupM, rem = lin % per;
+      const uint32_t gm = min(gridDim.x - first, kGroupM);
+      lin_bx = first + (rem % gm);
+      by = rem / gm;
+    }
+  }
+  lin_bx = __builtin_amdgcn_readfirstlane(lin_bx);
+  by = __builtin_amdgcn_readfirstlane(by);
+  const uint32_t g = __builtin_amdgcn_readfirstlane(lin_bx / m_tiles_per_grp);
+  const uint32_t bx_g = __builtin_amdgcn_readfirstlane(lin_bx % m_tiles_per_grp);
+  const uint32_t w_row_off = g * rank;
+  const uint32_t kbeg = ck ? __builtin_amdgcn_readfirstlane(blockIdx.z * ck) : 0u;
+  const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
+  const uint32_t ws_rows = ck ? (ng * rank) : 0u;
+  const uint32_t tile_id = by * gridDim.x + lin_bx;
+  gemm_fp8_grouped_b32_body<Full, PS, NT, MW, FK, MTW>(
+      Wp, Ws, Xp + (size_t)g * nb * cols, Sx + (size_t)g * nb * sx_cols,
+      Y + (size_t)g * rank * nb, FinalY ? (FinalY + (size_t)g * rank * nb) : nullptr, Ctr, rank,
+      cols, nb, sc_cols, sx_cols, w_row_off, bx_g, by, kbeg, kend, ws_rows, tile_id);
+}
+
 // `Full` = every dimension is an exact multiple of its tile, which every dense tensor in this model
 // satisfies (rows and nb are 128-aligned, cols is 64-aligned). The checked variant compiled to 107
 // s_and_saveexec_b32 and 140 s_cbranch_execz — a predicated branch around every staged element and
@@ -1670,9 +2022,19 @@ __device__ __forceinline__ float stripe_sum_n(float* red, uint32_t s, uint32_t b
 
 __global__ __launch_bounds__(32) void batch_quant_tm_fp8_kernel(
     const float* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ scales,
-    uint32_t nkb, uint32_t dim) {
+    uint32_t nkb, uint32_t dim, uint32_t n_live) {
   const uint32_t kb = blockIdx.x, tok = blockIdx.y, lane = threadIdx.x;
   const size_t base = ((size_t)tok * dim) + (size_t)kb * 128u;
+  if (n_live > 0u && tok >= n_live) {
+    if (lane == 0u) scales[(size_t)tok * nkb + kb] = 1.0f;
+    if ((reinterpret_cast<uintptr_t>(out + base) & 3u) == 0u) {
+      reinterpret_cast<uint32_t*>(out + base)[lane] = 0u;
+    } else {
+      uint8_t* dst = out + base + lane * 4u;
+      dst[0] = 0u; dst[1] = 0u; dst[2] = 0u; dst[3] = 0u;
+    }
+    return;
+  }
   float v0, v1, v2, v3;
   if ((reinterpret_cast<uintptr_t>(src + base) & 15u) == 0u) {
     const float4 v = reinterpret_cast<const float4*>(src + base)[lane];
@@ -1747,7 +2109,7 @@ __global__ __launch_bounds__(kRmsQThr) void batch_rms_norm_q8_kernel(
   __shared__ float red[kBlkStripe];
   __shared__ float s_inv;
   __shared__ float smx[kRmsQWinMax];
-  __shared__ float smx_w[kRmsQWinMax][4];
+  __shared__ float smx_w[kRmsQWinMax][2];
   const uint32_t tid = threadIdx.x, b = blockIdx.x;
   if (b >= nb) return;
   const uint32_t nkb = n >> 7;
@@ -1771,43 +2133,74 @@ __global__ __launch_bounds__(kRmsQThr) void batch_rms_norm_q8_kernel(
   float vr[8];
   uint32_t it = 0u;
   const uint32_t wave = tid >> 5, lane = tid & 31u;
-  for (uint32_t i = tid; i < n; i += kRmsQThr) {
-    const float w = w32 ? w32[i] : (wb ? __uint_as_float((uint32_t)wb[i] << 16) : 1.0f);
-    const float v = x[(size_t)i * nb + b] * inv * w;
-    out[(size_t)i * nb + b] = v;
-    if (cache_vr) vr[it++] = v;
+  for (uint32_t base = 0u; base < n; base += 2u * kRmsQThr) {
+    const uint32_t i = base + 2u * tid;
+    float v0 = 0.0f, v1 = 0.0f;
+    if (i < n) {
+      const float w0 = w32 ? w32[i] : (wb ? __uint_as_float((uint32_t)wb[i] << 16) : 1.0f);
+      const float w1 = w32 ? w32[i + 1u] : (wb ? __uint_as_float((uint32_t)wb[i + 1u] << 16) : 1.0f);
+      v0 = x[(size_t)i * nb + b] * inv * w0;
+      v1 = x[(size_t)(i + 1u) * nb + b] * inv * w1;
+      out[(size_t)i * nb + b] = v0;
+      out[(size_t)(i + 1u) * nb + b] = v1;
+      if (cache_vr) {
+        vr[it++] = v0;
+        vr[it++] = v1;
+      }
+    }
     if (q8) {
-      const float wm = aff::wave_reduce_max_dpp(fabsf(v));
-      if (lane == 0u) smx_w[i >> 7][wave & 3u] = wm;
+      const float av = (i < n) ? fmaxf(fabsf(v0), fabsf(v1)) : 0.0f;
+      const float wm = aff::wave_reduce_max_dpp(av);
+      if (lane == 0u && i < n) smx_w[i >> 7][wave & 1u] = wm;
     }
   }
   if (!q8) return;
   aff::lds_barrier();
   if (tid < nkb) {
-    const float m = fmaxf(fmaxf(smx_w[tid][0], smx_w[tid][1]),
-                          fmaxf(smx_w[tid][2], smx_w[tid][3]));
+    const float m = fmaxf(smx_w[tid][0], smx_w[tid][1]);
     smx[tid] = m;
     qs[(size_t)b * nkb + tid] = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
   }
   aff::lds_barrier();
+  const bool vec2_q8 = (((uintptr_t)q8 & 1u) == 0u);
   if (cache_vr) {
     uint32_t j = 0u;
-    for (uint32_t i = tid; i < n; i += kRmsQThr) {
-      const float m = smx[i >> 7];
-      const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
-      const float t = fminf(fmaxf(vr[j++] * (1.0f / sc), -448.0f), 448.0f);
-      int pk = 0;
-      pk = __builtin_amdgcn_cvt_pk_fp8_f32(t, 0.0f, pk, false);
-      q8[(size_t)b * n + i] = (uint8_t)((uint32_t)pk & 0xffu);
+    for (uint32_t base = 0u; base < n; base += 2u * kRmsQThr) {
+      const uint32_t i = base + 2u * tid;
+      if (i < n) {
+        const float m = smx[i >> 7];
+        const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+        const float inv_sc = 1.0f / sc;
+        const float t0 = fminf(fmaxf(vr[j++] * inv_sc, -448.0f), 448.0f);
+        const float t1 = fminf(fmaxf(vr[j++] * inv_sc, -448.0f), 448.0f);
+        const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(t0, t1, 0, false);
+        if (vec2_q8) {
+          ((uint16_t*)q8)[((size_t)b * n + i) >> 1] = (uint16_t)((uint32_t)pk & 0xffffu);
+        } else {
+          q8[(size_t)b * n + i] = (uint8_t)((uint32_t)pk & 0xffu);
+          q8[(size_t)b * n + i + 1u] = (uint8_t)(((uint32_t)pk >> 8) & 0xffu);
+        }
+      }
     }
   } else {
-    for (uint32_t i = tid; i < n; i += kRmsQThr) {
-      const float m = smx[i >> 7];
-      const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
-      const float t = fminf(fmaxf(out[(size_t)i * nb + b] * (1.0f / sc), -448.0f), 448.0f);
-      int pk = 0;
-      pk = __builtin_amdgcn_cvt_pk_fp8_f32(t, 0.0f, pk, false);
-      q8[(size_t)b * n + i] = (uint8_t)((uint32_t)pk & 0xffu);
+    for (uint32_t base = 0u; base < n; base += 2u * kRmsQThr) {
+      const uint32_t i = base + 2u * tid;
+      if (i < n) {
+        const float m = smx[i >> 7];
+        const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+        const float inv_sc = 1.0f / sc;
+        const float v0 = out[(size_t)i * nb + b];
+        const float v1 = out[(size_t)(i + 1u) * nb + b];
+        const float t0 = fminf(fmaxf(v0 * inv_sc, -448.0f), 448.0f);
+        const float t1 = fminf(fmaxf(v1 * inv_sc, -448.0f), 448.0f);
+        const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(t0, t1, 0, false);
+        if (vec2_q8) {
+          ((uint16_t*)q8)[((size_t)b * n + i) >> 1] = (uint16_t)((uint32_t)pk & 0xffffu);
+        } else {
+          q8[(size_t)b * n + i] = (uint8_t)((uint32_t)pk & 0xffu);
+          q8[(size_t)b * n + i + 1u] = (uint8_t)(((uint32_t)pk >> 8) & 0xffu);
+        }
+      }
     }
   }
 }
@@ -2037,6 +2430,120 @@ __global__ __launch_bounds__(kTrTile * kTileRows) void batch_attn_out_prep_kerne
       const uint32_t d = bx + ty + k;
       if (b < nb && d < n)
         dst[(size_t)d * nb + b] = tile[tx][ty + k];
+    }
+  }
+}
+
+// Direct E4M3 emission fused attn_out prep: reads [nb][ng * group_dim] f32, converts to BF16 in
+// LDS tile[tr][tx], applies inverse RoPE tail when rope_dim > 0, applies exact o_fp8_qdq_wave32
+// UE8M0 quantization, packs 4 lanes via DPP XOR, and writes contiguous [ng][nb][group_dim] E4M3
+// bytes + [ng][nb][group_dim >> 5] UE8M0 scale bytes.
+template <bool UseTable, uint32_t kTokTile = kTrTile, uint32_t kTileRows = kTrRows,
+          bool HwOqdq = true>
+__global__ __launch_bounds__(kTrTile * kTileRows) void batch_attn_out_prep_fp8_kernel(
+    const float* __restrict__ src, uint8_t* __restrict__ dst_q8, uint8_t* __restrict__ dst_sc,
+    const float* __restrict__ cos_t, const float* __restrict__ sin_t,
+    const uint32_t* __restrict__ pos, uint32_t ng, uint32_t group_dim, uint32_t head_dim,
+    uint32_t rope_dim, uint32_t pos0, float freq_scale, float theta_scale, float ext_factor,
+    float lo, float hi, float sin_sign, uint32_t nb) {
+  __shared__ uint16_t tile[kTokTile][kTrTile + 2];
+  const uint32_t bx = blockIdx.x * kTrTile;
+  const uint32_t by = blockIdx.y * kTokTile;
+  const uint32_t g = blockIdx.z;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  const uint32_t total_dim = ng * group_dim;
+
+#pragma unroll
+  for (uint32_t k = 0; k < kTokTile; k += kTileRows) {
+    const uint32_t r = by + ty + k;
+    const uint32_t d_g = bx + tx;
+    uint16_t h16 = 0u;
+    if (r < nb && d_g < group_dim) {
+      h16 = wmma::f32_to_bf16(src[(size_t)r * total_dim + (size_t)g * group_dim + d_g]);
+    }
+    tile[ty + k][tx] = h16;
+  }
+  aff::lds_barrier();
+
+  if (rope_dim > 0u) {
+    const uint32_t dh = bx % head_dim;
+    if (dh >= head_dim - rope_dim) {
+      const uint32_t k0 = (dh - (head_dim - rope_dim)) >> 1;
+      const uint32_t p = tx & 31u;
+      const uint32_t half_rot = rope_dim >> 1;
+      const float theta_pow = UseTable ? 0.0f : __powf(theta_scale, (float)(k0 + p));
+      const uint32_t r_base = (ty << 1) + (tx >> 5);
+#pragma unroll
+      for (uint32_t m = 0; m < kTokTile; m += (kTileRows << 1)) {
+        const uint32_t tr = r_base + m;
+        const uint32_t b = by + tr;
+        if (b < nb && (bx + 2u * p + 1u) < group_dim) {
+          float c, sn;
+          if constexpr (UseTable) {
+            const uint32_t tok_pos = pos ? pos[b] : b;
+            const size_t cs_idx = (size_t)tok_pos * half_rot + (k0 + p);
+            c = cos_t[cs_idx];
+            sn = -sin_t[cs_idx];
+          } else {
+            rope_cs_pre(k0 + p, theta_pow, pos0 + b, freq_scale, ext_factor, lo, hi, sin_sign, &c,
+                        &sn);
+          }
+          const float x0 = wmma::bf16_to_f32(tile[tr][2u * p]);
+          const float x1 = wmma::bf16_to_f32(tile[tr][2u * p + 1u]);
+          tile[tr][2u * p]      = wmma::f32_to_bf16(x0 * c - x1 * sn);
+          tile[tr][2u * p + 1u] = wmma::f32_to_bf16(x0 * sn + x1 * c);
+        }
+      }
+      aff::lds_barrier();
+    }
+  }
+
+  const uint32_t lane = tx & 31u;
+  const uint32_t sc_cols = group_dim >> 5;
+  const bool vec4_q8 = (((uintptr_t)dst_q8 & 3u) == 0u);
+  const uint32_t d0_g = bx + (tx & ~3u);
+#pragma unroll
+  for (uint32_t k = 0; k < kTokTile; k += kTileRows) {
+    const uint32_t tr = ty + k;
+    const uint32_t b = by + tr;
+    const uint32_t d_g = bx + tx;
+    const bool live = (b < nb) && (d_g < group_dim);
+    const float f = live ? wmma::bf16_to_f32(tile[tr][tx]) : 0.0f;
+    const float amax = aff::wave_reduce_max_dpp(fmaxf(fabsf(f), 1e-4f));
+    const uint32_t tbits = __float_as_uint(amax * (1.0f / 448.0f));
+    const int e = (int)((tbits >> 23) & 0xFFu) - 127 + ((tbits & 0x7FFFFFu) != 0u ? 1 : 0);
+    const float s = __uint_as_float((uint32_t)(e + 127) << 23);
+    const float inv_s = __uint_as_float((uint32_t)(127 - e) << 23);
+    const float scaled = ((uint32_t)(e + 127) <= 253u) ? (f * inv_s) : (f / s);
+    const float v = fminf(448.0f, fmaxf(-448.0f, scaled));
+    uint32_t qb = 0u;
+    if (v != 0.0f) {
+#if __has_builtin(__builtin_amdgcn_cvt_pk_fp8_f32)
+      if constexpr (HwOqdq) {
+        const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v, 0.0f, 0, false);
+        qb = (uint32_t)pk & 0xFFu;
+      } else {
+        qb = aff::e4m3_enc_sw(v);
+      }
+#else
+      qb = aff::e4m3_enc_sw(v);
+#endif
+    }
+    const uint32_t p1 = aff::dpp_xor_lane<1u>(qb);
+    const uint32_t pair = ((lane & 1u) == 0u) ? (qb | (p1 << 8)) : 0u;
+    const uint32_t p2 = aff::dpp_xor_lane<2u>(pair);
+    const uint32_t quad = pair | (p2 << 16);
+    if (b < nb) {
+      if (vec4_q8 && (d0_g + 3u) < group_dim) {
+        if ((lane & 3u) == 0u) {
+          *(uint32_t*)(dst_q8 + ((size_t)g * nb + b) * group_dim + d0_g) = quad;
+        }
+      } else if (d_g < group_dim) {
+        dst_q8[((size_t)g * nb + b) * group_dim + d_g] = (uint8_t)qb;
+      }
+      if (lane == 0u && (bx + (tx & 32u)) < group_dim) {
+        dst_sc[((size_t)g * nb + b) * sc_cols + (d_g >> 5)] = (uint8_t)(e + 127);
+      }
     }
   }
 }
@@ -2716,37 +3223,48 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_kernel(const float* __re
   aff::lds_barrier();
   const uint32_t nkb = n_embd >> 7;
   const uint32_t kb = blockIdx.x * 2 + win;
-  // Same expressions as batch_quant_fp8_kernel, to the letter. `1/s` computed once and MULTIPLIED,
-  // not a divide: v * (1/s) and v / s differ in the last bit, and that bit reaches the E4M3 code.
-  // Writing the divide instead moves the emitted text, and the acceptance rate with it — which
-  // reads like the prompt lottery and is not, it is a different quantisation.
-  float sc[NB];
-#pragma unroll
-  for (uint32_t b = 0; b < NB; ++b) {
-    const float m = fmaxf(fmaxf(s_wmax[win][0][b], s_wmax[win][1][b]),
-                          fmaxf(s_wmax[win][2][b], s_wmax[win][3][b]));
-    sc[b] = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+  const uint32_t lb = tid & 127u;
+  if (lb < NB) {
+    const float m = fmaxf(fmaxf(s_wmax[win][0][lb], s_wmax[win][1][lb]),
+                          fmaxf(s_wmax[win][2][lb], s_wmax[win][3][lb]));
+    qs[(size_t)lb * nkb + kb] = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
   }
-  if ((tid & 127u) < NB) qs[(size_t)(tid & 127u) * nkb + kb] = sc[tid & 127u];
   const uint32_t d0 = blockIdx.x * kHcnThreads + (tid & ~3u);
   const bool vec4_q8 = ((n_embd & 3u) == 0u) && (((uintptr_t)q8 & 3u) == 0u) && (d0 + 3u < n_embd);
+  static_assert((NB & 1u) == 0u, "NB must be even");
 #pragma unroll
-  for (uint32_t b = 0; b < NB; ++b) {
-    uint32_t qbyte = 0u;
+  for (uint32_t b = 0; b < NB; b += 2u) {
+    uint32_t qb0 = 0u, qb1 = 0u;
     if (d < n_embd) {
-      const float t = fminf(fmaxf(v[b] * (1.0f / sc[b]), -448.0f), 448.0f);
-      int pk = 0;
-      pk = __builtin_amdgcn_cvt_pk_fp8_f32(t, 0.0f, pk, false);
-      qbyte = (uint32_t)pk & 0xffu;
+      // Same expressions as batch_quant_fp8_kernel, to the letter: `1/s` once and MULTIPLIED.
+      const float m0 = fmaxf(fmaxf(s_wmax[win][0][b], s_wmax[win][1][b]),
+                             fmaxf(s_wmax[win][2][b], s_wmax[win][3][b]));
+      const float m1 = fmaxf(fmaxf(s_wmax[win][0][b + 1u], s_wmax[win][1][b + 1u]),
+                             fmaxf(s_wmax[win][2][b + 1u], s_wmax[win][3][b + 1u]));
+      const float sc0 = m0 > 0.0f ? m0 * (1.0f / 448.0f) : 1.0f;
+      const float sc1 = m1 > 0.0f ? m1 * (1.0f / 448.0f) : 1.0f;
+      const float t0 = fminf(fmaxf(v[b] * (1.0f / sc0), -448.0f), 448.0f);
+      const float t1 = fminf(fmaxf(v[b + 1u] * (1.0f / sc1), -448.0f), 448.0f);
+      const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(t0, t1, 0, false);
+      qb0 = (uint32_t)pk & 0xffu;
+      qb1 = ((uint32_t)pk >> 8) & 0xffu;
     }
-    const uint32_t p1 = aff::dpp_xor_lane<1u>(qbyte);
-    const uint32_t pair = ((tid & 1u) == 0u) ? (qbyte | (p1 << 8)) : 0u;
-    const uint32_t p2 = aff::dpp_xor_lane<2u>(pair);
-    const uint32_t quad = pair | (p2 << 16);
+    const uint32_t p1_0 = aff::dpp_xor_lane<1u>(qb0);
+    const uint32_t p1_1 = aff::dpp_xor_lane<1u>(qb1);
+    const uint32_t pair0 = ((tid & 1u) == 0u) ? (qb0 | (p1_0 << 8)) : 0u;
+    const uint32_t pair1 = ((tid & 1u) == 0u) ? (qb1 | (p1_1 << 8)) : 0u;
+    const uint32_t p2_0 = aff::dpp_xor_lane<2u>(pair0);
+    const uint32_t p2_1 = aff::dpp_xor_lane<2u>(pair1);
+    const uint32_t quad0 = pair0 | (p2_0 << 16);
+    const uint32_t quad1 = pair1 | (p2_1 << 16);
     if (vec4_q8) {
-      if ((tid & 3u) == 0u) *(uint32_t*)(q8 + (size_t)b * n_embd + d) = quad;
+      if ((tid & 3u) == 0u) {
+        *(uint32_t*)(q8 + (size_t)b * n_embd + d) = quad0;
+        *(uint32_t*)(q8 + (size_t)(b + 1u) * n_embd + d) = quad1;
+      }
     } else if (d < n_embd) {
-      q8[(size_t)b * n_embd + d] = (uint8_t)qbyte;
+      q8[(size_t)b * n_embd + d] = (uint8_t)qb0;
+      q8[(size_t)(b + 1u) * n_embd + d] = (uint8_t)qb1;
     }
   }
 }
@@ -2888,26 +3406,39 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_v41_kernel(
     }
     const uint32_t d0 = blockIdx.x * kHcnThreads + (tid & ~3u);
     const bool vec4_q8 = ((n_embd & 3u) == 0u) && (((uintptr_t)q8 & 3u) == 0u) && (d0 + 3u < n_embd);
+    static_assert((NB & 1u) == 0u, "NB must be even");
 #pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) {
-      uint32_t qbyte = 0u;
+    for (uint32_t b = 0; b < NB; b += 2u) {
+      uint32_t qb0 = 0u, qb1 = 0u;
       if (d < n_embd) {
-        const float m = fmaxf(fmaxf(s_wmax[win][0][b], s_wmax[win][1][b]),
-                              fmaxf(s_wmax[win][2][b], s_wmax[win][3][b]));
-        const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
-        const float t = fminf(fmaxf(v[b] * (1.0f / sc), -448.0f), 448.0f);
-        int pk = 0;
-        pk = __builtin_amdgcn_cvt_pk_fp8_f32(t, 0.0f, pk, false);
-        qbyte = (uint32_t)pk & 0xffu;
+        const float m0 = fmaxf(fmaxf(s_wmax[win][0][b], s_wmax[win][1][b]),
+                               fmaxf(s_wmax[win][2][b], s_wmax[win][3][b]));
+        const float m1 = fmaxf(fmaxf(s_wmax[win][0][b + 1u], s_wmax[win][1][b + 1u]),
+                               fmaxf(s_wmax[win][2][b + 1u], s_wmax[win][3][b + 1u]));
+        const float sc0 = m0 > 0.0f ? m0 * (1.0f / 448.0f) : 1.0f;
+        const float sc1 = m1 > 0.0f ? m1 * (1.0f / 448.0f) : 1.0f;
+        const float t0 = fminf(fmaxf(v[b] * (1.0f / sc0), -448.0f), 448.0f);
+        const float t1 = fminf(fmaxf(v[b + 1u] * (1.0f / sc1), -448.0f), 448.0f);
+        const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(t0, t1, 0, false);
+        qb0 = (uint32_t)pk & 0xffu;
+        qb1 = ((uint32_t)pk >> 8) & 0xffu;
       }
-      const uint32_t p1 = aff::dpp_xor_lane<1u>(qbyte);
-      const uint32_t pair = ((tid & 1u) == 0u) ? (qbyte | (p1 << 8)) : 0u;
-      const uint32_t p2 = aff::dpp_xor_lane<2u>(pair);
-      const uint32_t quad = pair | (p2 << 16);
+      const uint32_t p1_0 = aff::dpp_xor_lane<1u>(qb0);
+      const uint32_t p1_1 = aff::dpp_xor_lane<1u>(qb1);
+      const uint32_t pair0 = ((tid & 1u) == 0u) ? (qb0 | (p1_0 << 8)) : 0u;
+      const uint32_t pair1 = ((tid & 1u) == 0u) ? (qb1 | (p1_1 << 8)) : 0u;
+      const uint32_t p2_0 = aff::dpp_xor_lane<2u>(pair0);
+      const uint32_t p2_1 = aff::dpp_xor_lane<2u>(pair1);
+      const uint32_t quad0 = pair0 | (p2_0 << 16);
+      const uint32_t quad1 = pair1 | (p2_1 << 16);
       if (vec4_q8) {
-        if ((tid & 3u) == 0u) *(uint32_t*)(q8 + (size_t)b * n_embd + d) = quad;
+        if ((tid & 3u) == 0u) {
+          *(uint32_t*)(q8 + (size_t)b * n_embd + d) = quad0;
+          *(uint32_t*)(q8 + (size_t)(b + 1u) * n_embd + d) = quad1;
+        }
       } else if (d < n_embd) {
-        q8[(size_t)b * n_embd + d] = (uint8_t)qbyte;
+        q8[(size_t)b * n_embd + d] = (uint8_t)qb0;
+        q8[(size_t)(b + 1u) * n_embd + d] = (uint8_t)qb1;
       }
     }
   }
@@ -3585,11 +4116,11 @@ void batch_swiglu_quant_fp8_hip(const float* g, const float* u, uint8_t* out, fl
 }
 
 void batch_quant_tm_fp8_hip(const float* src, uint8_t* out, float* scales, uint32_t dim,
-                            uint32_t nb, void* stream) {
+                            uint32_t nb, void* stream, uint32_t n_live) {
   if (!nb || !dim || (dim % 128u) != 0u) return;
   const uint32_t nkb = dim >> 7;
   AFF_BLAUNCH(batch_quant_tm_fp8_kernel, dim3(nkb, nb), dim3(32), 0, (hipStream_t)stream, src, out,
-              scales, nkb, dim);
+              scales, nkb, dim, n_live);
 }
 
 // Waves a block for the narrow (nb <= 16) instantiation, i.e. the M tile in units of 16 rows. Take
@@ -3851,6 +4382,119 @@ void batch_gemm_grouped_hip(uint32_t quant, const void* W, const uint8_t* S, con
                 g * rank, (hipStream_t)stream, x_bf16, aff_file, aff_line);
 }
 
+void batch_gemm_fp8_grouped_b32_hip(const uint8_t* W, const uint8_t* Ws, const uint8_t* Xp,
+                                    const uint8_t* Sx, float* Y, uint32_t ng, uint32_t rank,
+                                    uint32_t group_dim, uint32_t nb, void* stream,
+                                    bool preshuffled) {
+  if (!ng || !rank || !group_dim || !nb) return;
+  if ((group_dim % 64u) != 0u) {
+    aff::ui::fatal("batch_gemm_fp8_grouped_b32: group_dim=%u is not a multiple of 64\n",
+                   group_dim);
+    std::abort();
+  }
+  if (preshuffled && ((rank % 16u) != 0u || (group_dim % 16u) != 0u)) {
+    aff::ui::fatal(
+        "batch_gemm_fp8_grouped_b32: preshuffled requires rank=%u, group_dim=%u %% 16 == 0\n",
+        rank, group_dim);
+    std::abort();
+  }
+  const hipStream_t st = (hipStream_t)stream;
+  const uint32_t sc_cols = (group_dim + 127u) / 128u;
+  const uint32_t sx_cols = group_dim >> 5;
+  const bool n128 = fp8_narrow128_enabled();
+  const bool narrow = (nb <= wmma::kN);
+  const uint32_t fk_sel = narrow ? (((group_dim % kFKNarrowWide) == 0u)
+                                        ? kFKNarrowWide
+                                        : ((n128 && (group_dim % kFKNarrow) == 0u) ? kFKNarrow
+                                                                                   : kFK))
+                                 : kFK;
+  const uint32_t nt = narrow ? 1u : kFNTiles;
+  const uint32_t fn = nt * 16u;
+  uint32_t mw = kFWaves;
+  if (narrow) {
+    const uint32_t tpg = (rank + 15u) / 16u;
+    mw = 1u;
+    for (uint32_t cand : {8u, 4u, 2u}) {
+      if (cand <= tpg && (uint64_t)ng * (tpg / cand) >= kSplitTarget) {
+        mw = cand;
+        break;
+      }
+    }
+  }
+  const uint32_t fm = mw * kFMTiles * 16u;
+  const uint32_t m_tiles_per_grp = (rank + fm - 1u) / fm;
+  const uint32_t gx = ng * m_tiles_per_grp;
+  const uint32_t gy = (nb + fn - 1u) / fn;
+  const bool inline_split = fp8_split_inline_enabled();
+  const uint32_t total_rows = ng * rank;
+  uint32_t ksplit = 1u;
+  float* ws = nullptr;
+  unsigned int* ctr_buf = nullptr;
+  if (narrow && gx * gy * mw < kSplitTarget && group_dim >= 512u) {
+    const uint32_t want = (kSplitTarget + gx * gy * mw - 1u) / (gx * gy * mw);
+    const uint32_t kq = (fk_sel == kFKNarrowWide) ? kFKNarrowWide : 128u;
+    uint32_t ckw = ((group_dim / want) + kq - 1u) / kq * kq;
+    if (ckw < kq) ckw = kq;
+    uint32_t k2 = (group_dim + ckw - 1u) / ckw;
+    if (k2 > kSplitThinCap && (uint64_t)total_rows * nb < 8192u) k2 = kSplitThinCap;
+    if (k2 > 1u) {
+      if (inline_split && gx * gy <= kSplitCtrFloats) {
+        ws = splitk_buf_with_ctr((size_t)k2 * total_rows * nb, &ctr_buf, st);
+        if (ws && ctr_buf) ksplit = k2;
+        else if (ws) { ctr_buf = nullptr; ksplit = k2; }
+        else { ws = nullptr; ctr_buf = nullptr; }
+      } else {
+        ws = splitk_buf((size_t)k2 * total_rows * nb, st);
+        if (ws) ksplit = k2;
+      }
+    }
+  }
+  const uint32_t kq = narrow ? ((fk_sel == kFKNarrowWide) ? kFKNarrowWide : 128u) : 128u;
+  uint32_t ck = ksplit > 1u ? ((group_dim + ksplit - 1u) / ksplit + kq - 1u) / kq * kq : 0u;
+  if (ck) ksplit = (group_dim + ck - 1u) / ck;
+  if (ksplit < 2u) { ck = 0u; ksplit = 1u; ws = nullptr; ctr_buf = nullptr; }
+  const dim3 grid(gx, gy, ksplit);
+  float* const dst = ksplit > 1u ? ws : Y;
+  float* const final_y = ksplit > 1u ? Y : nullptr;
+  const bool full = (rank % fm == 0u) && (rank % 128u == 0u) && (nb % fn == 0u) &&
+                    (group_dim % 128u == 0u) && (group_dim % fk_sel == 0u) &&
+                    (((uintptr_t)Sx & 7u) == 0u);
+  const bool prefill_4x2 = !narrow && fp8_prefill_4x2_enabled();
+#define AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, mtw_)                                             \
+  AFF_BLAUNCH((batch_gemm_fp8_grouped_b32_kernel<f, ps, nt_, mw_, fk_, mtw_>), grid,              \
+              dim3(mw_ * kWave), 0, st, W, Ws, Xp, Sx, dst, final_y, ctr_buf, ng, rank,           \
+              group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck)
+#define AFF_GEMM_GB32(f, ps, nt_, mw_, fk_) AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, 1u)
+#define AFF_GEMM_GB32_FK(f, ps, nt_, mw_)                                                         \
+  do {                                                                                            \
+    if (fk_sel == kFKNarrowWide)      AFF_GEMM_GB32(f, ps, nt_, mw_, kFKNarrowWide);              \
+    else if (fk_sel == kFKNarrow)     AFF_GEMM_GB32(f, ps, nt_, mw_, kFKNarrow);                  \
+    else                              AFF_GEMM_GB32(f, ps, nt_, mw_, kFK);                        \
+  } while (0)
+#define AFF_GEMM_GB32_MW(f, ps)                                                                   \
+  do {                                                                                            \
+    if (!narrow) {                                                                                \
+      if (prefill_4x2) AFF_GEMM_GB32_MTW(f, ps, kFNTiles, kFWaves, kFK, 2u);                      \
+      else             AFF_GEMM_GB32_MTW(f, ps, kFNTiles, kFWaves, kFK, 1u);                      \
+    }                                                                                             \
+    else if (mw == 1u) AFF_GEMM_GB32_FK(f, ps, 1u, 1u);                                           \
+    else if (mw == 2u) AFF_GEMM_GB32_FK(f, ps, 1u, 2u);                                           \
+    else if (mw == 4u) AFF_GEMM_GB32_FK(f, ps, 1u, 4u);                                           \
+    else               AFF_GEMM_GB32_FK(f, ps, 1u, 8u);                                           \
+  } while (0)
+  if (preshuffled) { if (full) AFF_GEMM_GB32_MW(true, true);  else AFF_GEMM_GB32_MW(false, true); }
+  else             { if (full) AFF_GEMM_GB32_MW(true, false); else AFF_GEMM_GB32_MW(false, false); }
+#undef AFF_GEMM_GB32_MW
+#undef AFF_GEMM_GB32_FK
+#undef AFF_GEMM_GB32
+#undef AFF_GEMM_GB32_MTW
+  if (ksplit > 1u && !ctr_buf) {
+    const size_t n = (size_t)total_rows * nb;
+    AFF_BLAUNCH(splitk_reduce_kernel, dim3((uint32_t)((n + 255u) / 256u)), dim3(256), 0, st, ws, Y,
+                total_rows, nb, ksplit);
+  }
+}
+
 bool batch_splitk_reserve_hip(size_t peak_floats, void* stream) {
   return splitk_buf_with_ctr(peak_floats, nullptr, (hipStream_t)stream) != nullptr;
 }
@@ -4035,6 +4679,90 @@ bool batch_attn_out_prep_hip(const float* src, uint16_t* dst, uint32_t n_head, u
     AFF_BLAUNCH((batch_attn_out_prep_kernel<false, kTrTile, kTrRows, true>), grid, blk, 0,
                 (hipStream_t)stream, src, dst, n_head, head_dim, n_rot, pos0, nb,
                 r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign);
+  }
+  return true;
+}
+
+bool batch_attn_out_prep_fp8_hip(const float* src, uint8_t* dst_q8, uint8_t* dst_sc,
+                                 const float* cos_t, const float* sin_t, const uint32_t* pos,
+                                 uint32_t ng, uint32_t group_dim, uint32_t head_dim,
+                                 uint32_t rope_dim, uint32_t nb, void* stream) {
+  if (!nb || !ng || !group_dim || !head_dim) return true;
+  if (!src || !dst_q8 || !dst_sc || (group_dim % 32u) != 0u) return false;
+  if (rope_dim > 0u) {
+    if ((head_dim % kTrTile) != 0u || (rope_dim % kTrTile) != 0u || rope_dim > head_dim ||
+        (group_dim % head_dim) != 0u || !cos_t || !sin_t)
+      return false;
+  }
+  const bool hw = hw_oqdq_enabled();
+  const hipStream_t st = (hipStream_t)stream;
+  const uint32_t gx = (group_dim + kTrTile - 1u) / kTrTile;
+  if (nb <= 16u) {
+    const dim3 grid(gx, 1u, ng);
+    const dim3 blk(kTrTile, 4u);
+    if (hw) {
+      AFF_BLAUNCH((batch_attn_out_prep_fp8_kernel<true, 16u, 4u, true>), grid, blk, 0, st, src,
+                  dst_q8, dst_sc, cos_t, sin_t, pos, ng, group_dim, head_dim, rope_dim, 0u, 0.0f,
+                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, nb);
+    } else {
+      AFF_BLAUNCH((batch_attn_out_prep_fp8_kernel<true, 16u, 4u, false>), grid, blk, 0, st, src,
+                  dst_q8, dst_sc, cos_t, sin_t, pos, ng, group_dim, head_dim, rope_dim, 0u, 0.0f,
+                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, nb);
+    }
+    return true;
+  }
+  const dim3 grid(gx, (nb + kTrTile - 1u) / kTrTile, ng);
+  const dim3 blk(kTrTile, kTrRows);
+  if (hw) {
+    AFF_BLAUNCH((batch_attn_out_prep_fp8_kernel<true, kTrTile, kTrRows, true>), grid, blk, 0, st,
+                src, dst_q8, dst_sc, cos_t, sin_t, pos, ng, group_dim, head_dim, rope_dim, 0u, 0.0f,
+                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, nb);
+  } else {
+    AFF_BLAUNCH((batch_attn_out_prep_fp8_kernel<true, kTrTile, kTrRows, false>), grid, blk, 0, st,
+                src, dst_q8, dst_sc, cos_t, sin_t, pos, ng, group_dim, head_dim, rope_dim, 0u, 0.0f,
+                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, nb);
+  }
+  return true;
+}
+
+bool batch_attn_out_prep_fp8_hip(const float* src, uint8_t* dst_q8, uint8_t* dst_sc,
+                                 uint32_t ng, uint32_t group_dim, uint32_t head_dim,
+                                 uint32_t rope_dim, uint32_t pos0, RopeDerived r, float sin_sign,
+                                 uint32_t nb, void* stream) {
+  if (!nb || !ng || !group_dim || !head_dim) return true;
+  if (!src || !dst_q8 || !dst_sc || (group_dim % 32u) != 0u) return false;
+  if (rope_dim > 0u) {
+    if ((head_dim % kTrTile) != 0u || (rope_dim % kTrTile) != 0u || rope_dim > head_dim ||
+        (group_dim % head_dim) != 0u)
+      return false;
+  }
+  const bool hw = hw_oqdq_enabled();
+  const hipStream_t st = (hipStream_t)stream;
+  const uint32_t gx = (group_dim + kTrTile - 1u) / kTrTile;
+  if (nb <= 16u) {
+    const dim3 grid(gx, 1u, ng);
+    const dim3 blk(kTrTile, 4u);
+    if (hw) {
+      AFF_BLAUNCH((batch_attn_out_prep_fp8_kernel<false, 16u, 4u, true>), grid, blk, 0, st, src,
+                  dst_q8, dst_sc, nullptr, nullptr, nullptr, ng, group_dim, head_dim, rope_dim,
+                  pos0, r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign, nb);
+    } else {
+      AFF_BLAUNCH((batch_attn_out_prep_fp8_kernel<false, 16u, 4u, false>), grid, blk, 0, st, src,
+                  dst_q8, dst_sc, nullptr, nullptr, nullptr, ng, group_dim, head_dim, rope_dim,
+                  pos0, r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign, nb);
+    }
+    return true;
+  }
+  const dim3 grid(gx, (nb + kTrTile - 1u) / kTrTile, ng);
+  const dim3 blk(kTrTile, kTrRows);
+  if (hw) {
+    AFF_BLAUNCH((batch_attn_out_prep_fp8_kernel<false, kTrTile, kTrRows, true>), grid, blk, 0, st,
+                src, dst_q8, dst_sc, nullptr, nullptr, nullptr, ng, group_dim, head_dim, rope_dim,
+                pos0, r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign, nb);
+  } else {
+    AFF_BLAUNCH((batch_attn_out_prep_fp8_kernel<false, kTrTile, kTrRows, false>), grid, blk, 0, st,
+                src, dst_q8, dst_sc, nullptr, nullptr, nullptr, ng, group_dim, head_dim, rope_dim,
+                pos0, r.freq_scale, r.theta_scale, r.ext_factor, r.lo, r.hi, sin_sign, nb);
   }
   return true;
 }
@@ -4750,6 +5478,149 @@ bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float
   }
 #undef AFF_W4_MX
   return true;
+}
+
+__global__ __launch_bounds__(256) void quantize_bf16_to_fp8_g128_kernel(
+    const uint16_t* __restrict__ w_bf16, uint8_t* __restrict__ fp8_data,
+    uint16_t* __restrict__ fp8_scales_bf16, uint64_t total_groups, uint64_t dst_grp_off) {
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint64_t wave_stride = (uint64_t)gridDim.x * 8u;
+  const bool vec4_out = (((uintptr_t)fp8_data & 3u) == 0u);
+  for (uint64_t blk = ((uint64_t)blockIdx.x * 8u) + (threadIdx.x >> 5); blk < total_groups;
+       blk += wave_stride) {
+    const uint16_t* gptr = w_bf16 + blk * 128u + lane * 4u;
+    const float f0 = wmma::bf16_to_f32(gptr[0]);
+    const float f1 = wmma::bf16_to_f32(gptr[1]);
+    const float f2 = wmma::bf16_to_f32(gptr[2]);
+    const float f3 = wmma::bf16_to_f32(gptr[3]);
+    float amax = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
+    amax = aff::wave_reduce_max_dpp(amax);
+    const float scale_raw = amax / 448.0f;
+    const uint16_t scale_bf16 = wmma::f32_to_bf16(scale_raw);
+    const float scale_dq = wmma::bf16_to_f32(scale_bf16);
+    const uint64_t out_grp = dst_grp_off + blk;
+    if (lane == 0u) fp8_scales_bf16[out_grp] = scale_bf16;
+    const float inv_s = (scale_dq > 0.0f) ? (1.0f / scale_dq) : 0.0f;
+    const float c0 = fminf(448.0f, fmaxf(-448.0f, f0 * inv_s));
+    const float c1 = fminf(448.0f, fmaxf(-448.0f, f1 * inv_s));
+    const float c2 = fminf(448.0f, fmaxf(-448.0f, f2 * inv_s));
+    const float c3 = fminf(448.0f, fmaxf(-448.0f, f3 * inv_s));
+    int pk = 0;
+    pk = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, pk, false);
+    pk = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, pk, true);
+    if (vec4_out) {
+      ((uint32_t*)fp8_data)[out_grp * 32u + lane] = (uint32_t)pk;
+    } else {
+      uint8_t* dst = fp8_data + out_grp * 128u + lane * 4u;
+      dst[0] = (uint8_t)((uint32_t)pk & 0xffu);
+      dst[1] = (uint8_t)(((uint32_t)pk >> 8) & 0xffu);
+      dst[2] = (uint8_t)(((uint32_t)pk >> 16) & 0xffu);
+      dst[3] = (uint8_t)(((uint32_t)pk >> 24) & 0xffu);
+    }
+  }
+}
+
+void quantize_bf16_to_fp8_g128_hip(const uint16_t* w_bf16, uint8_t* fp8_data,
+                                    uint16_t* fp8_scales_bf16, uint32_t rows, uint32_t cols,
+                                    uint32_t row_off, void* stream) {
+  if (!rows || !cols || (cols % 128u) != 0u || !w_bf16 || !fp8_data || !fp8_scales_bf16) return;
+  const uint64_t total_groups = (uint64_t)rows * (cols >> 7);
+  const uint64_t dst_grp_off = (uint64_t)row_off * (cols >> 7);
+  const uint64_t need = (total_groups + 7u) / 8u;
+  const uint32_t blk = aff::safe_grid_blocks((uint32_t)std::min<uint64_t>(need, 65535u), 8u);
+  AFF_BLAUNCH(quantize_bf16_to_fp8_g128_kernel, dim3(blk), dim3(256), 0, (hipStream_t)stream,
+              w_bf16, fp8_data, fp8_scales_bf16, total_groups, dst_grp_off);
+}
+
+struct Fp8G128XPtrs {
+  const float* p[8];
+};
+
+constexpr uint32_t kFp8G128Waves = 8;
+constexpr uint32_t kFp8G128Threads = kFp8G128Waves * kWave;
+
+template <uint32_t T>
+__global__ __launch_bounds__(kFp8G128Threads) void matvec_fp8_g128_multix_kernel(
+    const uint8_t* __restrict__ fp8_data, const uint16_t* __restrict__ fp8_scales_bf16,
+    Fp8G128XPtrs xp, float* __restrict__ y, uint32_t rows, uint32_t cols, uint32_t y_stride,
+    int out_token_major) {
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t wave = threadIdx.x >> 5;
+  const uint32_t sc_cols = cols >> 7;
+  for (uint32_t row = blockIdx.x * kFp8G128Waves + wave; row < rows;
+       row += gridDim.x * kFp8G128Waves) {
+    const uint8_t* wrow = fp8_data + (size_t)row * cols;
+    const uint16_t* srow = fp8_scales_bf16 + (size_t)row * sc_cols;
+    float acc[T];
+#pragma unroll
+    for (uint32_t t = 0; t < T; ++t) acc[t] = 0.0f;
+    for (uint32_t c = lane * 8u; c < cols; c += 256u) {
+      const uint2 p = *(const uint2*)(wrow + c);
+      const float s = wmma::bf16_to_f32(srow[c >> 7]);
+      const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(p.x);
+      const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(p.x);
+      const aff::aff_f32x2 d45 = aff::e4m3_decode_pk<false>(p.y);
+      const aff::aff_f32x2 d67 = aff::e4m3_decode_pk<true>(p.y);
+#pragma unroll
+      for (uint32_t t = 0; t < T; ++t) {
+        const float* xv = xp.p[t] + c;
+        const float4 xa = *(const float4*)(xv);
+        const float4 xb = *(const float4*)(xv + 4);
+        const float dot = ((d01.x * xa.x + d01.y * xa.y) + (d23.x * xa.z + d23.y * xa.w)) +
+                          ((d45.x * xb.x + d45.y * xb.y) + (d67.x * xb.z + d67.y * xb.w));
+        acc[t] = fmaf(dot, s, acc[t]);
+      }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < T; ++t) {
+      const float v = aff::wave_reduce_add_dpp(acc[t]);
+      if (lane == 0u) {
+        if (out_token_major)
+          y[(size_t)t * rows + row] = v;
+        else
+          y[(size_t)row * y_stride + t] = v;
+      }
+    }
+  }
+}
+
+bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_scales_bf16,
+                                const float* const* x_ptrs, float* y, uint32_t rows, uint32_t cols,
+                                uint32_t T, uint32_t y_stride, bool out_token_major, void* stream) {
+  if (!fp8_data || !fp8_scales_bf16 || !x_ptrs || !y || !rows || (cols % 128u) != 0u || !T ||
+      T > 8u)
+    return false;
+  Fp8G128XPtrs xp{};
+  for (uint32_t t = 0; t < T; ++t) {
+    if (!x_ptrs[t]) return false;
+    xp.p[t] = x_ptrs[t];
+  }
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (rows + kFp8G128Waves - 1u) / kFp8G128Waves), kFp8G128Waves);
+  const int tm = out_token_major ? 1 : 0;
+#define AFF_FP8_G128_MX(NT_)                                                                       \
+  case NT_:                                                                                        \
+    AFF_BLAUNCH((matvec_fp8_g128_multix_kernel<NT_>), dim3(blocks), dim3(kFp8G128Threads), 0,      \
+                (hipStream_t)stream, fp8_data, fp8_scales_bf16, xp, y, rows, cols, y_stride, tm);  \
+    break
+  switch (T) {
+    AFF_FP8_G128_MX(1); AFF_FP8_G128_MX(2); AFF_FP8_G128_MX(3); AFF_FP8_G128_MX(4);
+    AFF_FP8_G128_MX(5); AFF_FP8_G128_MX(6); AFF_FP8_G128_MX(7); AFF_FP8_G128_MX(8);
+    default: return false;
+  }
+#undef AFF_FP8_G128_MX
+  return true;
+}
+
+bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_scales_bf16,
+                                const float* x_tm, float* y, uint32_t rows, uint32_t cols,
+                                uint32_t nt, uint32_t out_col_stride, int out_token_major,
+                                void* stream) {
+  if (!x_tm || !nt || nt > 8u) return false;
+  const float* ptrs[8];
+  for (uint32_t t = 0; t < nt; ++t) ptrs[t] = x_tm + (size_t)t * cols;
+  return matvec_fp8_g128_multix_hip(fp8_data, fp8_scales_bf16, ptrs, y, rows, cols, nt,
+                                    out_col_stride, out_token_major != 0, stream);
 }
 
 void build_bf16x12_esc_host(const uint16_t* bf16_rows, uint32_t nrows, uint32_t cols,

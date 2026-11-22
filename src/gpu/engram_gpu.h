@@ -23,6 +23,9 @@
 
 #include <cstdint>
 
+struct ihipStream_t;
+typedef struct ihipStream_t* hipStream_t;
+
 namespace aff {
 
 // `hc` is [n_hc][n_embd][nb], f32 when `hc_bf16` is false (decode) and bf16 when true (prefill's
@@ -31,5 +34,13 @@ namespace aff {
 // f32. The state is updated in place.
 void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, uint32_t n_embd,
                      uint32_t n_hc, uint32_t nb, uint32_t hc_stride, float eps, void* stream);
+
+// Requantizes host-gathered raw MXFP8 tokens (`[nt][in_dim B E4M3 | (in_dim/32) B E8M0]`,
+// stride `in_dim + in_dim / 32`) into token-major per-128-K-block FP8 E4M3 (`out_q8`:
+// `[nt][in_dim]`) and F32 block scales (`out_scales`: `[nt][in_dim / 128]`), matching
+// `EngramTables::gather` + `batch_quant_tm_fp8_hip` bit-for-bit.
+// Returns false if `in_dim % 128u != 0u` (or invalid non-zero launch); `nt == 0` returns true.
+bool engram_mxfp8_requant_fp8_hip(const uint8_t* raw_mxfp8, uint8_t* out_q8, float* out_scales,
+                                  uint32_t nt, uint32_t in_dim, hipStream_t stream);
 
 }  // namespace aff

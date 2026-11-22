@@ -133,9 +133,10 @@ void batch_swiglu_quant_fp8_hip(const float* g, const float* u, uint8_t* out, fl
                                 uint32_t dim, uint32_t nb, float limit, void* stream = nullptr);
 
 // Quantise a token-major [nb][dim] f32 buffer directly into token-major E4M3 + per-(token,
-// 128-column) scale without a transpose pass. Requires dim % 128 == 0.
+// 128-column) scale without a transpose pass. Requires dim % 128 == 0. When n_live > 0, tokens
+// tok >= n_live emit zeroed E4M3 0x00 bytes and scale 1.0f.
 void batch_quant_tm_fp8_hip(const float* src, uint8_t* out, float* scales, uint32_t dim,
-                            uint32_t nb, void* stream = nullptr);
+                            uint32_t nb, void* stream = nullptr, uint32_t n_live = 0);
 
 // Permute an E4M3 weight into the order the WMMA fragment wants, once at load. This is
 // vllm-radiance's shuffle_weight(w, (16,16)) and it is what `batch_gemm_fp8_hip` expects `W` to be
@@ -183,6 +184,13 @@ void batch_gemm_grouped_hip(uint32_t quant, const void* W, const uint8_t* S, con
                             uint32_t nb, void* stream, bool x_bf16 = false,
                             const char* aff_file = __builtin_FILE(),
                             uint32_t aff_line = __builtin_LINE());
+
+// Grouped W8A8 FP8 WMMA across all ng groups in one launch, folding per-32 UE8M0 activation
+// scales (`Sx`: [ng][nb][group_dim >> 5]) with 128x128 UE8M0 weight scales (`Ws`).
+void batch_gemm_fp8_grouped_b32_hip(const uint8_t* W, const uint8_t* Ws, const uint8_t* Xp,
+                                    const uint8_t* Sx, float* Y, uint32_t ng, uint32_t rank,
+                                    uint32_t group_dim, uint32_t nb, void* stream,
+                                    bool preshuffled = true);
 
 // Pre-allocates the per-device Split-K scratch buffer (plus its 4 KiB arrival counter header) on
 // the current device for `stream`, eliminating mid-run hipMalloc + hipDeviceSynchronize pauses.
@@ -238,6 +246,18 @@ void o_fp8_qdq_f32_hip(float* x, uint32_t n_blocks32, void* stream);
 bool batch_attn_out_prep_hip(const float* src, uint16_t* dst, uint32_t n_head, uint32_t head_dim,
                              uint32_t n_rot, uint32_t pos0, RopeDerived rope, float sin_sign,
                              uint32_t nb, bool o_qdq, void* stream);
+
+// Direct E4M3 emission fused attn_out prep: reads [nb][ng * group_dim] f32, converts to BF16 in
+// LDS, applies inverse RoPE tail when rope_dim > 0, quantises per-32 via o_fp8_qdq_wave32 UE8M0
+// rules, and writes contiguous [ng][nb][group_dim] E4M3 + [ng][nb][group_dim >> 5] UE8M0.
+bool batch_attn_out_prep_fp8_hip(const float* src, uint8_t* dst_q8, uint8_t* dst_sc,
+                                 const float* cos_t, const float* sin_t, const uint32_t* pos,
+                                 uint32_t ng, uint32_t group_dim, uint32_t head_dim,
+                                 uint32_t rope_dim, uint32_t nb, void* stream);
+bool batch_attn_out_prep_fp8_hip(const float* src, uint8_t* dst_q8, uint8_t* dst_sc,
+                                 uint32_t ng, uint32_t group_dim, uint32_t head_dim,
+                                 uint32_t rope_dim, uint32_t pos0, RopeDerived rope,
+                                 float sin_sign, uint32_t nb, void* stream);
 
 // Cross-module registry allowing StaticPlacement to reuse D.q8/D.qs when batch_hc_pre already
 // quantised D.b_norm with matching geometry and AFF_HADAMARD_ROT == 0.
@@ -462,6 +482,19 @@ void quantize_bf16_to_w4_g128_hip(const uint16_t* src, uint8_t* w4, uint16_t* sc
 bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float* x_tm,
                           float* out, uint32_t rows, uint32_t cols, uint32_t nt,
                           uint32_t out_col_stride, int out_token_major, void* stream);
+
+// Group-128 per-(row, 128-col) E4M3 quantisation with BF16 scales for vocabulary head (`output`).
+void quantize_bf16_to_fp8_g128_hip(const uint16_t* w_bf16, uint8_t* fp8_data,
+                                    uint16_t* fp8_scales_bf16, uint32_t rows, uint32_t cols,
+                                    uint32_t row_off, void* stream);
+bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_scales_bf16,
+                                const float* const* x_ptrs, float* y, uint32_t rows,
+                                uint32_t cols, uint32_t T, uint32_t y_stride,
+                                bool out_token_major, void* stream);
+bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_scales_bf16,
+                                const float* x_tm, float* y, uint32_t rows, uint32_t cols,
+                                uint32_t nt, uint32_t out_col_stride, int out_token_major,
+                                void* stream);
 
 // Lossless 12.25-bit bf16x12 (32-elem K-block SoA + host CSR escapes) packing and bit-identical
 // decode kernels.

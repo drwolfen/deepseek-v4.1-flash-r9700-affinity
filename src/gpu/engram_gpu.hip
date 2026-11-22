@@ -1,4 +1,5 @@
 #include "gpu/engram_gpu.h"
+#include "gpu/device_math.h"
 #include "gpu/hip_common.h"
 #include "gpu/wmma.h"
 
@@ -123,6 +124,70 @@ __global__ void engram_gate_kernel(void* __restrict__ hc, const float* __restric
   }
 }
 
+__global__ __launch_bounds__(32) void engram_mxfp8_requant_fp8_kernel(
+    const uint8_t* __restrict__ raw_mxfp8, uint8_t* __restrict__ out_q8,
+    float* __restrict__ out_scales, uint32_t nkb, uint32_t in_dim, uint32_t raw_stride) {
+  const uint32_t kb = blockIdx.x;
+  const uint32_t tok = blockIdx.y;
+  const uint32_t lane = threadIdx.x;
+  const uint32_t sb = lane >> 3;
+
+  const uint8_t* const tok_base = raw_mxfp8 + (size_t)tok * raw_stride;
+  const uint8_t* const w_ptr = tok_base + (size_t)kb * 128u + lane * 4u;
+  const uint8_t* const s_ptr = tok_base + in_dim + (size_t)kb * 4u;
+
+  uint32_t w4;
+  uint32_t s4;
+  if ((reinterpret_cast<uintptr_t>(raw_mxfp8) & 3u) == 0u) {
+    w4 = *reinterpret_cast<const uint32_t*>(w_ptr);
+    s4 = *reinterpret_cast<const uint32_t*>(s_ptr);
+  } else {
+    w4 = (uint32_t)w_ptr[0] | ((uint32_t)w_ptr[1] << 8) |
+         ((uint32_t)w_ptr[2] << 16) | ((uint32_t)w_ptr[3] << 24);
+    s4 = (uint32_t)s_ptr[0] | ((uint32_t)s_ptr[1] << 8) |
+         ((uint32_t)s_ptr[2] << 16) | ((uint32_t)s_ptr[3] << 24);
+  }
+
+  const uint32_t e = (s4 >> (sb * 8u)) & 0xFFu;
+  // Match engram.cpp:247 E8M0 decode bit-for-bit: 0xFF -> 0.0f, 0 -> 2^-127 subnormal, else 2^(e-127).
+  const float s = (e == 0xFFu) ? 0.0f
+                : (e == 0u)    ? __uint_as_float(0x00400000u)
+                               : __uint_as_float(e << 23);
+
+  const aff_f32x2 d01 = e4m3_decode_pk<false>(w4);
+  const aff_f32x2 d23 = e4m3_decode_pk<true>(w4);
+  const float v0 = d01.x * s;
+  const float v1 = d01.y * s;
+  const float v2 = d23.x * s;
+  const float v3 = d23.y * s;
+
+  float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+  amax = aff::wave_reduce_max_dpp(amax);
+  const float sc128 = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+  if (lane == 0u) out_scales[(size_t)tok * nkb + kb] = sc128;
+
+  // Match batch_quant_tm_fp8_kernel: multiply by `1.0f / sc128` rather than dividing by `sc128`.
+  const float inv = 1.0f / sc128;
+  const float c0 = fminf(448.0f, fmaxf(-448.0f, v0 * inv));
+  const float c1 = fminf(448.0f, fmaxf(-448.0f, v1 * inv));
+  const float c2 = fminf(448.0f, fmaxf(-448.0f, v2 * inv));
+  const float c3 = fminf(448.0f, fmaxf(-448.0f, v3 * inv));
+  int pk = 0;
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, pk, false);
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, pk, true);
+
+  const size_t out_off = (size_t)tok * in_dim + (size_t)kb * 128u;
+  if ((reinterpret_cast<uintptr_t>(out_q8) & 3u) == 0u) {
+    reinterpret_cast<uint32_t*>(out_q8 + out_off)[lane] = (uint32_t)pk;
+  } else {
+    uint8_t* dst = out_q8 + out_off + lane * 4u;
+    dst[0] = (uint8_t)((uint32_t)pk & 0xFFu);
+    dst[1] = (uint8_t)(((uint32_t)pk >> 8) & 0xFFu);
+    dst[2] = (uint8_t)(((uint32_t)pk >> 16) & 0xFFu);
+    dst[3] = (uint8_t)(((uint32_t)pk >> 24) & 0xFFu);
+  }
+}
+
 }  // namespace
 
 void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, uint32_t n_embd,
@@ -148,6 +213,19 @@ void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, ui
     hipLaunchKernelGGL(engram_gate_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv, w, n_embd,
                        n_hc, nb, hc_stride, eps);
   AFF_HIP_CHECK(hipGetLastError());
+}
+
+bool engram_mxfp8_requant_fp8_hip(const uint8_t* raw_mxfp8, uint8_t* out_q8, float* out_scales,
+                                  uint32_t nt, uint32_t in_dim, hipStream_t stream) {
+  if ((in_dim % 128u) != 0u) return false;
+  if (nt == 0u) return true;
+  if (in_dim == 0u || !raw_mxfp8 || !out_q8 || !out_scales) return false;
+  const uint32_t nkb = in_dim >> 7;
+  const uint32_t raw_stride = in_dim + (in_dim >> 5);
+  hipLaunchKernelGGL(engram_mxfp8_requant_fp8_kernel, dim3(nkb, nt), dim3(32), 0, stream,
+                     raw_mxfp8, out_q8, out_scales, nkb, in_dim, raw_stride);
+  AFF_HIP_CHECK(hipGetLastError());
+  return true;
 }
 
 }  // namespace aff

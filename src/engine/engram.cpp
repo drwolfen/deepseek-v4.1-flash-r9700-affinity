@@ -251,4 +251,31 @@ void EngramTables::gather(uint32_t layer, const int64_t* ids, float* out) const 
   }
 }
 
+void EngramTables::gather_mxfp8(uint32_t layer, const int64_t* ids, uint8_t* dst) const {
+  if (!c_ || layer >= m_.size() || !dst || c_->head_dim % 32u != 0u) return;
+  const EngramConsts& c = *c_;
+  const Map& m = m_[layer];
+  const uint32_t dim = c.head_dim, nsc = dim / 32u;
+  const uint32_t in_dim = c.n_cols * dim;
+  uint8_t* const w_base = dst;
+  uint8_t* const s_base = dst + in_dim;
+  if (!m.w || !m.s || !ids) {
+    std::memset(w_base, 0x00, in_dim);
+    std::memset(s_base, 0xFF, (size_t)c.n_cols * nsc);
+    return;
+  }
+  for (uint32_t col = 0; col < c.n_cols; ++col) {
+    uint8_t* const w_dst = w_base + (size_t)col * dim;
+    uint8_t* const s_dst = s_base + (size_t)col * nsc;
+    const int64_t id = ids[col];
+    if (id < 0 || (uint64_t)id >= m.rows) {
+      std::memset(w_dst, 0x00, dim);
+      std::memset(s_dst, 0xFF, nsc);
+      continue;
+    }
+    std::memcpy(w_dst, m.w + (size_t)id * dim, dim);
+    std::memcpy(s_dst, m.s + (size_t)id * nsc, nsc);
+  }
+}
+
 }  // namespace aff

@@ -112,6 +112,20 @@ public:
   // what the reference's own bounds mask produces.
   void gather(uint32_t layer, const int64_t* ids, float* out) const;
 
+  bool has_mxfp8(uint32_t layer) const {
+    return c_ && layer < m_.size() && m_[layer].w != nullptr && m_[layer].s != nullptr &&
+           c_->head_dim % 32u == 0u;
+  }
+  uint32_t raw_mxfp8_stride() const {
+    if (!c_ || c_->head_dim % 32u != 0u) return 0u;
+    const uint32_t in_dim = c_->n_cols * c_->head_dim;
+    return in_dim + in_dim / 32u;
+  }
+  // Raw MXFP8 lookup for ONE position: writes `n_cols` rows concatenated as
+  // `[in_dim B E4M3 | (in_dim / 32) B E8M0]` (`raw_mxfp8_stride()` bytes).
+  // Missing tables or out-of-range row ids write 0x00 data and 0xFF scales (decoded to 0.0f).
+  void gather_mxfp8(uint32_t layer, const int64_t* ids, uint8_t* dst) const;
+
   uint64_t bytes() const { return bytes_; }
 
 private:
