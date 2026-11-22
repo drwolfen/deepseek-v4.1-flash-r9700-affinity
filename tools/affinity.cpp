@@ -2386,12 +2386,25 @@ int main(int argc, char** argv) {
       const float x = std::strtof(v, &end);
       return (end != v && std::isfinite(x)) ? std::max(0.0f, x) : 2.0f;
     }();
+    const bool draft_suffix_dynamic_on = [] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX_DYNAMIC");
+      return !(v && *v && std::strcmp(v, "0") == 0);
+    }();
+    const float sfx_gain = [] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX_GAIN");
+      if (!v || !*v) return 1.05f;
+      char* end = nullptr;
+      const float x = std::strtof(v, &end);
+      return (end != v && std::isfinite(x)) ? std::max(0.5f, x) : 1.05f;
+    }();
     const bool draft_depth_stop_on = [] {
       const char* v = std::getenv("AFF_DRAFT_DEPTH_STOP");
       return !(v && *v && std::strcmp(v, "0") == 0);
     }();
     aff::SuffixDraftIndex suffix_idx;
     suffix_idx.reset(1ull);
+    aff::SuffixGate sfx_gate;
+    sfx_gate.reset();
     std::vector<int32_t> suffix_buf(aff::kSpecTok);
     // Cactus rejection sampling with escape mixture, length-fade and acceptance cap (AFF_CACTUS_DELTA, default 0 = off; AFF_CACTUS_ESCAPE, default 0.25).
     const aff::CactusParams cactus_params = aff::CactusParams::from_env();
@@ -2486,18 +2499,34 @@ int main(int argc, char** argv) {
             {budget->pending_close_tokens(), (std::size_t)B, (std::size_t)(rem_out - 1u)});
       } else if (!has_force && rem_out > 1u) {
         const uint32_t max_nd = std::min<uint32_t>(aff::kSpecTok - 1u, rem_out - 1u);
+        const bool dspark_eligible = draft_on && st.pos && !skip_draft;
         if (draft_suffix_on && max_nd >= (uint32_t)sfx_min_match) {
           auto prop = suffix_idx.propose(
               hist, 1ull, sfx_min_match,
               (int)std::min<uint32_t>(sfx_max, max_nd), sfx_min_score, suffix_buf.data());
-          if (prop.n >= sfx_min_match && prop.expect >= sfx_min_expect) {
+          bool accept_suffix = false;
+          if (draft_suffix_dynamic_on) {
+            const uint32_t max_d = std::min<uint32_t>(B, kMaxQ - 1u);
+            float dspark_exp_acc = 0.0f;
+            for (uint32_t d = 1; d <= max_d; ++d) dspark_exp_acc += surv_ema[d];
+            const float dspark_cost_ms = cost_ema[std::min<uint32_t>(B + 1u, kMaxQ - 1u)];
+            const uint32_t prop_nd =
+                std::min<uint32_t>(prop.n > 0 ? static_cast<uint32_t>(prop.n) : 0u, max_nd);
+            const float sfx_cost_ms = cost_ema[std::min<uint32_t>(prop_nd + 1u, kMaxQ - 1u)];
+            accept_suffix = sfx_gate.should_preempt(prop, sfx_min_match, sfx_min_expect,
+                                                    dspark_eligible, dspark_exp_acc,
+                                                    dspark_cost_ms, sfx_cost_ms, sfx_gain);
+          } else {
+            accept_suffix = (prop.n >= sfx_min_match && prop.expect >= sfx_min_expect);
+          }
+          if (accept_suffix) {
             nd = std::min<uint32_t>((uint32_t)prop.n, max_nd);
             used_suffix = true;
             for (uint32_t i = 0; i < nd; ++i)
               draft[i] = static_cast<uint32_t>(suffix_buf[i]);
           }
         }
-        if (!used_suffix && draft_on && st.pos && !skip_draft) {
+        if (!used_suffix && dspark_eligible) {
           bool depth_stop = false;
           if (draft_depth_stop_on && !probe_in_flight) {
             if (adaptive_width_on && B >= 2 && my_blocks >= 4 &&
@@ -2708,6 +2737,7 @@ int main(int argc, char** argv) {
         my_blocks++; my_accepted += k;
         zero_run = (nd && k == 0) ? zero_run + 1u : 0u;   // streak of drafted blocks that accepted none
         model.note_block(nd, k, match.data());
+        if (used_suffix && draft_suffix_dynamic_on) sfx_gate.observe(nd, k);
       }
       // Positions P..P+k are real; P+k+1 holds tail and is fed by the next block.
       model.rollback(&st, P + k + 1);

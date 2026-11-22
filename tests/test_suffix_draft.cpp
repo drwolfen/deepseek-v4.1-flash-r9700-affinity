@@ -321,6 +321,68 @@ void test_high_load_resize_stability() {
   std::printf("PASS: test_high_load_resize_stability\n");
 }
 
+void test_suffix_gate_prose_backoff() {
+  SuffixGate gate;
+  // Prose DSpark runs strongly (~3.8 accepted in 120 ms -> utility 4.8/120 = 0.040 tok/ms).
+  // A medium-length 4-token prose collision (n=8, expect=6.0, sfx_cost=156 ms):
+  // initial eff_expect=5.4 -> sfx_u=6.4/156=0.0410 < 0.040*1.05=0.0420 -> rejected immediately.
+  SuffixDraftIndex::Proposal weak_hit{/*n=*/8, /*match_len=*/4, /*score=*/0.55f, /*expect=*/6.0f};
+  REQUIRE(!gate.should_preempt(weak_hit, 4, 2.0f, true, 3.8f, 120.0f, 156.0f, 1.05f));
+
+  // A long 12-token chance collision initially exceeds DSpark utility (11.8/204 = 0.0578 >= 0.0420),
+  // probes once, gets only 1 accepted token (k=1 of 12), dropping acc_ema and arming cooldown=2.
+  SuffixDraftIndex::Proposal chance_hit{/*n=*/12, /*match_len=*/4, /*score=*/0.80f, /*expect=*/12.0f};
+  REQUIRE(gate.should_preempt(chance_hit, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  gate.observe(12, 1);
+  REQUIRE(gate.acc_ema < 0.60f);
+  REQUIRE(gate.cooldown == 2);
+
+  // Next 2 short-match hits are suppressed by cooldown without decrementing below 0.
+  REQUIRE(!gate.should_preempt(chance_hit, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  REQUIRE(!gate.should_preempt(chance_hit, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  REQUIRE(gate.cooldown == 0);
+
+  // Even after cooldown clears, acc_ema ~ 0.53 -> sfx_u=(1+6.39)/204=0.0362 < 0.0420 -> stays DSpark.
+  REQUIRE(!gate.should_preempt(chance_hit, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+
+  std::printf("PASS: test_suffix_gate_prose_backoff\n");
+}
+
+void test_suffix_gate_code_edit_burst() {
+  SuffixGate gate;
+  // Simulate an earlier miss putting gate into cooldown.
+  gate.observe(6, 1);
+  REQUIRE(gate.cooldown == 2);
+
+  // A long exact code match (match_len >= min_match+2 && n >= min_match+2) breaks out of cooldown.
+  SuffixDraftIndex::Proposal code_long{/*n=*/12, /*match_len=*/7, /*score=*/1.0f, /*expect=*/12.0f};
+  gate.acc_ema = 0.90f;
+  REQUIRE(gate.should_preempt(code_long, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  REQUIRE(gate.cooldown == 0);
+
+  // Full acceptance bursts maintain high acc_ema >= 0.90 and keep cooldown at 0.
+  for (int i = 0; i < 4; ++i) {
+    gate.observe(12, 12);
+    REQUIRE(gate.cooldown == 0);
+    REQUIRE(gate.miss_streak == 0);
+    REQUIRE(gate.should_preempt(code_long, 4, 2.0f, true, 3.8f, 120.0f, 204.0f, 1.05f));
+  }
+  REQUIRE(gate.acc_ema >= 0.95f);
+
+  std::printf("PASS: test_suffix_gate_code_edit_burst\n");
+}
+
+void test_suffix_gate_no_dspark() {
+  SuffixGate gate;
+  SuffixDraftIndex::Proposal modest{/*n=*/4, /*match_len=*/4, /*score=*/0.7f, /*expect=*/3.0f};
+  REQUIRE(gate.should_preempt(modest, 4, 2.0f, /*dspark_active=*/false, 3.8f, 120.0f, 108.0f,
+                              1.05f));
+  REQUIRE(!gate.should_preempt(modest, 4, 2.0f, /*dspark_active=*/true, 3.8f, 120.0f, 108.0f,
+                               1.05f));
+
+  std::printf("PASS: test_suffix_gate_no_dspark\n");
+}
+
 }  // namespace
 
 int main() {
@@ -331,6 +393,9 @@ int main() {
   test_incremental_matches_fresh_bitwise();
   test_owner_change_shrink_and_rollback();
   test_high_load_resize_stability();
+  test_suffix_gate_prose_backoff();
+  test_suffix_gate_code_edit_burst();
+  test_suffix_gate_no_dspark();
   std::printf("ALL suffix_draft tests passed\n");
   return 0;
 }

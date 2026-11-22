@@ -366,4 +366,57 @@ private:
   uint64_t drop2_[kExtra + 1]{};
 };
 
+// Utility- and acceptance-aware gate controlling whether SuffixDecoding preempts
+// the GPU DSpark drafter on a block. Tracks empirical suffix acceptance EMA and
+// exponential miss cooldown so prose streams stay on DSpark while code/structured
+// continuations still trigger suffix drafting immediately on long exact matches.
+struct SuffixGate {
+  float acc_ema = 0.90f;
+  uint32_t miss_streak = 0;
+  uint32_t cooldown = 0;
+  uint32_t steps = 0;
+
+  void reset() noexcept {
+    acc_ema = 0.90f;
+    miss_streak = 0;
+    cooldown = 0;
+    steps = 0;
+  }
+
+  bool should_preempt(const SuffixDraftIndex::Proposal& prop, int min_match, float min_expect,
+                      bool dspark_active, float dspark_exp_acc, float dspark_cost_ms,
+                      float sfx_cost_ms, float min_gain = 1.05f) noexcept {
+    if (prop.n < min_match || prop.expect < min_expect) return false;
+    if (cooldown > 0) {
+      if (prop.match_len >= min_match + 2 && prop.n >= min_match + 2) {
+        cooldown = 0;
+      } else {
+        --cooldown;
+        return false;
+      }
+    }
+    const float eff_expect = prop.expect * acc_ema;
+    if (eff_expect < min_expect) return false;
+    if (!dspark_active) return true;
+    if (eff_expect <= dspark_exp_acc) return false;
+    const float sfx_u = (1.0f + eff_expect) / std::max(sfx_cost_ms, 1.0f);
+    const float dsp_u = (1.0f + std::max(dspark_exp_acc, 0.0f)) / std::max(dspark_cost_ms, 1.0f);
+    return sfx_u >= dsp_u * min_gain;
+  }
+
+  void observe(uint32_t nd, uint32_t k) noexcept {
+    if (nd == 0) return;
+    const float rate = static_cast<float>(k) / static_cast<float>(nd);
+    acc_ema = 0.55f * acc_ema + 0.45f * rate;
+    ++steps;
+    if (k < 2u || (k * 2u < nd)) {
+      ++miss_streak;
+      cooldown = std::min<uint32_t>(16u, 2u << std::min<uint32_t>(miss_streak - 1u, 3u));
+    } else {
+      miss_streak = 0;
+      cooldown = 0;
+    }
+  }
+};
+
 }  // namespace aff
