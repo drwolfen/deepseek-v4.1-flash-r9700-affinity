@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the affinity server on two R9700s with DeepSeek-V4.1-Flash v5.5.0.
+# Run the affinity server on two R9700s with DeepSeek-V4.1-Flash v5.6.0.
 # Adjust MODELS to where the .aff files live. Mirrors deploy/deepseek-v41-affinity.service.
 set -eu
 
@@ -7,7 +7,7 @@ MODELS=${MODELS:-/models/DeepSeek-V4.1-Flash-1017-MoonMath-aff}
 TOKENIZER=${TOKENIZER:-/models/LLM-Models/DeepSeek-V4.1-Flash-1017-MoonMath-FP8/tokenizer.json}
 ENGRAM_TABLES=${ENGRAM_TABLES:-/models/LLM-Models/DeepSeek-V4.1-Flash-1017-MoonMath-FP8}
 STORAGE_DIR=${STORAGE_DIR:-/models}
-IMAGE=${IMAGE:-deepseek-affinity:v5.5.0}
+IMAGE=${IMAGE:-deepseek-affinity:v5.6.0}
 NAME=${NAME:-deepseek-affinity}
 
 exec docker run --rm --name "$NAME" \
@@ -60,7 +60,7 @@ exec docker run --rm --name "$NAME" \
     --placement-hysteresis 1.6 --placement-min-gain 3.0 \
     --placement-save "$MODELS/placement.affprof" \
     --prefill-chunk-size 2816 \
-    --default-effort 60 \
+    --default-effort 75 \
     --repeat-penalty 1.1 \
     --repeat-last-n 96 \
     --dry-delta 40 \

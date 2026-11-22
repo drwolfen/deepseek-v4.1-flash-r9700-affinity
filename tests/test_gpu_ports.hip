@@ -3,6 +3,7 @@
 #include "gpu/batch_kernels.h"
 #include "gpu/compressor_gpu.h"
 #include "gpu/dense_gpu.h"
+#include "gpu/device_math.h"
 #include "gpu/engram_gpu.h"
 #include "gpu/expert_kernel_hip.h"
 #include "gpu/indexer_gpu.h"
@@ -23,7 +24,34 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
+
+namespace {
+__global__ void test_e4m3_enc_kernel(const float* in, uint8_t* out_hw, uint8_t* out_sw,
+                                     uint32_t n) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out_hw[i] = aff::e4m3_enc(in[i]);
+    out_sw[i] = aff::e4m3_enc_sw(in[i]);
+  }
+}
+
+static float mxfp8_e4m3_to_f32_ref(uint8_t b) {
+  const uint32_t sign = (uint32_t)(b & 0x80u) << 24;
+  const uint32_t ex = (b >> 3) & 0x0Fu;
+  const uint32_t mn = b & 0x07u;
+  if (ex == 15u && mn == 7u) return 0.0f;
+  if (ex == 0u) {
+    const float mag = (float)mn * (1.0f / 512.0f);
+    return (b & 0x80u) ? -mag : mag;
+  }
+  const uint32_t u = sign | ((ex + 120u) << 23) | (mn << 20);
+  float f = 0.0f;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}
+}  // namespace
 
 static uint16_t f32_to_bf16_cpu(float f) {
   uint32_t u;
@@ -2038,6 +2066,229 @@ int main() {
       std::free(raw_src);
       std::free(raw_sync);
       std::free(raw_async);
+    }
+  }
+
+  // 23. F7: e4m3_enc HW vs SW parity + subnormal boundary [7.5*2^-9, 8*2^-9) + host KV encode
+  {
+    const float inf = std::numeric_limits<float>::infinity();
+    std::vector<float> inputs = {
+        +0.0f, -0.0f, 0.015f, -0.015f,
+        7.5f / 512.0f, -7.5f / 512.0f, 7.4f / 512.0f,
+        0.001f, 0.001953125f, 0x1p-6f,
+        448.0f, -448.0f, 500.0f, -500.0f, inf, -inf,
+    };
+    for (int i = 0; i < 256; ++i) {
+      inputs.push_back((float)i * (1.0f / 1024.0f));
+      inputs.push_back(-(float)i * (1.0f / 1024.0f));
+      inputs.push_back((float)(i - 128) * 4.25f);
+    }
+    const uint32_t n = (uint32_t)inputs.size();
+    float* d_in = nullptr;
+    uint8_t *d_hw = nullptr, *d_sw = nullptr;
+    assert(hipMalloc(&d_in, n * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_hw, n) == hipSuccess);
+    assert(hipMalloc(&d_sw, n) == hipSuccess);
+    assert(hipMemcpy(d_in, inputs.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+    hipLaunchKernelGGL(test_e4m3_enc_kernel, dim3((n + 255u) / 256u), dim3(256u), 0, nullptr,
+                       d_in, d_hw, d_sw, n);
+    assert(hipDeviceSynchronize() == hipSuccess);
+    std::vector<uint8_t> hw(n), sw(n);
+    assert(hipMemcpy(hw.data(), d_hw, n, hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(sw.data(), d_sw, n, hipMemcpyDeviceToHost) == hipSuccess);
+    for (uint32_t i = 0; i < n; ++i) assert(hw[i] == sw[i]);
+    assert(hw[0] == 0x00u);   // +0.0
+    assert(hw[1] == 0x80u);   // -0.0
+    assert(hw[2] == 0x08u);   // 0.015f in [7.5*2^-9, 8*2^-9)
+    assert(hw[3] == 0x88u);   // -0.015f
+    assert(hw[4] == 0x08u);   // exact 7.5 * 2^-9 tie-to-even
+    assert(hw[10] == 0x7Eu);  // +448
+    assert(hw[11] == 0xFEu);  // -448
+    assert(hw[12] == 0x7Eu);  // +500 clamped
+    assert(hw[13] == 0xFEu);  // -500 clamped
+    assert(hw[14] == 0x7Eu);  // +Inf clamped
+    assert(hw[15] == 0xFEu);  // -Inf clamped
+    (void)hipFree(d_in);
+    (void)hipFree(d_hw);
+    (void)hipFree(d_sw);
+
+    // Host kv_encode_row(FP8) & kv_encode_fp8r_row with unit scale (amax = 448.0f per block)
+    std::vector<float> row(kFlashWidth, 0.0f);
+    for (uint32_t i = 0; i < kFlashWidth; ++i) {
+      if ((i % 64u) == 0u) row[i] = 448.0f;
+      else if ((i % 64u) == 1u) row[i] = -448.0f;
+      else if ((i % 64u) == 2u) row[i] = 0.015f;
+      else if ((i % 64u) == 3u) row[i] = -0.015f;
+      else if ((i % 64u) == 4u) row[i] = -0.0f;
+      else row[i] = std::sin((float)i * 0.37f) * 20.0f;
+    }
+    float* d_r = nullptr;
+    uint8_t *d_rhw = nullptr, *d_rsw = nullptr;
+    assert(hipMalloc(&d_r, kFlashWidth * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_rhw, kFlashWidth) == hipSuccess);
+    assert(hipMalloc(&d_rsw, kFlashWidth) == hipSuccess);
+    assert(hipMemcpy(d_r, row.data(), kFlashWidth * sizeof(float), hipMemcpyHostToDevice) ==
+           hipSuccess);
+    hipLaunchKernelGGL(test_e4m3_enc_kernel, dim3(2), dim3(256), 0, nullptr, d_r, d_rhw, d_rsw,
+                       kFlashWidth);
+    assert(hipDeviceSynchronize() == hipSuccess);
+    std::vector<uint8_t> r_hw(kFlashWidth);
+    assert(hipMemcpy(r_hw.data(), d_rhw, kFlashWidth, hipMemcpyDeviceToHost) == hipSuccess);
+    (void)hipFree(d_r);
+    (void)hipFree(d_rhw);
+    (void)hipFree(d_rsw);
+
+    std::vector<uint8_t> dst_fp8(kv_row_bytes(KvDtype::FP8, kFlashWidth, 0u), 0);
+    std::vector<uint8_t> dst_fp8r(kFlashRowBytes, 0);
+    kv_encode_row(KvDtype::FP8, row.data(), kFlashWidth, 0u, dst_fp8.data());
+    kv_encode_fp8r_row(row.data(), dst_fp8r.data());
+    assert(std::memcmp(dst_fp8.data(), r_hw.data(), kFlashWidth) == 0);
+    assert(std::memcmp(dst_fp8r.data(), r_hw.data(), kFlashWidth) == 0);
+  }
+
+  // 24. F4: tp_ar_fp8 clamping (>448, +-Inf) & cross-rank memcmp == 0
+  {
+    int ndev = 0, can01 = 0, can10 = 0;
+    if (hipGetDeviceCount(&ndev) == hipSuccess && ndev >= 2 &&
+        hipDeviceCanAccessPeer(&can01, 0, 1) == hipSuccess && can01 &&
+        hipDeviceCanAccessPeer(&can10, 1, 0) == hipSuccess && can10) {
+      TpContext ctx;
+      std::string err;
+      const size_t max_n = 1049003u;
+      assert(tp_init(&ctx, max_n, &err));
+      float *d_in[2] = {}, *d_out[2] = {};
+      for (int r = 0; r < 2; ++r) {
+        assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+        assert(hipMalloc(&d_in[r], max_n * sizeof(float)) == hipSuccess);
+        assert(hipMalloc(&d_out[r], max_n * sizeof(float)) == hipSuccess);
+      }
+      const float inf = std::numeric_limits<float>::infinity();
+      for (size_t n : {size_t(16384u), max_n}) {
+        // (a) finite > 448 values: outputs must stay finite, accurate, and bit-identical across ranks
+        std::vector<float> h0(n), h1(n);
+        for (size_t i = 0; i < n; ++i) {
+          h0[i] = std::sin((float)(i % 251u) * 0.07f) * 3.0f;
+          h1[i] = std::cos((float)(i % 199u) * 0.05f) * 2.5f;
+        }
+        h0[0] = 500.0f;    h1[0] = 600.0f;
+        h0[129] = -700.0f; h1[129] = -550.0f;
+        h0[n - 1] = 12000.0f; h1[n - 1] = -900.0f;
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+          assert(hipMemcpy(d_in[r], (r == 0 ? h0 : h1).data(), n * sizeof(float),
+                           hipMemcpyHostToDevice) == hipSuccess);
+        }
+        tp_all_reduce(ctx, d_in, d_out, n, TpReduce::Fp8);
+        tp_sync(ctx);
+        tp_check(ctx);
+        std::vector<float> out0(n), out1(n);
+        assert(hipSetDevice(ctx.dev[0]) == hipSuccess);
+        assert(hipMemcpy(out0.data(), d_out[0], n * sizeof(float), hipMemcpyDeviceToHost) ==
+               hipSuccess);
+        assert(hipSetDevice(ctx.dev[1]) == hipSuccess);
+        assert(hipMemcpy(out1.data(), d_out[1], n * sizeof(float), hipMemcpyDeviceToHost) ==
+               hipSuccess);
+        assert(std::memcmp(out0.data(), out1.data(), n * sizeof(float)) == 0);
+        for (size_t i : {size_t(0), size_t(129), n - 1}) {
+          assert(std::isfinite(out0[i]));
+          const float ref = h0[i] + h1[i];
+          assert(std::fabs(out0[i] - ref) <= std::max(0.5f, 0.1f * std::fabs(ref)));
+        }
+
+        // (b) +-Inf values: E4M3 codes must clamp finite & cross-rank outputs stay bit-identical
+        h0[3] = inf;  h1[3] = inf;
+        h0[256] = -inf; h1[256] = -inf;
+        for (int r = 0; r < 2; ++r) {
+          assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+          assert(hipMemcpy(d_in[r], (r == 0 ? h0 : h1).data(), n * sizeof(float),
+                           hipMemcpyHostToDevice) == hipSuccess);
+        }
+        tp_all_reduce(ctx, d_in, d_out, n, TpReduce::Fp8);
+        tp_sync(ctx);
+        tp_check(ctx);
+        assert(hipSetDevice(ctx.dev[0]) == hipSuccess);
+        assert(hipMemcpy(out0.data(), d_out[0], n * sizeof(float), hipMemcpyDeviceToHost) ==
+               hipSuccess);
+        assert(hipSetDevice(ctx.dev[1]) == hipSuccess);
+        assert(hipMemcpy(out1.data(), d_out[1], n * sizeof(float), hipMemcpyDeviceToHost) ==
+               hipSuccess);
+        assert(std::memcmp(out0.data(), out1.data(), n * sizeof(float)) == 0);
+      }
+      for (int r = 0; r < 2; ++r) {
+        assert(hipSetDevice(ctx.dev[r]) == hipSuccess);
+        (void)hipFree(d_in[r]);
+        (void)hipFree(d_out[r]);
+      }
+      tp_free(&ctx);
+    }
+  }
+
+  // 25. F5: engram_mxfp8_requant_fp8_hip bit-exact vs gather + batch_quant_tm_fp8_hip
+  {
+    assert(!engram_mxfp8_requant_fp8_hip(nullptr, nullptr, nullptr, 1u, 6000u, nullptr));
+    assert(engram_mxfp8_requant_fp8_hip(nullptr, nullptr, nullptr, 0u, 6144u, nullptr));
+    const uint32_t in_dim = 6144u;
+    const uint32_t sc_per_tok = in_dim / 32u;
+    const uint32_t qs_per_tok = in_dim / 128u;
+    const uint32_t stride = in_dim + sc_per_tok;
+    for (uint32_t nt : {1u, 6u, 64u}) {
+      std::vector<uint8_t> h_raw((size_t)nt * stride, 0u);
+      std::vector<float> h_f32((size_t)nt * in_dim, 0.0f);
+      for (uint32_t t = 0; t < nt; ++t) {
+        uint8_t* w = h_raw.data() + (size_t)t * stride;
+        uint8_t* sc = w + in_dim;
+        float* dst = h_f32.data() + (size_t)t * in_dim;
+        // Last token (when nt > 1) exercises OOR all-zero row (w=0x00, sc=0xFF)
+        if (nt > 1u && t == nt - 1u) {
+          std::memset(w, 0x00, in_dim);
+          std::memset(sc, 0xFF, sc_per_tok);
+          continue;
+        }
+        for (uint32_t b = 0; b < sc_per_tok; ++b) {
+          uint8_t e = (uint8_t)(0x79u + ((t * 13u + b) % 10u));
+          if (b == 0u) e = 0x00u;                    // 2^-127 smallest scale
+          else if (b == 5u || b == 6u) e = 0xFFu;    // invalid/OOR block -> 0.0f
+          sc[b] = e;
+          const float s = (e == 0xFFu) ? 0.0f : std::ldexp(1.0f, (int)e - 127);
+          for (uint32_t k = 0; k < 32u; ++k) {
+            uint8_t byte = (uint8_t)((t * 37u + b * 29u + k * 11u) & 0xFFu);
+            if ((byte & 0x7Fu) == 0x7Fu) byte = (uint8_t)(byte ^ 0x01u);  // keep finite E4M3
+            w[b * 32u + k] = byte;
+            dst[b * 32u + k] = mxfp8_e4m3_to_f32_ref(byte) * s;
+          }
+        }
+      }
+
+      uint8_t *d_raw = nullptr, *d_q8_ref = nullptr, *d_q8_got = nullptr;
+      float *d_f32 = nullptr, *d_qs_ref = nullptr, *d_qs_got = nullptr;
+      assert(hipMalloc(&d_raw, h_raw.size()) == hipSuccess);
+      assert(hipMalloc(&d_f32, h_f32.size() * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_q8_ref, (size_t)nt * in_dim) == hipSuccess);
+      assert(hipMalloc(&d_q8_got, (size_t)nt * in_dim) == hipSuccess);
+      assert(hipMalloc(&d_qs_ref, (size_t)nt * qs_per_tok * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_qs_got, (size_t)nt * qs_per_tok * sizeof(float)) == hipSuccess);
+      assert(hipMemcpy(d_raw, h_raw.data(), h_raw.size(), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_f32, h_f32.data(), h_f32.size() * sizeof(float), hipMemcpyHostToDevice) ==
+             hipSuccess);
+
+      batch_quant_tm_fp8_hip(d_f32, d_q8_ref, d_qs_ref, in_dim, nt, nullptr);
+      assert(engram_mxfp8_requant_fp8_hip(d_raw, d_q8_got, d_qs_got, nt, in_dim, nullptr));
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      std::vector<uint8_t> q8_ref((size_t)nt * in_dim), q8_got((size_t)nt * in_dim);
+      std::vector<float> qs_ref((size_t)nt * qs_per_tok), qs_got((size_t)nt * qs_per_tok);
+      assert(hipMemcpy(q8_ref.data(), d_q8_ref, q8_ref.size(), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(q8_got.data(), d_q8_got, q8_got.size(), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(qs_ref.data(), d_qs_ref, qs_ref.size() * sizeof(float),
+                       hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(qs_got.data(), d_qs_got, qs_got.size() * sizeof(float),
+                       hipMemcpyDeviceToHost) == hipSuccess);
+      assert(std::memcmp(q8_got.data(), q8_ref.data(), q8_ref.size()) == 0);
+      assert(std::memcmp(qs_got.data(), qs_ref.data(), qs_ref.size() * sizeof(float)) == 0);
+
+      for (void* p : {(void*)d_raw, (void*)d_f32, (void*)d_q8_ref, (void*)d_q8_got,
+                      (void*)d_qs_ref, (void*)d_qs_got})
+        (void)hipFree(p);
     }
   }
 
