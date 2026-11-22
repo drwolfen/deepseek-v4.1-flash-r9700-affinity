@@ -44,6 +44,10 @@ struct BudgetHook {
   int novelty_window = 0;
   int novelty_min_tokens = 1024;
   float novelty_min_ratio = 0.28f;
+  // Short-window bigram diversity detector for rapid mantra loops (<512 tokens; 0 disables).
+  int short_novelty_window = 0;
+  int short_novelty_min_tokens = 160;
+  float short_novelty_min_ratio = 0.20f;
 };
 
 // The reply reserve comes out of the request's output cap. When the cap is at
@@ -100,6 +104,10 @@ public:
       novelty_ring_.assign((size_t)hook_->novelty_window, 0);
       novelty_counts_.reserve((size_t)hook_->novelty_window * 2);
     }
+    if (hook_ && !hook_->close_token_ids.empty() && hook_->short_novelty_window > 0) {
+      short_novelty_ring_.assign((size_t)hook_->short_novelty_window, 0);
+      short_novelty_counts_.reserve((size_t)hook_->short_novelty_window * 2);
+    }
   }
   ThinkingBudget(BudgetHook&&, int) = delete;
 
@@ -111,6 +119,7 @@ public:
   bool freeze_triggered() const { return freeze_triggered_; }
   bool short_loop_triggered() const { return short_loop_triggered_; }
   bool novelty_triggered() const { return novelty_triggered_; }
+  bool short_novelty_triggered() const { return short_novelty_triggered_; }
   const char* close_reason() const { return close_reason_; }
   bool injecting() const {
     return forced_ && hook_ && inject_pos_ < hook_->close_token_ids.size();
@@ -123,12 +132,14 @@ public:
   bool needs_ar_tail(int max_block_tokens) const {
     return !settled() &&
            (looping_ || freeze_triggered_ || short_loop_triggered_ || novelty_triggered_ ||
+            short_novelty_triggered_ ||
             remaining_ - hook_->hard_limit_remaining <= max_block_tokens);
   }
 
   bool looping() const { return looping_ && !settled(); }
   void arm_loop_close() {
-    if (looping() || freeze_triggered_ || short_loop_triggered_ || novelty_triggered_)
+    if (looping() || freeze_triggered_ || short_loop_triggered_ || novelty_triggered_ ||
+        short_novelty_triggered_)
       loop_armed_ = true;
   }
 
@@ -159,6 +170,7 @@ public:
       if (loop_armed_) {
         if (freeze_triggered_) reason = "freeze_churn";
         else if (short_loop_triggered_) reason = "short_loop";
+        else if (short_novelty_triggered_) reason = "short_low_novelty";
         else if (novelty_triggered_) reason = "low_novelty";
         else reason = "loop_repeat";
       }
@@ -177,6 +189,10 @@ public:
     if (!short_loop_ring_.empty() && short_loop_check(candidate)) {
       short_loop_triggered_ = true;
       return force_close("short_loop");
+    }
+    if (!short_novelty_ring_.empty() && short_novelty_check(candidate)) {
+      short_novelty_triggered_ = true;
+      return force_close("short_low_novelty");
     }
     if (!novelty_ring_.empty() && novelty_check(candidate)) {
       novelty_triggered_ = true;
@@ -287,30 +303,46 @@ private:
     return ++short_loop_counts_[short_token_hash_] >= hook_->short_loop_repeats;
   }
 
-  // Tracks distinct token bigrams over the trailing novelty_window bigrams.
-  bool novelty_check(int32_t token) {
-    if (!has_prev_tok_) {
-      prev_tok_ = token;
-      has_prev_tok_ = true;
+  // Tracks distinct token bigrams over a sliding ring buffer.
+  static bool update_bigram_novelty(int32_t token, std::vector<uint64_t>& ring,
+                                    std::unordered_map<uint64_t, int>& counts, size_t& seen,
+                                    int32_t& prev_tok, bool& has_prev, int min_tokens,
+                                    float min_ratio, int thought_tokens) {
+    if (!has_prev) {
+      prev_tok = token;
+      has_prev = true;
       return false;
     }
-    const uint64_t bg = ((uint64_t)(uint32_t)prev_tok_ << 32) | (uint32_t)token;
-    prev_tok_ = token;
-    const size_t w = novelty_ring_.size();
-    const size_t at = novelty_seen_ % w;
-    if (novelty_seen_ >= w) {
-      const uint64_t old_bg = novelty_ring_[at];
-      auto it = novelty_counts_.find(old_bg);
-      if (it != novelty_counts_.end()) {
-        if (--(it->second) <= 0) novelty_counts_.erase(it);
+    const uint64_t bg = ((uint64_t)(uint32_t)prev_tok << 32) | (uint32_t)token;
+    prev_tok = token;
+    const size_t w = ring.size();
+    const size_t at = seen % w;
+    if (seen >= w) {
+      const uint64_t old_bg = ring[at];
+      auto it = counts.find(old_bg);
+      if (it != counts.end()) {
+        if (--(it->second) <= 0) counts.erase(it);
       }
     }
-    novelty_ring_[at] = bg;
-    ++novelty_seen_;
-    ++novelty_counts_[bg];
-    return thought_tokens_ >= hook_->novelty_min_tokens &&
-           novelty_seen_ >= w &&
-           (float)novelty_counts_.size() < hook_->novelty_min_ratio * (float)w;
+    ring[at] = bg;
+    ++seen;
+    ++counts[bg];
+    return thought_tokens >= min_tokens &&
+           seen >= w &&
+           (float)counts.size() < min_ratio * (float)w;
+  }
+
+  bool novelty_check(int32_t token) {
+    return update_bigram_novelty(token, novelty_ring_, novelty_counts_, novelty_seen_, prev_tok_,
+                                 has_prev_tok_, hook_->novelty_min_tokens, hook_->novelty_min_ratio,
+                                 thought_tokens_);
+  }
+
+  bool short_novelty_check(int32_t token) {
+    return update_bigram_novelty(token, short_novelty_ring_, short_novelty_counts_,
+                                 short_novelty_seen_, short_prev_tok_, short_has_prev_tok_,
+                                 hook_->short_novelty_min_tokens, hook_->short_novelty_min_ratio,
+                                 thought_tokens_);
   }
 
   void remember(int32_t token) {
@@ -330,6 +362,7 @@ private:
   bool freeze_triggered_ = false;
   bool short_loop_triggered_ = false;
   bool novelty_triggered_ = false;
+  bool short_novelty_triggered_ = false;
   const char* close_reason_ = "";
   std::size_t inject_pos_ = 0;
   std::vector<int32_t> marker_tail_;
@@ -357,6 +390,11 @@ private:
   size_t novelty_seen_ = 0;
   int32_t prev_tok_ = 0;
   bool has_prev_tok_ = false;
+  std::vector<uint64_t> short_novelty_ring_;
+  std::unordered_map<uint64_t, int> short_novelty_counts_;
+  size_t short_novelty_seen_ = 0;
+  int32_t short_prev_tok_ = 0;
+  bool short_has_prev_tok_ = false;
 };
 
 }  // namespace aff

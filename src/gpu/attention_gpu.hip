@@ -304,27 +304,33 @@ __device__ __forceinline__ void attend_body(
       uint32_t rs = raw0 + j; if (rs >= ring) rs -= ring;
       const KvRow<DT> k = (j < n_raw) ? KvRow<DT>(raw, rs, stride, width, nope)
                                       : KvRow<DT>(comp, j - n_raw, stride, width, nope);
-      if (DT == 4 && s_q && (width % 128u) == 0u && k.is_aligned4()) {
-        const float ksc = k.row_scale();
-        const uint32_t v_iters = per_lane >> 2;
-        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(k.p);
-        uint32_t kv_pk[kQPerLane / 4u];
-        for (uint32_t t = 0; t < v_iters; ++t) kv_pk[t] = p32[t * kWave + lane];
-        for (uint32_t h = 0; h < nh; ++h) {
-          const float4* q4 = reinterpret_cast<const float4*>(s_q + (size_t)h * width);
-          float d = 0.0f;
-          for (uint32_t t = 0; t < v_iters; ++t) {
-            const uint32_t u = kv_pk[t];
-            const float4 qv = q4[t * kWave + lane];
-            d = fmaf(qv.x, e4m3_decode(static_cast<uint8_t>(u)), d);
-            d = fmaf(qv.y, e4m3_decode(static_cast<uint8_t>(u >> 8)), d);
-            d = fmaf(qv.z, e4m3_decode(static_cast<uint8_t>(u >> 16)), d);
-            d = fmaf(qv.w, e4m3_decode(static_cast<uint8_t>(u >> 24)), d);
+      if constexpr (DT == 4) {
+        if (s_q && (width % 128u) == 0u && k.is_aligned4()) {
+          const float ksc = k.row_scale();
+          const uint32_t v_iters = per_lane >> 2;
+          const uint32_t* p32 = reinterpret_cast<const uint32_t*>(k.p);
+          uint32_t kv_pk[kQPerLane / 4u];
+          for (uint32_t t = 0; t < v_iters; ++t) kv_pk[t] = p32[t * kWave + lane];
+          for (uint32_t h = 0; h < nh; ++h) {
+            const float4* q4 = reinterpret_cast<const float4*>(s_q + (size_t)h * width);
+            float d = 0.0f;
+            for (uint32_t t = 0; t < v_iters; ++t) {
+              const uint32_t u = kv_pk[t];
+              const float4 qv = q4[t * kWave + lane];
+              const aff_f32x2 k01 = e4m3_decode_pk<false>(u);
+              const aff_f32x2 k23 = e4m3_decode_pk<true>(u);
+              d = fmaf(qv.x, k01.x, d);
+              d = fmaf(qv.y, k01.y, d);
+              d = fmaf(qv.z, k23.x, d);
+              d = fmaf(qv.w, k23.y, d);
+            }
+            d = wave_reduce_add_dpp(d);
+            if (lane == 0) s_score[(size_t)h * n_keys + j] = d * (ksc * scale);
           }
-          d = wave_reduce_add_dpp(d);
-          if (lane == 0) s_score[(size_t)h * n_keys + j] = d * (ksc * scale);
+          continue;
         }
-      } else {
+      }
+      {
         float kv[kQPerLane];
         for (uint32_t t = 0; t < per_lane; ++t) kv[t] = k[lane + t * kWave];
         for (uint32_t h = 0; h < nh; ++h) {
@@ -841,7 +847,17 @@ void mqa_attend_batch_hip(KvDtype dt, const void* q, const void* raw, const void
   const uint32_t last_avail = (last >= raw_floor) ? (last - raw_floor + 1u) : 0u;
   const uint32_t n_raw_max = flat_n ? flat_n : ((last_avail < sliding) ? last_avail : sliding);
   // Batched: n tokens already give the grid its width, so spend head-grouping on K/V reuse.
-  const uint32_t nhb = kHeadsPerBlk;
+  // For narrow flat_n (DSpark draft_attend, n=5), smaller nhb boosts CU occupancy on 64-CU GPUs.
+  const uint32_t draft_nhb = []() -> uint32_t {
+    const char* v = std::getenv("AFF_DRAFT_ATTN_NHB");
+    if (!v || !*v) return 2u;
+    const uint32_t val = (uint32_t)std::strtoul(v, nullptr, 10);
+    if (val == 1u || val == 2u || val == 4u || val == 8u) return val;
+    return 2u;
+  }();
+  const uint32_t nhb =
+      (flat_n != 0u && n <= 8u && n_head >= 16u) ? std::min<uint32_t>(draft_nhb, kHeadsPerBlk)
+                                                 : kHeadsPerBlk;
   const size_t n_keys_max = (size_t)n_raw_max + n_comp_max;
   const size_t base_lds = ((((size_t)nhb * n_keys_max + nhb) + 3u) & ~size_t(3)) * sizeof(float);
   const size_t q_lds = (size_t)nhb * width * sizeof(float);

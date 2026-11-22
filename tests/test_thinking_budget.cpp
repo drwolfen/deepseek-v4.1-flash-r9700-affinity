@@ -461,6 +461,95 @@ void test_full_vocab_freeze_short_loop_low_novelty_and_clean_trace() {
   std::printf("PASS: test_full_vocab_freeze_short_loop_low_novelty_and_clean_trace\n");
 }
 
+// Scenario 7: Short mantra permutations (20-tok Let me execute/call/do/write/go) trigger
+// short_loop (span=16, repeats=3) or short_low_novelty (window=128, min_tokens=160, min_ratio=0.20),
+// while normal diverse reasoning over 2400 tokens stays clean.
+void test_short_mantra_loop_and_short_novelty() {
+  // 1) Exact 16-token span repeated 3x triggers short_loop.
+  {
+    BudgetHook h = make_hook(reply_reserve_within(4096, 16384), /*loop_repeats=*/3, /*freeze_enabled=*/true);
+    h.freeze_distinct_max = 56;
+    h.short_loop_span = 16;
+    h.short_loop_repeats = 3;
+    h.short_loop_window = 1024;
+    h.short_novelty_window = 128;
+    h.short_novelty_min_tokens = 160;
+    h.short_novelty_min_ratio = 0.20f;
+
+    ThinkingBudget b(&h, 16384);
+    for (int i = 0; i < 40; ++i) REQUIRE(!b.apply(1000 + i).cut);
+    bool fired = false;
+    for (int rep = 0; rep < 3 && !fired; ++rep) {
+      for (int j = 0; j < 16; ++j) {
+        if (b.apply(25000 + j).cut) { fired = true; break; }
+      }
+    }
+    REQUIRE(fired);
+    REQUIRE(b.short_loop_triggered());
+    REQUIRE(std::strcmp(b.close_reason(), "short_loop") == 0);
+  }
+
+  // 2) Varying 20-token mantra permutations (~8-12 tokens, low bigram novelty) triggers short_low_novelty around ~160 tokens.
+  {
+    BudgetHook h = make_hook(reply_reserve_within(4096, 16384), /*loop_repeats=*/3, /*freeze_enabled=*/true);
+    h.freeze_distinct_max = 56;
+    h.short_loop_span = 16;
+    h.short_loop_repeats = 3;
+    h.short_loop_window = 1024;
+    h.short_novelty_window = 128;
+    h.short_novelty_min_tokens = 160;
+    h.short_novelty_min_ratio = 0.20f;
+
+    const int32_t verbs[5] = {8001, 8002, 8003, 8004, 8005}; // execute, call, do, write, go
+    ThinkingBudget b(&h, 16384);
+    for (int i = 0; i < 32; ++i) REQUIRE(!b.apply(12000 + i).cut);
+    bool fired = false;
+    int step = 0;
+    while (!fired && step < 260) {
+      const int j = step / 4;
+      const int v = verbs[(j * 3 + (j / 5) + (j / 7) * 2 + (j * j) / 11) % 5];
+      const int32_t phrase[4] = {9001, 9002, v, 9003}; // "\n\nLet me <verb>."
+      for (int k = 0; k < 4; ++k) {
+        if (b.apply(phrase[k]).cut) { fired = true; break; }
+        ++step;
+      }
+    }
+    REQUIRE(fired);
+    REQUIRE(b.short_novelty_triggered());
+    REQUIRE(b.thought_tokens() >= 160 && b.thought_tokens() < 240);
+    REQUIRE(std::strcmp(b.close_reason(), "short_low_novelty") == 0);
+  }
+
+  // 3) Diverse reasoning over 2400 tokens triggers ZERO false positives.
+  {
+    std::vector<int32_t> sorted_nl = {201, 271, 990};
+    BudgetHook h = make_hook(reply_reserve_within(4096, 16384), /*loop_repeats=*/3, /*freeze_enabled=*/true);
+    h.freeze_distinct_max = 56;
+    h.freeze_nl_sorted = &sorted_nl;
+    h.short_loop_span = 16;
+    h.short_loop_repeats = 3;
+    h.short_loop_window = 1024;
+    h.novelty_window = 512;
+    h.novelty_min_tokens = 1024;
+    h.novelty_min_ratio = 0.28f;
+    h.short_novelty_window = 128;
+    h.short_novelty_min_tokens = 160;
+    h.short_novelty_min_ratio = 0.20f;
+
+    ThinkingBudget b(&h, 16384);
+    for (int t = 0; t < 2400; ++t) {
+      const int32_t tok = (t % 20 == 19) ? 201 : (20000 + ((t * 131 + (t / 7) * 17) % 600));
+      auto d = b.apply(tok);
+      REQUIRE(!d.cut);
+      REQUIRE(!b.force_closed());
+    }
+    REQUIRE(!b.apply(128822).cut);
+    REQUIRE(b.naturally_closed());
+  }
+
+  std::printf("PASS: test_short_mantra_loop_and_short_novelty\n");
+}
+
 }  // namespace
 
 int main() {
@@ -470,6 +559,7 @@ int main() {
   test_executive_freeze_breaker();
   test_suppress_final_think_and_prefix_invariance();
   test_full_vocab_freeze_short_loop_low_novelty_and_clean_trace();
+  test_short_mantra_loop_and_short_novelty();
   std::printf("ALL thinking_budget tests passed\n");
   return 0;
 }

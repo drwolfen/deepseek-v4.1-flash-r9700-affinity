@@ -184,10 +184,11 @@ const char* bind_layer_common(const Binder& b, const ModelConfig& cfg, const Mod
   // dtype mismatch rather than reinterpreting one — correctly. Convert instead of refusing: the
   // rounding here is bit-for-bit what the quantiser now does at write time, so an old container
   // and a new one differ ONLY in the expert format, which is what an A/B between them is for.
-  if (const AffTensorEntry* rg = r.find_tensor(p + "ffn_gate_inp");
-      rg && rg->desc.quant == AFF_F32) {
+  const AffTensorEntry* rg = r.find_tensor(p + "ffn_gate_inp");
+  const uint32_t ne = (rg && rg->desc.rows) ? (uint32_t)rg->desc.rows : cfg.n_expert;
+  if (rg && rg->desc.quant == AFF_F32) {
     const float* src = reinterpret_cast<const float*>(r.tensor_data(*rg));
-    const size_t n = (size_t)cfg.n_expert * cfg.n_embd;
+    const size_t n = (size_t)ne * cfg.n_embd;
     router_bf16->emplace_back(n);
     uint16_t* dst = router_bf16->back().data();
     for (size_t i = 0; i < n; ++i) dst[i] = float_to_bf16(src[i]);
@@ -248,7 +249,7 @@ const char* bind_layer_common(const Binder& b, const ModelConfig& cfg, const Mod
   // layers too: they do not RANK by the logits, but they still weight by them, and doing that on
   // the host was the largest stall in the prefill.
   if (dops.reg_router)
-    w.router_gpu = dops.reg_router(dops.ctx, w.router_w, w.router_b, cfg.n_expert, cfg.n_embd);
+    w.router_gpu = dops.reg_router(dops.ctx, w.router_w, w.router_b, ne, cfg.n_embd);
   return nullptr;
 }
 

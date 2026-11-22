@@ -2227,6 +2227,27 @@ int main(int argc, char** argv) {
     // caller gets by passing nothing, and is still what the benchmarks that need a fixed stream use.
     std::mt19937_64 rng(sc ? sc->seed : 0ull);
     std::uniform_real_distribution<double> uni(0.0, 1.0);
+    const bool repeat_penalty_dynamic = [] {
+      const char* s = std::getenv("AFF_REPEAT_PENALTY_DYNAMIC");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
+    auto refresh_penalty_ids = [&]() {
+      if (sc && sc->repeat_penalty != 1.0f && sc->repeat_last_n) {
+        const size_t take = std::min<size_t>(hist.size(), sc->repeat_last_n);
+        vb.penalty_ids.assign(hist.end() - (std::ptrdiff_t)take, hist.end());
+        auto is_penalty_exempt = [&](uint32_t id) {
+          if (tok.eos() >= 0 && id == (uint32_t)tok.eos()) return true;
+          for (int32_t mid : think_marker_ids)
+            if (mid >= 0 && id == (uint32_t)mid) return true;
+          return std::binary_search(dry_exempt_ids.begin(), dry_exempt_ids.end(), id);
+        };
+        vb.penalty_ids.erase(
+            std::remove_if(vb.penalty_ids.begin(), vb.penalty_ids.end(), is_penalty_exempt),
+            vb.penalty_ids.end());
+      } else {
+        vb.penalty_ids.clear();
+      }
+    };
     if (sc) {
       vb.sample = true;
       vb.temperature = sc->temperature;
@@ -2238,21 +2259,7 @@ int main(int argc, char** argv) {
       // with the seed token `next` — hist is appended to only after a block is accepted. It
       // therefore penalises what the model has already said, never a proposal it has not committed
       // to, which is the same set a host sampler would see (`sampler.cpp` reads `history`).
-      if (sc->repeat_penalty != 1.0f && sc->repeat_last_n) {
-        const size_t take = std::min<size_t>(hist.size(), sc->repeat_last_n);
-        vb.penalty_ids.assign(hist.end() - (std::ptrdiff_t)take, hist.end());
-        auto is_penalty_exempt = [&](uint32_t id) {
-          if (tok.eos() >= 0 && id == (uint32_t)tok.eos()) return true;
-          for (int32_t mid : think_marker_ids)
-            if (mid >= 0 && id == (uint32_t)mid) return true;
-          return false;
-        };
-        vb.penalty_ids.erase(
-            std::remove_if(vb.penalty_ids.begin(), vb.penalty_ids.end(), is_penalty_exempt),
-            vb.penalty_ids.end());
-      } else {
-        vb.penalty_ids.clear();
-      }
+      refresh_penalty_ids();
       // DRY is computed per block, below: the suffix n-gram moves with every accepted token.
       vb.dry_delta = sc->dry_delta;
     }
@@ -2315,8 +2322,10 @@ int main(int argc, char** argv) {
           }
           return false;
         };
+        const bool in_think = budget && !budget->settled();
         for (const auto& c : cont) {
-          const size_t req_c = (dry_gen_only && in_prompt(c.first)) ? (need * 2) : need;
+          const size_t req_c =
+              (dry_gen_only && !in_think && in_prompt(c.first)) ? (need * 2) : need;
           if (c.second >= req_c) out.push_back(c.first);
         }
       }
@@ -2423,6 +2432,9 @@ int main(int argc, char** argv) {
       cost_ema[q] = cost_ema[7] + 12.0f * (float)(q - 7);
     }
     uint32_t cost_samples[kMaxQ] = {};
+    uint32_t cost_last_step[kMaxQ] = {};
+    const char* cr_env = std::getenv("AFF_ADAPTIVE_COST_RESCALE");
+    const bool adaptive_cost_rescale_on = !(cr_env && *cr_env && std::strcmp(cr_env, "0") == 0);
     const size_t ema_bucket_idx = st.pos < 32768u ? 0u : (st.pos < 131072u ? 1u : 2u);
     if (persist_spec_ema && adaptive_width_on) {
       SpecEmaBucket& b = spec_ema_buckets[ema_bucket_idx];
@@ -2457,7 +2469,10 @@ int main(int argc, char** argv) {
     std::vector<double> accept_u;
     accept_u.reserve(aff::kSpecTok);
     while (generated < max_new && !stop) {
-      if (sc) dry_ids_for(vb.dry_ids);
+      if (sc) {
+        if (repeat_penalty_dynamic) refresh_penalty_ids();
+        dry_ids_for(vb.dry_ids);
+      }
       // ONE BLOCK is one step. Taken here and dropped right after `rollback`, which is the last
       // thing in the iteration that touches the device: everything below it is host bookkeeping and
       // the emit callback, and emit writes to a socket.
@@ -2753,12 +2768,38 @@ int main(int argc, char** argv) {
         // Under greedy decoding (temp=0 / !sc), avoid wall-clock timing jitter altering verify width decisions (PR #967).
         // Also isolate from SuffixDecoding steps, which skip dspark_draft overhead.
         if (sc && !used_suffix && q_off < kMaxQ && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
-          const float clamped_ms = (cost_ema[q_off] > 0.0f)
-              ? std::min((float)step_ms, cost_ema[q_off] * 1.25f)
+          const float old_c = cost_ema[q_off];
+          const float clamped_ms = (old_c > 0.0f)
+              ? std::min((float)step_ms, old_c * 1.25f)
               : (float)step_ms;
-          cost_ema[q_off] = (cost_ema[q_off] > 0.0f)
-              ? (0.85f * cost_ema[q_off] + 0.15f * clamped_ms)
+          const float new_c = (old_c > 0.0f)
+              ? (0.85f * old_c + 0.15f * clamped_ms)
               : clamped_ms;
+          cost_ema[q_off] = new_c;
+          cost_last_step[q_off] = my_blocks;
+          if (adaptive_cost_rescale_on && old_c > 1.0f && new_c > 1.0f) {
+            const float ratio = std::clamp(new_c / old_c, 0.85f, 1.15f);
+            auto is_stale_q = [&](uint32_t qi) {
+              return cost_samples[qi] <= 2u || my_blocks >= cost_last_step[qi] + 8u;
+            };
+            for (uint32_t qi = 1u; qi < kMaxQ; ++qi) {
+              if (qi == q_off || cost_ema[qi] <= 0.0f) continue;
+              if (cost_samples[qi] <= 2u) {
+                cost_ema[qi] *= ratio;
+              } else if (my_blocks >= cost_last_step[qi] + 8u) {
+                cost_ema[qi] *= (1.0f + 0.5f * (ratio - 1.0f));
+              }
+            }
+            for (uint32_t qi = q_off; qi > 1u; ) {
+              --qi;
+              if (is_stale_q(qi) && cost_ema[qi] > cost_ema[qi + 1u] * 0.99f)
+                cost_ema[qi] = cost_ema[qi + 1u] * 0.99f;
+            }
+            for (uint32_t qi = q_off + 1u; qi < kMaxQ; ++qi) {
+              if (is_stale_q(qi) && cost_ema[qi] < cost_ema[qi - 1u] * 1.01f)
+                cost_ema[qi] = cost_ema[qi - 1u] * 1.01f;
+            }
+          }
         }
         if (nd > 0 && !used_suffix) {
           last_clean_accept = (k == nd);
@@ -3975,12 +4016,18 @@ int main(int argc, char** argv) {
       budget_hook.freeze_nl_thresh = 64;
       budget_hook.freeze_distinct_max = std::max(1, env_int("AFF_THINK_FREEZE_DISTINCT", 56));
       budget_hook.freeze_nl_sorted = &think_nl_ids;
-      budget_hook.short_loop_span = std::max(0, env_int("AFF_THINK_SHORT_LOOP_SPAN", 24));
-      budget_hook.short_loop_repeats = std::max(0, env_int("AFF_THINK_SHORT_LOOP_REPEATS", 4));
+      budget_hook.short_loop_span = std::max(0, env_int("AFF_THINK_SHORT_LOOP_SPAN", 16));
+      budget_hook.short_loop_repeats = std::max(0, env_int("AFF_THINK_SHORT_LOOP_REPEATS", 3));
       budget_hook.short_loop_window = std::max(1, env_int("AFF_THINK_SHORT_LOOP_WINDOW", 1024));
       budget_hook.novelty_window = std::max(0, env_int("AFF_THINK_NOVELTY_WINDOW", 512));
       budget_hook.novelty_min_ratio = std::clamp(env_float("AFF_THINK_NOVELTY_MIN", 0.28f), 0.0f, 1.0f);
       budget_hook.novelty_min_tokens = std::max(0, env_int("AFF_THINK_NOVELTY_MIN_TOKENS", 1024));
+      budget_hook.short_novelty_window =
+          std::max(0, env_int("AFF_THINK_SHORT_NOVELTY_WINDOW", 128));
+      budget_hook.short_novelty_min_tokens =
+          std::max(0, env_int("AFF_THINK_SHORT_NOVELTY_MIN_TOKENS", 160));
+      budget_hook.short_novelty_min_ratio =
+          std::clamp(env_float("AFF_THINK_SHORT_NOVELTY_MIN", 0.20f), 0.0f, 1.0f);
       budget = ThinkingBudget(&budget_hook, (int)total_budget);
       budget_ptr = &budget;
     }

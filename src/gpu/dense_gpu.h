@@ -599,6 +599,7 @@ private:
   int32_t  pending_pf0_ = -1;
   int32_t  pending_pf1_ = -1;
   size_t   n_vec_ = 0, n_router_ = 0;
+  uint32_t r_max_expert_ = 0;
   void     batch_shexp_join(size_t r);
   DenseGpuStats st_;
 

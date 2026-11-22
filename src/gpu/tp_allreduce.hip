@@ -1721,6 +1721,14 @@ static inline bool tp_ar_coded_enabled() {
   return v && *v && std::strcmp(v, "0") != 0;
 }
 
+static inline int tp_ar_fixed_blk_cfg() {
+  const char* v = std::getenv("AFF_AR_FIXED_BLK");
+  if (!v || !*v) return 32;
+  const int b = std::atoi(v);
+  if (b <= 0) return 0;
+  return b > kTpMaxBlocks ? kTpMaxBlocks : b;
+}
+
 static inline size_t tp_ar_prefetch_max_bytes() {
   const char* v = std::getenv("AFF_PREFETCH_MB");
   if (!v || !*v) return (size_t)8u << 20;
@@ -2063,8 +2071,11 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
       has_control && nb == 16u;
   const bool reg_form_env = tp_ar_reg_form_enabled();
   const int max_ar_blk = has_pre_collapse ? kTpHcnMaxBlocks : kTpMaxBlocks;
+  const int fixed_blk = tp_ar_fixed_blk_cfg();
   int ar_blk;
-  if (reg_form_env && live <= 16u) {
+  if (fixed_blk > 0 && reg_form_env && nb <= 16u && live <= 16u) {
+    ar_blk = std::max(1, std::min(max_ar_blk, fixed_blk));
+  } else if (reg_form_env && live <= 16u) {
     ar_blk = std::max(1, std::min(max_ar_blk,
                                   (int)((live_elems + 256u * 8u - 1u) / (256u * 8u))));
   } else {
