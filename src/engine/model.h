@@ -523,6 +523,8 @@ public:
     // upload stays on device: the state this writes lives there.
     bool (*engram)(void* ctx, int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t in_dim,
                    uint32_t n_embd, uint32_t n_hc, float eps) = nullptr;
+    bool (*engram_mxfp8)(void* ctx, int32_t h_wkv, int32_t qk_vec, const uint8_t* raw_rows,
+                         uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps) = nullptr;
     // Tells attn_q to keep qr_norm in VRAM for indexer_one rather than copying it to the host.
     void (*want_qrn_dev)(void* ctx, bool v) = nullptr;
     bool (*attend)(void* ctx, uint32_t layer, const float* q, const uint8_t* allowed,
@@ -648,6 +650,9 @@ public:
     // token — a quarter of a second of weight traffic a layer a chunk at 1,408 tokens.
     bool (*engram)(void* ctx, int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t n,
                    uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps) = nullptr;
+    bool (*engram_mxfp8)(void* ctx, int32_t h_wkv, int32_t qk_vec, const uint8_t* raw_rows,
+                         uint32_t n, uint32_t in_dim, uint32_t n_embd, uint32_t n_hc,
+                         float eps) = nullptr;
     bool (*attn_out)(void* ctx, int32_t woa, int32_t wob, uint32_t n_head, uint32_t width,
                      uint32_t n_rot, RopeDerived rope, uint32_t n_groups, uint64_t rank,
                      uint64_t hidden) = nullptr;
@@ -1100,6 +1105,7 @@ private:
   std::vector<int32_t> eng_slot_;        // layer -> its column band in the hash, -1 where none
   mutable std::vector<int64_t> eng_ids_;   // [n][n_layer][n_cols], this call's hash ids
   mutable std::vector<float>  eng_rows_;   // [n][n_cols*head_dim], the dequantised lookup
+  mutable std::vector<uint8_t> eng_raw_;   // [n][raw_mxfp8_stride()], raw MXFP8 lookup
   DenseW hc_head_fn_;
   const float* hc_head_base_ = nullptr;
   const float* hc_head_scale_ = nullptr;

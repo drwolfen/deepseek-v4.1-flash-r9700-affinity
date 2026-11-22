@@ -336,6 +336,8 @@ private:
     // `data` is in WMMA fragment order, not row-major. Only the W8A8 GEMM can read it; every other
     // reader is a wrong answer that still decodes fluently, so they abort instead.
     bool     ps = false;
+    void*    fp8_data = nullptr;    // device, group-128 E4M3 copy for `output` head
+    uint16_t* fp8_scales = nullptr; // device, [nrows][ncols/128] bf16 scales for `output` head
     uint8_t* w4_data = nullptr;     // device, group-128 int4 copy for `output` head
     uint16_t* w4_scales = nullptr;  // device, [nrows][ncols/128] bf16 scales for `output` head
     uint8_t*  b12_sm = nullptr;     // device, bf16x12 sign+mantissa for `output` head
@@ -649,6 +651,11 @@ private:
   // the prefill hidden state (bf16, a whole chunk) over the decode one (f32, one token).
   bool     engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t n, uint32_t in_dim,
                   uint32_t n_embd, uint32_t n_hc, float eps, bool batched);
+  bool     engram_mxfp8(int32_t h_wkv, int32_t qk_vec, const uint8_t* raw_rows, uint32_t n,
+                        uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps, bool batched);
+  bool     engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool raw_mxfp8,
+                       uint32_t n, uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps,
+                       bool batched);
   bool     engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t out_dim);
   bool     indexer_one(const Model::IndexArgs& a);
   // Tells attn_q to keep qr_norm in VRAM for indexer_one instead of copying it to the host.

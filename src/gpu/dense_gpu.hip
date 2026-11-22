@@ -502,6 +502,7 @@ struct DenseGpu::Impl {
     float* hi_q = nullptr;  float* hi_w = nullptr;    float* hi_k = nullptr;   // pinned staging
     uint32_t* i_nc = nullptr;  uint32_t* hi_nc = nullptr;   // per-token key counts
     uint32_t i_cap_tok = 0, i_cap_key = 0;
+    size_t i_q8_bytes = 0;
     // The router's top-k, rank 0 only. sel/wt/nsel come back; bias and the residency mask go out.
     uint32_t* b_rsel = nullptr;  float* b_rwt = nullptr;  uint32_t* b_rn = nullptr;
     float* b_rbias = nullptr;                    // [n_router][n_expert], one slice a layer
@@ -583,6 +584,31 @@ inline bool lmhead_bf16x12_enabled() {
   return !(v && *v && std::strcmp(v, "0") == 0);
 }
 
+inline bool lmhead_fp8_enabled() {
+  const char* v = std::getenv("AFF_LMHEAD_FP8");
+  return v && *v && std::strcmp(v, "0") != 0;
+}
+
+inline bool idx_wqb_fp8_enabled() {
+  const char* v = std::getenv("AFF_IDX_WQB_FP8");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool o_fp8_qdq_enabled() {
+  const char* v = std::getenv("AFF_O_FP8_QDQ");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool attn_out_a_fp8_enabled() {
+  const char* v = std::getenv("AFF_ATTN_OUT_A_FP8");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool mtp_proj_fp8_enabled() {
+  const char* v = std::getenv("AFF_MTP_PROJ_FP8");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
 inline bool prefetch_beside_enabled() {
   const char* v = std::getenv("AFF_PREFETCH_BESIDE");
   return v && *v && std::strcmp(v, "0") != 0;
@@ -599,6 +625,8 @@ template <typename ShardT>
 inline void free_shard_bufs(ShardT& sh) {
   if (sh.data)        { (void)hipFree(sh.data);        sh.data = nullptr; }
   if (sh.scales)      { (void)hipFree(sh.scales);      sh.scales = nullptr; }
+  if (sh.fp8_data)    { (void)hipFree(sh.fp8_data);    sh.fp8_data = nullptr; }
+  if (sh.fp8_scales)  { (void)hipFree(sh.fp8_scales);  sh.fp8_scales = nullptr; }
   if (sh.w4_data)     { (void)hipFree(sh.w4_data);     sh.w4_data = nullptr; }
   if (sh.w4_scales)   { (void)hipFree(sh.w4_scales);   sh.w4_scales = nullptr; }
   if (sh.b12_sm)      { (void)hipFree(sh.b12_sm);      sh.b12_sm = nullptr; }
@@ -844,6 +872,11 @@ Model::DenseOps DenseGpu::ops() {
                 uint32_t nh, float eps) {
     return static_cast<DenseGpu*>(c)->engram(w, qk, r, 1u, in, ne, nh, eps, /*batched=*/false);
   };
+  o.engram_mxfp8 = [](void* c, int32_t w, int32_t qk, const uint8_t* r, uint32_t in, uint32_t ne,
+                      uint32_t nh, float eps) {
+    return static_cast<DenseGpu*>(c)->engram_mxfp8(w, qk, r, 1u, in, ne, nh, eps,
+                                                   /*batched=*/false);
+  };
   o.set_shift_pre = [](void* c, bool v) { static_cast<DenseGpu*>(c)->set_shift_pre(v); };
   o.set_no_qrms = [](void* c, bool v) { static_cast<DenseGpu*>(c)->set_no_qrms(v); };
   o.indexer_one = [](void* c, const Model::IndexArgs& a) {
@@ -913,11 +946,14 @@ bool DenseGpu::shexp_collect_cb(void* ctx, float* out, uint64_t hidden) {
 //
 // Everything that reads these bytes as rows aborts rather than proceeding; see `shard_rows`.
 inline bool engram_fp8_enabled() {
-  static const bool on = [] {
-    const char* s = std::getenv("AFF_ENGRAM_FP8");
-    return !s || !*s || std::strcmp(s, "0") != 0;
-  }();
-  return on;
+  const char* s = std::getenv("AFF_ENGRAM_FP8");
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
+
+inline bool engram_raw_h2d_enabled() {
+  if (!engram_fp8_enabled()) return false;
+  const char* s = std::getenv("AFF_ENGRAM_RAW_H2D");
+  return !s || !*s || std::strcmp(s, "0") != 0;
 }
 
 bool DenseGpu::ps_for(const char* name) {
@@ -930,6 +966,9 @@ bool DenseGpu::ps_for(const char* name) {
   // block — against putting draft_kv on W8A8, which moves the emitted text. See draft_kv.
   if (!std::strcmp(s, "attn_kv") && !std::strncmp(name, "mtp.", 4)) return false;
   if (!std::strcmp(s, "engram_wkv")) return engram_fp8_enabled();
+  if (!std::strcmp(s, "idx_wq_b")) return idx_wqb_fp8_enabled();
+  if (!std::strcmp(s, "attn_out_a")) return o_fp8_qdq_enabled() && attn_out_a_fp8_enabled();
+  if (!std::strcmp(s, "mtp_main_proj")) return mtp_proj_fp8_enabled();
   for (const char* w : {"attn_q_a", "attn_q_b", "attn_kv", "attn_out_b", "shexp_gate", "shexp_up",
                         "shexp_down"})
     if (!std::strcmp(s, w)) return true;
@@ -1033,6 +1072,7 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
   const char* d_int4 = std::getenv("AFF_DRAFT_HEAD_INT4");
   const bool lmhead_int4_only = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
   const bool want_w4_head = (d_int4 && *d_int4 && std::strcmp(d_int4, "0") != 0) || lmhead_int4_only;
+  const bool lmhead_fp8 = lmhead_fp8_enabled();
   const bool lmhead_bf16x12 = lmhead_bf16x12_enabled();
 
   uint64_t placed = 0;
@@ -1063,8 +1103,12 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
     const bool is_output = name && !std::strcmp(name, "output") && quant == AFF_BF16 &&
                            (s.ncols % 256) == 0;
     const bool is_w4_chunked_output = want_w4_head && lmhead_int4_only && is_output;
-    const bool is_b12_output = lmhead_bf16x12 && !lmhead_int4_only && is_output &&
+    const bool is_fp8_output = lmhead_fp8 && !lmhead_int4_only && is_output && (s.ncols % 128) == 0;
+    const bool is_b12_output = lmhead_bf16x12 && !lmhead_int4_only && !is_fp8_output && is_output &&
                                s.ncols <= 65536;
+    if (d == 0 && is_fp8_output && lmhead_bf16x12 && s.ncols <= 65536) {
+      aff::ui::err("dense-gpu: AFF_LMHEAD_FP8=1 supersedes AFF_LMHEAD_BF16X12 on %s\n", name);
+    }
     bool freed_bf16 = false;
 
     size_t freeb = 0, totalb = 0;
@@ -1139,6 +1183,55 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
       aff::ui::err("dense-gpu: packed %s shard %zu to bf16x12 (%.1f MiB vs %.1f MiB bf16, esc=%u%s)\n",
                    name, d, b12_bytes / 1048576.0, nbytes / 1048576.0, s.b12_n_esc,
                    want_w4_head ? " + int4_g128" : "");
+    } else if (is_fp8_output) {
+      const uint64_t fp8_bytes = s.nrows * s.ncols;
+      const uint64_t fp8s_bytes = s.nrows * (s.ncols / 128) * sizeof(uint16_t);
+      const uint64_t w4_bytes = want_w4_head ? s.nrows * (s.ncols / 2) : 0ull;
+      const uint64_t w4s_bytes = want_w4_head ? s.nrows * (s.ncols / 128) * sizeof(uint16_t) : 0ull;
+      constexpr uint64_t kChunkRows = 1024;
+      const uint64_t chunk_bytes = std::min<uint64_t>(kChunkRows, s.nrows) * s.ncols * elem;
+      const uint64_t need_bytes = fp8_bytes + fp8s_bytes + w4_bytes + w4s_bytes + chunk_bytes;
+      if (freeb < need_bytes + kAllocHeadroom) {
+        aff::ui::err("dense-gpu: %s shard %zu fp8_g128 (%.1f MiB) does not fit, tensor stays on CPU\n",
+                     name, d, (fp8_bytes + fp8s_bytes + w4_bytes + w4s_bytes) / 1048576.0);
+        ++st_.cpu_fallbacks;
+        rollback_shards(d);
+        return -1;
+      }
+      uint16_t* d_chunk = nullptr;
+      const bool ok_alloc =
+          hipMalloc(&s.fp8_data, fp8_bytes) == hipSuccess &&
+          hipMalloc((void**)&s.fp8_scales, fp8s_bytes) == hipSuccess &&
+          (!want_w4_head || (hipMalloc((void**)&s.w4_data, w4_bytes) == hipSuccess &&
+                             hipMalloc((void**)&s.w4_scales, w4s_bytes) == hipSuccess)) &&
+          hipMalloc((void**)&d_chunk, chunk_bytes) == hipSuccess;
+      if (!ok_alloc) {
+        if (d_chunk) (void)hipFree(d_chunk);
+        rollback_shards(d);
+        return -1;
+      }
+      for (uint64_t r = 0; r < s.nrows; r += kChunkRows) {
+        const uint64_t cur_r = std::min<uint64_t>(kChunkRows, s.nrows - r);
+        AFF_HIP_CHECK(hipMemcpy(d_chunk, (const uint8_t*)host + (s.row0 + r) * cols * elem,
+                                cur_r * s.ncols * elem, hipMemcpyHostToDevice));
+        quantize_bf16_to_fp8_g128_hip(d_chunk, static_cast<uint8_t*>(s.fp8_data), s.fp8_scales,
+                                      (uint32_t)cur_r, (uint32_t)s.ncols, (uint32_t)r, nullptr);
+        if (want_w4_head) {
+          quantize_bf16_to_w4_g128_hip(d_chunk, s.w4_data + r * (s.ncols / 2),
+                                       s.w4_scales + r * (s.ncols / 128),
+                                       (uint32_t)cur_r, (uint32_t)s.ncols, nullptr);
+        }
+      }
+      AFF_HIP_CHECK(hipDeviceSynchronize());
+      AFF_HIP_CHECK(hipFree(d_chunk));
+      s.data = nullptr;
+      s.data_bytes = 0;
+      freed_bf16 = true;
+      const uint64_t fp8_tot = fp8_bytes + fp8s_bytes;
+      placed += fp8_tot + w4_bytes + w4s_bytes;
+      aff::ui::err("dense-gpu: chunked-quantised %s shard %zu to fp8_g128 (%.1f MiB vs %.1f MiB bf16%s)\n",
+                   name, d, fp8_tot / 1048576.0, nbytes / 1048576.0,
+                   want_w4_head ? " + int4_g128" : "");
     } else if (is_w4_chunked_output) {
       // Radiance 2ec647c: chunked staging trim (CH = 1024) avoids 1.3 GiB peak VRAM allocation
       const uint64_t w4_bytes = s.nrows * (s.ncols / 2);
@@ -1210,9 +1303,14 @@ int32_t DenseGpu::reg(const char* name, const void* host, const uint8_t* scales,
                                     sh_sc_cols, s.nrows / 128, hipMemcpyHostToDevice));
         }
       }
-      const bool eng_ok = std::strcmp(s_leaf, "engram_wkv") != 0 || (s.ncols % 128u) == 0u;
+      const bool ps_shape_ok =
+          (std::strcmp(s_leaf, "engram_wkv") != 0 || (s.ncols % 128u) == 0u) &&
+          (std::strcmp(s_leaf, "idx_wq_b") != 0 || (s.ncols % 128u) == 0u) &&
+          (std::strcmp(s_leaf, "attn_out_a") != 0 ||
+           ((s.nrows % 128u) == 0u && (s.ncols % 128u) == 0u)) &&
+          (std::strcmp(s_leaf, "mtp_main_proj") != 0 || (s.ncols % 128u) == 0u);
       if (ps_for(name) && quant == AFF_FP8_E4M3 && (s.nrows % 16) == 0 && (s.ncols % 16) == 0 &&
-          eng_ok) {
+          ps_shape_ok) {
         void* tmp = nullptr;
         if (hipMalloc(&tmp, nbytes) != hipSuccess) { rollback_shards(d); return -1; }
         AFF_HIP_CHECK(hipMemcpy(tmp, s.data, nbytes, hipMemcpyDeviceToDevice));
@@ -1435,6 +1533,8 @@ bool DenseGpu::mv_multi(const int32_t* h, const uint64_t* rows, uint64_t cols, u
       if (!nr[d][i]) continue;
       const Entry& e = ent_[h[i]];
       const uint64_t local = r0[d][i] - e.sh[d].row0;
+      const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
+      const bool lmhead_int4 = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
       if (!e.sh[d].data && e.sh[d].b12_sm && (cols % 256) == 0) {
         if (!matvec_bf16x12_multix_hip(
                 e.sh[d].b12_sm + local * cols,
@@ -1444,6 +1544,13 @@ bool DenseGpu::mv_multi(const int32_t* h, const uint64_t* rows, uint64_t cols, u
                 e.sh[d].b12_esc_col, e.sh[d].b12_esc_val, xin, D.d_y + off,
                 (uint32_t)nr[d][i], (uint32_t)cols, 1u, (uint32_t)nr[d][i],
                 /*out_token_major=*/1, D.stream))
+          return false;
+      } else if (!lmhead_int4 && !e.sh[d].data && e.sh[d].fp8_data && e.sh[d].fp8_scales &&
+                 (cols % 256) == 0) {
+        if (!matvec_fp8_g128_multix_hip(static_cast<const uint8_t*>(e.sh[d].fp8_data) + local * cols,
+                                        e.sh[d].fp8_scales + local * (cols / 128), xin, D.d_y + off,
+                                        (uint32_t)nr[d][i], (uint32_t)cols, 1u, (uint32_t)nr[d][i],
+                                        /*out_token_major=*/1, D.stream))
           return false;
       } else if (!e.sh[d].data && e.sh[d].w4_data && e.sh[d].w4_scales && (cols % 256) == 0) {
         if (!matvec_w4_multix_hip(e.sh[d].w4_data + local * (cols / 2),
@@ -3683,26 +3790,43 @@ bool DenseGpu::attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_t widt
     // V carried the rotated tail, so the rotation has to be undone on the heads attention produced.
     // wo_a is the only thing that reads them again, so it undoes it on the way in rather than paying
     // a tiny launch of its own to do it in place first.
-    no_ps(A.sh[d].ps, "the grouped wo_a matvec");
-    static const bool o_qdq_on = [] {
-      const char* v = std::getenv("AFF_O_FP8_QDQ");
-      return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    if (o_qdq_on || !matvec_fp8_grouped_rope_hip(
-            (const uint8_t*)A.sh[d].data, A.sh[d].scales, D.a_out, ng, (uint32_t)group_dim,
-            (uint32_t)rank, width, n_rot, pos, rope.freq_scale, rope.theta_scale, rope.ext_factor,
-            rope.lo, rope.hi, D.d_g, D.stream)) {
-      const uint32_t pairs = n_rot / 2, thr = 256;
-      const uint32_t blk = (a_hpr_ * pairs + thr - 1) / thr;
-      hipLaunchKernelGGL(rope_tail_kernel, dim3(blk), dim3(thr), 0, D.stream, D.a_out, a_hpr_,
-                         width, n_rot, pos, rope.freq_scale, rope.theta_scale, rope.ext_factor,
-                         rope.lo, rope.hi, -1.0f);     // sine negated: this is the INVERSE
-      AFF_HIP_CHECK(hipGetLastError());
-      if (o_qdq_on && ((a_hpr_ * width) % 32u) == 0u) {
-        o_fp8_qdq_f32_hip(D.a_out, (a_hpr_ * width) / 32u, D.stream);
+    const bool o_qdq_on = o_fp8_qdq_enabled();
+    const bool do_qdq = o_qdq_on && ((a_hpr_ * width) % 32u) == 0u;
+    const size_t nq = (size_t)ng * group_dim;
+    const size_t aq_bytes = (size_t)a_hpr_ * width * sizeof(float);
+    const size_t sc_off = (nq + 255u) & ~size_t(255);
+    const size_t sc_bytes = nq / 32u;
+    if ((A.sh[d].ps || (attn_out_a_fp8_enabled() && do_qdq)) && do_qdq &&
+        A.quant == AFF_FP8_E4M3 && A.sh[d].scales != nullptr && (group_dim % 128u) == 0u &&
+        (rank % 16u) == 0u && nq == (size_t)a_hpr_ * width && D.a_q &&
+        aq_bytes >= sc_off + sc_bytes) {
+      uint8_t* const q8_tmp = reinterpret_cast<uint8_t*>(D.a_q);
+      uint8_t* const sc_tmp = q8_tmp + sc_off;
+      if (!batch_attn_out_prep_fp8_hip(D.a_out, q8_tmp, sc_tmp, ng, (uint32_t)group_dim, width,
+                                       n_rot, pos, rope, -1.0f, /*nb=*/1u, D.stream))
+        return false;
+      batch_gemm_fp8_grouped_b32_hip((const uint8_t*)A.sh[d].data,
+                                     (const uint8_t*)A.sh[d].scales, q8_tmp, sc_tmp, D.d_g, ng,
+                                     (uint32_t)rank, (uint32_t)group_dim, /*nb=*/1u, D.stream,
+                                     A.sh[d].ps);
+    } else {
+      no_ps(A.sh[d].ps, "the grouped wo_a matvec");
+      if (o_qdq_on || !matvec_fp8_grouped_rope_hip(
+              (const uint8_t*)A.sh[d].data, A.sh[d].scales, D.a_out, ng, (uint32_t)group_dim,
+              (uint32_t)rank, width, n_rot, pos, rope.freq_scale, rope.theta_scale, rope.ext_factor,
+              rope.lo, rope.hi, D.d_g, D.stream)) {
+        const uint32_t pairs = n_rot / 2, thr = 256;
+        const uint32_t blk = (a_hpr_ * pairs + thr - 1) / thr;
+        hipLaunchKernelGGL(rope_tail_kernel, dim3(blk), dim3(thr), 0, D.stream, D.a_out, a_hpr_,
+                           width, n_rot, pos, rope.freq_scale, rope.theta_scale, rope.ext_factor,
+                           rope.lo, rope.hi, -1.0f);     // sine negated: this is the INVERSE
+        AFF_HIP_CHECK(hipGetLastError());
+        if (do_qdq) {
+          o_fp8_qdq_f32_hip(D.a_out, (a_hpr_ * width) / 32u, D.stream);
+        }
+        matvec_fp8_grouped_hip((const uint8_t*)A.sh[d].data, A.sh[d].scales, D.a_out, ng,
+                               (uint32_t)group_dim, (uint32_t)rank, D.d_g, D.stream);
       }
-      matvec_fp8_grouped_hip((const uint8_t*)A.sh[d].data, A.sh[d].scales, D.a_out, ng,
-                             (uint32_t)group_dim, (uint32_t)rank, D.d_g, D.stream);
     }
     launch_mv({B.sh[d].data, B.sh[d].scales, B.quant, B.sh[d].ps}, D.d_g, (uint32_t)hidden,
               (uint32_t)B.sh[d].ncols, block_out ? D.d_p : D.d_block, D.stream);
@@ -3735,6 +3859,8 @@ void DenseGpu::mv(int32_t h, const float* x, uint64_t rows, uint64_t cols, float
   // — so it is written for correctness rather than for speed: reduce, then take rank 0's copy.
   if (e.split != Split::Row) {
     float* in[kMaxRanks]; float* out[kMaxRanks];
+    const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
+    const bool lmhead_int4 = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
     for (size_t d = 0; d < I.dev.size(); ++d) {
       const Shard& s = e.sh[d];
       AFF_HIP_CHECK(hipSetDevice(I.dev[d].id));
@@ -3744,6 +3870,10 @@ void DenseGpu::mv(int32_t h, const float* x, uint64_t rows, uint64_t cols, float
                                   s.b12_esc_col, s.b12_esc_val, I.dev[d].d_x, I.dev[d].d_y,
                                   (uint32_t)rows, (uint32_t)s.ncols, 1u, (uint32_t)rows,
                                   /*out_token_major=*/1, I.dev[d].stream);
+      else if (!lmhead_int4 && !s.data && s.fp8_data && s.fp8_scales && (s.ncols % 256) == 0)
+        matvec_fp8_g128_multix_hip(static_cast<const uint8_t*>(s.fp8_data), s.fp8_scales,
+                                   I.dev[d].d_x, I.dev[d].d_y, (uint32_t)rows, (uint32_t)s.ncols,
+                                   1u, (uint32_t)rows, /*out_token_major=*/1, I.dev[d].stream);
       else if (!s.data && s.w4_data && s.w4_scales && (s.ncols % 256) == 0)
         matvec_w4_multix_hip(s.w4_data, s.w4_scales, I.dev[d].d_x, I.dev[d].d_y, (uint32_t)rows,
                              (uint32_t)s.ncols, 1u, (uint32_t)rows, /*out_token_major=*/1,
@@ -3765,6 +3895,8 @@ void DenseGpu::mv(int32_t h, const float* x, uint64_t rows, uint64_t cols, float
 
   // Issue every rank before synchronising any of them, so the two cards overlap. Synchronising
   // inside the loop would serialise them and give back exactly the parallelism this is for.
+  const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
+  const bool lmhead_int4 = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
   for (size_t d = 0; d < I.dev.size(); ++d) {
     const Shard& s = e.sh[d];
     if (!s.nrows || s.row0 >= rows) continue;
@@ -3777,6 +3909,10 @@ void DenseGpu::mv(int32_t h, const float* x, uint64_t rows, uint64_t cols, float
                                 s.b12_esc_val, I.dev[d].d_x, I.dev[d].d_y, (uint32_t)n,
                                 (uint32_t)cols, 1u, (uint32_t)n, /*out_token_major=*/1,
                                 I.dev[d].stream);
+    else if (!lmhead_int4 && !s.data && s.fp8_data && s.fp8_scales && (cols % 256) == 0)
+      matvec_fp8_g128_multix_hip(static_cast<const uint8_t*>(s.fp8_data), s.fp8_scales,
+                                 I.dev[d].d_x, I.dev[d].d_y, (uint32_t)n, (uint32_t)cols, 1u,
+                                 (uint32_t)n, /*out_token_major=*/1, I.dev[d].stream);
     else if (!s.data && s.w4_data && s.w4_scales && (cols % 256) == 0)
       matvec_w4_multix_hip(s.w4_data, s.w4_scales, I.dev[d].d_x, I.dev[d].d_y, (uint32_t)n,
                            (uint32_t)cols, 1u, (uint32_t)n, /*out_token_major=*/1,
@@ -3830,7 +3966,23 @@ void DenseGpu::mvg(int32_t h, const float* x, uint32_t n_groups, uint64_t group_
     // The WHOLE input, staged once. Per-group staging would race: the host memcpy for group g+1 is
     // not ordered against group g's in-flight H2D out of the same buffer, and nothing on the stream
     // says otherwise. One buffer, distinct offsets, no ordering question.
-    no_ps(s.ps, "mvg");
+    const bool ps_fp8 = s.ps && e.quant == AFF_FP8_E4M3 && s.scales != nullptr &&
+                        (group_dim % 128u) == 0u && (rank % 128u) == 0u;
+    if (s.ps && !ps_fp8) no_ps(s.ps, "mvg");
+    uint8_t* eq8 = nullptr;
+    float* eqs = nullptr;
+    bool ps_tmp_alloc = false;
+    if (ps_fp8) {
+      const size_t qs_off = ((size_t)group_dim + 15u) & ~size_t(15);
+      const size_t need_bytes = qs_off + (size_t)(group_dim / 128u) * sizeof(float);
+      if (I.dev[d].d_a && I.dev[d].cap_mid * sizeof(float) >= need_bytes) {
+        eq8 = reinterpret_cast<uint8_t*>(I.dev[d].d_a);
+      } else {
+        if (hipMalloc(&eq8, need_bytes) != hipSuccess) return;
+        ps_tmp_alloc = true;
+      }
+      eqs = reinterpret_cast<float*>(eq8 + qs_off);
+    }
     float* const pin = I.dev[d].stg[kStgMvg].h;
     AFF_HIP_CHECK(hipEventSynchronize(I.dev[d].stg[kStgMvg].ev));
     std::memcpy(pin, x, (size_t)n_groups * group_dim * sizeof(float));
@@ -3839,17 +3991,27 @@ void DenseGpu::mvg(int32_t h, const float* x, uint32_t n_groups, uint64_t group_
       AFF_HIP_CHECK(hipMemcpyAsync(I.dev[d].d_x, pin + (uint64_t)g * group_dim,
                                    group_dim * sizeof(float), hipMemcpyHostToDevice,
                                    I.dev[d].stream));
-      if (e.quant == AFF_FP8_E4M3)
+      if (ps_fp8) {
+        batch_quant_tm_fp8_hip(I.dev[d].d_x, eq8, eqs, (uint32_t)group_dim, 1u, I.dev[d].stream);
+        batch_gemm_fp8_hip((const uint8_t*)s.data, s.scales, eq8, eqs, I.dev[d].d_y,
+                           (uint32_t)rank, (uint32_t)group_dim, 1u, 0u, (uint32_t)local,
+                           I.dev[d].stream, /*preshuffled=*/true);
+      } else if (e.quant == AFF_FP8_E4M3) {
         matvec_fp8_hip((const uint8_t*)s.data + local * group_dim,
                        s.scales + (local / 128) * sc_cols, I.dev[d].d_x,
                        (uint32_t)rank, (uint32_t)group_dim, I.dev[d].d_y, I.dev[d].stream);
-      else
+      } else {
         matvec_bf16_hip((const uint16_t*)s.data + local * group_dim, I.dev[d].d_x,
                         (uint32_t)rank, (uint32_t)group_dim, I.dev[d].d_y, I.dev[d].stream);
+      }
       AFF_HIP_CHECK(hipMemcpyAsync(I.dev[d].h_y + (uint64_t)g * rank, I.dev[d].d_y,
                                    rank * sizeof(float), hipMemcpyDeviceToHost, I.dev[d].stream));
     }
     AFF_HIP_CHECK(hipEventRecord(I.dev[d].stg[kStgMvg].ev, I.dev[d].stream));
+    if (ps_tmp_alloc) {
+      AFF_HIP_CHECK(hipStreamSynchronize(I.dev[d].stream));
+      (void)hipFree(eq8);
+    }
   }
   for (size_t d = 0; d < I.dev.size(); ++d) {
     const Shard& s = e.sh[d];
@@ -4797,8 +4959,10 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
                    (void**)&D.i_sc, (void**)&D.hi_w, (void**)&D.i_nc, (void**)&D.hi_nc,
                    (void**)&D.i_ncb, (void**)&D.hi_ncb})
     if (*p) { (void)hipFree(*p); *p = nullptr; }
+  D.i_q8_bytes = 0;
   if (hipMalloc(&D.i_q, (size_t)cap * n_head * dim * sizeof(float)) != hipSuccess) return false;
   if (hipMalloc(&D.i_q8, (size_t)cap * n_head * dim) != hipSuccess) return false;
+  D.i_q8_bytes = (size_t)cap * n_head * dim;
   if (hipMalloc(&D.i_qs, (size_t)cap * sizeof(float)) != hipSuccess) return false;
   if (hipMalloc(&D.i_w, (size_t)cap * n_head * sizeof(float)) != hipSuccess) return false;
   // The score plane is the only buffer here that scales with CONTEXT as well as the chunk —
@@ -4843,8 +5007,10 @@ bool DenseGpu::batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     if (!idx_grow(&D, b_live_, n_head, dim)) return false;
-    batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), D.b_qr,
-                   D.b_y, (uint32_t)rows, (uint32_t)cols, b_nb_, D.stream);
+    if (idx_wqb_fp8_enabled() && q8_ok(h, cols) && quant_act(d, D.b_qr, (uint32_t)cols))
+      batch_gemm_ent_q8(d, h, D.b_y, rows, cols);
+    else
+      batch_gemm_ent(d, h, D.b_qr, D.b_y, rows, cols);
     // Dim-major [rows][nb] out of the GEMM; the indexer wants token-major [nb][rows].
     batch_transpose_hip(D.b_y, D.i_q, (uint32_t)rows, b_nb_, 1, D.stream);
     if (h_proj >= 0) {
@@ -5194,9 +5360,11 @@ bool DenseGpu::engram_reserve(uint32_t tile, uint32_t in_dim, uint32_t out_dim) 
   return true;
 }
 
-bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t n,
-                      uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps, bool batched) {
-  if (!attn_ok_ || h_wkv < 0 || (size_t)h_wkv >= ent_.size() || !n || !in_dim) return false;
+bool DenseGpu::engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool raw_mxfp8,
+                           uint32_t n, uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps,
+                           bool batched) {
+  if (!attn_ok_ || h_wkv < 0 || (size_t)h_wkv >= ent_.size() || !n || !in_dim || !rows)
+    return false;
   if (qk_vec < 0 || (size_t)qk_vec >= n_vec_) return false;
   AFF_TRACE(33);
   const Entry& e = ent_[h_wkv];
@@ -5204,8 +5372,13 @@ bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t
   // Replicated, like every other matrix whose result both cards need whole: the gate reads the
   // hidden state, which is replicated, so a row split would be half a key per card.
   if (e.split != Split::Rep || e.cols != in_dim || e.rows < out_dim) return false;
+  if (raw_mxfp8 && (!engram_fp8_enabled() || !engram_raw_h2d_enabled() ||
+                    e.quant != AFF_FP8_E4M3 || (in_dim % 128u) != 0u))
+    return false;
   const uint32_t tile = std::min(n, kEngramTileMax);
   const uint32_t hc_stride = batched ? b_nb_ : n;
+  const size_t token_bytes = raw_mxfp8 ? ((size_t)in_dim + (size_t)(in_dim / 32u))
+                                       : (size_t)in_dim * sizeof(float);
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -5218,8 +5391,8 @@ bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t
     }
     for (uint32_t off = 0; off < n; off += tile) {
       const uint32_t nt = std::min(tile, n - off);
-      const float* const slice_rows = rows + (size_t)off * in_dim;
-      const size_t row_bytes = (size_t)in_dim * nt * sizeof(float);
+      const void* const slice_rows = static_cast<const uint8_t*>(rows) + (size_t)off * token_bytes;
+      const size_t row_bytes = token_bytes * nt;
       if (D.eng.fit(row_bytes, kEngRingBudget)) {
         uint32_t es = 0;
         uint8_t* const pin = D.eng.claim(&es);
@@ -5230,7 +5403,16 @@ bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t
       } else {
         AFF_HIP_CHECK(hipMemcpyAsync(D.e_stage, slice_rows, row_bytes, hipMemcpyHostToDevice, st));
       }
-      if (engram_fp8_enabled() && e.quant == AFF_FP8_E4M3 && (in_dim % 128u) == 0u) {
+      if (raw_mxfp8) {
+        uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.e_in);
+        const size_t qs_off = ((size_t)nt * in_dim + 15u) & ~size_t(15);
+        float* const eqs = reinterpret_cast<float*>(eq8 + qs_off);
+        if (!engram_mxfp8_requant_fp8_hip(reinterpret_cast<const uint8_t*>(D.e_stage), eq8, eqs,
+                                          nt, in_dim, st))
+          return false;
+        batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, D.e_out,
+                           (uint32_t)out_dim, in_dim, nt, 0u, 0u, st, e.sh[d].ps);
+      } else if (engram_fp8_enabled() && e.quant == AFF_FP8_E4M3 && (in_dim % 128u) == 0u) {
         // D.e_stage is already token-major [nt][in_dim]: quantize directly into D.e_in (holding
         // [nt][in_dim] E4M3 + scales) and run W8A8 batch_gemm_fp8_hip without any transpose.
         uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.e_in);
@@ -5257,6 +5439,17 @@ bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t
   }
   ++st_.calls;
   return true;
+}
+
+bool DenseGpu::engram(int32_t h_wkv, int32_t qk_vec, const float* rows, uint32_t n,
+                      uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps, bool batched) {
+  return engram_impl(h_wkv, qk_vec, rows, false, n, in_dim, n_embd, n_hc, eps, batched);
+}
+
+bool DenseGpu::engram_mxfp8(int32_t h_wkv, int32_t qk_vec, const uint8_t* raw_rows, uint32_t n,
+                            uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps,
+                            bool batched) {
+  return engram_impl(h_wkv, qk_vec, raw_rows, true, n, in_dim, n_embd, n_hc, eps, batched);
 }
 
 bool DenseGpu::compress_one(const Model::CompressArgs& a) {
@@ -5562,8 +5755,20 @@ bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
       MvJob j{ep.sh[d].data, ep.sh[d].scales, ep.quant, n_head, D.i_w, a.scale};
       matvec_batch_hip(&j, 1, D.d_norm, (uint32_t)a.n_embd, st, nullptr);
     }
-    launch_mv({e.sh[d].data, e.sh[d].scales, e.quant, e.sh[d].ps}, D.d_qrn, (uint32_t)(n_head * a.dim),
-              (uint32_t)a.qr, D.i_q, st);
+    const size_t i_qs_off = ((size_t)a.qr + 15u) & ~size_t(15);
+    const size_t need_i_q8 = i_qs_off + (size_t)(a.qr / 128u) * sizeof(float);
+    if ((e.sh[d].ps || idx_wqb_fp8_enabled()) && e.quant == AFF_FP8_E4M3 &&
+        e.sh[d].scales != nullptr && (a.qr % 128u) == 0u && D.i_q8 &&
+        D.i_q8_bytes >= need_i_q8) {
+      uint8_t* const eq8 = D.i_q8;
+      float* const eqs = reinterpret_cast<float*>(eq8 + i_qs_off);
+      batch_quant_tm_fp8_hip(D.d_qrn, eq8, eqs, (uint32_t)a.qr, 1u, st);
+      batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, D.i_q,
+                         (uint32_t)(n_head * a.dim), (uint32_t)a.qr, 1u, 0u, 0u, st, e.sh[d].ps);
+    } else {
+      launch_mv({e.sh[d].data, e.sh[d].scales, e.quant, e.sh[d].ps}, D.d_qrn,
+                (uint32_t)(n_head * a.dim), (uint32_t)a.qr, D.i_q, st);
+    }
     idx_rope_qat_hip(D.i_q, 1, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
                      a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
     idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head * a.dim, st);
@@ -5833,41 +6038,65 @@ bool DenseGpu::batch_attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_
     // Both sides of the flash kernel, taken here because here is where both are still live and the
     // shapes are in scope. b_heads aliases b_qtm and at this point still holds the transposed q the
     // kernel READ; b_htm aliases b_q and holds what it WROTE. See the alias note in batch_init.
-    {
-      AFF_TRACE(42);
-      static const bool o_qdq_on = [] {
-        const char* v = std::getenv("AFF_O_FP8_QDQ");
-        return !v || !*v || std::strcmp(v, "0") != 0;
-      }();
-      static const bool fused_prep_on = [] {
-        const char* v = std::getenv("AFF_FUSED_ATTN_OUT_PREP");
-        return !v || !*v || std::strcmp(v, "0") != 0;
-      }();
-      const bool do_qdq = o_qdq_on && ((a_hpr_ * width) % 32u) == 0u;
-      if (!fused_prep_on ||
-          !batch_attn_out_prep_hip(D.b_htm, D.b_heads, a_hpr_, width, n_rot, b_pos0_, rope,
-                                   -1.0f, b_nb_, do_qdq, D.stream)) {
-        batch_transpose_bf16_hip(D.b_htm, D.b_heads, (uint32_t)((uint64_t)a_hpr_ * width), b_nb_, 0,
-                                 D.stream);
-        // V carried the rotated tail, so undo the rotation. Sine negated: this is the INVERSE.
-        batch_rope_tail_bf16_hip(D.b_heads, a_hpr_, width, n_rot, b_pos0_, rope, -1.0f, b_nb_,
-                                 D.stream);
-        if (do_qdq) {
-          batch_o_fp8_qdq_bf16_hip(D.b_heads, (a_hpr_ * width) / 32u, b_nb_, D.stream);
+    const bool o_qdq_on = o_fp8_qdq_enabled();
+    static const bool fused_prep_on = [] {
+      const char* v = std::getenv("AFF_FUSED_ATTN_OUT_PREP");
+      return !v || !*v || std::strcmp(v, "0") != 0;
+    }();
+    const bool do_qdq = o_qdq_on && ((a_hpr_ * width) % 32u) == 0u;
+    const uint64_t nq = (uint64_t)ng * group_dim;
+    const size_t q8_bytes = (size_t)nq * b_nb_;
+    const size_t sc_off = (q8_bytes + 255u) & ~size_t(255);
+    const size_t sc_bytes = (size_t)(nq / 32u) * b_nb_;
+    const size_t qtm_bytes = D.b_q_floats * sizeof(uint16_t);
+    const bool use_fp8_woa =
+        (A.sh[d].ps || (attn_out_a_fp8_enabled() && do_qdq)) && do_qdq &&
+        A.quant == AFF_FP8_E4M3 && A.sh[d].scales != nullptr && (group_dim % 128u) == 0u &&
+        (rank % 16u) == 0u && nq == (uint64_t)a_hpr_ * width && D.b_heads &&
+        qtm_bytes >= sc_off + sc_bytes;
+    if (use_fp8_woa) {
+      uint8_t* const q8 = reinterpret_cast<uint8_t*>(D.b_heads);
+      uint8_t* const sc = q8 + sc_off;
+      {
+        AFF_TRACE(42);
+        if (!batch_attn_out_prep_fp8_hip(D.b_htm, q8, sc, ng, group_dim, width, n_rot, b_pos0_,
+                                         rope, -1.0f, b_nb_, D.stream))
+          return false;
+      }
+      {
+        AFF_TRACE(43);
+        batch_gemm_fp8_grouped_b32_hip((const uint8_t*)A.sh[d].data,
+                                       (const uint8_t*)A.sh[d].scales, q8, sc, D.b_g, ng,
+                                       (uint32_t)rank, group_dim, b_nb_, D.stream, A.sh[d].ps);
+      }
+    } else {
+      {
+        AFF_TRACE(42);
+        if (!fused_prep_on ||
+            !batch_attn_out_prep_hip(D.b_htm, D.b_heads, a_hpr_, width, n_rot, b_pos0_, rope,
+                                     -1.0f, b_nb_, do_qdq, D.stream)) {
+          batch_transpose_bf16_hip(D.b_htm, D.b_heads, (uint32_t)((uint64_t)a_hpr_ * width), b_nb_, 0,
+                                   D.stream);
+          // V carried the rotated tail, so undo the rotation. Sine negated: this is the INVERSE.
+          batch_rope_tail_bf16_hip(D.b_heads, a_hpr_, width, n_rot, b_pos0_, rope, -1.0f, b_nb_,
+                                   D.stream);
+          if (do_qdq) {
+            batch_o_fp8_qdq_bf16_hip(D.b_heads, (a_hpr_ * width) / 32u, b_nb_, D.stream);
+          }
         }
       }
-    }
-    // wo_a stays on the bf16 kernel and only wo_b goes W8A8. The grouped projection is the one shape
-    // where W8A8 LOSES, because of the activation stride: its operand is the heads buffer, 16384
-    // wide per card, and each group reads a 4096-wide window, so a token's row is 16 KiB from the
-    // next and the fp8 kernel stages 128 scattered 32-byte pieces per step where the bf16 kernel
-    // reads 32 consecutive floats a wave. On top of that, one quantise pass over [16384][nb] is
-    // 67 MB of reads for four small GEMMs. Quantising each window compactly would fix both, at four
-    // passes rather than one.
-    {
-      AFF_TRACE(43);
-      batch_gemm_grouped_hip(A.quant, A.sh[d].data, A.sh[d].scales, D.b_heads, D.b_g, ng,
-                             group_dim, (uint32_t)rank, b_nb_, D.stream, /*x_bf16=*/true);
+      // wo_a stays on the bf16 kernel and only wo_b goes W8A8. The grouped projection is the one shape
+      // where W8A8 LOSES, because of the activation stride: its operand is the heads buffer, 16384
+      // wide per card, and each group reads a 4096-wide window, so a token's row is 16 KiB from the
+      // next and the fp8 kernel stages 128 scattered 32-byte pieces per step where the bf16 kernel
+      // reads 32 consecutive floats a wave. On top of that, one quantise pass over [16384][nb] is
+      // 67 MB of reads for four small GEMMs. Quantising each window compactly would fix both, at four
+      // passes rather than one.
+      {
+        AFF_TRACE(43);
+        batch_gemm_grouped_hip(A.quant, A.sh[d].data, A.sh[d].scales, D.b_heads, D.b_g, ng,
+                               group_dim, (uint32_t)rank, b_nb_, D.stream, /*x_bf16=*/true);
+      }
     }
     // Row-split, so no single card's value is comparable between two rank counts — but the SUM over
     // cards is, because it is the same 64 heads either way, only dealt differently.
@@ -6854,6 +7083,19 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     }
     return true;
   };
+  static auto launch_fp8_g128_head = [](const uint8_t* fp8, const uint16_t* sc, const float* x_tm,
+                                        float* y, uint32_t nr_rows, uint32_t cols, uint32_t nt,
+                                        uint32_t out_ld, int out_tm, hipStream_t st) -> bool {
+    if (!fp8 || !sc || (cols % 256) != 0 || !nt) return false;
+    for (uint32_t t0 = 0; t0 < nt; t0 += 8u) {
+      const uint32_t chunk = std::min<uint32_t>(8u, nt - t0);
+      float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
+      if (!matvec_fp8_g128_multix_hip(fp8, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols,
+                                      chunk, out_ld, out_tm, st))
+        return false;
+    }
+    return true;
+  };
   Impl::Dev& D0 = impl_->dev[0];
   bool pack_tm = (R > 1u) && (n < b_nb_) && D0.b_q && (D0.b_q_floats >= (size_t)vocab * n);
   uint64_t r0_band[kMaxRanks] = {};
@@ -6875,15 +7117,20 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     AFF_HIP_CHECK(hipSetDevice(D.id));
     const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
     const bool lmhead_int4 = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
-    const bool use_w4 = (lmhead_int4 || (!e.sh[d].data && !e.sh[d].b12_sm)) && e.sh[d].w4_data &&
-                        e.sh[d].w4_scales && (n_embd % 256) == 0;
-    const bool use_b12 = !use_w4 && !e.sh[d].data && e.sh[d].b12_sm && (n_embd % 256) == 0;
+    const bool use_fp8 = !lmhead_int4 && !e.sh[d].data && e.sh[d].fp8_data &&
+                         e.sh[d].fp8_scales && (n_embd % 256) == 0;
+    const bool use_w4 =
+        (lmhead_int4 || (!e.sh[d].data && !e.sh[d].b12_sm && !e.sh[d].fp8_data)) &&
+        e.sh[d].w4_data && e.sh[d].w4_scales && (n_embd % 256) == 0;
+    const bool use_b12 = !use_w4 && !use_fp8 && !e.sh[d].data && e.sh[d].b12_sm &&
+                         (n_embd % 256) == 0;
     if (x) {
-      if (!use_w4)
+      if (!use_w4 && !use_fp8)
         AFF_HIP_CHECK(hipMemsetAsync(D.b_emb, 0, (size_t)n_embd * b_nb_ * sizeof(float), D.stream));
       AFF_HIP_CHECK(hipMemcpyAsync(D.b_emb, x, (size_t)n * n_embd * sizeof(float),
                                    hipMemcpyHostToDevice, D.stream));
-      if (!use_w4) batch_transpose_hip(D.b_emb, D.b_norm, (uint32_t)n_embd, b_nb_, 0, D.stream);
+      if (!use_w4 && !use_fp8)
+        batch_transpose_hip(D.b_emb, D.b_norm, (uint32_t)n_embd, b_nb_, 0, D.stream);
     }
     const uint64_t r0 = r0_band[d], nr = nr_band[d];
     covered += nr;
@@ -6896,6 +7143,13 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
                           D.b_head + (size_t)r0 * b_nb_, (uint32_t)nr, (uint32_t)n_embd, n,
                           b_nb_, /*out_token_major=*/0, D.stream))
         return no("int4 head kernel failed");
+    } else if (use_fp8) {
+      const uint64_t off = r0 - e.sh[d].row0;
+      if (!launch_fp8_g128_head(static_cast<const uint8_t*>(e.sh[d].fp8_data) + off * n_embd,
+                                e.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb,
+                                D.b_head + (size_t)r0 * b_nb_, (uint32_t)nr, (uint32_t)n_embd, n,
+                                b_nb_, /*out_token_major=*/0, D.stream))
+        return no("fp8 g128 head kernel failed");
     } else if (use_b12) {
       const uint64_t off = r0 - e.sh[d].row0;
       batch_gemm_bf16x12_hip(e.sh[d].b12_sm, e.sh[d].b12_exp4, e.sh[d].b12_mexp,
@@ -7056,25 +7310,43 @@ bool DenseGpu::batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n
     }
     return true;
   };
+  static auto launch_fp8_g128_head = [](const uint8_t* fp8, const uint16_t* sc, const float* x_tm,
+                                        float* y, uint32_t nr_rows, uint32_t cols, uint32_t nt,
+                                        uint32_t out_ld, int out_tm, hipStream_t st) -> bool {
+    if (!fp8 || !sc || (cols % 256) != 0 || !nt) return false;
+    for (uint32_t t0 = 0; t0 < nt; t0 += 8u) {
+      const uint32_t chunk = std::min<uint32_t>(8u, nt - t0);
+      float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
+      if (!matvec_fp8_g128_multix_hip(fp8, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols,
+                                      chunk, out_ld, out_tm, st))
+        return false;
+    }
+    return true;
+  };
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     if (!D.b_head || !D.b_amx || !D.b_apeer || !D.b_hids || !D.h_hids || !D.ev_amx) return false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
     const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
     const bool lmhead_int4 = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
-    const bool use_w4 = (lmhead_int4 || (!e.sh[d].data && !e.sh[d].b12_sm)) && e.sh[d].w4_data &&
-                        e.sh[d].w4_scales && (n_embd % 256) == 0;
-    const bool use_b12 = !use_w4 && !e.sh[d].data && e.sh[d].b12_sm && (n_embd % 256) == 0;
+    const bool use_fp8 = !lmhead_int4 && !e.sh[d].data && e.sh[d].fp8_data &&
+                         e.sh[d].fp8_scales && (n_embd % 256) == 0;
+    const bool use_w4 =
+        (lmhead_int4 || (!e.sh[d].data && !e.sh[d].b12_sm && !e.sh[d].fp8_data)) &&
+        e.sh[d].w4_data && e.sh[d].w4_scales && (n_embd % 256) == 0;
+    const bool use_b12 = !use_w4 && !use_fp8 && !e.sh[d].data && e.sh[d].b12_sm &&
+                         (n_embd % 256) == 0;
     // The padding columns go through the transpose and the GEMM like any other, so the source of
     // them has to be finite; b_emb is the arena's upload slot and nothing else reads it here.
     if (x) {
-      if (!mx && !use_w4) {
+      if (!mx && !use_w4 && !use_fp8) {
         AFF_HIP_CHECK(hipMemsetAsync(D.b_emb, 0, (size_t)n_embd * b_nb_ * sizeof(float),
                                      D.stream));
       }
       AFF_HIP_CHECK(hipMemcpyAsync(D.b_emb, x, (size_t)n * n_embd * sizeof(float),
                                    hipMemcpyHostToDevice, D.stream));
-      if (!mx && !use_w4) batch_transpose_hip(D.b_emb, D.b_norm, (uint32_t)n_embd, b_nb_, 0, D.stream);
+      if (!mx && !use_w4 && !use_fp8)
+        batch_transpose_hip(D.b_emb, D.b_norm, (uint32_t)n_embd, b_nb_, 0, D.stream);
     }
     uint64_t r0 = 0, nr = 0;
     row_band(e.sh[d], vocab, &r0, &nr);
@@ -7087,6 +7359,13 @@ bool DenseGpu::batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n
                             e.sh[d].w4_scales + off * (n_embd / 128), D.b_emb, D.b_head,
                             (uint32_t)nr, (uint32_t)n_embd, n, (uint32_t)nr,
                             /*out_token_major=*/1, D.stream))
+          return false;
+      } else if (use_fp8) {
+        const uint64_t off = r0 - e.sh[d].row0;
+        if (!launch_fp8_g128_head(static_cast<const uint8_t*>(e.sh[d].fp8_data) + off * n_embd,
+                                  e.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb, D.b_head,
+                                  (uint32_t)nr, (uint32_t)n_embd, n, (uint32_t)nr,
+                                  /*out_token_major=*/1, D.stream))
           return false;
       } else if (use_b12) {
         const uint64_t off = r0 - e.sh[d].row0;
@@ -7111,6 +7390,13 @@ bool DenseGpu::batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n
                             e.sh[d].w4_scales + off * (n_embd / 128), D.b_emb, D.b_head,
                             (uint32_t)nr, (uint32_t)n_embd, n, b_nb_, /*out_token_major=*/0,
                             D.stream))
+          return false;
+      } else if (use_fp8) {
+        const uint64_t off = r0 - e.sh[d].row0;
+        if (!launch_fp8_g128_head(static_cast<const uint8_t*>(e.sh[d].fp8_data) + off * n_embd,
+                                  e.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb, D.b_head,
+                                  (uint32_t)nr, (uint32_t)n_embd, n, b_nb_,
+                                  /*out_token_major=*/0, D.stream))
           return false;
       } else if (use_b12) {
         const uint64_t off = r0 - e.sh[d].row0;
@@ -7213,12 +7499,23 @@ bool DenseGpu::draft_proj(int32_t h, int32_t norm_w, uint64_t rows, uint64_t col
     if (!D.b_dxt || !D.b_dx || !D.b_dm || !D.b_tap_s[slot_]) return false;
     if ((size_t)(tap_row0 + n) * cols * sizeof(float) > D.tap_bytes_s[slot_]) return false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    hipLaunchKernelGGL(draft_transpose_pad_kernel,
-                       dim3(((uint32_t)cols + 31u) / 32u, (kNarrowTok + 31u) / 32u), dim3(256),
-                       0, D.stream, D.b_tap_s[slot_] + (size_t)tap_row0 * cols, D.b_dx, n,
-                       kNarrowTok, (uint32_t)cols);
-    AFF_HIP_CHECK(hipGetLastError());
-    batch_gemm_ent(d, h, D.b_dx, D.b_dm, rows, cols);
+    const float* const tap_src = D.b_tap_s[slot_] + (size_t)tap_row0 * cols;
+    if ((e.sh[d].ps || mtp_proj_fp8_enabled()) && e.quant == AFF_FP8_E4M3 &&
+        e.sh[d].scales != nullptr && (cols % 128u) == 0u) {
+      uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.b_dx);
+      const size_t qs_off = ((size_t)kNarrowTok * cols + 15u) & ~size_t(15);
+      float* const eqs = reinterpret_cast<float*>(eq8 + qs_off);
+      batch_quant_tm_fp8_hip(tap_src, eq8, eqs, (uint32_t)cols, kNarrowTok, D.stream, n);
+      batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, D.b_dm,
+                         (uint32_t)rows, (uint32_t)cols, kNarrowTok, 0u, 0u, D.stream,
+                         e.sh[d].ps);
+    } else {
+      hipLaunchKernelGGL(draft_transpose_pad_kernel,
+                         dim3(((uint32_t)cols + 31u) / 32u, (kNarrowTok + 31u) / 32u), dim3(256),
+                         0, D.stream, tap_src, D.b_dx, n, kNarrowTok, (uint32_t)cols);
+      AFF_HIP_CHECK(hipGetLastError());
+      batch_gemm_ent(d, h, D.b_dx, D.b_dm, rows, cols);
+    }
     if (!D.vec[norm_w]) return false;
     batch_rms_norm_hip(D.b_dm, D.vec[norm_w], nullptr, D.b_dm, (uint32_t)rows, kNarrowTok, eps,
                        D.stream);
@@ -7447,6 +7744,17 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
                                   (uint32_t)nr[d], (uint32_t)n_embd, n, (uint32_t)nr[d],
                                   /*out_token_major=*/1, D.stream))
           return false;
+      } else if (!H.sh[d].data && H.sh[d].fp8_data && H.sh[d].fp8_scales && (n_embd % 256) == 0) {
+        const uint64_t off = r0[d] - H.sh[d].row0;
+        for (uint32_t t0 = 0; t0 < n; t0 += 8u) {
+          const uint32_t chunk = std::min<uint32_t>(8u, n - t0);
+          if (!matvec_fp8_g128_multix_hip(
+                  static_cast<const uint8_t*>(H.sh[d].fp8_data) + off * n_embd,
+                  H.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb + (size_t)t0 * n_embd,
+                  D.b_head + (size_t)t0 * nr[d], (uint32_t)nr[d], (uint32_t)n_embd, chunk,
+                  (uint32_t)nr[d], /*out_token_major=*/1, D.stream))
+            return false;
+        }
       } else if (!H.sh[d].data && H.sh[d].b12_sm && (n_embd % 256) == 0) {
         const uint64_t off = r0[d] - H.sh[d].row0;
         if (!matvec_bf16x12_multix_hip(
@@ -7472,6 +7780,18 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
                                   D.b_emb + (size_t)t0 * n_embd, D.b_head + t0,
                                   (uint32_t)nr[d], (uint32_t)n_embd, chunk, kNarrowTok,
                                   /*out_token_major=*/0, D.stream))
+          return false;
+      }
+    } else if (!H.sh[d].data && H.sh[d].fp8_data && H.sh[d].fp8_scales && (n_embd % 256) == 0) {
+      const uint64_t off = r0[d] - H.sh[d].row0;
+      for (uint32_t t0 = 0; t0 < n; t0 += 8u) {
+        const uint32_t chunk = std::min<uint32_t>(8u, n - t0);
+        if (!matvec_fp8_g128_multix_hip(
+                static_cast<const uint8_t*>(H.sh[d].fp8_data) + off * n_embd,
+                H.sh[d].fp8_scales + off * (n_embd / 128),
+                D.b_emb + (size_t)t0 * n_embd, D.b_head + t0,
+                (uint32_t)nr[d], (uint32_t)n_embd, chunk, kNarrowTok,
+                /*out_token_major=*/0, D.stream))
           return false;
       }
     } else if (!H.sh[d].data && H.sh[d].b12_sm) {
@@ -7688,6 +8008,11 @@ Model::BatchOps DenseGpu::batch_ops() {
                 uint32_t ne, uint32_t nh, float eps) {
     return static_cast<DenseGpu*>(c)->engram(w, qk, r, n, in, ne, nh, eps, /*batched=*/true);
   };
+  o.engram_mxfp8 = [](void* c, int32_t w, int32_t qk, const uint8_t* r, uint32_t n, uint32_t in,
+                      uint32_t ne, uint32_t nh, float eps) {
+    return static_cast<DenseGpu*>(c)->engram_mxfp8(w, qk, r, n, in, ne, nh, eps,
+                                                   /*batched=*/true);
+  };
   o.attend = [](void* c, uint32_t l, uint32_t b0, uint32_t n, uint32_t p0, const uint8_t* a,
                 uint32_t ms, const uint32_t* nc, float s, uint32_t rf) {
     return static_cast<DenseGpu*>(c)->batch_attend(l, b0, n, p0, a, ms, nc, s, rf);
@@ -7832,6 +8157,18 @@ uint64_t aff::DenseGpu::digest_weights(std::vector<std::pair<std::string, uint64
                             aff_wv_digest_dev(sh.b12_esc_val, ev_b, stage));
           total += ev_b;
         }
+        continue;
+      }
+      if (!sh.data && sh.fp8_data && sh.fp8_scales) {
+        (void)hipSetDevice(impl_->dev[d].id);
+        const uint64_t fp8_b = sh.nrows * sh.ncols;
+        const uint64_t sc_b = sh.nrows * (sh.ncols / 128) * sizeof(uint16_t);
+        out->emplace_back("ent" + std::to_string(i) + " rank" + std::to_string(d) + " fp8_data",
+                          aff_wv_digest_dev(sh.fp8_data, fp8_b, stage));
+        total += fp8_b;
+        out->emplace_back("ent" + std::to_string(i) + " rank" + std::to_string(d) + " fp8_scales",
+                          aff_wv_digest_dev(sh.fp8_scales, sc_b, stage));
+        total += sc_b;
         continue;
       }
       if (!sh.data || !sh.data_bytes) continue;

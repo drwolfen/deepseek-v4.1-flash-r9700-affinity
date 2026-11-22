@@ -46,6 +46,17 @@ namespace aff {
 
 namespace {
 
+inline bool engram_fp8_env() {
+  const char* v = std::getenv("AFF_ENGRAM_FP8");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool engram_raw_h2d_env() {
+  if (!engram_fp8_env()) return false;
+  const char* v = std::getenv("AFF_ENGRAM_RAW_H2D");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
 // A missing tensor yields null rather than failing the load: a container truncated with --layers
 // is legitimate, and every consumer below is null-tolerant.
 struct Binder {
@@ -1122,9 +1133,23 @@ void Model::forward_token(uint32_t token_id, SeqState* s,
     // 24 page faults on a cold n-gram.
     if (eng_on_ && eng_slot_[l] >= 0 && dops_.engram) {
       const uint32_t i = (uint32_t)eng_slot_[l];
-      eng_t_.gather(i, eng_ids_.data() + (size_t)i * eng_c_.n_cols, eng_rows_.data());
-      if (!dops_.engram(dops_.ctx, w.engram_wkv.gpu, eng_qk_[l], eng_rows_.data(),
-                        eng_c_.n_cols * eng_c_.head_dim, E, HC, cfg_.rms_eps)) {
+      const uint32_t eng_in_dim = eng_c_.n_cols * eng_c_.head_dim;
+      const uint32_t raw_stride = eng_t_.raw_mxfp8_stride();
+      const bool use_raw =
+          dops_.engram_mxfp8 && engram_raw_h2d_env() && eng_t_.has_mxfp8(i) &&
+          w.engram_wkv.quant == AFF_FP8_E4M3 && raw_stride > 0u && (eng_in_dim % 128u) == 0u;
+      bool eng_ok = false;
+      if (use_raw) {
+        eng_raw_.resize(raw_stride);
+        eng_t_.gather_mxfp8(i, eng_ids_.data() + (size_t)i * eng_c_.n_cols, eng_raw_.data());
+        eng_ok = dops_.engram_mxfp8(dops_.ctx, w.engram_wkv.gpu, eng_qk_[l], eng_raw_.data(),
+                                    eng_in_dim, E, HC, cfg_.rms_eps);
+      } else {
+        eng_t_.gather(i, eng_ids_.data() + (size_t)i * eng_c_.n_cols, eng_rows_.data());
+        eng_ok = dops_.engram(dops_.ctx, w.engram_wkv.gpu, eng_qk_[l], eng_rows_.data(),
+                              eng_in_dim, E, HC, cfg_.rms_eps);
+      }
+      if (!eng_ok) {
         aff::ui::fatal("fatal: engram refused at layer %u — the hidden state lives in VRAM and "
                      "this write is part of the model\n", l);
         std::abort();
@@ -1889,11 +1914,28 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
     // DSpark verify blocks), and overlap later slots (layer 14) asynchronously on the background
     // pool while GPUs execute layers 0..13.
     const uint32_t eng_in_dim = eng_c_.n_cols * eng_c_.head_dim;
+    const uint32_t eng_raw_stride = eng_t_.raw_mxfp8_stride();
+    bool use_raw_eng =
+        eng_on_ && eng_c_.n_layer > 0 && bops_.engram_mxfp8 && engram_raw_h2d_env() &&
+        eng_raw_stride > 0u && (eng_in_dim % 128u) == 0u;
+    if (use_raw_eng) {
+      for (uint32_t i = 0; i < eng_c_.n_layer; ++i) {
+        const uint32_t el = (uint32_t)cfg_.engram_layers[i];
+        if (!eng_t_.has_mxfp8(i) || el >= cfg_.n_layer ||
+            layers_[el].engram_wkv.quant != AFF_FP8_E4M3) {
+          use_raw_eng = false;
+          break;
+        }
+      }
+    }
     const bool async_eng_tail = (eng_on_ && live >= 64u && eng_c_.n_layer > 1u);
     if (eng_on_ && eng_c_.n_layer > 0) {
       if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
       eng_ids_.resize((size_t)live * eng_c_.n_layer * eng_c_.n_cols);
-      eng_rows_.resize((size_t)eng_c_.n_layer * live * eng_in_dim);
+      if (use_raw_eng)
+        eng_raw_.resize((size_t)eng_c_.n_layer * live * eng_raw_stride);
+      else
+        eng_rows_.resize((size_t)eng_c_.n_layer * live * eng_in_dim);
       const uint8_t* alive_ptr = nullptr;
       if (is_image_chunk) {
         ensure_size(sc.eng_alive, live);
@@ -1904,15 +1946,25 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       if (live < 64u) {
         for (uint32_t i = 0; i < eng_c_.n_layer; ++i) {
           for (uint32_t t = 0; t < live; ++t) {
-            eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
-                          eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+            const int64_t* const idp =
+                eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols;
+            if (use_raw_eng) {
+              eng_t_.gather_mxfp8(i, idp,
+                                  eng_raw_.data() + ((size_t)i * live + t) * eng_raw_stride);
+            } else {
+              eng_t_.gather(i, idp, eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+            }
           }
         }
       } else {
         parallel_for((uint64_t)live, 32, [&](uint64_t t0, uint64_t t1) {
           for (uint64_t t = t0; t < t1; ++t) {
-            eng_t_.gather(0, eng_ids_.data() + (size_t)t * eng_c_.n_layer * eng_c_.n_cols,
-                          eng_rows_.data() + (size_t)t * eng_in_dim);
+            const int64_t* const idp = eng_ids_.data() + (size_t)t * eng_c_.n_layer * eng_c_.n_cols;
+            if (use_raw_eng) {
+              eng_t_.gather_mxfp8(0, idp, eng_raw_.data() + (size_t)t * eng_raw_stride);
+            } else {
+              eng_t_.gather(0, idp, eng_rows_.data() + (size_t)t * eng_in_dim);
+            }
           }
         });
         if (async_eng_tail) {
@@ -1920,13 +1972,19 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
           EngramBgWorker* const bg = sc.eng_bg.get();
           const uint32_t tail_layers = eng_c_.n_layer - 1u;
           const uint64_t tail_jobs = (uint64_t)tail_layers * live;
-          bg->launch([this, bg, live, eng_in_dim, tail_jobs] {
+          bg->launch([this, bg, live, eng_in_dim, eng_raw_stride, use_raw_eng, tail_jobs] {
             bg->parallel_for_tail(tail_jobs, 32, [&](uint64_t j0, uint64_t j1) {
               for (uint64_t j = j0; j < j1; ++j) {
                 const uint32_t i = 1u + (uint32_t)(j / live);
                 const uint64_t t = j % live;
-                eng_t_.gather(i, eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols,
-                              eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+                const int64_t* const idp =
+                    eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols;
+                if (use_raw_eng) {
+                  eng_t_.gather_mxfp8(i, idp,
+                                      eng_raw_.data() + ((size_t)i * live + t) * eng_raw_stride);
+                } else {
+                  eng_t_.gather(i, idp, eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+                }
               }
             });
           });
@@ -1954,11 +2012,19 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       if (eng_on_ && eng_slot_[l] >= 0 && bops_.engram) {
         const uint32_t i = (uint32_t)eng_slot_[l];
         if (i > 0u) eng_wait.sync();
-        const float* layer_rows = eng_rows_.data() + (size_t)i * live * eng_in_dim;
+        bool eng_ok = false;
+        if (use_raw_eng) {
+          const uint8_t* layer_raw = eng_raw_.data() + (size_t)i * live * eng_raw_stride;
+          eng_ok = bops_.engram_mxfp8(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], layer_raw, live,
+                                      eng_in_dim, E, HC, cfg_.rms_eps);
+        } else {
+          const float* layer_rows = eng_rows_.data() + (size_t)i * live * eng_in_dim;
+          eng_ok = bops_.engram(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], layer_rows, live,
+                                eng_in_dim, E, HC, cfg_.rms_eps);
+        }
         // Fatal, not a refusal: a `false` here would fall through to the per-token prefill, which
         // does not run engram at all, and the run would silently become the model without it.
-        if (!bops_.engram(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], layer_rows, live, eng_in_dim,
-                          E, HC, cfg_.rms_eps)) {
+        if (!eng_ok) {
           aff::ui::fatal("fatal: engram refused at layer %u in batched prefill — this write is "
                        "part of the model, not an optimisation\n", l);
           std::abort();
