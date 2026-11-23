@@ -373,6 +373,65 @@ __device__ __forceinline__ void attend_body(
 
   // ---- weighted sum. k[d] is loaded once and feeds every head, which is the other half of the
   // per-head re-read this kernel used to pay.
+  if constexpr (DT == 4 && !LOOKAHEAD) {
+    const bool vec4_av =
+        ((width & 3u) == 0u) && ((stride & 3u) == 0u) &&
+        (((reinterpret_cast<uintptr_t>(raw) | reinterpret_cast<uintptr_t>(comp)) & 3u) == 0u);
+    if (vec4_av) {
+      const uint32_t w4 = width >> 2;
+      for (uint32_t d4 = tid; d4 < w4; d4 += kAttnThreads) {
+        float acc0[kHeadsPerBlk], acc1[kHeadsPerBlk], acc2[kHeadsPerBlk], acc3[kHeadsPerBlk];
+#pragma unroll
+        for (uint32_t h = 0; h < kHeadsPerBlk; ++h) {
+          acc0[h] = 0.0f;
+          acc1[h] = 0.0f;
+          acc2[h] = 0.0f;
+          acc3[h] = 0.0f;
+        }
+        for (uint32_t j = 0; j < n_keys; ++j) {
+          if constexpr (DRAFT_SKIP) {
+            bool all_zero = true;
+            for (uint32_t h = 0; h < nh; ++h) {
+              if (s_score[(size_t)h * n_keys + j] != 0.0f) { all_zero = false; break; }
+            }
+            if (all_zero) continue;
+          }
+          uint32_t rs = raw0 + j; if (rs >= ring) rs -= ring;
+          const KvRow<DT> k = (j < n_raw) ? KvRow<DT>(raw, rs, stride, width, nope)
+                                          : KvRow<DT>(comp, j - n_raw, stride, width, nope);
+          const uint32_t u = reinterpret_cast<const uint32_t*>(k.p)[d4];
+          const float ksc = k.row_scale();
+          const aff_f32x2 k01 = e4m3_decode_pk<false>(u);
+          const aff_f32x2 k23 = e4m3_decode_pk<true>(u);
+          const float kd0 = k01.x * ksc, kd1 = k01.y * ksc;
+          const float kd2 = k23.x * ksc, kd3 = k23.y * ksc;
+#pragma unroll
+          for (uint32_t h = 0; h < kHeadsPerBlk; ++h) {
+            if (h < nh) {
+              const float p = s_score[(size_t)h * n_keys + j];
+              acc0[h] = fmaf(p, kd0, acc0[h]);
+              acc1[h] = fmaf(p, kd1, acc1[h]);
+              acc2[h] = fmaf(p, kd2, acc2[h]);
+              acc3[h] = fmaf(p, kd3, acc3[h]);
+            }
+          }
+        }
+        const uint32_t d = d4 << 2;
+#pragma unroll
+        for (uint32_t h = 0; h < kHeadsPerBlk; ++h) {
+          if (h < nh) {
+            const float inv = s_inv[h];
+            float* const dst = obase + (size_t)h * width + d;
+            dst[0] = acc0[h] * inv;
+            dst[1] = acc1[h] * inv;
+            dst[2] = acc2[h] * inv;
+            dst[3] = acc3[h] * inv;
+          }
+        }
+      }
+      return;
+    }
+  }
   for (uint32_t d = tid; d < width; d += kAttnThreads) {
     float acc[kHeadsPerBlk];
     for (uint32_t h = 0; h < nh; ++h) acc[h] = 0.0f;
@@ -601,21 +660,26 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
                                        uint8_t* __restrict__ raw, uint64_t rb, uint32_t pos0,
                                        uint32_t ring, uint32_t width, uint32_t nope,
                                        KvNorm nrm = KvNorm{}) {
-  extern __shared__ float s_abs[];                  // width floats, then width/64 scales
-  float* s_scale = s_abs + width;
+  extern __shared__ float s_abs[];                  // Norm only: width floats, then 32-float red
+  __shared__ float s_wmax[32];                      // DPP16 per-wave maxes for QAT
+  __shared__ float s_wmax2[32];                     // DPP16 per-wave maxes for cache encode
   const uint32_t t = blockIdx.x;
   const uint32_t i = threadIdx.x;
+  const uint32_t lane = i & 31u, wave = i >> 5;
   uint8_t* slot = raw + (size_t)((pos0 + t) % ring) * rb;
 
   float v;
   if (Norm) {
-    float* red = s_scale + width / 64u + 1;         // 32 more floats; the launcher adds them
+    float* red = s_abs + width;                     // 32 more floats; the launcher adds them
     constexpr uint32_t kNT = 256;                   // rms_norm_rope_kernel's blockDim, exactly
     if (i < kNT) {
       float acc = 0.0f;
-      for (uint32_t j = i; j < width; j += kNT) { const float f = kv[j]; acc += f * f; }
-      for (int o = 16; o; o >>= 1) acc += __shfl_down(acc, o);
-      if ((i & 31u) == 0u) red[i >> 5] = acc;
+      for (uint32_t j = i; j < width; j += kNT) {
+        const float f = kv[(size_t)j * nb + b0 + t];
+        acc += f * f;
+      }
+      acc = wave_reduce_add_dpp(acc);
+      if (lane == 0u) red[wave] = acc;
     }
     lds_barrier();
     if (i == 0) {
@@ -625,7 +689,8 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
     }
     lds_barrier();
     const float inv = red[0];
-    if (i < width) s_abs[i] = kv[i] * inv * (nrm.w ? nrm.w[i] : 1.0f);
+    if (i < width)
+      s_abs[i] = kv[(size_t)i * nb + b0 + t] * inv * (nrm.w ? nrm.w[i] : 1.0f);
     lds_barrier();
     if (i < nope) {
       v = s_abs[i];
@@ -633,33 +698,30 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
       // This thread's element is half of a rotated pair; the other half is its LDS neighbour.
       const uint32_t r = i - nope, k = r >> 1;
       float c, sn;
-      rope_cs(k, nrm.pos, nrm.freq_scale, nrm.theta_scale, nrm.ext_factor, nrm.lo, nrm.hi, 1.0f,
+      rope_cs(k, pos0 + t, nrm.freq_scale, nrm.theta_scale, nrm.ext_factor, nrm.lo, nrm.hi, 1.0f,
               &c, &sn);
       const float x0 = s_abs[nope + 2u * k], x1 = s_abs[nope + 2u * k + 1u];
       v = (r & 1u) ? (x0 * sn + x1 * c) : (x0 * c - x1 * sn);
     } else {
       v = 0.0f;
     }
-    lds_barrier();                                // s_abs is the QAT's scratch from here on
   } else {
     v = (i < width) ? kv[(size_t)i * nb + b0 + t] : 0.0f;
   }
 
   // ---- fp8_kv_qat, in place, NOPE part only ----
   const uint32_t n_qat = (nope / 64u) * 64u;
-  s_abs[i] = (i < n_qat) ? fabsf(v) : 0.0f;
-  lds_barrier();
-  if (i < n_qat / 64u) {
-    float amax = 0.0f;
-    for (uint32_t j = 0; j < 64u; ++j) amax = fmaxf(amax, s_abs[i * 64u + j]);
-    s_scale[i] = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
+  {
+    const float wmax = wave_reduce_max_dpp((i < n_qat) ? fabsf(v) : 0.0f);
+    if (lane == 0u && i < n_qat) s_wmax[wave] = wmax;
   }
   lds_barrier();
   if (i < n_qat) {
-    const float sc = s_scale[i >> 6];
+    const uint32_t g = i >> 6;
+    const float amax = fmaxf(s_wmax[2u * g], s_wmax[2u * g + 1u]);
+    const float sc = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
     v = e4m3_decode(e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / sc)))) * sc;
   }
-  lds_barrier();
 
   // ---- kv_store: f16-round first, then encode ----
   v = __half2float(__float2half(v));
@@ -668,27 +730,33 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
     return;
   }
   if (DT == 4) {
-    s_abs[i] = (i < width) ? fabsf(v) : 0.0f;
-    row_scale(s_abs, s_scale, i, width, slot);
-    if (i < width) slot[i] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / s_scale[width / 64u])));
+    const uint32_t n_waves = (width + 31u) >> 5;
+    const float wmax = wave_reduce_max_dpp((i < width) ? fabsf(v) : 0.0f);
+    if (lane == 0u) s_wmax2[wave] = wmax;
+    lds_barrier();
+    const float rmax = wave_reduce_max_dpp((lane < n_waves) ? s_wmax2[lane] : 0.0f);
+    const float sc = exp2f(ceilf(log2f(fmaxf(rmax, 1e-6f) / 448.0f)));
+    if (i == 0u) *(float*)(slot + width) = sc;
+    if (i < width) slot[i] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / sc)));
     return;
   }
   const uint32_t n_e4m3 = (DT == 3) ? nope : width;
-  const uint32_t n_grp  = n_e4m3 / 64u;
   float* g_scale = (float*)(slot + ((DT == 3) ? nope + (size_t)(width - nope) * 2 : width));
-
-  s_abs[i] = (i < n_e4m3) ? fabsf(v) : 0.0f;
-  lds_barrier();
-  if (i < n_grp) {
-    float amax = 0.0f;
-    for (uint32_t j = 0; j < 64u; ++j) amax = fmaxf(amax, s_abs[i * 64u + j]);
-    s_scale[i] = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
-    g_scale[i] = s_scale[i];
+  {
+    const float wmax = wave_reduce_max_dpp((i < n_e4m3) ? fabsf(v) : 0.0f);
+    if (lane == 0u && i < n_e4m3) s_wmax2[wave] = wmax;
   }
   lds_barrier();
 
-  if (i < n_e4m3) slot[i] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / s_scale[i >> 6])));
-  else if (DT == 3 && i < width) ((__half*)(slot + nope))[i - nope] = __float2half(v);
+  if (i < n_e4m3) {
+    const uint32_t g = i >> 6;
+    const float amax = fmaxf(s_wmax2[2u * g], s_wmax2[2u * g + 1u]);
+    const float sc = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
+    if ((i & 63u) == 0u) g_scale[g] = sc;
+    slot[i] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / sc)));
+  } else if (DT == 3 && i < width) {
+    ((__half*)(slot + nope))[i - nope] = __float2half(v);
+  }
 }
 
 } // namespace
@@ -721,26 +789,65 @@ void kv_commit_batch_hip(KvDtype d, const float* kv, uint32_t nb, uint32_t b0, u
                          uint8_t* raw, uint32_t pos0, uint32_t ring, uint32_t width,
                          uint32_t n_rot, void* stream) {
   if (!n || !width) return;
-  const size_t lds = ((size_t)width + width / 64u + 1) * sizeof(float);
   const dim3 g(n), b(width);
   hipStream_t st = (hipStream_t)stream;
   const uint32_t nope = width - n_rot;
   const uint64_t rb = kv_row_bytes(d, width, n_rot);
   switch (d) {
     case KvDtype::F32:
-      hipLaunchKernelGGL((kv_commit_batch_kernel<0>), g, b, lds, st, kv, nb, b0, raw, rb, pos0,
+      hipLaunchKernelGGL((kv_commit_batch_kernel<0>), g, b, 0, st, kv, nb, b0, raw, rb, pos0,
                          ring, width, nope, KvNorm{}); break;
     case KvDtype::FP8:
-      hipLaunchKernelGGL((kv_commit_batch_kernel<2>), g, b, lds, st, kv, nb, b0, raw, rb, pos0,
+      hipLaunchKernelGGL((kv_commit_batch_kernel<2>), g, b, 0, st, kv, nb, b0, raw, rb, pos0,
                          ring, width, nope, KvNorm{}); break;
     case KvDtype::MIXED:
-      hipLaunchKernelGGL((kv_commit_batch_kernel<3>), g, b, lds, st, kv, nb, b0, raw, rb, pos0,
+      hipLaunchKernelGGL((kv_commit_batch_kernel<3>), g, b, 0, st, kv, nb, b0, raw, rb, pos0,
                          ring, width, nope, KvNorm{}); break;
     case KvDtype::FP8R:
-      hipLaunchKernelGGL((kv_commit_batch_kernel<4>), g, b, lds, st, kv, nb, b0, raw, rb, pos0,
+      hipLaunchKernelGGL((kv_commit_batch_kernel<4>), g, b, 0, st, kv, nb, b0, raw, rb, pos0,
                          ring, width, nope, KvNorm{}); break;
   }
   AFF_HIP_CHECK(hipGetLastError());
+}
+
+bool kv_fuse_batch_norm_enabled() {
+  const char* v = std::getenv("AFF_FUSE_BATCH_KV_NORM");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+bool kv_norm_commit_batch_hip(KvDtype d, const float* latent, const float* nw, float eps,
+                              uint32_t nb, uint32_t b0, uint32_t n, uint8_t* raw, uint32_t pos0,
+                              uint32_t ring, uint32_t width, uint32_t n_rot, float freq_scale,
+                              float theta_scale, float ext_factor, float lo, float hi,
+                              void* stream) {
+  // 256 threads must be 8 whole waves inside a block of `width` (<= 1024 for s_wmax[32]), the
+  // rotated tail must be an even count inside the block, and Norm needs s_abs[width] + red[32].
+  if (!n || !nb || width < 256u || width > 1024u || (width % 64u) || (n_rot % 2u) ||
+      n_rot > width) {
+    return false;
+  }
+  const size_t lds = ((size_t)width + 32u) * sizeof(float);
+  const dim3 g(n), b(width);
+  hipStream_t st = (hipStream_t)stream;
+  const uint32_t nope = width - n_rot;
+  const uint64_t rb = kv_row_bytes(d, width, n_rot);
+  const KvNorm nrm{nw, eps, n_rot, pos0, freq_scale, theta_scale, ext_factor, lo, hi};
+  switch (d) {
+    case KvDtype::F32:
+      hipLaunchKernelGGL((kv_commit_batch_kernel<0, true>), g, b, lds, st, latent, nb, b0, raw, rb,
+                         pos0, ring, width, nope, nrm); break;
+    case KvDtype::FP8:
+      hipLaunchKernelGGL((kv_commit_batch_kernel<2, true>), g, b, lds, st, latent, nb, b0, raw, rb,
+                         pos0, ring, width, nope, nrm); break;
+    case KvDtype::MIXED:
+      hipLaunchKernelGGL((kv_commit_batch_kernel<3, true>), g, b, lds, st, latent, nb, b0, raw, rb,
+                         pos0, ring, width, nope, nrm); break;
+    case KvDtype::FP8R:
+      hipLaunchKernelGGL((kv_commit_batch_kernel<4, true>), g, b, lds, st, latent, nb, b0, raw, rb,
+                         pos0, ring, width, nope, nrm); break;
+  }
+  AFF_HIP_CHECK(hipGetLastError());
+  return true;
 }
 
 // The same commit with the learned norm and the RoPE tail folded in front of it, for the ONE-token
@@ -750,31 +857,8 @@ bool kv_norm_commit_hip(KvDtype d, const float* latent, const float* nw, float e
                         uint32_t pos, uint32_t ring, uint32_t width, uint32_t n_rot,
                         float freq_scale, float theta_scale, float ext_factor, float lo, float hi,
                         void* stream) {
-  // 256 threads must be 8 whole waves inside a block of `width`, the rotated tail must be an even
-  // count inside the block, and the reduction needs its 32 floats past the QAT scales.
-  if (width < 256u || width % 64u || n_rot % 2u || n_rot > width) return false;
-  const size_t lds = ((size_t)width + width / 64u + 1 + 32) * sizeof(float);
-  const dim3 g(1), b(width);
-  hipStream_t st = (hipStream_t)stream;
-  const uint32_t nope = width - n_rot;
-  const uint64_t rb = kv_row_bytes(d, width, n_rot);
-  const KvNorm nrm{nw, eps, n_rot, pos, freq_scale, theta_scale, ext_factor, lo, hi};
-  switch (d) {
-    case KvDtype::F32:
-      hipLaunchKernelGGL((kv_commit_batch_kernel<0, true>), g, b, lds, st, latent, 1u, 0u, raw, rb,
-                         pos, ring, width, nope, nrm); break;
-    case KvDtype::FP8:
-      hipLaunchKernelGGL((kv_commit_batch_kernel<2, true>), g, b, lds, st, latent, 1u, 0u, raw, rb,
-                         pos, ring, width, nope, nrm); break;
-    case KvDtype::MIXED:
-      hipLaunchKernelGGL((kv_commit_batch_kernel<3, true>), g, b, lds, st, latent, 1u, 0u, raw, rb,
-                         pos, ring, width, nope, nrm); break;
-    case KvDtype::FP8R:
-      hipLaunchKernelGGL((kv_commit_batch_kernel<4, true>), g, b, lds, st, latent, 1u, 0u, raw, rb,
-                         pos, ring, width, nope, nrm); break;
-  }
-  AFF_HIP_CHECK(hipGetLastError());
-  return true;
+  return kv_norm_commit_batch_hip(d, latent, nw, eps, 1u, 0u, 1u, raw, pos, ring, width, n_rot,
+                                  freq_scale, theta_scale, ext_factor, lo, hi, stream);
 }
 
 void mqa_attend_hip(KvDtype dt, const float* q, const void* raw, const void* comp,

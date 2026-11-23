@@ -1,6 +1,11 @@
 #include "threadpool.h"
+#include "model.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #ifdef __linux__
 #include <sched.h>
@@ -21,7 +26,86 @@ namespace {
 // deadlocking on a pool that is already fully occupied.
 thread_local bool t_in_pool = false;
 
+#ifdef __linux__
+inline bool pin_numa0_enabled() noexcept {
+  const char* v = std::getenv("AFF_PIN_NUMA0");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+bool parse_cpulist(const char* text, cpu_set_t* out) noexcept {
+  CPU_ZERO(out);
+  if (!text) return false;
+  const char* p = text;
+  bool any = false;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') ++p;
+    if (!*p) break;
+    if (!std::isdigit(static_cast<unsigned char>(*p))) return false;
+    char* end1 = nullptr;
+    const unsigned long lo = std::strtoul(p, &end1, 10);
+    if (end1 == p) return false;
+    unsigned long hi = lo;
+    p = end1;
+    if (*p == '-') {
+      ++p;
+      if (!std::isdigit(static_cast<unsigned char>(*p))) return false;
+      char* end2 = nullptr;
+      hi = std::strtoul(p, &end2, 10);
+      if (end2 == p || hi < lo) return false;
+      p = end2;
+    }
+    if (*p && *p != ',' && *p != '\n' && *p != '\r' && *p != ' ' && *p != '\t') return false;
+    for (unsigned long cpu = lo; cpu <= hi && cpu < static_cast<unsigned long>(CPU_SETSIZE); ++cpu) {
+      CPU_SET(static_cast<int>(cpu), out);
+      any = true;
+    }
+  }
+  return any;
+}
+
+bool read_node0_cpuset(cpu_set_t* out) noexcept {
+  std::FILE* f = std::fopen("/sys/devices/system/node/node0/cpulist", "r");
+  if (!f) return false;
+  std::string text;
+  char buf[512];
+  while (const size_t n = std::fread(buf, 1, sizeof(buf), f)) {
+    text.append(buf, n);
+    if (text.size() >= 16384u) break;
+  }
+  std::fclose(f);
+  return parse_cpulist(text.c_str(), out);
+}
+
+// Intersects the caller's current allowed CPU set with NUMA node 0. Returns false when
+// AFF_PIN_NUMA0=0, sysfs node0 is unavailable, or the intersection is empty (graceful no-op).
+bool compute_numa0_affinity(cpu_set_t* out) noexcept {
+  CPU_ZERO(out);
+  if (!pin_numa0_enabled()) return false;
+  static const struct Node0Mask {
+    bool valid = false;
+    cpu_set_t mask{};
+    Node0Mask() noexcept { valid = read_node0_cpuset(&mask); }
+  } node0;
+  if (!node0.valid) return false;
+  cpu_set_t cur;
+  CPU_ZERO(&cur);
+  if (sched_getaffinity(0, sizeof(cur), &cur) != 0) return false;
+  CPU_AND(out, &cur, &node0.mask);
+  return CPU_COUNT(out) > 0;
+}
+#endif
+
 } // namespace
+
+bool pin_thread_numa0() noexcept {
+#ifdef __linux__
+  cpu_set_t target;
+  if (!compute_numa0_affinity(&target)) return false;
+  return sched_setaffinity(0, sizeof(target), &target) == 0;
+#else
+  return false;
+#endif
+}
 
 ThreadPool::ThreadPool(unsigned n_threads) : nthreads_(n_threads < 1 ? 1u : n_threads) {
   n_threads = nthreads_;
@@ -42,6 +126,7 @@ ThreadPool::~ThreadPool() {
 }
 
 void ThreadPool::worker_loop(unsigned id) {
+  (void)pin_thread_numa0();
   const unsigned nt = size();
   uint64_t seen = 0;
   for (;;) {
@@ -131,6 +216,7 @@ ThreadPool& global_pool() {
     // when the engine is not decoding.
 #ifdef __linux__
     cpu_set_t cpuset;
+    if (compute_numa0_affinity(&cpuset)) return (unsigned)CPU_COUNT(&cpuset);
     CPU_ZERO(&cpuset);
     if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0 && CPU_COUNT(&cpuset) > 0)
       return (unsigned)CPU_COUNT(&cpuset);

@@ -1,16 +1,24 @@
 #include "engine/engram.h"
 
+#include "engine/threadpool.h"
 #include "quant/source_dtypes.h"
 
+#include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace aff {
 namespace {
@@ -82,6 +90,48 @@ bool EngramConsts::load(const std::string& path, std::string* err) {
                         prime(l, max_ngram - 2u, n_heads - 1u);
     if ((uint64_t)end > rows[l]) return fail("bucket ranges overflow the table");
   }
+  std::string mul_err;
+  if (!build_prime_muls(&mul_err)) return fail(mul_err.c_str());
+  return true;
+}
+
+bool EngramConsts::build_prime_muls(std::string* err) {
+  prime_muls.resize(primes.size());
+  for (size_t k = 0; k < primes.size(); ++k) {
+    if (primes[k] <= 0) {
+      if (err) *err = "non-positive prime";
+      return false;
+    }
+    const uint64_t p = static_cast<uint64_t>(primes[k]);
+    const EngramPrimeMul mul = make_barrett_mul(p);
+    prime_muls[k] = mul;
+
+    constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
+    constexpr uint64_t kMaxI64 = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    const uint64_t edges[] = {
+      0ULL,
+      1ULL,
+      p > 1ULL ? p - 1ULL : 0ULL,
+      p,
+      p < kMaxU64 ? p + 1ULL : kMaxU64,
+      p <= (kMaxU64 / 2ULL) ? (2ULL * p - 1ULL) : kMaxU64,
+      p <= (kMaxU64 / 2ULL) ? (2ULL * p) : kMaxU64,
+      kMaxI64 - 1ULL,
+      kMaxI64,
+      kMaxI64 + 1ULL,
+      kMaxU64 - 1ULL,
+      kMaxU64,
+    };
+    for (uint64_t x : edges) {
+      const uint64_t got = barrett_mod(x, p, mul);
+      const uint64_t want = x % p;
+      assert(got == want);
+      if (got != want) {
+        if (err) *err = "barrett_mod parity mismatch";
+        return false;
+      }
+    }
+  }
   return true;
 }
 
@@ -90,6 +140,14 @@ void EngramHash::init(const EngramConsts* c, uint64_t hint) {
   // A hint, not a bound: the cache grows in `push`. Sizing it from --kv-size would take 4 MB of
   // first-touched zeroes at a 1M context for a buffer most runs never reach the end of.
   cache_.assign((size_t)(hint ? hint : 4096u) + 1u, EngramConsts::kDead);
+  fallback_muls_.clear();
+  if (c_ && c_->prime_muls.size() != c_->primes.size()) {
+    fallback_muls_.resize(c_->primes.size());
+    for (size_t k = 0; k < c_->primes.size(); ++k) {
+      if (c_->primes[k] > 0)
+        fallback_muls_[k] = make_barrett_mul(static_cast<uint64_t>(c_->primes[k]));
+    }
+  }
   filled_ = 0;
 }
 
@@ -119,7 +177,8 @@ void EngramHash::push(const uint32_t* ids, uint32_t n, uint64_t pos0, int64_t* o
   const uint32_t ng = c.max_ngram;
 
   // The compressed ids first, so a later position in this same batch can look back at an earlier
-  // one. The reference writes the whole chunk into its cache before hashing any of it.
+  // one. The reference writes the whole chunk into its cache before hashing any of it; completing
+  // this pass before the parallel hash phase preserves the exact causal sliding-window invariant.
   grow(pos0 + n);
   for (uint32_t t = 0; t < n; ++t) {
     const size_t p = (size_t)(pos0 + t);
@@ -129,37 +188,63 @@ void EngramHash::push(const uint32_t* ids, uint32_t n, uint64_t pos0, int64_t* o
   }
   filled_ = pos0 + n;
 
-  int64_t tok_stack[16];
-  std::vector<int64_t> tok_heap;
-  int64_t* tok = ng <= 16 ? tok_stack : (tok_heap.resize(ng), tok_heap.data());
-  for (uint32_t t = 0; t < n; ++t) {
-    const int64_t pos = (int64_t)(pos0 + t);
-    // Look back `ng` slots. `blocked` latches: past the start of the sequence or past a dead
-    // position, this and every LONGER n-gram take the pad id.
-    bool blocked = false;
-    for (uint32_t s = 0; s < ng; ++s) {
-      const int64_t src_pos = pos - (int64_t)s > 0 ? pos - (int64_t)s : 0;
-      const int32_t src = cache_[(size_t)src_pos];
-      if (pos < (int64_t)s || src == EngramConsts::kDead) blocked = true;
-      tok[s] = blocked ? (int64_t)c.pad : (int64_t)src;
-    }
-    for (uint32_t l = 0; l < c.n_layer; ++l) {
-      const int64_t* ml = &c.mult[(size_t)l * ng];
-      // XOR the multiplied ids together one look-back at a time, so the running value after step i
-      // is the hash of the (i+1)-gram. Products stay non-negative — the multiplier bound in the
-      // reference exists so `id * multiplier` cannot overflow int64 — which is what lets the
-      // modulus below match Python's, whose result takes the sign of the divisor.
-      int64_t rolling = tok[0] * ml[0];
-      int64_t* orow = out + ((size_t)t * c.n_layer + l) * c.n_cols;
-      for (uint32_t i = 1; i < ng; ++i) {
-        rolling ^= tok[i] * ml[i];
-        for (uint32_t h = 0; h < c.n_heads; ++h) {
-          const uint32_t col = (i - 1u) * c.n_heads + h;
-          orow[col] = rolling % c.prime(l, i - 1u, h) + c.offsets[(size_t)l * c.n_cols + col];
+  const EngramPrimeMul* muls = nullptr;
+  if (c.prime_muls.size() == c.primes.size()) {
+    muls = c.prime_muls.data();
+  } else if (fallback_muls_.size() == c.primes.size()) {
+    muls = fallback_muls_.data();
+  }
+
+  // Once cache_ holds all compressed ids for [pos0, pos0 + n), each position t depends only on
+  // read-only cache_[pos - (ng - 1) .. pos] and writes disjointly to out[t], so parallel execution
+  // for n >= 256 is 100% bit-identical to serial execution.
+  parallel_for((uint64_t)n, 256, [&](uint64_t lo, uint64_t hi) {
+    int64_t tok_stack[16];
+    std::vector<int64_t> tok_heap;
+    int64_t* tok = ng <= 16 ? tok_stack : (tok_heap.resize(ng), tok_heap.data());
+    const size_t prime_layer_stride = (size_t)(ng - 1u) * c.n_heads;
+    for (uint64_t t = lo; t < hi; ++t) {
+      const int64_t pos = (int64_t)(pos0 + t);
+      // Look back `ng` slots. `blocked` latches: past the start of the sequence or past a dead
+      // position, this and every LONGER n-gram take the pad id.
+      bool blocked = false;
+      for (uint32_t s = 0; s < ng; ++s) {
+        const int64_t src_pos = pos - (int64_t)s > 0 ? pos - (int64_t)s : 0;
+        const int32_t src = cache_[(size_t)src_pos];
+        if (pos < (int64_t)s || src == EngramConsts::kDead) blocked = true;
+        tok[s] = blocked ? (int64_t)c.pad : (int64_t)src;
+      }
+      for (uint32_t l = 0; l < c.n_layer; ++l) {
+        const int64_t* ml = &c.mult[(size_t)l * ng];
+        const int64_t* pl = &c.primes[(size_t)l * prime_layer_stride];
+        const EngramPrimeMul* pm = muls ? (muls + (size_t)l * prime_layer_stride) : nullptr;
+        const int64_t* ol = &c.offsets[(size_t)l * c.n_cols];
+        // XOR the multiplied ids together one look-back at a time, so the running value after step i
+        // is the hash of the (i+1)-gram. Products stay non-negative — the multiplier bound in the
+        // reference exists so `id * multiplier` cannot overflow int64 — which is what lets the
+        // modulus below match Python's, whose result takes the sign of the divisor.
+        int64_t rolling = tok[0] * ml[0];
+        int64_t* orow = out + ((size_t)t * c.n_layer + l) * c.n_cols;
+        for (uint32_t i = 1; i < ng; ++i) {
+          rolling ^= tok[i] * ml[i];
+          const uint32_t base_col = (i - 1u) * c.n_heads;
+          if (__builtin_expect(rolling >= 0 && pm != nullptr, 1)) {
+            const uint64_t ux = static_cast<uint64_t>(rolling);
+            for (uint32_t h = 0; h < c.n_heads; ++h) {
+              const uint32_t col = base_col + h;
+              const uint64_t p = static_cast<uint64_t>(pl[col]);
+              orow[col] = static_cast<int64_t>(barrett_mod(ux, p, pm[col])) + ol[col];
+            }
+          } else {
+            for (uint32_t h = 0; h < c.n_heads; ++h) {
+              const uint32_t col = base_col + h;
+              orow[col] = rolling % pl[col] + ol[col];
+            }
+          }
         }
       }
     }
-  }
+  });
 }
 
 // ---- the tables ---------------------------------------------------------------------------------
@@ -264,17 +349,58 @@ void EngramTables::gather_mxfp8(uint32_t layer, const int64_t* ids, uint8_t* dst
     std::memset(s_base, 0xFF, (size_t)c.n_cols * nsc);
     return;
   }
+#if defined(__x86_64__) || defined(_M_X64)
+  constexpr uint32_t kPrefetchAhead = 16u;
+  auto prefetch_col = [&](uint32_t k) {
+    const int64_t pid = ids[k];
+    if (pid >= 0 && (uint64_t)pid < m.rows) {
+      const char* pw = reinterpret_cast<const char*>(m.w + (size_t)pid * dim);
+      for (uint32_t off = 0; off < dim; off += 64u) _mm_prefetch(pw + off, _MM_HINT_T0);
+      const char* ps = reinterpret_cast<const char*>(m.s + (size_t)pid * nsc);
+      for (uint32_t off = 0; off < nsc; off += 64u) _mm_prefetch(ps + off, _MM_HINT_T0);
+    }
+  };
+  const uint32_t prime_n = std::min(kPrefetchAhead, c.n_cols);
+  for (uint32_t k = 0; k < prime_n; ++k) prefetch_col(k);
+#endif
+#ifdef __AVX2__
+  const __m256i vzero = _mm256_setzero_si256();
+#endif
   for (uint32_t col = 0; col < c.n_cols; ++col) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (col + kPrefetchAhead < c.n_cols) prefetch_col(col + kPrefetchAhead);
+#endif
     uint8_t* const w_dst = w_base + (size_t)col * dim;
     uint8_t* const s_dst = s_base + (size_t)col * nsc;
     const int64_t id = ids[col];
     if (id < 0 || (uint64_t)id >= m.rows) {
+#ifdef __AVX2__
+      for (uint32_t off = 0; off < dim; off += 32u)
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(w_dst + off), vzero);
+#else
       std::memset(w_dst, 0x00, dim);
+#endif
       std::memset(s_dst, 0xFF, nsc);
       continue;
     }
-    std::memcpy(w_dst, m.w + (size_t)id * dim, dim);
-    std::memcpy(s_dst, m.s + (size_t)id * nsc, nsc);
+    const uint8_t* const w_src = m.w + (size_t)id * dim;
+    const uint8_t* const s_src = m.s + (size_t)id * nsc;
+#ifdef __AVX2__
+    // 256-bit AVX2 copy only (no 512-bit ZMM instructions) to avoid Skylake-SP License L2 downclock.
+    for (uint32_t off = 0; off < dim; off += 32u) {
+      const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w_src + off));
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(w_dst + off), v);
+    }
+#else
+    std::memcpy(w_dst, w_src, dim);
+#endif
+    if (nsc == 8u) {
+      uint64_t sv;
+      std::memcpy(&sv, s_src, 8);
+      std::memcpy(s_dst, &sv, 8);
+    } else {
+      std::memcpy(s_dst, s_src, nsc);
+    }
   }
 }
 

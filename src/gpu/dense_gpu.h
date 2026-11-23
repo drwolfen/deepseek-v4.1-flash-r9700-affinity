@@ -466,6 +466,15 @@ private:
   float        kvn_eps_ = 0.0f;
   uint32_t     kvn_pos_ = 0;
   RopeDerived  kvn_rope_{};
+  bool         b_kvn_pending_ = false;
+  const float* b_kvn_src_[kMaxRanks] = {};
+  const float* b_kvn_w_[kMaxRanks] = {};
+  float        b_kvn_eps_ = 0.0f;
+  uint32_t     b_kvn_pos0_ = 0;
+  uint32_t     b_kvn_nb_ = 0;
+  RopeDerived  b_kvn_rope_{};
+  uint32_t     b_kv_width_ = 0;
+  bool         ensure_b_kv(uint32_t width, std::string* err = nullptr);
   // Destinations of the compressor half, outstanding until comp_collect. Those matrices are Row so
   // each rank's d_y layout differs; wq_a and wkv are Rep and sit at the same offsets on both.
   uint32_t pre_n_ = 0;
@@ -611,6 +620,8 @@ private:
   // a NaN into an arithmetic that would otherwise be finite.
   bool     batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uint32_t n_embd,
                        uint32_t n_hc);
+  bool     batch_begin_bf16(uint32_t n_live, uint32_t pos0, const uint16_t* emb_bf16,
+                            uint32_t n_embd, uint32_t n_hc);
   bool     batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,
                         uint32_t n_hc, uint32_t iters, float hc_eps, float rms_eps,
                         float* norm_host);

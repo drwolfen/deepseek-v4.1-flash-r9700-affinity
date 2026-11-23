@@ -1104,7 +1104,7 @@ __global__ __launch_bounds__(256) void tp_ar_coded_staged_kernel(
 // pre_in collapse+sq, and side-band Infinity Cache prefetch) over live tokens [0, live) using
 // ctx.scratch (0 B extra VRAM) and zeroing `block` across all [0, nb).
 template <uint32_t NH, bool HasTap, bool HasControl, bool LiveOne, bool HasPreCollapse,
-          bool RegForm, bool Bf16Wire = false>
+          bool RegForm, bool Bf16Wire = false, bool HcDpp = false>
 __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
     uint16_t* __restrict__ out_hc, float* __restrict__ block, const uint16_t* __restrict__ hc,
     const float* __restrict__ post, const float* __restrict__ comb, uint32_t n_embd, uint32_t nb,
@@ -1152,10 +1152,14 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
     return;
   }
 
+  constexpr bool kPreDpp = HasPreCollapse && HcDpp;
+  constexpr bool kPreLds = HasPreCollapse && !HcDpp;
   __shared__ unsigned int s_seq;
   __shared__ float s_pre[HasPreCollapse ? (NH * 16u) : 1u];
-  __shared__ float s_red_cur[HasPreCollapse ? (16u * 256u) : 1u];
-  __shared__ float s_red_hc[HasPreCollapse ? (16u * 256u) : 1u];
+  __shared__ float s_red_cur[kPreLds ? (16u * 256u) : 1u];
+  __shared__ float s_red_hc[kPreLds ? (16u * 256u) : 1u];
+  // 1 KiB per-wave reduction buffer ([hc/cur][tok][wave]) replacing 32 KiB s_red_cur/hc when HcDpp.
+  __shared__ float s_dpp[kPreDpp ? 2u : 1u][kPreDpp ? (LiveOne ? 1u : 16u) : 1u][kPreDpp ? 8u : 1u];
   const uint32_t eff_live = LiveOne ? 1u : live;
   if (tid == 0u) s_seq = atomicAdd(&seq_ctrs[b_blk], 1u) + 1u;
   if constexpr (HasPreCollapse) {
@@ -1164,9 +1168,11 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
       const uint32_t b = tid & 15u;
       s_pre[tid] = (b < eff_live) ? pre_in[(size_t)h * nb + b] : 0.0f;
     }
-    for (uint32_t b = 0u; b < eff_live; ++b) {
-      s_red_cur[b * 256u + tid] = 0.0f;
-      s_red_hc[b * 256u + tid] = 0.0f;
+    if constexpr (kPreLds) {
+      for (uint32_t b = 0u; b < eff_live; ++b) {
+        s_red_cur[b * 256u + tid] = 0.0f;
+        s_red_hc[b * 256u + tid] = 0.0f;
+      }
     }
   }
   aff::lds_barrier();
@@ -1329,6 +1335,17 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
   aff::lds_barrier();
   fence_sys_acq();
 
+  constexpr uint32_t kPreRegToks = kPreDpp ? (LiveOne ? 1u : 16u) : 1u;
+  float r_red_cur[kPreRegToks];
+  float r_red_hc[kPreRegToks];
+  if constexpr (kPreDpp) {
+#pragma unroll
+    for (uint32_t b = 0u; b < kPreRegToks; ++b) {
+      r_red_cur[b] = 0.0f;
+      r_red_hc[b] = 0.0f;
+    }
+  }
+
   auto process_elem = [&](uint32_t d, uint32_t tok, float bv) __attribute__((always_inline)) {
     const size_t blk_idx = (size_t)d * nb + tok;
     if (zb) block[blk_idx] = 0.0f;
@@ -1365,8 +1382,23 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
       }
       if constexpr (HasPreCollapse) {
         out_cur[blk_idx] = cval;
-        s_red_cur[tok * 256u + tid] += cval * cval;
-        s_red_hc[tok * 256u + tid] += hsq;
+        if constexpr (kPreDpp) {
+          if constexpr (LiveOne) {
+            r_red_cur[0] += cval * cval;
+            r_red_hc[0] += hsq;
+          } else {
+#pragma unroll
+            for (uint32_t b = 0u; b < 16u; ++b) {
+              if (b == tok) {
+                r_red_cur[b] += cval * cval;
+                r_red_hc[b] += hsq;
+              }
+            }
+          }
+        } else {
+          s_red_cur[tok * 256u + tid] += cval * cval;
+          s_red_hc[tok * 256u + tid] += hsq;
+        }
       }
     } else {
       out_hc[blk_idx] = wmma::f32_to_bf16(wmma::bf16_to_f32(out_hc[blk_idx]) + bv);
@@ -1475,21 +1507,87 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
   }
 
   if constexpr (HasPreCollapse) {
-    aff::lds_barrier();
-    for (uint32_t st = 128u; st > 0u; st >>= 1) {
-      if (tid < st) {
-        for (uint32_t b = 0u; b < eff_live; ++b) {
-          s_red_cur[b * 256u + tid] += s_red_cur[b * 256u + tid + st];
-          s_red_hc[b * 256u + tid]  += s_red_hc[b * 256u + tid + st];
+    if constexpr (kPreDpp) {
+      const uint32_t lane = tid & 31u, wave = tid >> 5;
+      if constexpr (LiveOne) {
+        const float w_hc  = aff::wave_reduce_add_dpp(r_red_hc[0]);
+        const float w_cur = aff::wave_reduce_add_dpp(r_red_cur[0]);
+        if (lane == 0u) {
+          s_dpp[0][0][wave] = w_hc;
+          s_dpp[1][0][wave] = w_cur;
+        }
+        aff::lds_barrier();
+        if (wave == 0u) {
+          const uint32_t kind = lane >> 3;
+          const uint32_t w = lane & 7u;
+          float v = (kind < 2u) ? s_dpp[kind][0][w] : 0.0f;
+          // Exact 3-level binary tree across 8 waves (matching st = 128 -> 64 -> 32).
+          v += aff::dpp_xor_lane<4u>(v);
+          v += aff::dpp_xor_lane<2u>(v);
+          v += aff::dpp_xor_lane<1u>(v);
+          if (lane == 0u) out_part[(size_t)b_blk * 16u] = v;
+          if (lane == 8u) out_part[(size_t)(32u + b_blk) * 16u] = v;
+          if (lane >= 1u && lane < 16u) {
+            out_part[(size_t)b_blk * 16u + lane] = 0.0f;
+            out_part[(size_t)(32u + b_blk) * 16u + lane] = 0.0f;
+          }
+        }
+      } else {
+        // Constant-bound unroll keeps r_red_cur/r_red_hc in registers (zero scratch); eff_live is
+        // uniform across the block so every wave enters wave_reduce_add_dpp together.
+#pragma unroll
+        for (uint32_t b = 0u; b < 16u; ++b) {
+          if (b < eff_live) {
+            const float w_hc  = aff::wave_reduce_add_dpp(r_red_hc[b]);
+            const float w_cur = aff::wave_reduce_add_dpp(r_red_cur[b]);
+            if (lane == 0u) {
+              s_dpp[0][b][wave] = w_hc;
+              s_dpp[1][b][wave] = w_cur;
+            }
+          }
+        }
+        aff::lds_barrier();
+        if (wave == 0u) {
+          const uint32_t grp = lane >> 3;
+          const uint32_t w   = lane & 7u;
+          for (uint32_t b0 = 0u; b0 < eff_live; b0 += 4u) {
+            const uint32_t b = b0 + grp;
+            float v_hc  = (b < eff_live) ? s_dpp[0][b][w] : 0.0f;
+            float v_cur = (b < eff_live) ? s_dpp[1][b][w] : 0.0f;
+            v_hc  += aff::dpp_xor_lane<4u>(v_hc);
+            v_hc  += aff::dpp_xor_lane<2u>(v_hc);
+            v_hc  += aff::dpp_xor_lane<1u>(v_hc);
+            v_cur += aff::dpp_xor_lane<4u>(v_cur);
+            v_cur += aff::dpp_xor_lane<2u>(v_cur);
+            v_cur += aff::dpp_xor_lane<1u>(v_cur);
+            if (w == 0u && b < eff_live) {
+              out_part[(size_t)b_blk * 16u + b] = v_hc;
+              out_part[(size_t)(32u + b_blk) * 16u + b] = v_cur;
+            }
+          }
+          if (lane >= eff_live && lane < 16u) {
+            out_part[(size_t)b_blk * 16u + lane] = 0.0f;
+            out_part[(size_t)(32u + b_blk) * 16u + lane] = 0.0f;
+          }
         }
       }
+    } else {
       aff::lds_barrier();
-    }
-    if (tid < 16u) {
-      const float v_hc  = (tid < eff_live) ? s_red_hc[tid * 256u]  : 0.0f;
-      const float v_cur = (tid < eff_live) ? s_red_cur[tid * 256u] : 0.0f;
-      out_part[(size_t)b_blk * 16u + tid] = v_hc;
-      out_part[(size_t)(32u + b_blk) * 16u + tid] = v_cur;
+      for (uint32_t st = 128u; st > 0u; st >>= 1) {
+        if (tid < st) {
+          for (uint32_t b = 0u; b < eff_live; ++b) {
+            s_red_cur[b * 256u + tid] += s_red_cur[b * 256u + tid + st];
+            s_red_hc[b * 256u + tid]  += s_red_hc[b * 256u + tid + st];
+          }
+        }
+        aff::lds_barrier();
+      }
+      if (tid < 16u) {
+        const float v_hc  = (tid < eff_live) ? s_red_hc[tid * 256u]  : 0.0f;
+        const float v_cur = (tid < eff_live) ? s_red_cur[tid * 256u] : 0.0f;
+        out_part[(size_t)b_blk * 16u + tid] = v_hc;
+        out_part[(size_t)(32u + b_blk) * 16u + tid] = v_cur;
+      }
     }
   }
 }
@@ -1803,6 +1901,11 @@ static inline bool tp_ar_reg_form_enabled() {
 static inline bool tp_ar_hc_bf16_enabled() {
   const char* v = std::getenv("AFF_AR_HC_BF16");
   return v && *v && std::strcmp(v, "0") != 0;
+}
+
+static inline bool tp_hc_dpp_enabled() {
+  const char* v = std::getenv("AFF_TP_HC_DPP");
+  return !(v && *v && std::strcmp(v, "0") == 0);
 }
 
 static inline bool tp_ar_coded_enabled() {
@@ -2226,6 +2329,7 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
       out_cur && out_cur[0] && out_cur[1] &&
       out_part && out_part[0] && out_part[1] &&
       has_control && nb == 16u;
+  const bool hc_dpp = has_pre_collapse && tp_hc_dpp_enabled();
   const bool reg_form_env = tp_ar_reg_form_enabled();
   const int max_ar_blk = has_pre_collapse ? kTpHcnMaxBlocks : kTpMaxBlocks;
   const int fixed_blk = tp_ar_fixed_blk_cfg();
@@ -2293,23 +2397,28 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
 
     set_device(ctx.dev[r]);
     const hipStream_t st = (hipStream_t)ctx.stream[r];
-#define AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, REG_, BF16_)                                  \
-  hipLaunchKernelGGL((tp_ar_batch_hc_expand_kernel<NH_, TAP_, CTL_, ONE_, PRE_, REG_, BF16_>),    \
+#define AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, REG_, BF16_, HCDPP_)                          \
+  hipLaunchKernelGGL((tp_ar_batch_hc_expand_kernel<NH_, TAP_, CTL_, ONE_, PRE_, REG_, BF16_,      \
+                                                   HCDPP_>),                                      \
                      dim3(launch_blk), dim3(nt), 0, st, out_hc[r], block[r],                      \
                      hc ? hc[r] : nullptr, post ? post[r] : nullptr, comb ? comb[r] : nullptr,    \
                      n_embd, nb, live, zb, tap_r, b_lo, n_keep, row0, rows_cap, row_stride,       \
                      slot_off, ps, ms, pf, mf, pw, ctx.seq[r], ctx.timeout_dev, slot_floats,      \
                      (uint32_t)ar_blk, ar_flags, pre_r, cur_r, part_r, pf_p0_r, pf_n16_0_r,       \
                      pf_p1_r, pf_n16_1_r, pf_blk_r)
-#define AFF_TP_BHC_REG(NH_, TAP_, CTL_, ONE_, PRE_, BF16_)                                        \
+#define AFF_TP_BHC_REG(NH_, TAP_, CTL_, ONE_, PRE_, BF16_, HCDPP_)                                \
   do {                                                                                            \
-    if (use_reg_form) AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, true, BF16_);                   \
-    else              AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, false, BF16_);                  \
+    if (use_reg_form) AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, true, BF16_, HCDPP_);           \
+    else              AFF_TP_BHC_EXP(NH_, TAP_, CTL_, ONE_, PRE_, false, BF16_, HCDPP_);          \
   } while (0)
 #define AFF_TP_BHC_PRE(NH_, TAP_, ONE_, BF16_)                                                    \
   do {                                                                                            \
-    if (has_pre_collapse) AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, true, BF16_);                     \
-    else                  AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, false, BF16_);                    \
+    if (has_pre_collapse) {                                                                       \
+      if (hc_dpp) AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, true, BF16_, true);                       \
+      else        AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, true, BF16_, false);                      \
+    } else {                                                                                      \
+      AFF_TP_BHC_REG(NH_, TAP_, true, ONE_, false, BF16_, false);                                 \
+    }                                                                                             \
   } while (0)
 #define AFF_TP_BHC_TAP(NH_, ONE_, BF16_)                                                          \
   do {                                                                                            \
@@ -2323,11 +2432,11 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
   } while (0)
     if (!has_control) {
       if (use_bf16_wire) {
-        if (live_one) AFF_TP_BHC_REG(4u, false, false, true, false, true);
-        else          AFF_TP_BHC_REG(4u, false, false, false, false, true);
+        if (live_one) AFF_TP_BHC_REG(4u, false, false, true, false, true, false);
+        else          AFF_TP_BHC_REG(4u, false, false, false, false, true, false);
       } else {
-        if (live_one) AFF_TP_BHC_REG(4u, false, false, true, false, false);
-        else          AFF_TP_BHC_REG(4u, false, false, false, false, false);
+        if (live_one) AFF_TP_BHC_REG(4u, false, false, true, false, false, false);
+        else          AFF_TP_BHC_REG(4u, false, false, false, false, false, false);
       }
     } else if (n_hc == 4u) {
       if (use_bf16_wire) AFF_TP_BHC_ONE(4u, true);

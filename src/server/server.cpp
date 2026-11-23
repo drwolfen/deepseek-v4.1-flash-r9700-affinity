@@ -1,4 +1,5 @@
 #include "server.h"
+#include "engine/model.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1131,6 +1132,7 @@ bool Server::start(const std::string& host, uint16_t port, GenerateFn gen, std::
   port_ = ntohs(a.sin_port);
   running_ = true;
   accept_thread_ = std::thread([this] {
+    (void)pin_thread_numa0();
     while (running_) {
       const int fd = ::accept(listen_fd_, nullptr, nullptr);
       if (fd < 0) {
@@ -1145,6 +1147,7 @@ bool Server::start(const std::string& host, uint16_t port, GenerateFn gen, std::
       // One thread per connection. With a latency-first scheduler at B<=4 the connection count is
       // small by design, so a thread pool would be complexity without benefit.
       std::thread([this, fd] {
+        (void)pin_thread_numa0();
         struct WorkerGuard {
           Server* s;
           ~WorkerGuard() {

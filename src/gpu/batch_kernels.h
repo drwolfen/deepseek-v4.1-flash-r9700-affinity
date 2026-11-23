@@ -371,6 +371,9 @@ void batch_hc_add_bf16_hip(uint16_t* dst, float* src, uint64_t n, bool zero_src,
 // (the host dequantised it out of the container's bf16 table) and is transposed into place.
 void batch_hc_seed_hip(const float* emb, uint16_t* hc, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
                        void* stream);
+// Direct BF16 embedding seed: takes token-major BF16 rows, zeroing columns >= n_live.
+void batch_hc_seed_bf16_hip(const uint16_t* emb_bf16, uint16_t* hc, uint32_t n_embd,
+                            uint32_t n_hc, uint32_t n_live, uint32_t nb, void* stream);
 
 // The hc lanes averaged — `h.mean(dim=2)`, which is what DSpark conditions its draft on — written
 // TOKEN-MAJOR straight into the tap plane the draft's projection reads, so the value never leaves

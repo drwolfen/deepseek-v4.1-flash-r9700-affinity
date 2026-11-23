@@ -182,37 +182,25 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
 // enough to accumulate index_topk compressed rows, so every other hash must come back unchanged.
 constexpr uint32_t kIdxDecHeads = 64;
 
+template <bool MultiTok>
 __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
     const uint8_t* __restrict__ q8, const float* __restrict__ qs, const uint8_t* __restrict__ k8,
     const float* __restrict__ ks, const float* __restrict__ hw, float* __restrict__ out,
-    uint32_t n_keys, uint32_t n_head) {
-  __shared__ __align__(16) uint8_t s_q[kIdxDecHeads * kQLd];
-  __shared__ float s_w[kIdxDecHeads];
+    uint32_t n_keys, uint32_t n_head, uint32_t nb) {
+  // Double-buffer Q and weights in MultiTok (17,920 B <= 18,432 B) so K fragments stay in
+  // registers across all nb tokens with 1 barrier per token and zero redundant K global reads.
+  constexpr uint32_t kQBufs = MultiTok ? 2u : 1u;
+  __shared__ __align__(16) uint8_t s_q[kQBufs][kIdxDecHeads * kQLd];
+  __shared__ float s_w[kQBufs][kIdxDecHeads];
 
   const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
   const uint32_t c = lane & 15u, hlf = lane >> 4;
-  const uint32_t tok = blockIdx.z;
-  const uint8_t* const q8_b = q8 + (size_t)tok * n_head * kD;
-  const float* const hw_b = hw + (size_t)tok * n_head;
-  float* const out_b = out + (size_t)tok * n_keys;
-  const float qs_b = qs[tok];
-
-  // Q is n_head rows of 128 bytes and every block reads all of it, so it is staged once: 8 KB at
-  // 16 bytes a thread a step, using 8-byte vectorized stores (uint64_t) to eliminate LDS conflicts.
-  for (uint32_t i = tid; i < n_head * (kD / 16u); i += kThreads) {
-    const uint32_t row = i / (kD / 16u), dq = (i % (kD / 16u)) * 16u;
-    const uint4 qv = *(const uint4*)(q8_b + (size_t)row * kD + dq);
-    uint8_t* dst = s_q + (size_t)row * kQLd + dq;
-    *(uint64_t*)(dst + 0) = *(const uint64_t*)&qv.x;
-    *(uint64_t*)(dst + 8) = *(const uint64_t*)&qv.z;
-  }
-  if (tid < n_head) s_w[tid] = hw_b[tid];
-  lds_barrier();
-
   const uint32_t key = blockIdx.x * (kWaves * 16u) + wave * 16u + c;
+  const bool live_key = (key < n_keys);
+
   // An out-of-range key reads row 0 and is dropped on store rather than branched around: every lane
   // of the wave has to supply a defined operand for the fragment to be well formed.
-  const uint8_t* row_kp = k8 + (size_t)(key < n_keys ? key : 0u) * kD;
+  const uint8_t* row_kp = k8 + (size_t)(live_key ? key : 0u) * kD;
   wmma::i2v bf[kD / 16u];
   if ((reinterpret_cast<uintptr_t>(k8) & 15u) == 0u) {
     const uint4* ku4 = reinterpret_cast<const uint4*>(row_kp);
@@ -233,21 +221,54 @@ __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
 #pragma unroll
     for (uint32_t d = 0; d < kD / 16u; ++d) bf[d] = *(const wmma::i2v*)(kp + d * 16u);
   }
+  const float kscale = live_key ? ks[key] : 0.0f;
 
-  float sum = 0.0f;
-  for (uint32_t mt = 0; mt < n_head; mt += 16u) {
-    wmma::f8v acc = wmma::acc_zero();
-    const uint8_t* qp = s_q + (size_t)(mt + c) * kQLd + hlf * 8u;
+  // Q is n_head rows of 128 bytes and every block reads all of it, so it is staged once per token:
+  // 8 KB at 16 bytes a thread a step, using 8-byte vectorized stores (uint64_t) to avoid LDS bank
+  // conflicts.
+  auto stage_tok = [&](uint32_t tok_idx, uint32_t buf) __attribute__((always_inline)) {
+    const uint8_t* const q8_b = q8 + (size_t)tok_idx * n_head * kD;
+    const float* const hw_b = hw + (size_t)tok_idx * n_head;
+    for (uint32_t i = tid; i < n_head * (kD / 16u); i += kThreads) {
+      const uint32_t row = i / (kD / 16u), dq = (i % (kD / 16u)) * 16u;
+      const uint4 qv = *(const uint4*)(q8_b + (size_t)row * kD + dq);
+      uint8_t* dst = s_q[buf] + (size_t)row * kQLd + dq;
+      *(uint64_t*)(dst + 0) = *(const uint64_t*)&qv.x;
+      *(uint64_t*)(dst + 8) = *(const uint64_t*)&qv.z;
+    }
+    if (tid < n_head) s_w[buf][tid] = hw_b[tid];
+  };
+
+  const uint32_t tok_beg = MultiTok ? 0u : blockIdx.z;
+  const uint32_t tok_end = MultiTok ? nb : (blockIdx.z + 1u);
+  stage_tok(tok_beg, 0u);
+  lds_barrier();
+
+  for (uint32_t tok = tok_beg; tok < tok_end; ++tok) {
+    const uint32_t buf = MultiTok ? (tok & 1u) : 0u;
+    if constexpr (MultiTok) {
+      if (tok + 1u < tok_end) stage_tok(tok + 1u, buf ^ 1u);
+    }
+    const float qs_b = qs[tok];
+    float sum = 0.0f;
+    for (uint32_t mt = 0; mt < n_head; mt += 16u) {
+      wmma::f8v acc = wmma::acc_zero();
+      const uint8_t* qp = s_q[buf] + (size_t)(mt + c) * kQLd + hlf * 8u;
 #pragma unroll
-    for (uint32_t d = 0; d < kD / 16u; ++d)
-      acc = wmma::mma_fp8(*(const wmma::i2v*)(qp + d * 16u), bf[d], acc);
-    // ReLU then the head weight, exactly as above; the accumulator row IS the head here, where in
-    // the batched kernel it is the token.
+      for (uint32_t d = 0; d < kD / 16u; ++d)
+        acc = wmma::mma_fp8(*(const wmma::i2v*)(qp + d * 16u), bf[d], acc);
+      // ReLU then the head weight, exactly as above; the accumulator row IS the head here, where
+      // in the batched kernel it is the token.
 #pragma unroll
-    for (int j = 0; j < 8; ++j) sum += s_w[mt + hlf * 8u + (uint32_t)j] * fmaxf(acc[j], 0.0f);
+      for (int j = 0; j < 8; ++j)
+        sum += s_w[buf][mt + hlf * 8u + (uint32_t)j] * fmaxf(acc[j], 0.0f);
+    }
+    sum += dpp_xor_lane<16u>(sum);               // the wave's other eight heads a tile
+    if (hlf == 0u && live_key) out[(size_t)tok * n_keys + key] = sum * qs_b * kscale;
+    if constexpr (MultiTok) {
+      if (tok + 1u < tok_end) lds_barrier();
+    }
   }
-  sum += dpp_xor_lane<16u>(sum);               // the wave's other eight heads a tile
-  if (hlf == 0u && key < n_keys) out_b[key] = sum * qs_b * ks[key];
 }
 
 // ---- f32 rows -> E4M3 + one scale a row, on device ----------------------------------------------
@@ -547,7 +568,11 @@ __device__ __forceinline__ void tie_cutoff_excl(const uint32_t* tie, uint32_t nt
       if (cnt < quota) {
         quota -= cnt;
       } else {
-        for (int o = 16; o; o >>= 1) cut |= static_cast<uint32_t>(__shfl_xor(static_cast<int>(cut), o, 32));
+        cut |= dpp_xor_lane<16u>(cut);
+        cut |= dpp_xor_lane<8u>(cut);
+        cut |= dpp_xor_lane<4u>(cut);
+        cut |= dpp_xor_lane<2u>(cut);
+        cut |= dpp_xor_lane<1u>(cut);
         quota = 0u;
       }
     }
@@ -962,8 +987,9 @@ __global__ __launch_bounds__(128) void idx_rope_qat_kernel(float* __restrict__ q
       theta = theta * (1.0f - mix) + theta_extrap * mix;
     }
     const float c = __cosf(theta), sn = __sinf(theta);
-    // The pair (j, j+1) is two adjacent lanes of the same wave, so the partner is a shuffle.
-    const float partner = __shfl_xor(v, 1);
+    // The pair (j, j+1) is two adjacent lanes of the same wave, and n_nope is even, so both
+    // partner lanes are always active together under xor-1 DPP16 exchange.
+    const float partner = dpp_xor_lane<1u>(v);
     v = (j & 1u) ? (partner * sn + v * c) : (v * c - partner * sn);
   }
 
@@ -989,9 +1015,7 @@ __global__ __launch_bounds__(128) void idx_rope_qat_kernel(float* __restrict__ q
     v = r[i] * 0.08838834764831845f;            // 1/sqrt(128)
   }
 
-  float amax = fabsf(v);
-#pragma unroll
-  for (int o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o));
+  float amax = wave_reduce_max_dpp(fabsf(v));
   amax = fmaxf(amax, 7.052966104933725e-38f);
   const float sc = exp2f(ceilf(log2f(amax / 6.0f)));
   g[i] = e2m1_round_d(fminf(6.0f, fmaxf(-6.0f, v / sc))) * sc;
@@ -1061,9 +1085,17 @@ void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, c
   const uint32_t dec_max_nb = idx_narrow ? 8u : 1u;
   if (nb <= dec_max_nb && n_head <= kIdxDecHeads && (n_head % 16u) == 0u) {
     const uint32_t kpb = kWaves * 16u;                // 64 keys a block
-    const dim3 g((n_keys + kpb - 1u) / kpb, 1u, nb);
-    hipLaunchKernelGGL(indexer_dec_kernel, g, dim3(kThreads), 0,
-                       (hipStream_t)stream, q8, qs, k8, ks, hw, out, n_keys, n_head);
+    const char* mt_env = std::getenv("AFF_IDX_DEC_MULTITOK");
+    const bool dec_multitok = !(mt_env && *mt_env && std::strcmp(mt_env, "0") == 0);
+    if (dec_multitok && nb > 1u) {
+      const dim3 g((n_keys + kpb - 1u) / kpb, 1u, 1u);
+      hipLaunchKernelGGL((indexer_dec_kernel<true>), g, dim3(kThreads), 0,
+                         (hipStream_t)stream, q8, qs, k8, ks, hw, out, n_keys, n_head, nb);
+    } else {
+      const dim3 g((n_keys + kpb - 1u) / kpb, 1u, nb);
+      hipLaunchKernelGGL((indexer_dec_kernel<false>), g, dim3(kThreads), 0,
+                         (hipStream_t)stream, q8, qs, k8, ks, hw, out, n_keys, n_head, nb);
+    }
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }

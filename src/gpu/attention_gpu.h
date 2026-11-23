@@ -175,4 +175,16 @@ bool kv_norm_commit_hip(KvDtype dt, const float* latent, const float* nw, float 
                         float freq_scale, float theta_scale, float ext_factor, float lo, float hi,
                         void* stream);
 
+// Returns true unless AFF_FUSE_BATCH_KV_NORM=0.
+bool kv_fuse_batch_norm_enabled();
+
+// Batched RMSNorm + RoPE + QAT + f16 round + cache encode for `n` consecutive tokens from
+// dim-major `latent` [width][nb] starting at column `b0` and sequence position `pos0`.
+// Returns false having launched nothing if the shape does not fit the single-block norm prologue.
+bool kv_norm_commit_batch_hip(KvDtype dt, const float* latent, const float* nw, float eps,
+                              uint32_t nb, uint32_t b0, uint32_t n, uint8_t* raw, uint32_t pos0,
+                              uint32_t ring, uint32_t width, uint32_t n_rot, float freq_scale,
+                              float theta_scale, float ext_factor, float lo, float hi,
+                              void* stream);
+
 } // namespace aff

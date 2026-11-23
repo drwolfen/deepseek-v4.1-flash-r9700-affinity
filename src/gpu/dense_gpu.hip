@@ -480,7 +480,7 @@ struct DenseGpu::Impl {
     //
     // If any of the ring rows is ever non-zero in the AFF_BLOCK table, that ring is shallower than
     // the host's lookahead and the fix is a larger budget, not a different design.
-    StageRing ncomp, rsel, emb, eng, rres;
+    StageRing ncomp, rsel, emb, emb_dec, eng, rres;
     uint32_t* b_ncomp = nullptr;                          // device, the same counts
     // The lightning indexer, all of it on device. `i_q`/`i_w`/`i_k` are the staged f32 inputs,
     // `i_q8`/`i_k8` their E4M3 forms with one scale a row, `i_sc` the [n][n_keys] score plane.
@@ -891,7 +891,7 @@ DenseGpu::~DenseGpu() {
     norm_q8_invalidate_dev(D.id);
     for (void* p : {(void*)D.q8, (void*)D.qs, (void*)D.q8_sw, (void*)D.qs_sw})
       if (p) (void)hipFree(p);
-    for (StageRing* r : {&D.ncomp, &D.rsel, &D.emb, &D.eng, &D.rres}) r->free();
+    for (StageRing* r : {&D.ncomp, &D.rsel, &D.emb, &D.emb_dec, &D.eng, &D.rres}) r->free();
     for (void* p : {(void*)D.hi_w, (void*)D.hi_nc, (void*)D.hi_ncb})
       if (p) (void)hipHostFree(p);
     if (D.b_ncomp) (void)hipFree(D.b_ncomp);
@@ -4367,6 +4367,8 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       alias_on ? (std::max<size_t>((size_t)b_u_cap_ * nb, (size_t)vocab * kNarrowTok) *
                   sizeof(float))
                : ((size_t)b_u_cap_ * nb * sizeof(float));
+  b_kv_width_ = (uint32_t)width;
+  const bool fuse_kv = kv_fuse_batch_norm_enabled();
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -4387,7 +4389,7 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       {&D.b_emb, emb_aliases_y ? 0u : ((size_t)n_embd * nb * sizeof(float)),
        emb_aliases_y ? 0ull : n_embd, "emb"},
       {&D.b_q, (size_t)nq * nb * sizeof(float), nq, "q"},
-      {&D.b_kv, (size_t)width * nb * sizeof(float), width, "kv"},
+      {&D.b_kv, fuse_kv ? 0u : ((size_t)width * nb * sizeof(float)), fuse_kv ? 0ull : width, "kv"},
       // One float a head a token: the per-head RMS scale; omitted when no_qrms_ (V4.1).
       {&D.b_hinv, no_qrms_ ? 0u : ((size_t)(nq / width) * nb * sizeof(float)),
        no_qrms_ ? 0ull : (nq / width), "hinv"},
@@ -4625,6 +4627,30 @@ bool DenseGpu::ensure_by(uint32_t need_rows, std::string* err) {
     if (emb_was_y) D.b_emb = p;
   }
   b_y_cap_ = need_rows;
+  return true;
+}
+
+bool DenseGpu::ensure_b_kv(uint32_t width, std::string* err) {
+  const uint32_t nb = b_cap_ ? b_cap_ : b_nb_;
+  if (!nb || !width) return false;
+  if (width <= b_kv_width_ &&
+      std::all_of(impl_->dev.begin(), impl_->dev.end(), [](const Impl::Dev& D) { return D.b_kv != nullptr; }))
+    return true;
+  const uint32_t new_w = std::max(width, b_kv_width_);
+  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    if (D.b_kv && width <= b_kv_width_) continue;
+    AFF_HIP_CHECK(hipSetDevice(D.id));
+    if (D.b_kv) {
+      AFF_HIP_CHECK(hipDeviceSynchronize());
+      (void)hipFree(D.b_kv);
+      D.b_kv = nullptr;
+    }
+    if (!hip_try(hipMalloc(&D.b_kv, (size_t)new_w * nb * sizeof(float)), "hipMalloc batch kv", err))
+      return false;
+    AFF_HIP_CHECK(hipMemset(D.b_kv, 0, (size_t)new_w * nb * sizeof(float)));
+  }
+  b_kv_width_ = new_w;
   return true;
 }
 
@@ -4919,11 +4945,12 @@ void DenseGpu::batch_stage_out(size_t r, const float* src_dm, uint32_t n, uint32
 bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uint32_t n_embd,
                            uint32_t n_hc) {
   AFF_TRACE(20);
-  if (!b_cap_ || !n_live) return false;
+  if (!b_cap_ || !n_live || !emb) return false;
   // A new chunk: whatever admissions the b_* buffers hold were written for a previous chunk's
   // token count and are garbage past it. batch_indexer re-arms this for its own layer.
   b_idx_layer_[slot_] = -1;
   b_cand_src_[slot_] = -1;
+  b_kvn_pending_ = false;
   // The SAME function batch_init sized the arena with, deliberately. As a second copy of the
   // expression it drifted: a chunk asked for a stride larger than its own arena, was refused here,
   // and the caller quietly fell back to one token at a time — so prefill reported decode's rate,
@@ -4942,6 +4969,8 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
   pending_pf0_ = -1;
   pending_pf1_ = -1;
   const size_t live_bytes = (size_t)n_live * n_embd * sizeof(float);
+  const size_t fit_bytes =
+      (nb <= kNarrowTok) ? ((size_t)kNarrowTok * n_embd * sizeof(float)) : live_bytes;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     D.b_shexp_ev = false;
@@ -4949,17 +4978,13 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
     D.b_ar_npart = 0;
     AFF_HIP_CHECK(hipSetDevice(D.id));
     keepalive_notify_active(D.id);
-    // ---- through the ring, which is what deleted the drain that used to be here ------------------
-    //
-    // `emb` belongs to the caller. For the draft it is `dspark_emb_`, a member — but one whose row 0
-    // is rebuilt in place every block, so "not a local" was never the property that mattered. What
-    // matters is that the DMA reads it after this call returns, and the drain was the only thing
-    // guaranteeing it had. A ring slot per call carries the same guarantee without pinning the host
-    // back to one block of lookahead.
-    if (!D.emb.fit(live_bytes, kRingPlaneBudget)) return false;
+    // Split StageRing by phase (D.emb_dec for decode/narrow <= kNarrowTok, D.emb for prefill)
+    // so prefill<->decode transitions never call hipEventSynchronize + hipHostFree + hipHostMalloc.
+    StageRing& ring = (nb <= kNarrowTok) ? D.emb_dec : D.emb;
+    if (!ring.fit(fit_bytes, kRingPlaneBudget)) return false;
     uint32_t es = 0;
-    uint8_t* const pin = D.emb.claim(&es);
-    AFF_BLOCK_AT(aff::BlockSite::Begin, AFF_HIP_CHECK(D.emb.wait(es)));
+    uint8_t* const pin = ring.claim(&es);
+    AFF_BLOCK_AT(aff::BlockSite::Begin, AFF_HIP_CHECK(ring.wait(es)));
     std::memcpy(pin, emb, live_bytes);
     // The padding columns run through every kernel; zeroing the [n_live, nb) tail is what keeps
     // them finite without re-zeroing [0, n_live) before the H2D overwrite.
@@ -4967,9 +4992,53 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
     if (nb > n_live)
       AFF_HIP_CHECK(hipMemsetAsync(D.b_emb + (size_t)n_live * n_embd, 0,
                                    (size_t)(nb - n_live) * n_embd * sizeof(float), D.stream));
-    AFF_HIP_CHECK(D.emb.done(es, D.stream));
+    AFF_HIP_CHECK(ring.done(es, D.stream));
     batch_hc_seed_hip(D.b_emb, D.b_hc, n_embd, n_hc, nb, D.stream);
     // Every token in the chunk starts its stack with the reference's one-hot mix.
+    if (shift_pre_) seed_pre_identity(D.b_pre_prev, n_hc, nb, D.stream);
+    D.q8_src = nullptr;
+    norm_q8_invalidate(D.id, D.b_norm);
+  }
+  return true;
+}
+
+bool DenseGpu::batch_begin_bf16(uint32_t n_live, uint32_t pos0, const uint16_t* emb_bf16,
+                                uint32_t n_embd, uint32_t n_hc) {
+  AFF_TRACE(20);
+  if (!b_cap_ || !n_live || !emb_bf16) return false;
+  b_idx_layer_[slot_] = -1;
+  b_cand_src_[slot_] = -1;
+  b_kvn_pending_ = false;
+  const uint32_t nb = batch_round(n_live);
+  if (nb > b_cap_) {
+    aff::ui::fatal("batch_begin_bf16: %u live -> stride %u exceeds the %u-token arena\n", n_live,
+                   nb, b_cap_);
+    std::abort();
+  }
+  b_nb_ = nb; b_live_ = n_live; b_pos0_ = pos0;
+  b_ar_pending_ = 0;
+  pending_pf0_ = -1;
+  pending_pf1_ = -1;
+  const size_t live_bytes = (size_t)n_live * n_embd * sizeof(uint16_t);
+  const size_t fit_bytes =
+      (nb <= kNarrowTok) ? ((size_t)kNarrowTok * n_embd * sizeof(uint16_t)) : live_bytes;
+  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    D.b_shexp_ev = false;
+    D.b_ar_precollapsed = false;
+    D.b_ar_npart = 0;
+    AFF_HIP_CHECK(hipSetDevice(D.id));
+    keepalive_notify_active(D.id);
+    StageRing& ring = (nb <= kNarrowTok) ? D.emb_dec : D.emb;
+    if (!ring.fit(fit_bytes, kRingPlaneBudget)) return false;
+    uint32_t es = 0;
+    uint8_t* const pin = ring.claim(&es);
+    AFF_BLOCK_AT(aff::BlockSite::Begin, AFF_HIP_CHECK(ring.wait(es)));
+    std::memcpy(pin, emb_bf16, live_bytes);
+    uint16_t* const dst_bf16 = reinterpret_cast<uint16_t*>(D.b_emb);
+    AFF_HIP_CHECK(hipMemcpyAsync(dst_bf16, pin, live_bytes, hipMemcpyHostToDevice, D.stream));
+    AFF_HIP_CHECK(ring.done(es, D.stream));
+    batch_hc_seed_bf16_hip(dst_bf16, D.b_hc, n_embd, n_hc, n_live, nb, D.stream);
     if (shift_pre_) seed_pre_identity(D.b_pre_prev, n_hc, nb, D.stream);
     D.q8_src = nullptr;
     norm_q8_invalidate(D.id, D.b_norm);
@@ -5088,6 +5157,11 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
                           a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u &&
                           width == kFlashWidth && (n_rot % 64u) == 0u &&
                           flash_q_e4m3_enabled();
+  const bool defer_bkvn = kv_fuse_batch_norm_enabled() && attn_ok_ && a_ring_ &&
+                          width == a_width_ && n_rot == a_rot_ && width >= 256u &&
+                          width <= 1024u && (width % 64u) == 0u && (n_rot % 2u) == 0u &&
+                          n_rot <= width;
+  if (!defer_bkvn && !ensure_b_kv(width)) { b_kvn_pending_ = false; return false; }
 
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
@@ -5163,12 +5237,23 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
         D.b_qtm_e4m3 = true;
       } else if (!batch_head_rms_rope_tr_hip(D.b_q, D.b_qtm, D.b_hinv, nh, width, n_rot, b_pos0_,
                                              rope, eps, b_nb_, D.stream, !no_qrms_)) {
+        b_kvn_pending_ = false;
         return false;
       }
-      batch_rms_norm_rope_hip(ykv, D.vec[kvnorm], D.b_kv, width, n_rot, b_pos0_, rope, eps, b_nb_,
-                              D.stream);
+      if (defer_bkvn) {
+        b_kvn_src_[d] = ykv;
+        b_kvn_w_[d] = D.vec[kvnorm];
+      } else {
+        batch_rms_norm_rope_hip(ykv, D.vec[kvnorm], D.b_kv, width, n_rot, b_pos0_, rope, eps, b_nb_,
+                                D.stream);
+      }
     }
   }
+  b_kvn_pending_ = defer_bkvn;
+  b_kvn_eps_ = eps;
+  b_kvn_pos0_ = b_pos0_;
+  b_kvn_nb_ = b_nb_;
+  b_kvn_rope_ = rope;
   if (qrnorm_host) {
     if (!ensure_btm((uint32_t)qr)) return false;
     Impl::Dev& D = impl_->dev[0];                     // wq_a is replicated
@@ -5265,17 +5350,35 @@ bool DenseGpu::batch_mv_host(int src, const int32_t* h, const uint64_t* rows, ui
 
 bool DenseGpu::batch_kv_commit(uint32_t layer, uint32_t b0, uint32_t n, uint32_t pos0,
                                uint32_t width, uint32_t n_rot) {
-  if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size() || !a_ring_ || !n) return false;
+  if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size() || !a_ring_ || !n) {
+    b_kvn_pending_ = false;
+    return false;
+  }
   AFF_TRACE(24);
-  if (width != a_width_ || n_rot != a_rot_) return false;
-  if (n > a_ring_) return false;                      // a sub-batch may not lap its own ring
+  if (width != a_width_ || n_rot != a_rot_ || n > a_ring_) {
+    b_kvn_pending_ = false;
+    return false;                      // a sub-batch may not lap its own ring
+  }
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    // One launch, straight from the chunk's dim-major latent. The per-token version staged a 2 KiB
-    // column through d_u and then ran two more kernels on it, three launches a token a layer.
-    kv_commit_batch_hip(a_dt_, D.b_kv, b_nb_, b0, n, D.a_raw_s[slot_][layer], pos0, a_ring_, width, n_rot,
-                        D.stream);
+    bool done = false;
+    if (b_kvn_pending_ && b_kvn_src_[d] && b_kvn_nb_) {
+      done = kv_norm_commit_batch_hip(a_dt_, b_kvn_src_[d], b_kvn_w_[d], b_kvn_eps_, b_kvn_nb_, b0,
+                                      n, D.a_raw_s[slot_][layer], pos0, a_ring_, width, n_rot,
+                                      b_kvn_rope_.freq_scale, b_kvn_rope_.theta_scale,
+                                      b_kvn_rope_.ext_factor, b_kvn_rope_.lo, b_kvn_rope_.hi,
+                                      D.stream);
+    }
+    if (!done) {
+      if (!ensure_b_kv(width)) { b_kvn_pending_ = false; return false; }
+      if (b_kvn_pending_ && b_kvn_src_[d] && b_kvn_nb_) {
+        batch_rms_norm_rope_hip(b_kvn_src_[d], b_kvn_w_[d], D.b_kv, width, n_rot, b_kvn_pos0_,
+                                b_kvn_rope_, b_kvn_eps_, b_kvn_nb_, D.stream);
+      }
+      kv_commit_batch_hip(a_dt_, D.b_kv, b_nb_, b0, n, D.a_raw_s[slot_][layer], pos0, a_ring_,
+                          width, n_rot, D.stream);
+    }
   }
   return true;
 }
@@ -7925,6 +8028,10 @@ bool DenseGpu::draft_kv(uint32_t layer, int32_t kv, int32_t kvnorm, uint32_t n, 
   if (!n || n > kNarrowTok || kv < 0 || (size_t)kv >= ent_.size() || kvnorm < 0) return false;
   if (!attn_ok_ || layer >= impl_->dev[0].a_raw_s[slot_].size()) return false;
   b_nb_ = kNarrowTok; b_live_ = n;
+  const bool defer_bkvn = kv_fuse_batch_norm_enabled() && a_ring_ && width == a_width_ &&
+                          n_rot == a_rot_ && width >= 256u && width <= 1024u &&
+                          (width % 64u) == 0u && (n_rot % 2u) == 0u && n_rot <= width;
+  if (!defer_bkvn && !ensure_b_kv(width)) { b_kvn_pending_ = false; return false; }
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     if (!D.b_dm || !D.vec[kvnorm]) return false;
@@ -7935,9 +8042,19 @@ bool DenseGpu::draft_kv(uint32_t layer, int32_t kv, int32_t kvnorm, uint32_t n, 
     // matching the non-speculative one, which it had matched exactly. A draft that changes what the
     // target emits is not drafting.
     batch_gemm_ent(d, kv, D.b_dm, D.b_u, width, hidden);
-    batch_rms_norm_rope_hip(D.b_u, D.vec[kvnorm], D.b_kv, width, n_rot, pos0, rope, eps,
-                            kNarrowTok, D.stream);
+    if (defer_bkvn) {
+      b_kvn_src_[d] = D.b_u;
+      b_kvn_w_[d] = D.vec[kvnorm];
+    } else {
+      batch_rms_norm_rope_hip(D.b_u, D.vec[kvnorm], D.b_kv, width, n_rot, pos0, rope, eps,
+                              kNarrowTok, D.stream);
+    }
   }
+  b_kvn_pending_ = defer_bkvn;
+  b_kvn_eps_ = eps;
+  b_kvn_pos0_ = pos0;
+  b_kvn_nb_ = kNarrowTok;
+  b_kvn_rope_ = rope;
   return batch_kv_commit(layer, 0, n, pos0, width, n_rot);
 }
 
@@ -8321,6 +8438,10 @@ Model::BatchOps DenseGpu::batch_ops() {
   o.cap = [](void* c) { return static_cast<DenseGpu*>(c)->b_cap_; };
   o.begin = [](void* c, uint32_t nl, uint32_t p0, const float* e, uint32_t ne, uint32_t nh) {
     return static_cast<DenseGpu*>(c)->batch_begin(nl, p0, e, ne, nh);
+  };
+  o.begin_bf16 = [](void* c, uint32_t nl, uint32_t p0, const uint16_t* e, uint32_t ne,
+                    uint32_t nh) {
+    return static_cast<DenseGpu*>(c)->batch_begin_bf16(nl, p0, e, ne, nh);
   };
   o.hc_pre = [](void* c, int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t ne, uint32_t nh,
                 uint32_t it, float he, float re, float* n) {

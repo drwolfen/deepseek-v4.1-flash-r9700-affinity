@@ -13,7 +13,8 @@
 namespace aff {
 
 // CPU kernel variant. 1 is the scalar reference; 2 adds two accumulators and one field load per
-// block pair; 4 is the default and cuts instructions with AVX512_VBMI, bit-identical to v2. 3 and 5
+// block pair (default on AVX-512 hosts without VBMI, e.g. Skylake-SP); 4 is the default on VBMI
+// hosts and cuts instructions with AVX512_VBMI, bit-identical to v2. 3 and 5
 // are intermediate points kept as controls rather than as attributions — both are unstable against
 // code layout, so the only claim this file makes is v2 -> v4. All are retained so the set stays
 // comparable after a change to the surrounding code (`aff-kbench`).
@@ -22,7 +23,11 @@ namespace aff {
 // chases operation count and nothing else.
 //
 // The shipped variant. `aff-kbench` sets others through cpu_kernel_variant() to compare them.
+#if defined(__AVX512VBMI__)
 static int g_cpu_variant = 4;
+#else
+static int g_cpu_variant = 2;
+#endif
 void cpu_kernel_variant(int v) { g_cpu_variant = v; }
 int  cpu_kernel_variant() { return g_cpu_variant; }
 
@@ -176,7 +181,13 @@ void expert_gemv_scaled(const ExpertMatrixView& m, const Codebook& cb,
   //     load_bits was pure duplication.
   //   * `acc` was a single serial FMA chain across all 128 block pairs of a row. At one thread the
   //     kernel is nowhere near the DRAM wall, so that latency is exposed.
+#if defined(__AVX512VBMI__)
   if (g_cpu_variant == 2) {
+#else
+  // Hosts without AVX512_VBMI (e.g. Skylake-SP) cannot run v3-v5 vpmultishiftqb, so any
+  // non-v1 variant selection routes to dual-accumulator v2 rather than falling back to v1.
+  if (g_cpu_variant >= 2) {
+#endif
    for (uint64_t r = 0; r < m.rows; ++r) {
     const float rs = rscale_of(m.rscales, r, s.row_scale_f32) * w;
     const uint64_t cbase = r * codes_row * 5;

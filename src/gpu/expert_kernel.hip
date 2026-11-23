@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace aff {
@@ -311,9 +312,16 @@ constexpr bool     fmt_has_sign(uint32_t f) { return f == kFmtQuad4S || f == kFm
 // codebook fitted to them holds both orderings anyway; this bit reclaims one of the two copies for a
 // single v_alignbit and no extra LDS.
 constexpr bool     fmt_has_rot2(uint32_t f) { return f == kFmtQuad2S; }
+#ifndef AFF_MOE_STAGEB_SPLIT
+#define AFF_MOE_STAGEB_SPLIT 1
+#endif
+#ifndef AFF_MOE_XOR_SWIZZLE
+#define AFF_MOE_XOR_SWIZZLE 1
+#endif
+
 constexpr uint32_t kEWaves = 4, kEThreads = kEWaves * kWave;
 constexpr uint32_t kEK = 64;           // columns staged per iteration = bytes per LDS row
-constexpr uint32_t kEPitch = kEK + 8u; // padded LDS stride avoids 32-bank conflicts on 8B load_efrag
+constexpr uint32_t kEPitch = AFF_MOE_XOR_SWIZZLE ? kEK : (kEK + 8u); // bijective XOR swizzle removes +8B pad while keeping 0 bank conflicts
 
 // Single-buffer the A stage to cross an occupancy step. Compile-time so the two arms differ in the
 // kernel and nowhere else; see the note at the LDS declarations for why it is legal and what it
@@ -333,6 +341,39 @@ __device__ __forceinline__ uint32_t e4m3_pack2(float a, float b) {
   return (uint32_t)p & 0xffffu;
 }
 
+template <uint32_t Start, uint32_t Width>
+__device__ __forceinline__ uint32_t ubits32(uint32_t lo, uint32_t hi) {
+  static_assert(Width > 0u && Width < 32u && Start + Width <= 64u, "bad ubits32 range");
+  constexpr uint32_t kMask = (1u << Width) - 1u;
+  if constexpr (Start == 0u) {
+    return lo & kMask;
+  } else if constexpr (Start + Width <= 32u) {
+#ifdef __HIP_DEVICE_COMPILE__
+    return __builtin_amdgcn_ubfe(lo, Start, Width);
+#else
+    return (lo >> Start) & kMask;
+#endif
+  } else if constexpr (Start >= 32u) {
+#ifdef __HIP_DEVICE_COMPILE__
+    return __builtin_amdgcn_ubfe(hi, Start - 32u, Width);
+#else
+    return (hi >> (Start - 32u)) & kMask;
+#endif
+  } else {
+    return __builtin_amdgcn_alignbit(hi, lo, Start) & kMask;
+  }
+}
+
+// 16-row bijective XOR swizzle on 8-byte LDS granules: swaps bank pairs across pairs of rows so
+// load_efrag (16 rows x 8B) and decode_store_a / store_b_lds have zero LDS bank conflicts at kEPitch=64.
+__device__ __forceinline__ uint32_t lds_swz_k(uint32_t row, uint32_t k) {
+  if constexpr (AFF_MOE_XOR_SWIZZLE != 0) {
+    return k ^ (((row >> 1) & 7u) << 3);
+  } else {
+    return k;
+  }
+}
+
 // NOT `__restrict__` on `lds`, and that is load-bearing under kSingleA. A noalias scope on the LDS
 // pointer licenses hoisting a later store to s_a above these loads, and under kSingleA the next
 // half's staging is exactly such a store to the rows these loads read. Dropping the qualifier denies
@@ -342,7 +383,7 @@ __device__ __forceinline__ uint32_t e4m3_pack2(float a, float b) {
 __device__ __forceinline__ wmma::i2v load_efrag(const uint8_t* lds, uint32_t row0,
                                                 uint32_t k0, uint32_t lane) {
   const uint32_t row = row0 + wmma::frag_c(lane);
-  const uint32_t k = k0 + wmma::frag_k0(lane);
+  const uint32_t k = lds_swz_k(row, k0 + wmma::frag_k0(lane));
   const uint2 v = *(const uint2*)(lds + row * kEPitch + k);
   wmma::i2v f;
   f[0] = (int)v.x;
@@ -362,14 +403,18 @@ __device__ __forceinline__ wmma::i2v load_efrag(const uint8_t* lds, uint32_t row
 // the request size was never the problem, the addressing was.
 template <uint32_t NT, uint32_t MT, uint32_t FMT, bool TR>
 constexpr int expert_gemm_min_waves() {
-  if constexpr (NT == 2u && MT == 2u && FMT == kFmtQuad2S) return 5;
+  if constexpr (NT == 2u && MT == 2u && FMT == kFmtQuad2S) {
+    return AFF_MOE_XOR_SWIZZLE ? 6 : 5;
+  }
   if constexpr (NT == 4u && MT == 2u && FMT == kFmtQuad2S && !TR) return 4;
   return 1;
 }
 
 template <uint32_t NT, uint32_t MT, uint32_t FMT, bool TR>
 constexpr int expert_gemm_max_waves() {
-  if constexpr (NT == 2u && MT == 2u && FMT == kFmtQuad2S) return 5;
+  if constexpr (NT == 2u && MT == 2u && FMT == kFmtQuad2S) {
+    return AFF_MOE_XOR_SWIZZLE ? 6 : 5;
+  }
   if constexpr (NT == 4u && MT == 2u && FMT == kFmtQuad2S && !TR) return 4;
   return 16;
 }
@@ -493,22 +538,9 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   const uint32_t sblk = (tid % kETPR) * kEBPT;          // its first 16-column block
   const uint32_t tok0 = wmma::frag_c(lane);
 
-  // The activation scale row for each of this lane's NT token columns, hoisted out of the K loop.
-  // `tok[t]` is loop-invariant, and reloading it inside the fold makes a dependent pair of global
-  // loads — tok[t], then xs[tok[t]*sc_cols + kb] — so the fold stalls on a pointer chase every 128
-  // columns. Dead columns (t >= nt) point at row 0 rather than branching: `stage` zeroes the B
-  // fragment past `nt` so their `raw` is zero, and the epilogue does not store them.
-  const AFF_GLOBAL float* xrow[NT];
-#pragma unroll
-  for (uint32_t j = 0; j < NT; ++j) {
-    const uint32_t t = tok0 + j * 16;
-    xrow[j] = as_global(xs) +
-              (t < nt ? (size_t)(tok ? as_global(tok)[t] : t) * sc_cols : (size_t)0);
-  }
-
   // Everything that fills one LDS buffer, so the loop can call it for the NEXT column block while
   // the WMMA below still reads the current one. A and B are SEPARATE lambdas because under kSingleA
-  // they no longer belong at the same point in the loop: B still stages a block ahead, A cannot.
+  // they no longer belong at the same point in the loop: B stages ahead, A cannot.
   // ---- THE WEIGHT PLANES ARE READ ONCE AND NEVER AGAIN --------------------------------------------
   //
   // grid.x partitions the rows and grid.y the tiles, so within a launch every (row, column group) of
@@ -526,8 +558,26 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   constexpr bool kWide = kETPR == 1 && kEBPT == 4;
   constexpr bool kHalfTR = TR && (kETPR == 2 && kEBPT == 2);
   constexpr bool kPrefA = kSingleA && (FMT == kFmtQuad2S) && (kWide || kHalfTR);
+  constexpr bool kSplitB = (AFF_MOE_STAGEB_SPLIT != 0) && (NT <= 4u);
   using u16_ua = uint16_t __attribute__((aligned(1)));
+  using u64_a4 = uint64_t __attribute__((aligned(4)));
   struct PrefA { uint32_t w0, w1, w2, w3, w4, f01, f2; };
+  struct PrefB { aff::aff_u32x4 v, w; };
+  // Simple C++17/C++20 compile-time integer constant wrapper so `bb`/`i` fold to literals.
+  auto unroll_4 = [&](auto&& fn) {
+    fn(std::integral_constant<uint32_t, 0>{});
+    fn(std::integral_constant<uint32_t, 1>{});
+    fn(std::integral_constant<uint32_t, 2>{});
+    fn(std::integral_constant<uint32_t, 3>{});
+  };
+  auto unroll_bb = [&](auto&& fn) {
+    fn(std::integral_constant<uint32_t, 0>{});
+    if constexpr (kEBPT > 1u) fn(std::integral_constant<uint32_t, 1>{});
+    if constexpr (kEBPT > 2u) {
+      fn(std::integral_constant<uint32_t, 2>{});
+      fn(std::integral_constant<uint32_t, 3>{});
+    }
+  };
 
   auto load_a_regs = [&](uint32_t c0) -> PrefA {
     PrefA p{};
@@ -553,12 +603,17 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
       } else if constexpr (kHalfTR) {
         const size_t g = (size_t)(c0 / kEK) * rows + row;
         const auto* g32 = (const AFF_GLOBAL uint32_t*)as_global(data + g * (kEK / 16 * 5));
-        const auto* gp = g32 + (sblk ? 2u : 0u);
-        p.w0 = ld_nt(&gp[0]); p.w1 = ld_nt(&gp[1]); p.w2 = ld_nt(&gp[2]);
         if (sblk == 0u) {
+          p.w0 = ld_nt(&g32[0]); p.w1 = ld_nt(&g32[1]); p.w2 = ld_nt(&g32[2]);
           const AFF_GLOBAL uint8_t* fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
           p.f01 = (uint32_t)ld_nt((const AFF_GLOBAL u16_ua*)fp0);
           p.f2  = (uint32_t)ld_nt(&fp0[2]);
+        } else {
+          // Odd lanes share g32[2] and f24 from lane^1 via DPP in decode_store_a, loading 1x 64-bit
+          // word into p.w3/p.w4 so load_a_regs writes disjoint VGPRs across sblk == 0 vs != 0.
+          const uint64_t w34 = ld_nt((const AFF_GLOBAL u64_a4*)&g32[3]);
+          p.w3 = (uint32_t)w34;
+          p.w4 = (uint32_t)(w34 >> 32);
         }
       }
     }
@@ -604,7 +659,7 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
         //
         // Codes: 5*kEBPT contiguous bytes, dword-aligned — `crow` is 16-aligned and 5*b0 is a
         // multiple of 20 — so five dword loads. A block's 5 bytes never span more than two of them,
-        // so its window is one 64-bit shift of an adjacent pair.
+        // so its window is two 32-bit words extracted via alignbyte/ubfe/alignbit.
         //
         // Fields: b0 a multiple of 4 makes 6*b0 a multiple of 24 bits, so the group starts on a byte
         // and is exactly 3 bytes wide, which retires both the straddle branch and the one-byte plane
@@ -612,48 +667,61 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
         //
         // Under TR the same five dwords are still one aligned span, so the widened load survives the
         // reorder untouched.
-        const uint32_t w0 = p.w0, w1 = p.w1, w2 = p.w2, w3 = p.w3, w4 = p.w4;
-        uint32_t f24 = p.f01 | (p.f2 << 16);
+        uint32_t w0 = p.w0;
+        const uint32_t w1 = (kHalfTR && sblk != 0u) ? p.w3 : p.w1;
+        const uint32_t w2 = (kHalfTR && sblk != 0u) ? p.w4 : p.w2;
+        const uint32_t w3 = p.w3, w4 = p.w4;
+        // Pack f01 (low 16b) and f2 (byte 2) via v_perm_b32 on device so the shift does not hoist
+        // into load_a_regs and force s_wait_loadcnt before mma_half.
+        uint32_t f24;
+#ifdef __HIP_DEVICE_COMPILE__
+        f24 = __builtin_amdgcn_perm(p.f2, p.f01, 0x07040100u);
+#else
+        f24 = p.f01 | (p.f2 << 16);
+#endif
         // Row-major reaches this only when kWide made 6*b0 a multiple of 24; TR always can, because
         // the group's three bytes are a unit by construction.
         if constexpr (kHalfTR) {
           const uint32_t f24_partner = aff::dpp_xor_lane<1u>(f24);
-          if (sblk != 0u) f24 = f24_partner;
+          const uint32_t w2_partner = aff::dpp_xor_lane<1u>(p.w2);
+          if (sblk != 0u) {
+            f24 = f24_partner;
+            w0 = w2_partner;
+          }
         } else if constexpr (!kWide && TR) {
           f24 = (uint32_t)ld_nt(&fp0[0]) | ((uint32_t)ld_nt(&fp0[1]) << 8) |
                 ((uint32_t)ld_nt(&fp0[2]) << 16);
         }
 
-#pragma unroll
-        for (uint32_t bb = 0; bb < kEBPT; ++bb) {
+        unroll_bb([&](auto bb_c) {
+          constexpr uint32_t bb = decltype(bb_c)::value;
           const uint32_t b = b0 + bb;
           uint32_t field;
-          uint64_t win;                                 // 8 pairs = 40 bits at byte b*5
-          if (kWide) {
+          uint32_t lo = 0, hi = 0;
+          constexpr uint32_t kBOff = kWide ? (((bb * 5u) & 3u) * 8u) : 0u;
+          if constexpr (kWide) {
             field = (f24 >> (fsh0 + bb * 6)) & 63u;
-            // Bytes [5bb, 5bb+5) never span more than two dwords, and `bb` is a literal here.
-            const uint32_t lo = bb == 0 ? w0 : bb == 1 ? w1 : bb == 2 ? w2 : w3;
-            const uint32_t hi = bb == 0 ? w1 : bb == 1 ? w2 : bb == 2 ? w3 : w4;
-            win = ((((uint64_t)hi) << 32) | lo) >> (((bb * 5) & 3u) * 8);
-          } else if (kHalfTR) {
+            lo = bb == 0 ? w0 : bb == 1 ? w1 : bb == 2 ? w2 : w3;
+            hi = bb == 0 ? w1 : bb == 1 ? w2 : bb == 2 ? w3 : w4;
+          } else if constexpr (kHalfTR) {
             field = (f24 >> (fsh0 + bb * 6)) & 63u;
-            if (sblk == 0u) {
-              win = (bb == 0u)
-                        ? ((uint64_t)w0 | ((uint64_t)(w1 & 0xFFu) << 32))
-                        : ((uint64_t)(w1 >> 8) | ((uint64_t)(w2 & 0xFFFFu) << 24));
-            } else {
-              win = (bb == 0u)
-                        ? ((uint64_t)(w0 >> 16) | ((uint64_t)(w1 & 0xFFFFFFu) << 16))
-                        : ((uint64_t)(w1 >> 24) | ((uint64_t)w2 << 8));
-            }
-          } else if (TR) {
+            const uint32_t c_lo = (bb == 0u) ? w0 : w1;
+            const uint32_t c_hi = (bb == 0u) ? w1 : w2;
+            const uint32_t byte_off = bb + (sblk ? 2u : 0u);
+#ifdef __HIP_DEVICE_COMPILE__
+            lo = __builtin_amdgcn_alignbyte(c_hi, c_lo, byte_off);
+#else
+            lo = (uint32_t)((((uint64_t)c_hi << 32) | c_lo) >> (byte_off * 8u));
+#endif
+            hi = c_hi >> (byte_off * 8u);
+          } else if constexpr (TR) {
             // MT=1: a thread owns half a group, so its span starts 10 bytes in and is only 2-byte
             // aligned. Bytes, not dwords — but the field still comes out of the group's f24.
             field = (f24 >> (fsh0 + bb * 6)) & 63u;
             const auto* cp = cp0 + (size_t)bb * 5;
-            win = 0;
-#pragma unroll
-            for (uint32_t i = 0; i < 5; ++i) win |= (uint64_t)ld_nt(&cp[i]) << (8 * i);
+            lo = (uint32_t)ld_nt(&cp[0]) | ((uint32_t)ld_nt(&cp[1]) << 8) |
+                 ((uint32_t)ld_nt(&cp[2]) << 16) | ((uint32_t)ld_nt(&cp[3]) << 24);
+            hi = (uint32_t)ld_nt(&cp[4]);
           } else {
             const auto* crow = as_global(data + (size_t)row * code_bytes_row);
             const auto* frow = as_global(fields + (size_t)row * field_bytes_row);
@@ -665,9 +733,9 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
                                 ((fb & 7u) > 2u ? ((uint32_t)frow[fi + 1] << 8) : 0u);
             field = (fw >> (fb & 7)) & 63u;
             const auto* cp = crow + (size_t)b * 5;
-            win = 0;
-#pragma unroll
-            for (uint32_t i = 0; i < 5; ++i) win |= (uint64_t)cp[i] << (8 * i);
+            lo = (uint32_t)cp[0] | ((uint32_t)cp[1] << 8) |
+                 ((uint32_t)cp[2] << 16) | ((uint32_t)cp[3] << 24);
+            hi = (uint32_t)cp[4];
           }
           // 3 variant bits pick the table, 3 scale bits become an exponent add. `sc * 0x08080808`
           // is `sc << 3` in each byte and cannot carry out of one: the largest is 7*8 = 56. It
@@ -689,29 +757,30 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
             // A 2-byte rotate is a funnel shift of the dword with itself, and it commutes with both
             // the exponent add and the sign xor because all three act on whole bytes.
             const uint32_t rsh = (fmt_has_rot2(FMT) && (field & 16u)) ? 16u : 0u;
-#pragma unroll
-            for (uint32_t i = 0; i < 4; ++i) {
-              uint32_t q = (tab[(uint32_t)((win >> (10 * i)) & 1023u)] + add) ^ neg;
+            unroll_4([&](auto i_c) {
+              constexpr uint32_t i = decltype(i_c)::value;
+              const uint32_t code = ubits32<kBOff + 10u * i, 10u>(lo, hi);
+              uint32_t q = (tab[code] + add) ^ neg;
               if constexpr (fmt_has_rot2(FMT)) q = __builtin_amdgcn_alignbit(q, q, rsh);
               d[bb * 2 + (i >> 1)][i & 1] = q;
-            }
+            });
           } else {
             const uint16_t* tab = (const uint16_t*)s_lut + ((field >> 4) * 16u + (field & 15u)) * 32u;
-#pragma unroll
-            for (uint32_t i = 0; i < 4; ++i) {
-              const uint32_t lo = tab[(uint32_t)((win >> (10 * i)) & 31u)];
-              const uint32_t hi = tab[(uint32_t)((win >> (10 * i + 5)) & 31u)];
-              d[bb * 2 + (i >> 1)][i & 1] = lo | (hi << 16);
-            }
+            unroll_4([&](auto i_c) {
+              constexpr uint32_t i = decltype(i_c)::value;
+              const uint32_t lo5 = tab[ubits32<kBOff + 10u * i, 5u>(lo, hi)];
+              const uint32_t hi5 = tab[ubits32<kBOff + 10u * i + 5u, 5u>(lo, hi)];
+              d[bb * 2 + (i >> 1)][i & 1] = lo5 | (hi5 << 16);
+            });
           }
-        }
+        });
       } else {
 #pragma unroll
         for (uint32_t i = 0; i < kEBPT * 2; ++i) { d[i][0] = 0; d[i][1] = 0; }
       }
 #pragma unroll
       for (uint32_t g = 0; g < kEBPT * 2; ++g) {
-        const uint32_t k = sblk * 16 + g * 8;
+        const uint32_t k = lds_swz_k(sm, sblk * 16 + g * 8);
         *(uint2*)(s_a + sm * kEPitch + k) =
             make_uint2(d[g][0], d[g][1]);
       }
@@ -722,6 +791,52 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     decode_store_a(buf, c0, load_a_regs(c0));
   };
 
+  // The LUT and s_tok are read by activation setup and `stage`, so wait for the prologue barrier
+  // before deriving per-token scale offsets and B staging pointers from s_tok.
+  aff::lds_barrier();
+
+  // The activation scale offset for each of this lane's NT token columns, computed from s_tok
+  // after the barrier rather than re-reading global `tok` 4x per column before the barrier.
+  uint32_t xoff[NT];
+#pragma unroll
+  for (uint32_t j = 0; j < NT; ++j) {
+    const uint32_t t = tok0 + j * 16u;
+    xoff[j] = (t < nt) ? s_tok[t] * sc_cols : 0u;
+  }
+
+  // Hoist loop-invariant B row address out of s_tok so load_b_regs issues pure global loads
+  // with zero LDS reads or dscnt waits inside the K-loop (NT <= 4).
+  const bool b_lane = (NT == 4u) ? true : (tid < NT * 32u);
+  const uint32_t b_sn = tid >> 1;
+  const uint32_t b_sk = (tid & 1u) * 32u;
+  const bool b_live_row = b_lane && (b_sn < nt);
+  const AFF_GLOBAL uint8_t* b_row =
+      b_live_row ? as_global(x8 + (size_t)s_tok[b_sn] * cols + b_sk) : nullptr;
+
+  auto load_b_regs = [&](uint32_t c0) -> PrefB {
+    PrefB pb{};
+    if (b_lane && b_live_row && (c0 + b_sk + 32u <= cols)) {
+      const auto* p = b_row + c0;
+      pb.v = *(const AFF_GLOBAL aff::aff_u32x4*)p;
+      pb.w = *(const AFF_GLOBAL aff::aff_u32x4*)(p + 16);
+    }
+    return pb;
+  };
+
+  auto store_b_lds = [&](uint32_t buf, const PrefB& pb) {
+    if (!b_lane) return;
+    uint8_t* const s_b = s_b_all + (size_t)buf * kBSz;
+    const uint2 gr[4] = {
+        make_uint2(pb.v[0], pb.v[1]), make_uint2(pb.v[2], pb.v[3]),
+        make_uint2(pb.w[0], pb.w[1]), make_uint2(pb.w[2], pb.w[3]),
+    };
+#pragma unroll
+    for (uint32_t g = 0; g < 4; ++g) {
+      const uint32_t k = lds_swz_k(b_sn, b_sk + g * 8);
+      *(uint2*)(s_b + b_sn * kEPitch + k) = gr[g];
+    }
+  };
+
   auto stage_b = [&](uint32_t buf, uint32_t c0) {
     uint8_t* const s_b = s_b_all + (size_t)buf * kBSz;
     // ---- B: the activation, already E4M3 and token-major, so a pure copy. Strided over
@@ -729,28 +844,26 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     for (uint32_t idx = tid; idx < NT * 16 * 2; idx += kEThreads) {
       const uint32_t sn = idx >> 1, sk = (idx & 1u) * 32;
       const bool live = sn < nt && c0 + sk + 32 <= cols;
-      uint4 v = make_uint4(0, 0, 0, 0), w = make_uint4(0, 0, 0, 0);
+      aff::aff_u32x4 v = {0, 0, 0, 0}, w = {0, 0, 0, 0};
       if (live) {
         // One indirection: an expert owns an arbitrary subset of the chunk's tokens.
         const auto* p = as_global(x8 + (size_t)s_tok[sn] * cols + c0 + sk);
-        v = *(const AFF_GLOBAL uint4*)p;
-        w = *(const AFF_GLOBAL uint4*)(p + 16);
+        v = *(const AFF_GLOBAL aff::aff_u32x4*)p;
+        w = *(const AFF_GLOBAL aff::aff_u32x4*)(p + 16);
       }
-      const uint2 gr[4] = {make_uint2(v.x, v.y), make_uint2(v.z, v.w), make_uint2(w.x, w.y),
-                           make_uint2(w.z, w.w)};
+      const uint2 gr[4] = {make_uint2(v[0], v[1]), make_uint2(v[2], v[3]), make_uint2(w[0], w[1]),
+                           make_uint2(w[2], w[3])};
 #pragma unroll
       for (uint32_t g = 0; g < 4; ++g) {
-        const uint32_t k = sk + g * 8;
+        const uint32_t k = lds_swz_k(sn, sk + g * 8);
         *(uint2*)(s_b + sn * kEPitch + k) = gr[g];
       }
     }
   };
 
-  // The LUT is read by `stage`, so it has to be complete before the first call; the loop's own
-  // barrier comes too late to cover it.
-  aff::lds_barrier();
   stage_a(0, 0);
-  stage_b(0, 0);
+  if constexpr (kSplitB) store_b_lds(0, load_b_regs(0));
+  else stage_b(0, 0);
 
   // One 128-column block an iteration, two staged buffers, hand-unrolled. The point is not the
   // branch: it puts the activation-scale fold at a static point, so `raw` is dead at the top of
@@ -880,12 +993,14 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     const uint32_t kb = c0 >> 7;
     float xs_cur[NT];
 #pragma unroll
-    for (uint32_t j = 0; j < NT; ++j) xs_cur[j] = xrow[j][kb];
+    for (uint32_t j = 0; j < NT; ++j) xs_cur[j] = as_global(xs)[(size_t)xoff[j] + kb];
     PrefA p1{};
+    PrefB pb1{};
     if (c0 + kEK < cols) {
       if constexpr (kPrefA) p1 = load_a_regs(c0 + kEK);
       else if constexpr (!kSingleA) stage_a(1, c0 + kEK);
-      stage_b(1, c0 + kEK);
+      if constexpr (kSplitB) pb1 = load_b_regs(c0 + kEK);
+      else stage_b(1, c0 + kEK);
     }
     mma_half(0, /*init=*/true, xs_cur);
     // A tail half-block only happens if `cols` is not a multiple of 128, which no shipped shape is
@@ -893,18 +1008,21 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     if (c0 + kEK < cols) {
       if constexpr (kPrefA) decode_store_a(1, c0 + kEK, p1);
       else if constexpr (kSingleA) stage_a(1, c0 + kEK);
+      if constexpr (kSplitB) store_b_lds(1, pb1);
       aff::lds_barrier();
       PrefA p0{};
+      PrefB pb0{};
       if (c0 + 128 < cols) {
         if constexpr (kPrefA) p0 = load_a_regs(c0 + 128);
         else if constexpr (!kSingleA) stage_a(0, c0 + 128);
-        stage_b(0, c0 + 128);
+        if constexpr (kSplitB) pb0 = load_b_regs(c0 + 128);
+        else stage_b(0, c0 + 128);
       }
       mma_half(1, /*init=*/false, xs_cur);
-      if constexpr (kPrefA) {
-        if (c0 + 128 < cols) decode_store_a(0, c0 + 128, p0);
-      } else if constexpr (kSingleA) {
-        if (c0 + 128 < cols) stage_a(0, c0 + 128);
+      if (c0 + 128 < cols) {
+        if constexpr (kPrefA) decode_store_a(0, c0 + 128, p0);
+        else if constexpr (kSingleA) stage_a(0, c0 + 128);
+        if constexpr (kSplitB) store_b_lds(0, pb0);
       }
     }
 
@@ -986,12 +1104,19 @@ __global__ void expert_swiglu_tile_kernel(const float* __restrict__ g, const flo
 // the dense SwiGLU so the two cannot drift by someone editing the other file.
 constexpr uint32_t kSQTok = 32, kSQThreads = 256;
 
+// Bijective column swizzle across 8 16-row bands (`k >> 4` in 0..7) shifted into bits [4:2] so
+// both writer (varying tt in 0..31 at uniform k) and quantizer (varying wt&3 in [1:0] and wk>>4 in
+// [4:2]) map 32 lanes onto 32 distinct LDS banks with zero +1 column padding.
+__device__ __forceinline__ uint32_t sq_tile_col(uint32_t k, uint32_t t) {
+  return t ^ ((k & 0x70u) >> 2);
+}
+
 template <bool Hadamard32 = false>
 __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
     const uint16_t* __restrict__ g, const uint16_t* __restrict__ u, const float* __restrict__ w,
     uint8_t* __restrict__ out, float* __restrict__ scales, uint32_t dim, uint32_t total,
     float limit) {
-  __shared__ float tile[128][kSQTok + 1];
+  __shared__ float tile[128][kSQTok];
   __shared__ float part[8][kSQTok];
   __shared__ float smax[kSQTok];
 
@@ -1022,7 +1147,7 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
         constexpr uint32_t kSignMask = 0x96696996u ^ 0xA53C965Au;
         if ((kSignMask >> (k & 31u)) & 1u) v = -v;
       }
-      tile[k][tt] = v;
+      tile[k][sq_tile_col(k, tt)] = v;
       if constexpr (!Hadamard32) m = fmaxf(m, fabsf(v));
     }
     if constexpr (Hadamard32) {
@@ -1032,9 +1157,11 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
         for (uint32_t b32 = 0; b32 < 4u; ++b32) {
           for (uint32_t pair_idx = kk; pair_idx < 16u; pair_idx += 8u) {
             const uint32_t base = b32 * 32u + (pair_idx / stride) * (2u * stride) + (pair_idx % stride);
-            const float a = tile[base][tt], b = tile[base + stride][tt];
-            tile[base][tt] = a + b;
-            tile[base + stride][tt] = a - b;
+            const uint32_t ca = sq_tile_col(base, tt);
+            const uint32_t cb2 = sq_tile_col(base + stride, tt);
+            const float a = tile[base][ca], b = tile[base + stride][cb2];
+            tile[base][ca] = a + b;
+            tile[base + stride][cb2] = a - b;
           }
         }
         aff::lds_barrier();
@@ -1042,8 +1169,9 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
 #pragma unroll
       for (uint32_t i = 0; i < 16; ++i) {
         const uint32_t k = kk + i * 8;
-        const float v = tile[k][tt] * 0.17677669529663689f;
-        tile[k][tt] = v;
+        const uint32_t c = sq_tile_col(k, tt);
+        const float v = tile[k][c] * 0.17677669529663689f;
+        tile[k][c] = v;
         m = fmaxf(m, fabsf(v));
       }
     }
@@ -1061,6 +1189,7 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
     const uint32_t wt = tid >> 3, wk = (tid & 7u) * 16;
     if (t0 + wt < total) {
       const float inv = 1.0f / smax[wt];
+      const uint32_t wt_swz = sq_tile_col(wk, wt);
       uint32_t wo[4];
 #pragma unroll
       for (uint32_t q = 0; q < 4; ++q) {
@@ -1070,7 +1199,7 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
         // than saturating -- so the block's own maximum is the element that breaks.
 #pragma unroll
         for (uint32_t j = 0; j < 4; ++j)
-          v[j] = fminf(fmaxf(tile[wk + q * 4 + j][wt] * inv, -448.0f), 448.0f);
+          v[j] = fminf(fmaxf(tile[wk + q * 4 + j][wt_swz] * inv, -448.0f), 448.0f);
         int pk = 0;
         pk = __builtin_amdgcn_cvt_pk_fp8_f32(v[0], v[1], pk, false);
         pk = __builtin_amdgcn_cvt_pk_fp8_f32(v[2], v[3], pk, true);
@@ -1082,8 +1211,41 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
   }
 }
 
-// Decode scatter: one WG of 64 dims per token so `run[t]`, `run[t+1]`, and `ord[i]` are
-// wave-uniform across all 64 adjacent dims.
+// Coalesced decode scatter (`nb_tok <= 16`, `total <= 192`): each WG of 128 threads owns 8 dims,
+// cooperatively loads `y[d][0..total)` coalesced along `slot` into 3 KiB LDS, then reduces in exact
+// `i = a..b-1` sequential FP32 order and stores `block[d][0..nb_tok)` coalesced along `t`.
+constexpr uint32_t kScatterDecCoalD = 8u;
+constexpr uint32_t kScatterDecCoalMaxTotal = 192u;
+constexpr uint32_t kScatterDecCoalThreads = 128u;
+
+__global__ __launch_bounds__(kScatterDecCoalThreads) void expert_scatter_slots_dec_coal_kernel(
+    const uint16_t* __restrict__ y, float* __restrict__ block, const uint32_t* __restrict__ ord,
+    const uint32_t* __restrict__ run, uint32_t dim, uint32_t nb_tok, uint32_t nb_stride,
+    uint32_t total) {
+  __shared__ uint16_t s_y[kScatterDecCoalD][kScatterDecCoalMaxTotal];
+  const uint32_t tid = threadIdx.x;
+  const uint32_t r = tid >> 4;
+  const uint32_t t = tid & 15u;
+  const uint32_t d = blockIdx.x * kScatterDecCoalD + r;
+  if (d < dim) {
+    const uint16_t* __restrict__ yrow = y + (size_t)d * total;
+    for (uint32_t s = t; s < total; s += 16u) {
+      s_y[r][s] = yrow[s];
+    }
+  }
+  aff::lds_barrier();
+  if (d >= dim || t >= nb_tok) return;
+  const uint32_t a = run[t], b = run[t + 1u];
+  if (a == b) return;
+  float acc = 0.0f;
+  for (uint32_t i = a; i < b; ++i) {
+    acc += bf16_to_f32_dev(s_y[r][ord[i]]);
+  }
+  block[(size_t)d * nb_stride + t] += acc;
+}
+
+// Decode scatter fallback (nb_tok in 17..32, total > 192, or AFF_MOE_SCATTER_COAL=0): one WG of
+// 64 dims per token so `run[t]`, `run[t+1]`, and `ord[i]` are wave-uniform across 64 dims.
 __global__ void expert_scatter_slots_dec_kernel(const uint16_t* __restrict__ y,
                                                 float* __restrict__ block,
                                                 const uint32_t* __restrict__ ord,
@@ -3261,7 +3423,16 @@ void expert_scatter_slots_hip(const uint16_t* y, float* block, const uint32_t* o
                               const uint32_t* run, uint32_t dim, uint32_t nb_tok,
                               uint32_t nb_stride, uint32_t total, void* stream) {
   if (!dim || !nb_tok || !total) return;
-  if (nb_tok <= 32u) {
+  static const bool coal = [] {
+    const char* s = std::getenv("AFF_MOE_SCATTER_COAL");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  if (nb_tok <= 16u && total <= kScatterDecCoalMaxTotal && coal) {
+    hipLaunchKernelGGL(expert_scatter_slots_dec_coal_kernel,
+                       dim3((dim + kScatterDecCoalD - 1u) / kScatterDecCoalD),
+                       dim3(kScatterDecCoalThreads), 0, (hipStream_t)stream,
+                       y, block, ord, run, dim, nb_tok, nb_stride, total);
+  } else if (nb_tok <= 32u) {
     hipLaunchKernelGGL(expert_scatter_slots_dec_kernel, dim3((dim + 63u) / 64u, nb_tok),
                        dim3(64), 0, (hipStream_t)stream, y, block, ord, run, dim, nb_stride,
                        total);

@@ -600,6 +600,8 @@ public:
     // an arithmetic that would otherwise be finite.
     bool (*begin)(void* ctx, uint32_t n_live, uint32_t pos0, const float* emb, uint32_t n_embd,
                   uint32_t n_hc) = nullptr;
+    bool (*begin_bf16)(void* ctx, uint32_t n_live, uint32_t pos0, const uint16_t* emb_bf16,
+                       uint32_t n_embd, uint32_t n_hc) = nullptr;
     // control + reduce + rms_norm for every token. `norm_host`, when non-null, receives the result
     // token-major — the router's top-k, the compressor and the expert dispatch all read it there.
     bool (*hc_pre)(void* ctx, int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,
@@ -1087,6 +1089,7 @@ private:
   // The draft block's seed embeddings, sized once on the first block and then only row 0 rewritten.
   // See dspark_draft: rows 1..B-1 are the noise token in every block there will ever be.
   mutable std::vector<float> dspark_emb_;
+  mutable std::vector<uint16_t> dspark_emb_bf16_;
   // Per-token confidence of the last draft block; empty when the head is unbound. See
   // dspark_confidence().
   mutable std::vector<float> dspark_conf_;
@@ -1119,5 +1122,10 @@ private:
   uint32_t index_topk_override_ = 0;      // 0 = use the container's value
   uint32_t max_layers_ = 0;               // 0 = every layer the container holds
 };
+
+// Pins the calling thread to the intersection of its current CPU affinity mask and NUMA node 0
+// (`/sys/devices/system/node/node0/cpulist`) when AFF_PIN_NUMA0 is enabled (default ON unless "0").
+// No-ops gracefully if the intersection is empty (e.g., restricted to Socket 1) or sysfs is absent.
+bool pin_thread_numa0() noexcept;
 
 } // namespace aff

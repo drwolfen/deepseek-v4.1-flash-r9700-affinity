@@ -580,6 +580,10 @@ int main(int argc, char** argv) {
     }
     else if (a == "--prefill-chunk-size")
       prefill_chunk = (uint32_t)std::strtoul(nxt(), nullptr, 10);
+    else if (a == "--pin-numa0") {
+      const char* v = nxt();
+      ::setenv("AFF_PIN_NUMA0", (v && *v && std::strcmp(v, "0") != 0) ? "1" : "0", 1);
+    }
 #ifdef AFF_WITH_HIP
     // One accessor per flag, each parsing its value rather than testing for presence: a flag an A/B
     // sets on both sides has to be read the same way by everything that consults it.
@@ -758,6 +762,9 @@ int main(int argc, char** argv) {
         "                              taken from free VRAM rather than from residency\n"
         "      --keepalive-us U        per-card heartbeat interval; 0 = off (default). See\n"
         "                              src/gpu/keepalive.h\n"
+        "      --pin-numa0 0|1         pin dispatch/HTTP/worker threads to NUMA node 0 when the\n"
+        "                              allowed CPU mask intersects node 0 (default 1, env\n"
+        "                              AFF_PIN_NUMA0)\n"
         "\n"
         "Diagnostics\n"
         "      --prefill-reps N        re-run the prefill N times in ONE process and report the\n"
@@ -847,6 +854,9 @@ int main(int argc, char** argv) {
         "                              check that compares the two cards against each other can be\n"
         "                              shown to fire. A check reporting zero checks is a failed\n"
         "                              check.\n"
+        "      AFF_PIN_NUMA0=0|1       pin dispatch/HTTP/worker threads to NUMA node 0 (default 1)\n"
+        "      AFF_ENGRAM_ASYNC_DEC=0|1  overlap tail Engram layer gathers on decode blocks\n"
+        "                              (live >= 1) during layers 0..13 GPU execution (default 1)\n"
         "\n"
         "Serves /v1/chat/completions, /v1/completions and /v1/models.\n");
       return 0;
@@ -859,6 +869,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_path.empty()) { aff::ui::err("error: -m/--model is required\n"); return 2; }
+  (void)aff::pin_thread_numa0();
 
   std::string err;
   // Before the model, because it needs nothing but the tokenizer and the container is 101 GiB.
@@ -2215,6 +2226,7 @@ int main(int argc, char** argv) {
                          const size_t* dry_floor = nullptr) -> uint32_t {
     const uint32_t B = dspark_on ? c.dspark_block : 0u;
     const bool draft_on = dspark_on && c.dspark_block > 0;
+    (void)aff::pin_thread_numa0();
     // Sized from the checkpoint, not from B: dspark_draft writes dspark_block_size ids through this
     // pointer and takes no count, so the buffer's length must come from where the writer's does,
     // and at least aff::kSpecTok - 1 so SuffixDecoding proposals up to 15 tokens fit cleanly.

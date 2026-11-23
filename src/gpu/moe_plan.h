@@ -213,6 +213,12 @@ void moe_prefetch_pack_hip(uint8_t* pref_slab, const uint8_t* const* pref_src,
 // The dynamic LDS the kernel needs, so the caller can refuse before launching rather than after.
 size_t moe_plan_lds_bytes(uint32_t n_expert, uint32_t nb_tok);
 
+// Narrow specialization bounds (`AFF_MOE_PLAN_NARROW=1`, default ON): 256-thread single-WG plan
+// staging `slot_col[384]` in 1.5 KiB LDS and scanning only active buckets for `nb_tok <= 64`.
+constexpr uint32_t kMoePlanNarrowMaxTok = 64u;
+constexpr uint32_t kMoePlanNarrowMaxSlots = 384u;
+size_t moe_plan_narrow_lds_bytes(uint32_t n_expert, uint32_t nb_tok);
+
 // The largest `n_expert` and `k` the single-workgroup form serves. 256 and 6 are this model's.
 constexpr uint32_t kMoePlanMaxExperts = 512;
 constexpr uint32_t kMoePlanMaxK = 16;

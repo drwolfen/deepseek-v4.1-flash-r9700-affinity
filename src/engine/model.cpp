@@ -57,6 +57,16 @@ inline bool engram_raw_h2d_env() {
   return !v || !*v || std::strcmp(v, "0") != 0;
 }
 
+inline bool engram_async_dec_env() {
+  const char* v = std::getenv("AFF_ENGRAM_ASYNC_DEC");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool begin_bf16_enabled() {
+  const char* v = std::getenv("AFF_BEGIN_BF16");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
 // A missing tensor yields null rather than failing the load: a container truncated with --layers
 // is legitimate, and every consumer below is null-tolerant.
 struct Binder {
@@ -815,6 +825,7 @@ struct EngramBgWorker {
 
 private:
   void run() {
+    (void)aff::pin_thread_numa0();
     for (;;) {
       std::function<void()> fn;
       {
@@ -836,6 +847,7 @@ private:
 
 struct Model::PrefillScratch {
   std::vector<float> emb, normb, blockh, rlogb, iqb, swb, sw;
+  std::vector<uint16_t> emb_bf16;
   std::vector<float> hg, hu, ha, embd, norm, flat, pre;
   std::vector<uint32_t> selb, nselb, ncompb, sel;
   std::vector<uint8_t> handled, residentb, eng_alive;
@@ -1889,24 +1901,41 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       return false;
     }
     const uint32_t pos0 = s->pos;
-    for (uint32_t b = 0; b < live; ++b) {
-      uint32_t g = base + b;
-      if (vision && vision->count > 0 && vision->embeddings &&
-          g >= vision->start && g < vision->start + vision->count) {
-        const float* src = vision->embeddings + (size_t)(g - vision->start) * E;
-        std::memcpy(emb.data() + (size_t)b * E, src, E * sizeof(float));
-      } else {
-        const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
-        bf16_dequant(src_emb + (size_t)ids[g] * E, E, emb.data() + (size_t)b * E);
+    const bool chunk_has_vision =
+        vision && vision->count > 0 && vision->embeddings &&
+        base < vision->start + vision->count && base + live > vision->start;
+    if (!chunk_has_vision && bops_.begin_bf16 && begin_bf16_enabled()) {
+      ensure_size(sc.emb_bf16, (size_t)live * E);
+      const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
+      for (uint32_t b = 0; b < live; ++b) {
+        std::memcpy(sc.emb_bf16.data() + (size_t)b * E,
+                    src_emb + (size_t)ids[base + b] * E, (size_t)E * sizeof(uint16_t));
       }
-    }
-    // Not `return false`: every reason this can refuse was checked once before the loop, and by
-    // the time base > 0 the KV cache already holds the earlier chunks — the caller's per-token
-    // retry would then re-append them. A refusal here is a bug, and the shape of the bug is a
-    // prefill that quietly runs at decode speed.
-    if (!bops_.begin(bops_.ctx, live, pos0, emb.data(), E, HC)) {
-      aff::ui::fatal("fatal: batched prefill refused %u tokens at position %u\n", live, pos0);
-      std::abort();
+      if (!bops_.begin_bf16(bops_.ctx, live, pos0, sc.emb_bf16.data(), E, HC)) {
+        aff::ui::fatal("fatal: batched prefill refused %u bf16 tokens at position %u\n",
+                       live, pos0);
+        std::abort();
+      }
+    } else {
+      for (uint32_t b = 0; b < live; ++b) {
+        uint32_t g = base + b;
+        if (vision && vision->count > 0 && vision->embeddings &&
+            g >= vision->start && g < vision->start + vision->count) {
+          const float* src = vision->embeddings + (size_t)(g - vision->start) * E;
+          std::memcpy(emb.data() + (size_t)b * E, src, E * sizeof(float));
+        } else {
+          const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
+          bf16_dequant(src_emb + (size_t)ids[g] * E, E, emb.data() + (size_t)b * E);
+        }
+      }
+      // Not `return false`: every reason this can refuse was checked once before the loop, and by
+      // the time base > 0 the KV cache already holds the earlier chunks — the caller's per-token
+      // retry would then re-append them. A refusal here is a bug, and the shape of the bug is a
+      // prefill that quietly runs at decode speed.
+      if (!bops_.begin(bops_.ctx, live, pos0, emb.data(), E, HC)) {
+        aff::ui::fatal("fatal: batched prefill refused %u tokens at position %u\n", live, pos0);
+        std::abort();
+      }
     }
     AFF_PH(hyper);
 
@@ -1929,7 +1958,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         }
       }
     }
-    const bool async_eng_tail = (eng_on_ && live >= 64u && eng_c_.n_layer > 1u);
+    const uint32_t async_min_live = engram_async_dec_env() ? 1u : 64u;
+    const bool async_eng_tail = (eng_on_ && live >= async_min_live && eng_c_.n_layer > 1u);
     if (eng_on_ && eng_c_.n_layer > 0) {
       if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
       eng_ids_.resize((size_t)live * eng_c_.n_layer * eng_c_.n_cols);
@@ -1944,7 +1974,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         alive_ptr = sc.eng_alive.data();
       }
       eng_h_.push(ids + base, live, pos0, eng_ids_.data(), alive_ptr);
-      if (live < 64u) {
+      if (!async_eng_tail && live < 64u) {
         for (uint32_t i = 0; i < eng_c_.n_layer; ++i) {
           for (uint32_t t = 0; t < live; ++t) {
             const int64_t* const idp =
@@ -2750,25 +2780,50 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
   // the draft was trained on and dspark_block_size does not vary. So they are dequantised once and
   // only row 0, the token the target just committed, is rebuilt. The buffer is a member for the
   // same reason: it is what `begin` uploads, and a caller-local one is why that upload has to drain.
-  if (dspark_emb_.size() != (size_t)B * E) {
-    dspark_emb_.assign((size_t)B * E, 0.0f);
-    const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
-    for (uint32_t b = 1; b < B; ++b)
-      bf16_dequant(src_emb + (size_t)cfg_.dspark_noise_token * E, E,
-                   dspark_emb_.data() + (size_t)b * E);
-  }
-  {
-    const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
-    bf16_dequant(src_emb + (size_t)first_id * E, E, dspark_emb_.data());
-  }
   static const bool slot_debug = std::getenv("AFF_SLOT_DEBUG") != nullptr;
-  if (slot_debug) {
-    uint64_t v = 1469598103934665603ull;
-    for (size_t i = 0; i < (size_t)E; ++i) { uint32_t bits; std::memcpy(&bits, &dspark_emb_[i], 4); v ^= bits; v *= 1099511628211ull; }
-    aff::ui::err("slot-hash dspark_emb row0 first_id=%u P=%u hash=%016llx\n",
-                 first_id, P, (unsigned long long)v);
+  if (bops_.begin_bf16 && begin_bf16_enabled()) {
+    const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
+    if (dspark_emb_bf16_.size() != (size_t)B * E) {
+      dspark_emb_bf16_.resize((size_t)B * E);
+      for (uint32_t b = 1; b < B; ++b) {
+        std::memcpy(dspark_emb_bf16_.data() + (size_t)b * E,
+                    src_emb + (size_t)cfg_.dspark_noise_token * E,
+                    (size_t)E * sizeof(uint16_t));
+      }
+    }
+    std::memcpy(dspark_emb_bf16_.data(), src_emb + (size_t)first_id * E,
+                (size_t)E * sizeof(uint16_t));
+    if (slot_debug) {
+      uint64_t v = 1469598103934665603ull;
+      for (size_t i = 0; i < (size_t)E; ++i) {
+        uint32_t bits = (uint32_t)dspark_emb_bf16_[i] << 16;
+        v ^= bits;
+        v *= 1099511628211ull;
+      }
+      aff::ui::err("slot-hash dspark_emb row0 first_id=%u P=%u hash=%016llx\n",
+                   first_id, P, (unsigned long long)v);
+    }
+    if (!bops_.begin_bf16(bops_.ctx, B, P, dspark_emb_bf16_.data(), E, HC)) return false;
+  } else {
+    if (dspark_emb_.size() != (size_t)B * E) {
+      dspark_emb_.assign((size_t)B * E, 0.0f);
+      const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
+      for (uint32_t b = 1; b < B; ++b)
+        bf16_dequant(src_emb + (size_t)cfg_.dspark_noise_token * E, E,
+                     dspark_emb_.data() + (size_t)b * E);
+    }
+    {
+      const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
+      bf16_dequant(src_emb + (size_t)first_id * E, E, dspark_emb_.data());
+    }
+    if (slot_debug) {
+      uint64_t v = 1469598103934665603ull;
+      for (size_t i = 0; i < (size_t)E; ++i) { uint32_t bits; std::memcpy(&bits, &dspark_emb_[i], 4); v ^= bits; v *= 1099511628211ull; }
+      aff::ui::err("slot-hash dspark_emb row0 first_id=%u P=%u hash=%016llx\n",
+                   first_id, P, (unsigned long long)v);
+    }
+    if (!bops_.begin(bops_.ctx, B, P, dspark_emb_.data(), E, HC)) return false;
   }
-  if (!bops_.begin(bops_.ctx, B, P, dspark_emb_.data(), E, HC)) return false;
   AFF_PH(draft_seed);
 
   // The key set, computed once: the target's last `sliding` real positions plus the block itself.

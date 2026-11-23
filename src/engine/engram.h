@@ -28,6 +28,31 @@
 
 namespace aff {
 
+// Precomputed 128-bit Lemire fastmod multiplier ceil(2^128 / p) for exact 64-bit x % p.
+struct EngramPrimeMul {
+  uint64_t lo = 0;
+  uint64_t hi = 0;
+};
+
+// Returns ceil(2^128 / p) for p >= 2, or {0, 0} for p <= 1 (barrett_mod returns 0 == x % 1).
+inline EngramPrimeMul make_barrett_mul(uint64_t p) noexcept {
+  if (p <= 1u) return {0u, 0u};
+  __extension__ using u128 = unsigned __int128;
+  const u128 m = (~static_cast<u128>(0) / p) + 1u;
+  return {static_cast<uint64_t>(m), static_cast<uint64_t>(m >> 64)};
+}
+
+// Exact unsigned remainder x % p for all uint64_t x and p >= 1 using Lemire 128-bit fastmod.
+inline uint64_t barrett_mod(uint64_t x, uint64_t p, EngramPrimeMul m) noexcept {
+  __extension__ using u128 = unsigned __int128;
+  const u128 mult = (static_cast<u128>(m.hi) << 64) | static_cast<u128>(m.lo);
+  const u128 lowbits = mult * static_cast<u128>(x);
+  const uint64_t hi = static_cast<uint64_t>(lowbits >> 64);
+  const uint64_t lo = static_cast<uint64_t>(lowbits);
+  const u128 sum = static_cast<u128>(hi) * p + ((static_cast<u128>(lo) * p) >> 64);
+  return static_cast<uint64_t>(sum >> 64);
+}
+
 // The layout and constants of the n-gram hash, as `tools/v41/engram_prep.py` emits them.
 struct EngramConsts {
   static constexpr int32_t kDead = -1;   // a position that may not take part in an n-gram
@@ -43,6 +68,7 @@ struct EngramConsts {
   std::vector<uint64_t> rows;            // [n_layer]                 table rows
   std::vector<int64_t>  mult;            // [n_layer][max_ngram]
   std::vector<int64_t>  primes;          // [n_layer][max_ngram-1][n_heads]   bucket modulus
+  std::vector<EngramPrimeMul> prime_muls; // precomputed 128-bit fastmod multipliers for `primes`
   std::vector<int64_t>  offsets;         // [n_layer][n_cols]         where each bucket range starts
   std::vector<int32_t>  token_map;       // [vocab]
   // Where each layer's table actually lives, so the engine mmaps two byte ranges instead of
@@ -51,6 +77,7 @@ struct EngramConsts {
   std::vector<Table> tables;             // [n_layer]
 
   bool load(const std::string& path, std::string* err);
+  bool build_prime_muls(std::string* err = nullptr);
   // Which engram layers these are, in the order their hash columns are laid out. Read from the
   // model config rather than the file, which carries only the count.
   int64_t prime(uint32_t l, uint32_t ng, uint32_t h) const {
@@ -89,6 +116,7 @@ private:
   void grow(uint64_t end);
   const EngramConsts* c_ = nullptr;
   std::vector<int32_t> cache_;           // compressed id per position, kDead where blocked
+  std::vector<EngramPrimeMul> fallback_muls_;  // used only if EngramConsts was built without load()
   uint64_t filled_ = 0;
 };
 
