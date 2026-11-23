@@ -105,7 +105,9 @@ uint64_t idx_topk_scratch_bytes(uint32_t tok, uint64_t* state_bytes, uint64_t* t
 void idx_topk_mask_hip(const float* scores, uint8_t* mask, const uint32_t* nkeys, uint32_t nb,
                        uint32_t stride, uint32_t mstride, uint32_t mlen, uint32_t k, void* stream,
                        const TopkScratch* sp = nullptr, uint32_t* adm = nullptr,
-                       uint32_t* admn = nullptr, uint32_t adm_stride = 0);
+                       uint32_t* admn = nullptr, uint32_t adm_stride = 0,
+                       uint16_t* cand_ids_out = nullptr, uint32_t* cand_n_out = nullptr,
+                       uint32_t cand_stride = 0);
 
 // f32 [n][dim] -> E4M3 [n][dim] + one f32 scale a row. Host side, for the bench and for rows the
 // engine still builds on the host.
@@ -134,5 +136,56 @@ void idx_block_max_hip(const float* scores, float* bsc, const uint32_t* nkeys, u
 void idx_apply_cand_hip(float* scores, const uint8_t* cand, const uint32_t* nkeys, uint32_t nb,
                         uint32_t sstride, uint32_t cstride, uint32_t keys_max, uint32_t block,
                         uint32_t keys_all, void* stream);
+
+// ---- W3-2a: Gather-only candidate indexer -------------------------------------------------------
+//
+// Runtime toggle (`AFF_IDX_CAND_GATHER`, default ON unless "0").
+bool idx_cand_gather_enabled();
+
+// Maximum candidate blocks representable by uint16_t block IDs (block indices 0..65534).
+constexpr uint32_t kIdxCandMaxBlocks = 65535u;
+inline bool idx_cand_blocks_fit_u16(uint32_t nb_blocks) {
+  return nb_blocks <= kIdxCandMaxBlocks;
+}
+
+// Layer 20 candidate publisher: selects top `cand_topk_blocks` blocks per token from `bsc`
+// ([nb][bstride], clamped to `nb_blocks` and optional per-token `nblocks[t]`) and emits strictly
+// ascending uint16_t block IDs into `cand_ids_out[t][0..cand_n_out[t]-1]` (`[nb][cand_stride]`).
+// Skips writing the dense [nb][mstride] byte plane when `cand_mask == nullptr`.
+// Returns false (without launching) if `nb_blocks > kIdxCandMaxBlocks` (uint16_t overflow guard)
+// or `cand_ids_out` output parameters are invalid (`!cand_n_out || cand_stride < cand_topk_blocks`),
+// so callers can fall back to the legacy dense candidate byte plane.
+bool idx_topk_mask_cand_emit_hip(const float* bsc, uint8_t* cand_mask, const uint32_t* nblocks,
+                                 uint32_t nb, uint32_t bstride, uint32_t mstride,
+                                 uint32_t nb_blocks, uint32_t cand_topk_blocks,
+                                 uint16_t* cand_ids_out, uint32_t* cand_n_out,
+                                 uint32_t cand_stride, void* stream,
+                                 const TopkScratch* sp = nullptr);
+
+// Gather-only candidate scorer for consumer layers (after Layer 20 candidate source).
+// Scores ONLY the `cand_n[t] * cand_block` keys referenced by `cand_ids[t]` (`[nb][cand_stride]`,
+// ascending uint16_t block IDs) for each token `t`, writing compact scores
+// `out[t][0 .. cand_n[t]*cand_block - 1]` (`[nb][out_stride]`).
+// Positions inside an active block with global key `>= min(nkeys[t], n_keys)` emit `-INFINITY`.
+// Preserves exact bit-for-bit accumulation order vs `indexer_scores_hip` across both decode
+// (`nb <= dec_max_nb`, M=heads reduction) and prefill (`nb > dec_max_nb`, sequential head order).
+void indexer_scores_cand_hip(const uint8_t* q8, const float* qs, const uint8_t* k8,
+                             const float* ks, const float* hw, const uint16_t* cand_ids,
+                             const uint32_t* cand_n, const uint32_t* nkeys, float* out,
+                             uint32_t nb, uint32_t n_keys, uint32_t n_head, uint32_t cand_stride,
+                             uint32_t cand_block, uint32_t cand_max_blocks, uint32_t out_stride,
+                             void* stream);
+
+// Gather-only top-k over compact candidate scores `cand_scores` (`[nb][sstride]`) produced by
+// `indexer_scores_cand_hip`. Selects top-`k` keys per token using the identical 4-pass radix
+// threshold and lower-global-index tie rule, emitting ascending GLOBAL key indices into `adm`
+// (`[nb][adm_stride]`, count `admn[t]`) and/or dense byte mask `mask` (`[nb][mstride]`, cleared
+// up to `mlen` bytes per row). When `mask == nullptr`, skips dense mask zeroing and writes.
+void idx_topk_mask_cand_hip(const float* cand_scores, uint8_t* mask, const uint16_t* cand_ids,
+                            const uint32_t* cand_n, uint32_t nb, uint32_t sstride,
+                            uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks,
+                            uint32_t mstride, uint32_t mlen, uint32_t k, void* stream,
+                            const TopkScratch* sp = nullptr, uint32_t* adm = nullptr,
+                            uint32_t* admn = nullptr, uint32_t adm_stride = 0);
 
 }  // namespace aff

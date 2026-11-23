@@ -1,0 +1,13 @@
+[package]
+name = "aff_rust_accel"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "aff_rust_accel"
+path = "lib.rs"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 3
+lto = false

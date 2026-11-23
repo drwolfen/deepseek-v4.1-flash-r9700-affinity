@@ -1085,6 +1085,7 @@ int main(int argc, char** argv) {
   std::vector<int32_t> think_close_ids;
   std::vector<int32_t> think_nl_ids;
   std::vector<uint32_t> dry_exempt_ids;
+  std::vector<uint8_t> dry_exempt_lut;
   if (tok.vocab_size()) {
     for (uint32_t id : tok.encode(kThinkEnd, false))
       think_marker_ids.push_back((int32_t)id);
@@ -1104,7 +1105,15 @@ int main(int argc, char** argv) {
     std::sort(dry_exempt_ids.begin(), dry_exempt_ids.end());
     dry_exempt_ids.erase(std::unique(dry_exempt_ids.begin(), dry_exempt_ids.end()),
                          dry_exempt_ids.end());
+    dry_exempt_lut.assign(vsz, 0u);
+    for (uint32_t id : dry_exempt_ids) {
+      if (id < dry_exempt_lut.size()) dry_exempt_lut[id] = 1u;
+    }
   }
+  auto is_dry_exempt = [&](uint32_t id) noexcept -> bool {
+    if (id < dry_exempt_lut.size()) return dry_exempt_lut[id] != 0;
+    return std::binary_search(dry_exempt_ids.begin(), dry_exempt_ids.end(), id);
+  };
 
 
 #ifdef AFF_WITH_HIP
@@ -1242,7 +1251,8 @@ int main(int argc, char** argv) {
     std::string rerr;
     if (!dense_gpu.reserve_runtime(c.n_layer, ratios.data(), c.head_dim, c.index_head_dim,
                                    c.index_n_heads, &rerr, c.v41 ? key_layers.data() : nullptr,
-                                   c.v41 && c.candidate_source_layer >= 0 ? c.candidate_block : 0u))
+                                   c.v41 && c.candidate_source_layer >= 0 ? c.candidate_block : 0u,
+                                   c.v41 && c.candidate_source_layer >= 0 ? c.candidate_topk_blocks : 0u))
       aff::ui::out("runtime reservation: %s — expert placement will over-commit\n", rerr.c_str());
     vram.mark("compressor + indexer");
     // Engram's buffers at the full prefill chunk, for the same reason and in the same place.
@@ -2207,6 +2217,9 @@ int main(int argc, char** argv) {
     uint32_t cost_samples[kMaxQ] = {};
   };
   SpecEmaBucket spec_ema_buckets[3];
+  // 8-entry LRU LCP pool of SuffixDraftIndex instances so consecutive agent turns
+  // (e.g. 64K -> 140K) reuse prefix automaton state and only append delta tokens.
+  aff::SuffixSessionPool suffix_pool;
   const bool persist_spec_ema = [] {
     const char* s = std::getenv("AFF_PERSIST_SPEC_EMA");
     return s && *s && std::strcmp(s, "0") != 0;
@@ -2251,7 +2264,7 @@ int main(int argc, char** argv) {
           if (tok.eos() >= 0 && id == (uint32_t)tok.eos()) return true;
           for (int32_t mid : think_marker_ids)
             if (mid >= 0 && id == (uint32_t)mid) return true;
-          return std::binary_search(dry_exempt_ids.begin(), dry_exempt_ids.end(), id);
+          return is_dry_exempt(id);
         };
         vb.penalty_ids.erase(
             std::remove_if(vb.penalty_ids.begin(), vb.penalty_ids.end(), is_penalty_exempt),
@@ -2280,6 +2293,17 @@ int main(int argc, char** argv) {
       const char* s = std::getenv("AFF_DRY_GEN_ONLY");
       return !s || !*s || std::strcmp(s, "0") != 0;
     }();
+    const bool draft_suffix_on = [] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX");
+      return !(v && *v && std::strcmp(v, "0") == 0);
+    }();
+    const bool need_suffix_idx =
+        draft_suffix_on || (sc && sc->dry_delta > 0.0f && sc->dry_ngram > 0);
+    aff::SuffixSessionPool::Lease sfx_lease =
+        need_suffix_idx ? suffix_pool.acquire(hist, 1ull)
+                        : aff::SuffixSessionPool::Lease{};
+    aff::SuffixDraftIndex* suffix_idx = need_suffix_idx ? &sfx_lease.index() : nullptr;
+    std::vector<uint32_t> dry_probe_ngram;
     // DRY ids for THIS block: the tokens that continued a repeated key.
     //
     // The signal is how often the CURRENT suffix key has already occurred in the recent window.
@@ -2297,6 +2321,8 @@ int main(int argc, char** argv) {
       const size_t ng = sc->dry_ngram;
       if (hist.size() <= ng + 1) return;
       const size_t end = hist.size();
+      // O(1) fast-path: if Rust SAM match_len < ng, the trailing ng-gram never occurred earlier.
+      if (suffix_idx && suffix_idx->rust_sam_active() && suffix_idx->match_len() < ng) return;
       size_t lo = end > (size_t)sc->dry_window + ng ? end - (size_t)sc->dry_window - ng : 0;
       if (dry_gen_only) {
         size_t floor_pos = gen_start_pos;
@@ -2314,7 +2340,7 @@ int main(int argc, char** argv) {
         if (!same) continue;
         ++occurrences;
         const uint32_t nx = hist[i + ng];
-        if (std::binary_search(dry_exempt_ids.begin(), dry_exempt_ids.end(), nx))
+        if (is_dry_exempt(nx))
           continue;            // never suppress structural markers or EOS
         bool found = false;
         for (auto& c : cont)
@@ -2324,6 +2350,14 @@ int main(int argc, char** argv) {
       if (occurrences >= need) {
         auto in_prompt = [&](uint32_t nx) -> bool {
           if (gen_start_pos <= ng) return false;
+          if (suffix_idx && suffix_idx->rust_sam_active()) {
+            // O(ng) SAM lookup via first_endpos <= gen_start_pos instead of O(prompt_len) scan.
+            dry_probe_ngram.resize(ng + 1);
+            for (size_t k = 0; k < ng; ++k) dry_probe_ngram[k] = hist[end - ng + k];
+            dry_probe_ngram[ng] = nx;
+            return suffix_idx->contains_ngram_before(dry_probe_ngram.data(), ng + 1,
+                                                     gen_start_pos);
+          }
           const uint32_t k0 = hist[end - ng];
           for (size_t i = 0; i + ng < gen_start_pos; ++i) {
             if (hist[i] != k0 || hist[i + ng] != nx) continue;
@@ -2373,10 +2407,6 @@ int main(int argc, char** argv) {
     const char* aw_env = std::getenv("AFF_ADAPTIVE_WIDTH");
     const bool adaptive_width_on = (!aw_env || !*aw_env || std::strcmp(aw_env, "0") != 0) && kConfT <= 0.0f;
     // SuffixDecoding empirical n-gram drafting and adaptive draft depth stop.
-    const bool draft_suffix_on = [] {
-      const char* v = std::getenv("AFF_DRAFT_SUFFIX");
-      return !(v && *v && std::strcmp(v, "0") == 0);
-    }();
     const int sfx_min_match = [] {
       const char* v = std::getenv("AFF_DRAFT_SUFFIX_MIN_MATCH");
       if (!v || !*v) return 4;
@@ -2422,8 +2452,6 @@ int main(int argc, char** argv) {
       const char* v = std::getenv("AFF_DRAFT_DEPTH_STOP");
       return !(v && *v && std::strcmp(v, "0") == 0);
     }();
-    aff::SuffixDraftIndex suffix_idx;
-    suffix_idx.reset(1ull);
     aff::SuffixGate sfx_gate;
     sfx_gate.reset();
     std::vector<int32_t> suffix_buf(aff::kSpecTok);
@@ -2481,6 +2509,7 @@ int main(int argc, char** argv) {
     std::vector<double> accept_u;
     accept_u.reserve(aff::kSpecTok);
     while (generated < max_new && !stop) {
+      if (suffix_idx) suffix_idx->append_delta(hist.data(), hist.size());
       if (sc) {
         if (repeat_penalty_dynamic) refresh_penalty_ids();
         dry_ids_for(vb.dry_ids);
@@ -2527,8 +2556,8 @@ int main(int argc, char** argv) {
       } else if (!has_force && rem_out > 1u) {
         const uint32_t max_nd = std::min<uint32_t>(aff::kSpecTok - 1u, rem_out - 1u);
         const bool dspark_eligible = draft_on && st.pos && !skip_draft;
-        if (draft_suffix_on && max_nd >= (uint32_t)sfx_min_match) {
-          auto prop = suffix_idx.propose(
+        if (draft_suffix_on && suffix_idx && max_nd >= (uint32_t)sfx_min_match) {
+          auto prop = suffix_idx->propose(
               hist, 1ull, sfx_min_match,
               (int)std::min<uint32_t>(sfx_max, max_nd), sfx_min_score, suffix_buf.data());
           bool accept_suffix = false;
@@ -2959,6 +2988,7 @@ int main(int argc, char** argv) {
       }
       b.initialized = true;
     }
+    if (need_suffix_idx) sfx_lease.release(hist);
     if (slot_dbg)
       aff::ui::err("LOCAL slot %u: %u blocks, %u accepted (%.2f tok/blk), %u generated\n", slot, my_blocks,
                    my_accepted, my_blocks ? (double)generated / my_blocks : 0.0, generated);

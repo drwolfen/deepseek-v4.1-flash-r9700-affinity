@@ -182,7 +182,8 @@ public:
   bool engram_reserve(uint32_t tile, uint32_t in_dim, uint32_t out_dim);
   bool reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_t width, uint32_t idx_dim,
                        uint32_t idx_heads, std::string* err,
-                       const uint8_t* key_layers = nullptr, uint32_t cand_block = 0);
+                       const uint8_t* key_layers = nullptr, uint32_t cand_block = 0,
+                       uint32_t cand_topk_blocks = 0);
 
   // ---- attention state, resident in VRAM ------------------------------------------------------
   // Per layer and bounded: `sliding` raw rows in a ring (attention is over a SET, so ring order is
@@ -517,7 +518,9 @@ private:
   // V4.1's candidate pre-filter. `cand_block_` 0 means the model has none and every path below is
   // skipped; `cand_blocks_cap_` is the cache capacity in blocks, which is what the buffers are
   // sized by. See gpu/indexer_gpu.h — it restricts what the top-k may CHOOSE, not what is scored.
-  uint32_t cand_block_ = 0, cand_blocks_cap_ = 0;
+  uint32_t cand_block_ = 0, cand_blocks_cap_ = 0, cand_topk_cap_ = 0;
+  std::vector<uint32_t> pen_seen_;
+  uint32_t pen_epoch_ = 0;
   bool     cand_noted_ = false;
   // One stderr line the first time the filter actually selects rather than keeping everything.
   void     cand_note(uint32_t layer, uint32_t keys, uint32_t nblk, uint32_t topk_blocks);

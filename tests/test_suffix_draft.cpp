@@ -1,5 +1,6 @@
 #include "engine/suffix_draft.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -80,7 +81,11 @@ void test_exact_repeated_code_pattern() {
 
   auto p = idx.propose(seq, /*owner=*/7, /*min_match=*/4, /*max_draft=*/8, 0.5f, out.data());
   REQUIRE(p.n == 8);
-  REQUIRE(p.match_len == 4 + SuffixDraftIndex::kExtra);
+  if (idx.rust_sam_active()) {
+    REQUIRE(p.match_len == 24);
+  } else {
+    REQUIRE(p.match_len == 4 + SuffixDraftIndex::kExtra);
+  }
   REQUIRE(std::fabs(p.score - 1.0f) < 1e-6f);
   REQUIRE(std::fabs(p.expect - 8.0f) < 1e-5f);
   for (int i = 0; i < 8; ++i) {
@@ -124,7 +129,11 @@ void test_longest_suffix_wins() {
   REQUIRE(out[0] == 100);
   REQUIRE(out[1] == 101);
   REQUIRE(out[2] == 102);
-  REQUIRE(std::fabs(p.score - (2.0f / 3.0f)) < 1e-5f);
+  if (idx.rust_sam_active()) {
+    REQUIRE(std::fabs(p.score - 1.0f) < 1e-5f);
+  } else {
+    REQUIRE(std::fabs(p.score - (2.0f / 3.0f)) < 1e-5f);
+  }
 
   std::printf("PASS: test_longest_suffix_wins\n");
 }
@@ -397,6 +406,235 @@ void test_suffix_gate_no_dspark() {
   std::printf("PASS: test_suffix_gate_no_dspark\n");
 }
 
+void test_sam_parity_and_env_toggle() {
+  std::vector<uint32_t> seq = {
+      1001, 1002, 1003, 10, 11, 12, 13, 21, 2001,
+      1004, 1005, 1006, 10, 11, 12, 13, 20, 30, 2002,
+      1007, 1008, 1009, 10, 11, 12, 13, 20, 30, 2003,
+      1010, 1011, 1012, 10, 11, 12, 13,
+  };
+  SuffixDraftIndex cpp_idx(false);
+  REQUIRE(!cpp_idx.rust_sam_active());
+  std::vector<int32_t> out_cpp(8, -1);
+  auto pc = cpp_idx.propose(seq, 1, 4, 4, 0.5f, out_cpp.data());
+  REQUIRE(pc.n == 2 && pc.match_len == 4);
+  REQUIRE(out_cpp[0] == 20 && out_cpp[1] == 30);
+
+#ifdef AFF_WITH_RUST
+  // Default AFF_RUST_SAM=1 enables Rust SAM.
+  ::unsetenv("AFF_RUST_SAM");
+  SuffixDraftIndex rust_idx;
+  REQUIRE(rust_idx.rust_sam_active());
+  std::vector<int32_t> out_rust(8, -1);
+  auto pr = rust_idx.propose(seq, 1, 4, 4, 0.5f, out_rust.data());
+  REQUIRE(pr.n == pc.n);
+  REQUIRE(pr.match_len == pc.match_len);
+  REQUIRE(std::fabs(pr.score - pc.score) < 1e-5f);
+  REQUIRE(std::fabs(pr.expect - pc.expect) < 1e-5f);
+  for (int i = 0; i < pr.n; ++i) {
+    REQUIRE(out_rust[i] == out_cpp[i]);
+  }
+
+  // AFF_RUST_SAM=0 cleanly falls back to C++ table.
+  ::setenv("AFF_RUST_SAM", "0", 1);
+  SuffixDraftIndex fallback_idx;
+  REQUIRE(!fallback_idx.rust_sam_active());
+  auto pf = fallback_idx.propose(seq, 1, 4, 4, 0.5f, out_rust.data());
+  REQUIRE(pf.n == pc.n && pf.match_len == pc.match_len);
+  ::unsetenv("AFF_RUST_SAM");
+#endif
+
+  std::printf("PASS: test_sam_parity_and_env_toggle\n");
+}
+
+void test_unbounded_match_len_24() {
+  std::vector<uint32_t> seq;
+  // Earlier distractor sharing only the trailing 7 tokens -> [9000..9011].
+  seq.insert(seq.end(), {5001, 5002, 5003});
+  for (uint32_t t = 1017; t < 1024; ++t) seq.push_back(t);
+  for (uint32_t t = 9000; t < 9012; ++t) seq.push_back(t);
+
+  // Exact 24-token pattern -> [2000..2011].
+  for (uint32_t t = 1000; t < 1024; ++t) seq.push_back(t);
+  for (uint32_t t = 2000; t < 2012; ++t) seq.push_back(t);
+  seq.insert(seq.end(), {6001, 6002, 6003});
+  for (uint32_t t = 1000; t < 1024; ++t) seq.push_back(t);
+
+  SuffixDraftIndex idx;
+  std::vector<int32_t> out(16, -1);
+  auto p = idx.propose(seq, 42, 4, 12, 0.5f, out.data());
+  REQUIRE(p.n == 12);
+  if (idx.rust_sam_active()) {
+    REQUIRE(p.match_len == 24);
+    REQUIRE(std::fabs(p.score - 1.0f) < 1e-6f);
+    REQUIRE(std::fabs(p.expect - 12.0f) < 1e-5f);
+    for (int i = 0; i < 12; ++i) {
+      REQUIRE(out[i] == static_cast<int32_t>(2000 + i));
+    }
+    SuffixGate gate;
+    REQUIRE(gate.should_preempt(p, 4, 2.0f, true, 3.8f, 120.0f, 150.0f, 1.05f));
+  } else {
+    REQUIRE(p.match_len == 4 + SuffixDraftIndex::kExtra);
+  }
+
+  std::printf("PASS: test_unbounded_match_len_24\n");
+}
+
+void test_non_destructive_rollback_and_contains_ngram() {
+  SuffixDraftIndex idx;
+  const std::vector<uint32_t> prefix = {
+      10, 11, 12, 13, 14, 15, 16, 17, 77, 78, 79, 80,
+      90, 91, 92, 10, 11, 12, 13, 14, 15, 16, 17,
+  };
+  idx.reset(11);
+  idx.append_delta(prefix.data(), prefix.size());
+  REQUIRE(idx.filled() == prefix.size());
+
+  const std::vector<uint32_t> p_ng = {10, 11, 12, 13, 14, 15};
+  const std::vector<uint32_t> absent_ng = {10, 11, 12, 999};
+  REQUIRE(idx.contains_ngram(p_ng.data(), p_ng.size()));
+  REQUIRE(!idx.contains_ngram(absent_ng.data(), absent_ng.size()));
+  REQUIRE(idx.contains_ngram_before(p_ng.data(), p_ng.size(), 8));
+  REQUIRE(!idx.contains_ngram_before(p_ng.data(), p_ng.size(), 5));
+
+  std::vector<uint32_t> extended = prefix;
+  const std::vector<uint32_t> branch_b = {301, 302, 303, 304, 305};
+  extended.insert(extended.end(), branch_b.begin(), branch_b.end());
+  idx.append_delta(extended.data(), extended.size());
+  REQUIRE(idx.filled() == extended.size());
+  REQUIRE(idx.contains_ngram(branch_b.data(), branch_b.size()));
+  REQUIRE(!idx.contains_ngram_before(branch_b.data(), branch_b.size(), prefix.size()));
+  REQUIRE(idx.contains_ngram_before(branch_b.data(), branch_b.size(), extended.size()));
+
+  // Non-destructive rollback_to preserves [0..prefix.size()) while dropping branch_b.
+  idx.rollback_to(prefix.size());
+  REQUIRE(idx.filled() == prefix.size());
+  REQUIRE(idx.contains_ngram(p_ng.data(), p_ng.size()));
+  REQUIRE(!idx.contains_ngram(branch_b.data(), branch_b.size()));
+
+  std::vector<int32_t> out(8, -1);
+  auto p = idx.propose(prefix, 11, 4, 4, 0.5f, out.data());
+  REQUIRE(p.n == 4);
+  REQUIRE(out[0] == 77 && out[1] == 78 && out[2] == 79 && out[3] == 80);
+
+  // Append new branch C after rollback.
+  std::vector<uint32_t> branch_c = prefix;
+  const std::vector<uint32_t> c_tail = {401, 402, 403, 404};
+  branch_c.insert(branch_c.end(), c_tail.begin(), c_tail.end());
+  idx.append_delta(branch_c.data(), branch_c.size());
+  REQUIRE(idx.contains_ngram(c_tail.data(), c_tail.size()));
+  REQUIRE(!idx.contains_ngram(branch_b.data(), branch_b.size()));
+
+  std::printf("PASS: test_non_destructive_rollback_and_contains_ngram\n");
+}
+
+void test_lru_lcp_pool_reuse() {
+  SuffixSessionPool pool;
+
+  // Build 64K base prompt.
+  std::vector<uint32_t> turn1(65536);
+  for (size_t i = 0; i < turn1.size(); ++i) {
+    turn1[i] = static_cast<uint32_t>(1000u + (i % 50000u));
+  }
+  // Plant an exact 16-token pattern inside turn1.
+  for (uint32_t j = 0; j < 16; ++j) turn1[1024 + j] = 800000u + j;
+  for (uint32_t j = 0; j < 8; ++j) turn1[1040 + j] = 810000u + j;
+
+  {
+    auto lease1 = pool.acquire(turn1, 1ull);
+    REQUIRE(lease1.lcp() == 0);
+    // Simulate turn1 generation appending 128 tokens.
+    for (uint32_t j = 0; j < 128; ++j) turn1.push_back(900000u + j);
+    lease1.index().append_delta(turn1.data(), turn1.size());
+    lease1.release(turn1);
+  }
+  REQUIRE(pool.size() == 1);
+  REQUIRE(pool.stats().misses == 1);
+
+  // Consecutive agent turn extending 64K -> +1024 delta tokens (fast LCP delta path).
+  std::vector<uint32_t> turn2 = turn1;
+  for (uint32_t j = 0; j < 1008; ++j) turn2.push_back(910000u + j);
+  for (uint32_t j = 0; j < 16; ++j) turn2.push_back(800000u + j);
+
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto lease2 = pool.acquire(turn2, 1ull);
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    REQUIRE(lease2.lcp() == turn1.size());
+    std::vector<int32_t> out(8, -1);
+    auto prop = lease2.index().propose(turn2, 1ull, 4, 8, 0.5f, out.data());
+    REQUIRE(prop.n == 8);
+    if (lease2.index().rust_sam_active()) {
+      REQUIRE(prop.match_len == 16);
+      REQUIRE(ms < 10.0);
+    }
+    for (int i = 0; i < 8; ++i) REQUIRE(out[i] == static_cast<int32_t>(810000 + i));
+    lease2.release(turn2);
+  }
+  REQUIRE(pool.stats().hits == 1);
+
+  // Partial LCP rollback (e.g. turn drop_thinking trims 128 tokens and extends to 140K).
+  std::vector<uint32_t> turn3(turn1.begin(), turn1.begin() + 65536);
+  turn3.resize(140000);
+  for (size_t i = 65536; i < turn3.size(); ++i) {
+    turn3[i] = static_cast<uint32_t>(70000u + (i % 40000u));
+  }
+  {
+    auto lease3 = pool.acquire(turn3, 1ull);
+    REQUIRE(lease3.lcp() == 65536);
+    REQUIRE(lease3.index().filled() == 140000);
+    const uint32_t needle[4] = {800000u, 800001u, 800002u, 800003u};
+    REQUIRE(lease3.index().contains_ngram(needle, 4));
+    lease3.release(turn3);
+  }
+  REQUIRE(pool.stats().hits == 2);
+
+  // Fill remaining 7 pool entries and verify 8-entry LRU eviction + concurrent >8 fallback.
+  std::vector<std::vector<uint32_t>> sessions(8);
+  sessions[0] = turn3;
+  for (size_t s = 1; s < 8; ++s) {
+    sessions[s].assign(128, static_cast<uint32_t>(300000u + s * 1000u));
+    auto ls = pool.acquire(sessions[s], 1ull);
+    ls.release(sessions[s]);
+  }
+  REQUIRE(pool.size() == SuffixSessionPool::kCapacity);
+
+  // Touch session 0 so session 1 becomes the LRU victim.
+  {
+    auto l0 = pool.acquire(sessions[0], 1ull);
+    REQUIRE(l0.lcp() == sessions[0].size());
+    l0.release(sessions[0]);
+  }
+  std::vector<uint32_t> session8(128, 450000u);
+  {
+    auto l8 = pool.acquire(session8, 1ull);
+    REQUIRE(l8.lcp() == 0);
+    l8.release(session8);
+  }
+  REQUIRE(pool.size() == SuffixSessionPool::kCapacity);
+  // Session 0 survived; session 1 (LRU) was evicted.
+  {
+    auto l0_again = pool.acquire(sessions[0], 1ull);
+    REQUIRE(l0_again.lcp() == sessions[0].size());
+    l0_again.release(sessions[0]);
+    auto l1_evicted = pool.acquire(sessions[1], 1ull);
+    REQUIRE(l1_evicted.lcp() == 0);
+    l1_evicted.release(sessions[1]);
+  }
+
+  // Holding 9 simultaneous leases exercises ephemeral fallback safely.
+  std::vector<SuffixSessionPool::Lease> held;
+  for (size_t s = 0; s < 9; ++s) {
+    std::vector<uint32_t> tmp(64, static_cast<uint32_t>(500000u + s * 100u));
+    held.push_back(pool.acquire(tmp, 1ull));
+    REQUIRE(held.back().index().filled() == 64);
+  }
+  held.clear();
+
+  std::printf("PASS: test_lru_lcp_pool_reuse\n");
+}
+
 }  // namespace
 
 int main() {
@@ -410,6 +648,10 @@ int main() {
   test_suffix_gate_prose_backoff();
   test_suffix_gate_code_edit_burst();
   test_suffix_gate_no_dspark();
+  test_sam_parity_and_env_toggle();
+  test_unbounded_match_len_24();
+  test_non_destructive_rollback_and_contains_ngram();
+  test_lru_lcp_pool_reuse();
   std::printf("ALL suffix_draft tests passed\n");
   return 0;
 }

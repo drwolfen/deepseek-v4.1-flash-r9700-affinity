@@ -471,9 +471,10 @@ constexpr uint32_t kTopkWaves = kTopkThr / 32u;
 // makes the list a deterministic function of the mask, which an atomic append would not.
 //
 // One block a token, which is what both callers already are — so this costs no extra launch.
-__device__ __forceinline__ void compact_row(const uint8_t* __restrict__ row, uint32_t n,
-                                            uint32_t tid, uint32_t* __restrict__ adm, uint32_t cap,
-                                            uint32_t* s_wc, uint32_t* s_base) {
+template <typename OutIdx>
+__device__ __forceinline__ void compact_row_t(const uint8_t* __restrict__ row, uint32_t n,
+                                              uint32_t tid, OutIdx* __restrict__ adm, uint32_t cap,
+                                              uint32_t* s_wc, uint32_t* s_base) {
   const uint32_t lane = tid & 31u, wave = tid >> 5;
   if (tid == 0) *s_base = 0;
   lds_barrier();
@@ -488,7 +489,7 @@ __device__ __forceinline__ void compact_row(const uint8_t* __restrict__ row, uin
     uint32_t off = 0;
     for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
     const uint32_t p = *s_base + off + wr;
-    if (a && p < cap) adm[p] = i;
+    if (a && p < cap) adm[p] = static_cast<OutIdx>(i);
     lds_barrier();
     if (tid == 0) {
       uint32_t s = 0;
@@ -499,11 +500,12 @@ __device__ __forceinline__ void compact_row(const uint8_t* __restrict__ row, uin
   }
 }
 
-__device__ __forceinline__ void compact_admitted(const float* __restrict__ sc, uint32_t n,
-                                                 uint32_t T, uint32_t tie_excl_end,
-                                                 uint32_t tid, uint32_t* __restrict__ adm,
-                                                 uint32_t cap, uint32_t* s_wc,
-                                                 uint32_t* s_base) {
+template <typename OutIdx>
+__device__ __forceinline__ void compact_admitted_t(const float* __restrict__ sc, uint32_t n,
+                                                   uint32_t T, uint32_t tie_excl_end,
+                                                   uint32_t tid, OutIdx* __restrict__ adm,
+                                                   uint32_t cap, uint32_t* s_wc,
+                                                   uint32_t* s_base) {
   const uint32_t lane = tid & 31u, wave = tid >> 5;
   if (tid == 0) *s_base = 0;
   lds_barrier();
@@ -522,7 +524,54 @@ __device__ __forceinline__ void compact_admitted(const float* __restrict__ sc, u
     uint32_t off = 0;
     for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
     const uint32_t p = *s_base + off + wr;
-    if (a && p < cap) adm[p] = i;
+    if (a && p < cap) adm[p] = static_cast<OutIdx>(i);
+    lds_barrier();
+    if (tid == 0) {
+      uint32_t s = 0;
+      for (uint32_t w = 0; w < kTopkWaves; ++w) s += s_wc[w];
+      *s_base += s;
+    }
+    lds_barrier();
+  }
+}
+
+template <uint32_t FixedBlock>
+__device__ __forceinline__ uint32_t cand_global_key(const uint16_t* __restrict__ cids,
+                                                    uint32_t cand_block, uint32_t u) {
+  const uint32_t blk_w = (FixedBlock > 0u) ? FixedBlock : cand_block;
+  const uint32_t j = (FixedBlock > 0u) ? (u / FixedBlock) : (u / cand_block);
+  const uint32_t r = (FixedBlock > 0u) ? (u & (FixedBlock - 1u)) : (u - j * cand_block);
+  return (uint32_t)cids[j] * blk_w + r;
+}
+
+template <uint32_t FixedBlock>
+__device__ __forceinline__ void compact_admitted_cand(const float* __restrict__ sc,
+                                                      const uint16_t* __restrict__ cids,
+                                                      uint32_t cand_block, uint32_t n, uint32_t T,
+                                                      uint32_t tie_excl_end, uint32_t tid,
+                                                      uint32_t* __restrict__ adm, uint32_t cap,
+                                                      uint32_t* s_wc, uint32_t* s_base) {
+  const uint32_t lane = tid & 31u, wave = tid >> 5;
+  if (tid == 0) *s_base = 0;
+  lds_barrier();
+  for (uint32_t i0 = 0; i0 < n; i0 += kTopkThr) {
+    const uint32_t i = i0 + tid;
+    bool a = false;
+    uint32_t g = 0u;
+    if (i < n) {
+      const uint32_t key = mono(sc[i]);
+      a = (key > KEY_NEG_INF) && ((key > T) || (key == T && i < tie_excl_end));
+      if (a) g = cand_global_key<FixedBlock>(cids, cand_block, i);
+    }
+    const uint32_t bm = (uint32_t)__ballot(a);
+    const uint32_t mask_lt = (lane == 0) ? 0u : ((1u << lane) - 1u);
+    const uint32_t wr = (uint32_t)__popc(bm & mask_lt);
+    if (lane == 0) s_wc[wave] = (uint32_t)__popc(bm);
+    lds_barrier();
+    uint32_t off = 0;
+    for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
+    const uint32_t p = *s_base + off + wr;
+    if (a && p < cap) adm[p] = g;
     lds_barrier();
     if (tid == 0) {
       uint32_t s = 0;
@@ -580,6 +629,19 @@ __device__ __forceinline__ void tie_cutoff_excl(const uint32_t* tie, uint32_t nt
   }
 }
 
+__device__ __forceinline__ void clear_mask_row(uint8_t* __restrict__ row, uint32_t b,
+                                                uint32_t clr, uint32_t tid) {
+  if (b >= clr) return;
+  const uint32_t head = (uint32_t)((16u - ((uintptr_t)(row + b) & 15u)) & 15u);
+  const uint32_t hb = b + (head < clr - b ? head : clr - b);
+  for (uint32_t i = b + tid; i < hb; i += kTopkThr) row[i] = 0;
+  const uint32_t v4 = (clr - hb) >> 4;
+  uint4* p4 = (uint4*)(row + hb);
+  const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+  for (uint32_t i = tid; i < v4; i += kTopkThr) p4[i] = z;
+  for (uint32_t i = hb + (v4 << 4) + tid; i < clr; i += kTopkThr) row[i] = 0;
+}
+
 __device__ __forceinline__ void tie_admit(const uint32_t* tie, uint32_t nt, uint32_t need,
                                           uint32_t tid, const float* sc, uint8_t* row,
                                           uint32_t n_keys, uint32_t T) {
@@ -609,10 +671,49 @@ __device__ __forceinline__ void tie_admit(const uint32_t* tie, uint32_t nt, uint
   }
 }
 
+template <uint32_t FixedBlock>
+__device__ __forceinline__ void tie_admit_cand(const uint32_t* tie, uint32_t nt, uint32_t need,
+                                               uint32_t tid, const float* sc,
+                                               const uint16_t* __restrict__ cids,
+                                               uint32_t cand_block, uint8_t* row, uint32_t n_keys,
+                                               uint32_t mlen, uint32_t T) {
+  if (need == 0) return;
+  if (nt <= kTieCap) {
+    for (uint32_t a = tid; a < nt; a += kTopkThr) {
+      const uint32_t v = tie[a];
+      uint32_t rank = 0;
+      for (uint32_t b = 0; b < nt; ++b) rank += (tie[b] < v) ? 1u : 0u;
+      if (rank < need) {
+        const uint32_t g = cand_global_key<FixedBlock>(cids, cand_block, v);
+        if (g < mlen) row[g] = 1;
+      }
+    }
+    return;
+  }
+  if (tid < 32) {
+    uint32_t quota = need;
+    for (uint32_t i0 = 0; i0 < n_keys && quota; i0 += 32u) {
+      const uint32_t i = i0 + tid;
+      const uint32_t kv = (i < n_keys) ? mono(sc[i]) : KEY_NEG_INF;
+      const bool eq = (i < n_keys) && (kv == T) && (kv > KEY_NEG_INF);
+      const uint32_t bm = (uint32_t)__ballot(eq);
+      const uint32_t mask_lt = (tid == 0) ? 0u : ((1u << tid) - 1u);
+      const uint32_t before = (uint32_t)__popc(bm & mask_lt);
+      if (eq && before < quota) {
+        const uint32_t g = cand_global_key<FixedBlock>(cids, cand_block, i);
+        if (g < mlen) row[g] = 1;
+      }
+      quota -= min(quota, (uint32_t)__popc(bm));
+    }
+  }
+}
+
 __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
     const float* __restrict__ scores, uint8_t* __restrict__ mask,
-    const uint32_t* __restrict__ nkeys, uint32_t stride, uint32_t mstride, uint32_t mlen,
-    uint32_t k, uint32_t* __restrict__ adm, uint32_t* __restrict__ admn, uint32_t adm_stride) {
+    const uint32_t* __restrict__ nkeys, uint32_t stride, uint32_t max_keys, uint32_t mstride,
+    uint32_t mlen, uint32_t k, uint32_t* __restrict__ adm, uint32_t* __restrict__ admn,
+    uint32_t adm_stride, uint16_t* __restrict__ cand_ids_out, uint32_t* __restrict__ cand_n_out,
+    uint32_t cand_stride) {
   __shared__ uint32_t s_hist[256];
   __shared__ uint32_t s_tie[kTieCap];
   __shared__ uint32_t s_wc[kTopkWaves];
@@ -621,12 +722,10 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   const float* sc = scores + (size_t)t * stride;
   uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
   // The compressed cache GROWS inside a chunk — the compressor emits a row every `ratio` positions
-  // — so each token sees its own prefix of it. Scoring past that is scoring against rows derived
-  // from tokens that come later. Clamped to `stride` because that is how many scores exist: the two
-  // compressors have separate capacities and the attention's count can be the larger, in which case
-  // the rows past it have no score and must come back unadmitted rather than as whatever was there.
-  const uint32_t nk0 = nkeys ? nkeys[t] : stride;
-  const uint32_t n_keys = nk0 < stride ? nk0 : stride;
+  // — so each token sees its own prefix of it. Clamped to `max_keys` (`stride` for scores, or
+  // `nb_blocks` when publishing Layer 20 candidate blocks).
+  const uint32_t nk0 = nkeys ? nkeys[t] : max_keys;
+  const uint32_t n_keys = nk0 < max_keys ? nk0 : max_keys;
 
   // ---- clear ONLY the tail no later pass writes.
   //
@@ -636,15 +735,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   // which is normally empty — and it is cleared 16 bytes a lane rather than one.
   if (row) {
     const uint32_t clr = mlen > n_keys ? mlen : n_keys;
-    uint32_t b = n_keys;
-    const uint32_t head = (uint32_t)((16u - ((uintptr_t)(row + b) & 15u)) & 15u);
-    const uint32_t hb = b + (head < clr - b ? head : clr - b);
-    for (uint32_t i = b + tid; i < hb; i += kTopkThr) row[i] = 0;
-    const uint32_t v4 = (clr - hb) >> 4;
-    uint4* p4 = (uint4*)(row + hb);
-    const uint4 z = make_uint4(0u, 0u, 0u, 0u);
-    for (uint32_t i = tid; i < v4; i += kTopkThr) p4[i] = z;
-    for (uint32_t i = hb + (v4 << 4) + tid; i < clr; i += kTopkThr) row[i] = 0;
+    clear_mask_row(row, n_keys, clr, tid);
   }
   // Fewer keys than the budget: admit all finite ones, skipping the radix passes completely.
   if (n_keys <= k) {
@@ -653,24 +744,40 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
         const bool valid = mono(sc[i]) > KEY_NEG_INF;
         row[i] = valid ? 1u : 0u;
       }
+      if (adm || cand_ids_out) lds_barrier();
       if (adm) {
-        // Each thread reads only the row[i] entries it wrote above; compact_row syncs LDS first.
-        lds_barrier();
-        compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+        compact_row_t<uint32_t>(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc,
+                                &s_base);
         if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
       }
-    } else if (adm) {
-      compact_admitted(sc, n_keys, KEY_NEG_INF, 0u, tid, adm + (size_t)t * adm_stride, adm_stride,
-                       s_wc, &s_base);
-      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+      if (cand_ids_out) {
+        if (adm) lds_barrier();
+        compact_row_t<uint16_t>(row, n_keys, tid, cand_ids_out + (size_t)t * cand_stride,
+                                cand_stride, s_wc, &s_base);
+        if (tid == 0) cand_n_out[t] = s_base < cand_stride ? s_base : cand_stride;
+      }
+    } else {
+      if (adm) {
+        compact_admitted_t<uint32_t>(sc, n_keys, KEY_NEG_INF, 0u, tid,
+                                     adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+        if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+      }
+      if (cand_ids_out) {
+        if (adm) lds_barrier();
+        compact_admitted_t<uint16_t>(sc, n_keys, KEY_NEG_INF, 0u, tid,
+                                     cand_ids_out + (size_t)t * cand_stride, cand_stride, s_wc,
+                                     &s_base);
+        if (tid == 0) cand_n_out[t] = s_base < cand_stride ? s_base : cand_stride;
+      }
     }
     return;
   }
   if (tid == 0) { s_prefix = 0; s_need = k; s_gt = 0; }
   lds_barrier();
 
-  // Narrow the key eight bits at a time. Vectorized 16-byte uint4 loads (8 floats per thread slot).
-  const uint32_t T8 = n_keys >> 3;
+  // Narrow the key eight bits at a time. Vectorized 16-byte uint4 loads when 16B aligned.
+  const bool sc_aligned16 = (reinterpret_cast<uintptr_t>(sc) & 15u) == 0u;
+  const uint32_t T8 = sc_aligned16 ? (n_keys >> 3) : 0u;
   for (int sh = 24; sh >= 0; sh -= 8) {
     if (tid < 256u) s_hist[tid] = 0;
     lds_barrier();
@@ -750,17 +857,33 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   __syncthreads();
   if (row) {
     tie_admit(s_tie, s_nt, need, tid, sc, row, n_keys, T);
+    if (adm || cand_ids_out) __syncthreads();           // the mask is only final after the ties
     if (adm) {
-      __syncthreads();                                 // the mask is only final after the ties
-      compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      compact_row_t<uint32_t>(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc,
+                              &s_base);
       if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
     }
-  } else if (adm) {
+    if (cand_ids_out) {
+      if (adm) lds_barrier();
+      compact_row_t<uint16_t>(row, n_keys, tid, cand_ids_out + (size_t)t * cand_stride,
+                              cand_stride, s_wc, &s_base);
+      if (tid == 0) cand_n_out[t] = s_base < cand_stride ? s_base : cand_stride;
+    }
+  } else if (adm || cand_ids_out) {
     tie_cutoff_excl(s_tie, s_nt, need, tid, sc, n_keys, T, &s_tie_end);
     lds_barrier();
-    compact_admitted(sc, n_keys, T, s_tie_end, tid, adm + (size_t)t * adm_stride, adm_stride,
-                     s_wc, &s_base);
-    if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    if (adm) {
+      compact_admitted_t<uint32_t>(sc, n_keys, T, s_tie_end, tid, adm + (size_t)t * adm_stride,
+                                   adm_stride, s_wc, &s_base);
+      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    }
+    if (cand_ids_out) {
+      if (adm) lds_barrier();
+      compact_admitted_t<uint16_t>(sc, n_keys, T, s_tie_end, tid,
+                                   cand_ids_out + (size_t)t * cand_stride, cand_stride, s_wc,
+                                   &s_base);
+      if (tid == 0) cand_n_out[t] = s_base < cand_stride ? s_base : cand_stride;
+    }
   }
 }
 
@@ -793,18 +916,20 @@ uint32_t topk_blocks() {
 // state[t]: prefix, need, gt, arrivals.
 __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
     const float* __restrict__ scores, const uint32_t* __restrict__ nkeys, uint32_t stride,
-    uint32_t k, int sh, uint32_t* __restrict__ hist, uint32_t* __restrict__ state) {
+    uint32_t max_keys, uint32_t k, int sh, uint32_t* __restrict__ hist,
+    uint32_t* __restrict__ state) {
   __shared__ uint32_t s_h[kTopkHist];
   __shared__ uint32_t s_last, s_b, s_any;
   const uint32_t t = blockIdx.y, tid = threadIdx.x;
   const float* sc = scores + (size_t)t * stride;
-  const uint32_t nk0 = nkeys ? nkeys[t] : stride;
-  const uint32_t n_keys = nk0 < stride ? nk0 : stride;
+  const uint32_t nk0 = nkeys ? nkeys[t] : max_keys;
+  const uint32_t n_keys = nk0 < max_keys ? nk0 : max_keys;
   uint32_t* g_h = hist + (size_t)t * kTopkHist;
   uint32_t* g_s = state + (size_t)t * 4u;
   // Fewer keys than the budget admits all of them and never consults the threshold, so no pass runs
   // and nothing here may touch the counter — it has to come out of this call as it went in.
   if (n_keys <= k) return;
+  if (sh < 24 && g_s[0] == KEY_NEG_INF && g_s[1] == 0u) return;
 
   if (tid < kTopkHist) s_h[tid] = 0;
   lds_barrier();
@@ -849,9 +974,15 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
   uint32_t b = 0, acc = 0;
   hist_scan(s_h, &s_b, &s_any, need, tid, &b, &acc);
   if (tid == 0) {
-    g_s[0] = pre | (b << sh);
-    g_s[1] = need - acc;
-    g_s[2] = ((sh == 24) ? 0u : g_s[2]) + acc;        // strictly above the bucket descended into
+    if (sh == 24 && !s_any) {
+      g_s[0] = KEY_NEG_INF;
+      g_s[1] = 0u;
+      g_s[2] = 0u;
+    } else {
+      g_s[0] = pre | (b << sh);
+      g_s[1] = need - acc;
+      g_s[2] = ((sh == 24) ? 0u : g_s[2]) + acc;        // strictly above the bucket descended into
+    }
     g_s[3] = 0;
   }
 }
@@ -861,13 +992,13 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
 // launch have no order between them.
 __global__ __launch_bounds__(kTopkThr) void idx_topk_mark_kernel(
     const float* __restrict__ scores, uint8_t* __restrict__ mask,
-    const uint32_t* __restrict__ nkeys, uint32_t stride, uint32_t mstride, uint32_t mlen,
-    uint32_t k, const uint32_t* __restrict__ state, uint32_t* __restrict__ tie) {
+    const uint32_t* __restrict__ nkeys, uint32_t stride, uint32_t max_keys, uint32_t mstride,
+    uint32_t mlen, uint32_t k, const uint32_t* __restrict__ state, uint32_t* __restrict__ tie) {
   const uint32_t t = blockIdx.y, tid = threadIdx.x;
   const float* sc = scores + (size_t)t * stride;
   uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
-  const uint32_t nk0 = nkeys ? nkeys[t] : stride;
-  const uint32_t n_keys = nk0 < stride ? nk0 : stride;
+  const uint32_t nk0 = nkeys ? nkeys[t] : max_keys;
+  const uint32_t n_keys = nk0 < max_keys ? nk0 : max_keys;
   const uint32_t clr = mlen > n_keys ? mlen : n_keys;
   const uint32_t str = kTopkThr * gridDim.x;
   const uint32_t g0 = blockIdx.x * kTopkThr + tid;
@@ -898,26 +1029,40 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mark_kernel(
 // scores are equal only when their float bits are.
 __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
     const float* __restrict__ scores, uint8_t* __restrict__ mask,
-    const uint32_t* __restrict__ nkeys, uint32_t stride, uint32_t mstride, uint32_t k,
-    const uint32_t* __restrict__ state, uint32_t* __restrict__ tie, uint32_t* __restrict__ adm,
-    uint32_t* __restrict__ admn, uint32_t adm_stride) {
+    const uint32_t* __restrict__ nkeys, uint32_t stride, uint32_t max_keys, uint32_t mstride,
+    uint32_t k, const uint32_t* __restrict__ state, uint32_t* __restrict__ tie,
+    uint32_t* __restrict__ adm, uint32_t* __restrict__ admn, uint32_t adm_stride,
+    uint16_t* __restrict__ cand_ids_out, uint32_t* __restrict__ cand_n_out, uint32_t cand_stride) {
   __shared__ uint32_t s_tie[kTieCap];
   __shared__ uint32_t s_wc[kTopkWaves];
   __shared__ uint32_t s_base, s_tie_end;
   const uint32_t t = blockIdx.x, tid = threadIdx.x;
   const float* sc = scores + (size_t)t * stride;
   uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
-  const uint32_t nk0 = nkeys ? nkeys[t] : stride;
-  const uint32_t n_keys = nk0 < stride ? nk0 : stride;
+  const uint32_t nk0 = nkeys ? nkeys[t] : max_keys;
+  const uint32_t n_keys = nk0 < max_keys ? nk0 : max_keys;
   if (n_keys <= k) {
     if (adm) {
       if (row) {
-        compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+        compact_row_t<uint32_t>(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc,
+                                &s_base);
       } else {
-        compact_admitted(sc, n_keys, KEY_NEG_INF, 0u, tid, adm + (size_t)t * adm_stride,
-                         adm_stride, s_wc, &s_base);
+        compact_admitted_t<uint32_t>(sc, n_keys, KEY_NEG_INF, 0u, tid,
+                                     adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
       }
       if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    }
+    if (cand_ids_out) {
+      if (adm) lds_barrier();
+      if (row) {
+        compact_row_t<uint16_t>(row, n_keys, tid, cand_ids_out + (size_t)t * cand_stride,
+                                cand_stride, s_wc, &s_base);
+      } else {
+        compact_admitted_t<uint16_t>(sc, n_keys, KEY_NEG_INF, 0u, tid,
+                                     cand_ids_out + (size_t)t * cand_stride, cand_stride, s_wc,
+                                     &s_base);
+      }
+      if (tid == 0) cand_n_out[t] = s_base < cand_stride ? s_base : cand_stride;
     }
     return;
   }
@@ -930,20 +1075,34 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
   const uint32_t need = state[(size_t)t * 4u + 1u];
   if (row) {
     tie_admit(s_tie, nt, need, tid, sc, row, n_keys, T);
-    __syncthreads();  // cross-wave global store visibility from tie_admit before compact_row
-    if (tid == 0) g_t[0] = 0;                          // back to empty for the next call
+    if (adm || cand_ids_out) __syncthreads();  // cross-wave global store visibility from tie_admit
+    if (tid == 0) g_t[0] = 0;                  // back to empty for the next call
     if (adm) {
-      compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      compact_row_t<uint32_t>(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc,
+                              &s_base);
       if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
     }
+    if (cand_ids_out) {
+      if (adm) lds_barrier();
+      compact_row_t<uint16_t>(row, n_keys, tid, cand_ids_out + (size_t)t * cand_stride,
+                              cand_stride, s_wc, &s_base);
+      if (tid == 0) cand_n_out[t] = s_base < cand_stride ? s_base : cand_stride;
+    }
   } else {
-    if (adm) tie_cutoff_excl(s_tie, nt, need, tid, sc, n_keys, T, &s_tie_end);
+    if (adm || cand_ids_out) tie_cutoff_excl(s_tie, nt, need, tid, sc, n_keys, T, &s_tie_end);
     lds_barrier();
     if (tid == 0) g_t[0] = 0;                          // back to empty for the next call
     if (adm) {
-      compact_admitted(sc, n_keys, T, s_tie_end, tid, adm + (size_t)t * adm_stride, adm_stride,
-                       s_wc, &s_base);
+      compact_admitted_t<uint32_t>(sc, n_keys, T, s_tie_end, tid, adm + (size_t)t * adm_stride,
+                                   adm_stride, s_wc, &s_base);
       if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    }
+    if (cand_ids_out) {
+      if (adm) lds_barrier();
+      compact_admitted_t<uint16_t>(sc, n_keys, T, s_tie_end, tid,
+                                   cand_ids_out + (size_t)t * cand_stride, cand_stride, s_wc,
+                                   &s_base);
+      if (tid == 0) cand_n_out[t] = s_base < cand_stride ? s_base : cand_stride;
     }
   }
 }
@@ -1074,7 +1233,493 @@ __global__ void idx_apply_cand_kernel(float* __restrict__ sc, const uint8_t* __r
   if (!cand[(size_t)t * cstride + s / block]) sc[(size_t)t * sstride + s] = -INFINITY;
 }
 
+// ---- W3-2a: Gather-only candidate scorer & top-k ------------------------------------------------
+//
+// Consumer layers (24, 28, 32, 36) score ONLY the `cand_n[t] * cand_block` keys named in
+// `cand_ids[t][0..cand_n[t]-1]` and run top-k directly over those compact scores, emitting
+// ascending global key indices into `adm` (or setting dense `mask` bits).
+template <bool ExactHeadOrder, uint32_t FixedBlock>
+__global__ __launch_bounds__(kThreads) void indexer_scores_cand_kernel(
+    const uint8_t* __restrict__ q8, const float* __restrict__ qs, const uint8_t* __restrict__ k8,
+    const float* __restrict__ ks, const float* __restrict__ hw,
+    const uint16_t* __restrict__ cand_ids, const uint32_t* __restrict__ cand_n,
+    const uint32_t* __restrict__ nkeys, float* __restrict__ out, uint32_t n_keys, uint32_t n_head,
+    uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks, uint32_t out_stride) {
+  __shared__ __align__(16) uint8_t s_q[kIdxDecHeads * kQLd];
+  __shared__ float s_w[kIdxDecHeads];
+
+  const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
+  const uint32_t c = lane & 15u, hlf = lane >> 4;
+  const uint32_t tok = blockIdx.z;
+
+  const uint32_t nc_cap = cand_max_blocks < cand_stride ? cand_max_blocks : cand_stride;
+  const uint32_t nc0 = cand_n ? cand_n[tok] : nc_cap;
+  const uint32_t nc = nc0 < nc_cap ? nc0 : nc_cap;
+  const uint32_t n_cand_keys = nc * cand_block;
+  constexpr uint32_t kpb = kWaves * 16u;
+  if (blockIdx.x * kpb >= n_cand_keys) return;
+
+  const uint32_t u = blockIdx.x * kpb + wave * 16u + c;
+  const uint32_t tok_keys0 = nkeys ? nkeys[tok] : n_keys;
+  const uint32_t tok_keys = tok_keys0 < n_keys ? tok_keys0 : n_keys;
+  const bool in_cand = (u < n_cand_keys) && (u < out_stride);
+  uint32_t key = 0u;
+  bool live_key = false;
+  if (in_cand) {
+    const uint32_t blk_w = (FixedBlock > 0u) ? FixedBlock : cand_block;
+    const uint32_t j = (FixedBlock > 0u) ? (u / FixedBlock) : (u / cand_block);
+    const uint32_t r = (FixedBlock > 0u) ? (u & (FixedBlock - 1u)) : (u - j * cand_block);
+    const uint32_t b = (uint32_t)cand_ids[(size_t)tok * cand_stride + j];
+    key = b * blk_w + r;
+    live_key = (key < tok_keys);
+  }
+
+  // Inactive/tail-padded lanes read row 0 safely and drop/mask on store so DPP lane-exchange stays
+  // well-defined across all 32 lanes of the wave.
+  const uint8_t* row_kp = k8 + (size_t)(live_key ? key : 0u) * kD;
+  wmma::i2v bf[kD / 16u];
+  if ((reinterpret_cast<uintptr_t>(k8) & 15u) == 0u) {
+    const uint4* ku4 = reinterpret_cast<const uint4*>(row_kp);
+#pragma unroll
+    for (uint32_t d2 = 0; d2 < kD / 32u; ++d2) {
+      const uint4 uv = ku4[2u * d2 + hlf];
+      const uint32_t ex0 = dpp_xor_lane<16>(hlf == 0u ? uv.z : uv.x);
+      const uint32_t ex1 = dpp_xor_lane<16>(hlf == 0u ? uv.w : uv.y);
+      bf[2u * d2 + 0u] = wmma::i2v{
+          static_cast<int>(hlf == 0u ? uv.x : ex0),
+          static_cast<int>(hlf == 0u ? uv.y : ex1)};
+      bf[2u * d2 + 1u] = wmma::i2v{
+          static_cast<int>(hlf == 0u ? ex0 : uv.z),
+          static_cast<int>(hlf == 0u ? ex1 : uv.w)};
+    }
+  } else {
+    const uint8_t* kp = row_kp + hlf * 8u;
+#pragma unroll
+    for (uint32_t d = 0; d < kD / 16u; ++d) bf[d] = *(const wmma::i2v*)(kp + d * 16u);
+  }
+  const float kscale = live_key ? ks[key] : 0.0f;
+
+  const uint8_t* const q8_b = q8 + (size_t)tok * n_head * kD;
+  const float* const hw_b = hw + (size_t)tok * n_head;
+  const float qs_b = qs[tok];
+  float sum = 0.0f;
+
+  for (uint32_t hg = 0; hg < n_head; hg += kIdxDecHeads) {
+    if (hg > 0u) lds_barrier();
+    const uint32_t n_stage = (n_head - hg < kIdxDecHeads) ? (n_head - hg) : kIdxDecHeads;
+    const uint32_t n_stage_pad = (n_stage + 15u) & ~15u;
+    for (uint32_t i = tid; i < n_stage_pad * (kD / 16u); i += kThreads) {
+      const uint32_t row = i / (kD / 16u), dq = (i % (kD / 16u)) * 16u;
+      const uint4 qv = (row < n_stage)
+                           ? *(const uint4*)(q8_b + (size_t)(hg + row) * kD + dq)
+                           : make_uint4(0u, 0u, 0u, 0u);
+      uint8_t* dst = s_q + (size_t)row * kQLd + dq;
+      *(uint64_t*)(dst + 0) = *(const uint64_t*)&qv.x;
+      *(uint64_t*)(dst + 8) = *(const uint64_t*)&qv.z;
+    }
+    if (tid < kIdxDecHeads) s_w[tid] = (tid < n_stage) ? hw_b[hg + tid] : 0.0f;
+    lds_barrier();
+
+    for (uint32_t mt = 0; mt < n_stage; mt += 16u) {
+      wmma::f8v acc = wmma::acc_zero();
+      const uint8_t* qp = s_q + (size_t)(mt + c) * kQLd + hlf * 8u;
+#pragma unroll
+      for (uint32_t d = 0; d < kD / 16u; ++d)
+        acc = wmma::mma_fp8(*(const wmma::i2v*)(qp + d * 16u), bf[d], acc);
+      if constexpr (!ExactHeadOrder) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          sum += s_w[mt + hlf * 8u + (uint32_t)j] * fmaxf(acc[j], 0.0f);
+      } else {
+        // Exact h = 0..n_head-1 left-to-right accumulation order matching `indexer_kernel`:
+        // hlf==1 passes its 8 heads to hlf==0 via single-instruction permlanex16 so hlf==0
+        // sums heads mt+0..mt+7 then mt+8..mt+15 sequentially under -ffp-contract=off.
+        float v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t hr = mt + hlf * 8u + (uint32_t)j;
+          v[j] = (hr < n_stage) ? (s_w[hr] * fmaxf(acc[j], 0.0f)) : 0.0f;
+        }
+        float uval[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) uval[j] = dpp_xor_lane<16u>(v[j]);
+        if (hlf == 0u) {
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            if (mt + (uint32_t)j < n_stage) sum += v[j];
+          }
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            if (mt + 8u + (uint32_t)j < n_stage) sum += uval[j];
+          }
+        }
+      }
+    }
+  }
+  if constexpr (!ExactHeadOrder) sum += dpp_xor_lane<16u>(sum);
+  if (hlf == 0u && in_cand) {
+    out[(size_t)tok * out_stride + u] = live_key ? (sum * qs_b * kscale) : -INFINITY;
+  }
+}
+
+__device__ __forceinline__ uint32_t cand_row_len(const uint32_t* __restrict__ cand_n, uint32_t t,
+                                                 uint32_t sstride, uint32_t cand_stride,
+                                                 uint32_t cand_block, uint32_t cand_max_blocks) {
+  const uint32_t nc_cap = cand_max_blocks < cand_stride ? cand_max_blocks : cand_stride;
+  const uint32_t nc0 = cand_n ? cand_n[t] : nc_cap;
+  const uint32_t nc = nc0 < nc_cap ? nc0 : nc_cap;
+  const uint32_t n_cand = nc * cand_block;
+  return n_cand < sstride ? n_cand : sstride;
+}
+
+__global__ __launch_bounds__(kTopkThr) void idx_clear_mask_kernel(
+    uint8_t* __restrict__ mask, uint32_t mstride, uint32_t mlen) {
+  uint8_t* row = mask + (size_t)blockIdx.x * mstride;
+  clear_mask_row(row, 0u, mlen, threadIdx.x);
+}
+
+template <uint32_t FixedBlock>
+__global__ __launch_bounds__(kTopkThr) void idx_topk_cand_mask_kernel(
+    const float* __restrict__ cand_scores, uint8_t* __restrict__ mask,
+    const uint16_t* __restrict__ cand_ids, const uint32_t* __restrict__ cand_n, uint32_t sstride,
+    uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks, uint32_t mstride,
+    uint32_t mlen, uint32_t k, uint32_t* __restrict__ adm, uint32_t* __restrict__ admn,
+    uint32_t adm_stride) {
+  __shared__ uint32_t s_hist[256];
+  __shared__ uint32_t s_tie[kTieCap];
+  __shared__ uint32_t s_wc[kTopkWaves];
+  __shared__ uint32_t s_prefix, s_need, s_gt, s_b, s_any, s_nt, s_base, s_tie_end;
+  const uint32_t t = blockIdx.x, tid = threadIdx.x;
+  const float* sc = cand_scores + (size_t)t * sstride;
+  const uint16_t* cids = cand_ids + (size_t)t * cand_stride;
+  uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
+  const uint32_t n_keys =
+      cand_row_len(cand_n, t, sstride, cand_stride, cand_block, cand_max_blocks);
+
+  if (row) {
+    clear_mask_row(row, 0u, mlen, tid);
+    lds_barrier();
+  }
+  if (n_keys <= k) {
+    if (row) {
+      for (uint32_t i = tid; i < n_keys; i += kTopkThr) {
+        if (mono(sc[i]) > KEY_NEG_INF) {
+          const uint32_t g = cand_global_key<FixedBlock>(cids, cand_block, i);
+          if (g < mlen) row[g] = 1u;
+        }
+      }
+    }
+    if (adm) {
+      compact_admitted_cand<FixedBlock>(sc, cids, cand_block, n_keys, KEY_NEG_INF, 0u, tid,
+                                        adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    }
+    return;
+  }
+  if (tid == 0) { s_prefix = 0; s_need = k; s_gt = 0; }
+  lds_barrier();
+
+  const bool sc_aligned16 = (reinterpret_cast<uintptr_t>(sc) & 15u) == 0u;
+  const uint32_t T8 = sc_aligned16 ? (n_keys >> 3) : 0u;
+  for (int sh = 24; sh >= 0; sh -= 8) {
+    if (tid < 256u) s_hist[tid] = 0;
+    lds_barrier();
+    const uint32_t pre = s_prefix, msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+    for (uint32_t i = tid; i < T8; i += kTopkThr) {
+      const uint4 v0 = ((const uint4*)sc)[2 * i + 0];
+      const uint4 v1 = ((const uint4*)sc)[2 * i + 1];
+      const uint32_t ks[8] = {
+        mono_u(v0.x), mono_u(v0.y), mono_u(v0.z), mono_u(v0.w),
+        mono_u(v1.x), mono_u(v1.y), mono_u(v1.z), mono_u(v1.w)
+      };
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const uint32_t key = ks[j];
+        hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+      }
+    }
+    for (uint32_t i = T8 * 8u + tid; i < n_keys; i += kTopkThr) {
+      const uint32_t key = mono(sc[i]);
+      hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+    }
+    lds_barrier();
+    uint32_t b = 0, acc = 0;
+    hist_scan(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
+    if (sh == 24 && !s_any) {
+      if (tid == 0) {
+        s_prefix = KEY_NEG_INF;
+        s_need = 0;
+      }
+      break;
+    }
+    if (tid == 0) {
+      s_gt += acc;
+      s_need -= acc;
+      s_prefix = pre | (b << sh);
+    }
+    lds_barrier();
+  }
+
+  const uint32_t T = s_prefix, need = s_need;
+  if (tid == 0) s_nt = 0;
+  lds_barrier();
+  for (uint32_t i = tid; i < T8; i += kTopkThr) {
+    const uint4 v0 = ((const uint4*)sc)[2 * i + 0];
+    const uint4 v1 = ((const uint4*)sc)[2 * i + 1];
+    const uint32_t ks[8] = {
+      mono_u(v0.x), mono_u(v0.y), mono_u(v0.z), mono_u(v0.w),
+      mono_u(v1.x), mono_u(v1.y), mono_u(v1.z), mono_u(v1.w)
+    };
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t idx = i * 8u + (uint32_t)j;
+      const uint32_t key = ks[j];
+      if (row && (key > T) && (key > KEY_NEG_INF)) {
+        const uint32_t g = cand_global_key<FixedBlock>(cids, cand_block, idx);
+        if (g < mlen) row[g] = 1u;
+      }
+      if (key == T && key > KEY_NEG_INF) {
+        const uint32_t p = atomicAdd(&s_nt, 1u);
+        if (p < kTieCap) s_tie[p] = idx;
+      }
+    }
+  }
+  for (uint32_t i = T8 * 8u + tid; i < n_keys; i += kTopkThr) {
+    const uint32_t key = mono(sc[i]);
+    if (row && (key > T) && (key > KEY_NEG_INF)) {
+      const uint32_t g = cand_global_key<FixedBlock>(cids, cand_block, i);
+      if (g < mlen) row[g] = 1u;
+    }
+    if (key == T && key > KEY_NEG_INF) {
+      const uint32_t p = atomicAdd(&s_nt, 1u);
+      if (p < kTieCap) s_tie[p] = i;
+    }
+  }
+  __syncthreads();
+  if (row) {
+    tie_admit_cand<FixedBlock>(s_tie, s_nt, need, tid, sc, cids, cand_block, row, n_keys, mlen, T);
+  }
+  if (adm) {
+    if (row) lds_barrier();
+    tie_cutoff_excl(s_tie, s_nt, need, tid, sc, n_keys, T, &s_tie_end);
+    lds_barrier();
+    compact_admitted_cand<FixedBlock>(sc, cids, cand_block, n_keys, T, s_tie_end, tid,
+                                      adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+    if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+  }
+}
+
+__global__ __launch_bounds__(kTopkThr) void idx_topk_cand_hist_kernel(
+    const float* __restrict__ cand_scores, const uint32_t* __restrict__ cand_n, uint32_t sstride,
+    uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks, uint32_t k, int sh,
+    uint32_t* __restrict__ hist, uint32_t* __restrict__ state) {
+  __shared__ uint32_t s_h[kTopkHist];
+  __shared__ uint32_t s_last, s_b, s_any;
+  const uint32_t t = blockIdx.y, tid = threadIdx.x;
+  const float* sc = cand_scores + (size_t)t * sstride;
+  const uint32_t n_keys =
+      cand_row_len(cand_n, t, sstride, cand_stride, cand_block, cand_max_blocks);
+  uint32_t* g_h = hist + (size_t)t * kTopkHist;
+  uint32_t* g_s = state + (size_t)t * 4u;
+  if (n_keys <= k) return;
+  if (sh < 24 && g_s[0] == KEY_NEG_INF && g_s[1] == 0u) return;
+
+  if (tid < kTopkHist) s_h[tid] = 0;
+  lds_barrier();
+  const uint32_t pre = (sh == 24) ? 0u : g_s[0];
+  const uint32_t msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+  const uint32_t per = (n_keys + gridDim.x - 1u) / gridDim.x;
+  const uint32_t lo = blockIdx.x * per;
+  const uint32_t hi = (lo + per < n_keys) ? lo + per : n_keys;
+  for (uint32_t i = lo + tid; i < hi; i += kTopkThr) {
+    const uint32_t key = mono(sc[i]);
+    hist_add(s_h, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+  }
+  lds_barrier();
+  if (tid < kTopkHist && s_h[tid]) atomicAdd(&g_h[tid], s_h[tid]);
+#ifdef __HIP_DEVICE_COMPILE__
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
+  __threadfence();
+#endif
+  lds_barrier();
+  if (tid == 0) {
+    s_last = (__hip_atomic_fetch_add(&g_s[3], 1u, __ATOMIC_RELEASE,
+                                     __HIP_MEMORY_SCOPE_AGENT) == gridDim.x - 1u)
+                 ? 1u
+                 : 0u;
+  }
+  lds_barrier();
+  if (!s_last) return;
+#ifdef __HIP_DEVICE_COMPILE__
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
+  __threadfence();
+#endif
+  const uint32_t need = (sh == 24) ? k : g_s[1];
+  if (tid < kTopkHist) { s_h[tid] = g_h[tid]; g_h[tid] = 0; }
+  lds_barrier();
+  uint32_t b = 0, acc = 0;
+  hist_scan(s_h, &s_b, &s_any, need, tid, &b, &acc);
+  if (tid == 0) {
+    if (sh == 24 && !s_any) {
+      g_s[0] = KEY_NEG_INF;
+      g_s[1] = 0u;
+      g_s[2] = 0u;
+    } else {
+      g_s[0] = pre | (b << sh);
+      g_s[1] = need - acc;
+      g_s[2] = ((sh == 24) ? 0u : g_s[2]) + acc;
+    }
+    g_s[3] = 0;
+  }
+}
+
+template <uint32_t FixedBlock>
+__global__ __launch_bounds__(kTopkThr) void idx_topk_cand_mark_kernel(
+    const float* __restrict__ cand_scores, uint8_t* __restrict__ mask,
+    const uint16_t* __restrict__ cand_ids, const uint32_t* __restrict__ cand_n, uint32_t sstride,
+    uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks, uint32_t mstride,
+    uint32_t mlen, uint32_t k, const uint32_t* __restrict__ state, uint32_t* __restrict__ tie) {
+  const uint32_t t = blockIdx.y, tid = threadIdx.x;
+  const float* sc = cand_scores + (size_t)t * sstride;
+  const uint16_t* cids = cand_ids + (size_t)t * cand_stride;
+  uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
+  const uint32_t n_keys =
+      cand_row_len(cand_n, t, sstride, cand_stride, cand_block, cand_max_blocks);
+  const uint32_t str = kTopkThr * gridDim.x;
+  const uint32_t g0 = blockIdx.x * kTopkThr + tid;
+  if (n_keys <= k) {
+    if (row) {
+      for (uint32_t i = g0; i < n_keys; i += str) {
+        if (mono(sc[i]) > KEY_NEG_INF) {
+          const uint32_t g = cand_global_key<FixedBlock>(cids, cand_block, i);
+          if (g < mlen) row[g] = 1u;
+        }
+      }
+    }
+    return;
+  }
+  const uint32_t T = state[(size_t)t * 4u];
+  uint32_t* g_t = tie + (size_t)t * (kTieCap + 1u);
+  for (uint32_t i = g0; i < n_keys; i += str) {
+    const uint32_t key = mono(sc[i]);
+    if (row && (key > T) && (key > KEY_NEG_INF)) {
+      const uint32_t g = cand_global_key<FixedBlock>(cids, cand_block, i);
+      if (g < mlen) row[g] = 1u;
+    }
+    if (key == T && key > KEY_NEG_INF) {
+      const uint32_t p = atomicAdd(&g_t[0], 1u);
+      if (p < kTieCap) g_t[1u + p] = i;
+    }
+  }
+}
+
+template <uint32_t FixedBlock>
+__global__ __launch_bounds__(kTopkThr) void idx_topk_cand_tie_kernel(
+    const float* __restrict__ cand_scores, uint8_t* __restrict__ mask,
+    const uint16_t* __restrict__ cand_ids, const uint32_t* __restrict__ cand_n, uint32_t sstride,
+    uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks, uint32_t mstride,
+    uint32_t mlen, uint32_t k, const uint32_t* __restrict__ state, uint32_t* __restrict__ tie,
+    uint32_t* __restrict__ adm, uint32_t* __restrict__ admn, uint32_t adm_stride) {
+  __shared__ uint32_t s_tie[kTieCap];
+  __shared__ uint32_t s_wc[kTopkWaves];
+  __shared__ uint32_t s_base, s_tie_end;
+  const uint32_t t = blockIdx.x, tid = threadIdx.x;
+  const float* sc = cand_scores + (size_t)t * sstride;
+  const uint16_t* cids = cand_ids + (size_t)t * cand_stride;
+  uint8_t* row = mask ? (mask + (size_t)t * mstride) : nullptr;
+  const uint32_t n_keys =
+      cand_row_len(cand_n, t, sstride, cand_stride, cand_block, cand_max_blocks);
+  if (n_keys <= k) {
+    if (adm) {
+      compact_admitted_cand<FixedBlock>(sc, cids, cand_block, n_keys, KEY_NEG_INF, 0u, tid,
+                                        adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+      if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+    }
+    return;
+  }
+  uint32_t* g_t = tie + (size_t)t * (kTieCap + 1u);
+  const uint32_t nt = g_t[0];
+  const uint32_t nc = nt < kTieCap ? nt : kTieCap;
+  for (uint32_t i = tid; i < nc; i += kTopkThr) s_tie[i] = g_t[1u + i];
+  lds_barrier();
+  const uint32_t T = state[(size_t)t * 4u];
+  const uint32_t need = state[(size_t)t * 4u + 1u];
+  if (row) {
+    tie_admit_cand<FixedBlock>(s_tie, nt, need, tid, sc, cids, cand_block, row, n_keys, mlen, T);
+  }
+  if (adm) {
+    if (row) lds_barrier();
+    tie_cutoff_excl(s_tie, nt, need, tid, sc, n_keys, T, &s_tie_end);
+  }
+  lds_barrier();
+  if (tid == 0) g_t[0] = 0;
+  if (adm) {
+    compact_admitted_cand<FixedBlock>(sc, cids, cand_block, n_keys, T, s_tie_end, tid,
+                                      adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
+    if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
+  }
+}
+
+void idx_topk_mask_dispatch(const float* scores, uint8_t* mask, const uint32_t* nkeys, uint32_t nb,
+                            uint32_t stride, uint32_t max_keys, uint32_t mstride, uint32_t mlen,
+                            uint32_t k, void* stream, const TopkScratch* sp, uint32_t* adm,
+                            uint32_t* admn, uint32_t adm_stride, uint16_t* cand_ids_out,
+                            uint32_t* cand_n_out, uint32_t cand_stride) {
+  if (!nb || !stride || !max_keys) return;
+  if (adm && (!admn || adm_stride < k)) { adm = nullptr; admn = nullptr; }
+  if (cand_ids_out && (!cand_n_out || cand_stride < k)) {
+    cand_ids_out = nullptr; cand_n_out = nullptr;
+  }
+  if (!mask && !adm && !cand_ids_out) return;
+  hipStream_t st = (hipStream_t)stream;
+  if (k == 0u) {
+    if (mask) {
+      const uint32_t clr = mlen > max_keys ? mlen : max_keys;
+      hipLaunchKernelGGL(idx_clear_mask_kernel, dim3(nb), dim3(kTopkThr), 0, st, mask, mstride,
+                         clr);
+      AFF_HIP_CHECK(hipGetLastError());
+    }
+    if (admn) AFF_HIP_CHECK(hipMemsetAsync(admn, 0, (size_t)nb * sizeof(uint32_t), st));
+    if (cand_n_out) AFF_HIP_CHECK(hipMemsetAsync(cand_n_out, 0, (size_t)nb * sizeof(uint32_t), st));
+    return;
+  }
+  // One block a workgroup processor, which is what `multiProcessorCount` reports on RDNA and what
+  // `device_cus` doubles. Queried once a device: this is on the dispatch path and
+  // hipGetDeviceProperties is a driver call.
+  const uint32_t blocks = topk_blocks();
+  // Spread it only when the token count cannot fill the card by itself. Six launches for one select
+  // is a real cost — an added kernel is never free here — so it has to buy back more than that,
+  // which needs both a small grid and enough keys for the passes to dominate.
+  if (sp && sp->hist && sp->tie && nb <= sp->tok_cap && nb < blocks && max_keys >= 4096u) {
+    const dim3 g(blocks, nb), b(kTopkThr);
+    for (int sh = 24; sh >= 0; sh -= 8) {
+      hipLaunchKernelGGL(idx_topk_hist_kernel, g, b, 0, st, scores, nkeys, stride, max_keys, k, sh,
+                         sp->hist, sp->state);
+      AFF_HIP_CHECK(hipGetLastError());
+    }
+    hipLaunchKernelGGL(idx_topk_mark_kernel, g, b, 0, st, scores, mask, nkeys, stride, max_keys,
+                       mstride, mlen, k, sp->state, sp->tie);
+    AFF_HIP_CHECK(hipGetLastError());
+    hipLaunchKernelGGL(idx_topk_tie_kernel, dim3(nb), dim3(kTopkThr), 0, st, scores, mask, nkeys,
+                       stride, max_keys, mstride, k, sp->state, sp->tie, adm, admn, adm_stride,
+                       cand_ids_out, cand_n_out, cand_stride);
+    AFF_HIP_CHECK(hipGetLastError());
+    return;
+  }
+  hipLaunchKernelGGL(idx_topk_mask_kernel, dim3(nb), dim3(kTopkThr), 0, st, scores, mask, nkeys,
+                     stride, max_keys, mstride, mlen, k, adm, admn, adm_stride, cand_ids_out,
+                     cand_n_out, cand_stride);
+  AFF_HIP_CHECK(hipGetLastError());
+}
+
 }  // namespace
+
+bool idx_cand_gather_enabled() {
+  const char* s = std::getenv("AFF_IDX_CAND_GATHER");
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
 
 void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, const float* ks,
                         const float* hw, float* out, uint32_t nb, uint32_t n_keys,
@@ -1143,35 +1788,132 @@ uint64_t idx_topk_scratch_bytes(uint32_t tok, uint64_t* state_bytes, uint64_t* t
 void idx_topk_mask_hip(const float* scores, uint8_t* mask, const uint32_t* nkeys, uint32_t nb,
                        uint32_t stride, uint32_t mstride, uint32_t mlen, uint32_t k,
                        void* stream, const TopkScratch* sp, uint32_t* adm, uint32_t* admn,
-                       uint32_t adm_stride) {
-  if (!nb || !stride) return;
+                       uint32_t adm_stride, uint16_t* cand_ids_out, uint32_t* cand_n_out,
+                       uint32_t cand_stride) {
+  if (cand_ids_out && !nkeys && stride > kIdxCandMaxBlocks) {
+    cand_ids_out = nullptr; cand_n_out = nullptr;
+  }
+  idx_topk_mask_dispatch(scores, mask, nkeys, nb, stride, stride, mstride, mlen, k, stream, sp, adm,
+                         admn, adm_stride, cand_ids_out, cand_n_out, cand_stride);
+}
+
+bool idx_topk_mask_cand_emit_hip(const float* bsc, uint8_t* cand_mask, const uint32_t* nblocks,
+                                 uint32_t nb, uint32_t bstride, uint32_t mstride,
+                                 uint32_t nb_blocks, uint32_t cand_topk_blocks,
+                                 uint16_t* cand_ids_out, uint32_t* cand_n_out,
+                                 uint32_t cand_stride, void* stream, const TopkScratch* sp) {
+  if (!nb_blocks || !idx_cand_blocks_fit_u16(nb_blocks)) return false;
+  if (!cand_ids_out || !cand_n_out || cand_stride < cand_topk_blocks) return false;
+  if (!nb) return true;
+  const uint32_t eff_blocks = nb_blocks < bstride ? nb_blocks : bstride;
+  idx_topk_mask_dispatch(bsc, cand_mask, nblocks, nb, bstride, eff_blocks, mstride, nb_blocks,
+                         cand_topk_blocks, stream, sp, nullptr, nullptr, 0u, cand_ids_out,
+                         cand_n_out, cand_stride);
+  return true;
+}
+
+void indexer_scores_cand_hip(const uint8_t* q8, const float* qs, const uint8_t* k8,
+                             const float* ks, const float* hw, const uint16_t* cand_ids,
+                             const uint32_t* cand_n, const uint32_t* nkeys, float* out,
+                             uint32_t nb, uint32_t n_keys, uint32_t n_head, uint32_t cand_stride,
+                             uint32_t cand_block, uint32_t cand_max_blocks, uint32_t out_stride,
+                             void* stream) {
+  if (!nb || !n_keys || !n_head || !cand_ids || !cand_block || !cand_max_blocks || !out_stride) {
+    return;
+  }
+  const uint32_t eff_blocks = cand_max_blocks < cand_stride ? cand_max_blocks : cand_stride;
+  const uint32_t n_cand_max = eff_blocks * cand_block;
+  if (!n_cand_max) return;
+  const char* narrow_env = std::getenv("AFF_IDX_NARROW");
+  const bool idx_narrow = !(narrow_env && *narrow_env && std::strcmp(narrow_env, "0") == 0);
+  const uint32_t dec_max_nb = idx_narrow ? 8u : 1u;
+  const bool exact_head_order = !(nb <= dec_max_nb && n_head <= kIdxDecHeads && (n_head % 16u) == 0u);
+  constexpr uint32_t kpb = kWaves * 16u;
+  const uint32_t gx = (n_cand_max + kpb - 1u) / kpb;
+  constexpr uint32_t kMaxGridZ = 65535u;
+  hipStream_t st = (hipStream_t)stream;
+
+  auto launch = [&]<bool Exact, uint32_t FixedBlk>() {
+    for (uint32_t t_off = 0; t_off < nb; t_off += kMaxGridZ) {
+      const uint32_t chunk = std::min(nb - t_off, kMaxGridZ);
+      const dim3 g(gx, 1u, chunk);
+      hipLaunchKernelGGL((indexer_scores_cand_kernel<Exact, FixedBlk>), g, dim3(kThreads), 0, st,
+                         q8 + (size_t)t_off * n_head * kD, qs + t_off, k8, ks,
+                         hw + (size_t)t_off * n_head, cand_ids + (size_t)t_off * cand_stride,
+                         cand_n ? cand_n + t_off : nullptr, nkeys ? nkeys + t_off : nullptr,
+                         out + (size_t)t_off * out_stride, n_keys, n_head, cand_stride, cand_block,
+                         eff_blocks, out_stride);
+      AFF_HIP_CHECK(hipGetLastError());
+    }
+  };
+  if (exact_head_order) {
+    if (cand_block == 16u) launch.template operator()<true, 16u>();
+    else if (cand_block == 8u) launch.template operator()<true, 8u>();
+    else launch.template operator()<true, 0u>();
+  } else {
+    if (cand_block == 16u) launch.template operator()<false, 16u>();
+    else if (cand_block == 8u) launch.template operator()<false, 8u>();
+    else launch.template operator()<false, 0u>();
+  }
+}
+
+void idx_topk_mask_cand_hip(const float* cand_scores, uint8_t* mask, const uint16_t* cand_ids,
+                            const uint32_t* cand_n, uint32_t nb, uint32_t sstride,
+                            uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks,
+                            uint32_t mstride, uint32_t mlen, uint32_t k, void* stream,
+                            const TopkScratch* sp, uint32_t* adm, uint32_t* admn,
+                            uint32_t adm_stride) {
+  if (!nb || !sstride || !cand_ids || !cand_block || !cand_max_blocks) return;
   if (adm && (!admn || adm_stride < k)) { adm = nullptr; admn = nullptr; }
   if (!mask && !adm) return;
   hipStream_t st = (hipStream_t)stream;
-  // One block a workgroup processor, which is what `multiProcessorCount` reports on RDNA and what
-  // `device_cus` doubles. Queried once a device: this is on the dispatch path and
-  // hipGetDeviceProperties is a driver call.
-  const uint32_t blocks = topk_blocks();
-  // Spread it only when the token count cannot fill the card by itself. Six launches for one select
-  // is a real cost — an added kernel is never free here — so it has to buy back more than that,
-  // which needs both a small grid and enough keys for the passes to dominate.
-  if (sp && sp->hist && sp->tie && nb <= sp->tok_cap && nb < blocks && stride >= 4096u) {
-    const dim3 g(blocks, nb), b(kTopkThr);
-    for (int sh = 24; sh >= 0; sh -= 8) {
-      hipLaunchKernelGGL(idx_topk_hist_kernel, g, b, 0, st, scores, nkeys, stride, k, sh, sp->hist,
-                         sp->state);
+  if (k == 0u) {
+    if (mask) {
+      hipLaunchKernelGGL(idx_clear_mask_kernel, dim3(nb), dim3(kTopkThr), 0, st, mask, mstride,
+                         mlen);
       AFF_HIP_CHECK(hipGetLastError());
     }
-    hipLaunchKernelGGL(idx_topk_mark_kernel, g, b, 0, st, scores, mask, nkeys, stride, mstride,
-                       mlen, k, sp->state, sp->tie);
-    hipLaunchKernelGGL(idx_topk_tie_kernel, dim3(nb), dim3(kTopkThr), 0, st, scores, mask, nkeys,
-                       stride, mstride, k, sp->state, sp->tie, adm, admn, adm_stride);
-    AFF_HIP_CHECK(hipGetLastError());
+    if (admn) AFF_HIP_CHECK(hipMemsetAsync(admn, 0, (size_t)nb * sizeof(uint32_t), st));
     return;
   }
-  hipLaunchKernelGGL(idx_topk_mask_kernel, dim3(nb), dim3(kTopkThr), 0, st, scores,
-                     mask, nkeys, stride, mstride, mlen, k, adm, admn, adm_stride);
-  AFF_HIP_CHECK(hipGetLastError());
+  const uint32_t eff_blocks = cand_max_blocks < cand_stride ? cand_max_blocks : cand_stride;
+  const uint32_t max_cand_keys = std::min(sstride, eff_blocks * cand_block);
+  const uint32_t blocks = topk_blocks();
+  const bool use_spread =
+      sp && sp->hist && sp->tie && nb <= sp->tok_cap && nb < blocks && max_cand_keys >= 4096u;
+
+  auto run = [&]<uint32_t FixedBlk>() {
+    if (use_spread) {
+      const dim3 g(blocks, nb), b(kTopkThr);
+      for (int sh = 24; sh >= 0; sh -= 8) {
+        hipLaunchKernelGGL(idx_topk_cand_hist_kernel, g, b, 0, st, cand_scores, cand_n, sstride,
+                           cand_stride, cand_block, eff_blocks, k, sh, sp->hist, sp->state);
+        AFF_HIP_CHECK(hipGetLastError());
+      }
+      if (mask) {
+        hipLaunchKernelGGL(idx_clear_mask_kernel, dim3(nb), dim3(kTopkThr), 0, st, mask, mstride,
+                           mlen);
+        AFF_HIP_CHECK(hipGetLastError());
+      }
+      hipLaunchKernelGGL((idx_topk_cand_mark_kernel<FixedBlk>), g, b, 0, st, cand_scores, mask,
+                         cand_ids, cand_n, sstride, cand_stride, cand_block, eff_blocks, mstride,
+                         mlen, k, sp->state, sp->tie);
+      AFF_HIP_CHECK(hipGetLastError());
+      hipLaunchKernelGGL((idx_topk_cand_tie_kernel<FixedBlk>), dim3(nb), dim3(kTopkThr), 0, st,
+                         cand_scores, mask, cand_ids, cand_n, sstride, cand_stride, cand_block,
+                         eff_blocks, mstride, mlen, k, sp->state, sp->tie, adm, admn, adm_stride);
+      AFF_HIP_CHECK(hipGetLastError());
+      return;
+    }
+    hipLaunchKernelGGL((idx_topk_cand_mask_kernel<FixedBlk>), dim3(nb), dim3(kTopkThr), 0, st,
+                       cand_scores, mask, cand_ids, cand_n, sstride, cand_stride, cand_block,
+                       eff_blocks, mstride, mlen, k, adm, admn, adm_stride);
+    AFF_HIP_CHECK(hipGetLastError());
+  };
+
+  if (cand_block == 16u) run.template operator()<16u>();
+  else if (cand_block == 8u) run.template operator()<8u>();
+  else run.template operator()<0u>();
 }
 
 void idx_encode_rows(const float* src, uint8_t* dst, float* scale, uint32_t n, uint32_t dim) {

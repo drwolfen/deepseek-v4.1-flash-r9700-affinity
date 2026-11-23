@@ -1,5 +1,6 @@
 #include "engine/prefix_cache.h"
 
+#include "engine/threadpool.h"
 #include "ui/log.h"
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -706,62 +707,152 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
   chain(ids, n_restore, &keys);
 
   ++st_.lookups;
+  const char* par_env = std::getenv("AFF_PCACHE_PAR_RESTORE");
+  const bool par_restore = !par_env || !*par_env || std::strcmp(par_env, "0") != 0;
+
   const uint32_t hdr = (uint32_t)round_up(sizeof(SlotHeader) + (uint64_t)B * sizeof(uint32_t),
                                           kAlign);
+  struct RegionGatherMeta {
+    uint64_t off;
+    uint64_t rpb;
+    uint64_t seg;
+  };
+  std::vector<RegionGatherMeta> reg_meta(app_.size());
+  {
+    uint64_t o = 0;
+    for (uint32_t ri = 0; ri < app_.size(); ++ri) {
+      const KvRegion& r = app_[ri];
+      const uint64_t rpb = B / r.ratio;
+      const uint64_t seg = rpb * r.row_bytes;
+      reg_meta[ri] = RegionGatherMeta{o, rpb, seg};
+      o += (uint64_t)kSavedRanks * seg;
+    }
+  }
   // Every block this restore read, so the eviction order can be set once at the end and deep-end
   // first — see the note in publish(). Touching them as they are read does it the other way round.
   std::vector<uint32_t> used(nfull, kNil);
   // ---- the full blocks, a batch at a time -------------------------------------------------------
   for (uint32_t b0 = 0; b0 < nfull; b0 += impl_->gblocks) {
     const uint32_t g = std::min(impl_->gblocks, nfull - b0);
-    for (uint32_t i = 0; i < g; ++i) {
-      const int32_t s = find(keys.data() + (size_t)(b0 + i) * 32);
-      if (s < 0) { if (err) *err = "prefix cache: a block vanished between lookup and restore"; return false; }
-      if (!read_exact(impl_->blk_fd, impl_->rbuf[i], blk_slot_, (uint64_t)s * blk_slot_)) {
-        if (err) *err = std::string("prefix cache: block read failed: ") + std::strerror(errno);
-        return false;
+    if (par_restore && g >= 2) {
+      enum class ReadStatus : uint8_t { Ok = 0, Vanished = 1, ReadErr = 2, VerifyErr = 3 };
+      struct BlockReadRes {
+        ReadStatus status = ReadStatus::Ok;
+        int32_t slot = -1;
+        int err_no = 0;
+      };
+      std::vector<BlockReadRes> res(g);
+      // After drain(), the index and disk slots are immutable; workers pread into disjoint
+      // rbuf[i] buffers and report per-block status so drop()/stats stay single-threaded.
+      parallel_for(g, 2, [&](uint64_t lo, uint64_t hi) {
+        for (uint64_t i = lo; i < hi; ++i) {
+          const int32_t s = find(keys.data() + (size_t)(b0 + i) * 32);
+          if (s < 0) {
+            res[i] = BlockReadRes{ReadStatus::Vanished, -1, 0};
+            continue;
+          }
+          if (!read_exact(impl_->blk_fd, impl_->rbuf[i], blk_slot_, (uint64_t)s * blk_slot_)) {
+            res[i] = BlockReadRes{ReadStatus::ReadErr, s, errno};
+            continue;
+          }
+          const SlotHeader* h = (const SlotHeader*)impl_->rbuf[i];
+          const uint32_t* tok = (const uint32_t*)(impl_->rbuf[i] + sizeof(SlotHeader));
+          if (h->magic != kBlockMagic || h->fingerprint != fp_ || h->n_tokens != B ||
+              std::memcmp(tok, ids + (size_t)(b0 + i) * B, (size_t)B * sizeof(uint32_t))) {
+            res[i] = BlockReadRes{ReadStatus::VerifyErr, s, 0};
+            continue;
+          }
+          res[i] = BlockReadRes{ReadStatus::Ok, s, 0};
+        }
+      });
+      for (uint32_t i = 0; i < g; ++i) {
+        const BlockReadRes& r = res[i];
+        if (r.status == ReadStatus::Vanished) {
+          if (err) *err = "prefix cache: a block vanished between lookup and restore";
+          return false;
+        }
+        if (r.status == ReadStatus::ReadErr) {
+          if (err) *err = std::string("prefix cache: block read failed: ") + std::strerror(r.err_no);
+          return false;
+        }
+        if (r.status == ReadStatus::VerifyErr) {
+          ++st_.verify_misses;
+          drop(r.slot, false);          // or this prefix reports a hit and prefills from scratch forever
+          if (err) *err = "prefix cache: a block failed verification";
+          return false;
+        }
+        st_.bytes_read += blk_slot_;
+        used[b0 + i] = (uint32_t)r.slot;
       }
-      const SlotHeader* h = (const SlotHeader*)impl_->rbuf[i];
-      const uint32_t* tok = (const uint32_t*)(impl_->rbuf[i] + sizeof(SlotHeader));
-      // The key matched; this is what makes that enough. A collision now costs a miss instead of
-      // serving one conversation another's context.
-      if (h->magic != kBlockMagic || h->fingerprint != fp_ || h->n_tokens != B ||
-          std::memcmp(tok, ids + (size_t)(b0 + i) * B, (size_t)B * sizeof(uint32_t))) {
-        ++st_.verify_misses;
-        drop(s, false);          // or this prefix reports a hit and prefills from scratch forever
-        if (err) *err = "prefix cache: a block failed verification";
-        return false;
+    } else {
+      for (uint32_t i = 0; i < g; ++i) {
+        const int32_t s = find(keys.data() + (size_t)(b0 + i) * 32);
+        if (s < 0) { if (err) *err = "prefix cache: a block vanished between lookup and restore"; return false; }
+        if (!read_exact(impl_->blk_fd, impl_->rbuf[i], blk_slot_, (uint64_t)s * blk_slot_)) {
+          if (err) *err = std::string("prefix cache: block read failed: ") + std::strerror(errno);
+          return false;
+        }
+        const SlotHeader* h = (const SlotHeader*)impl_->rbuf[i];
+        const uint32_t* tok = (const uint32_t*)(impl_->rbuf[i] + sizeof(SlotHeader));
+        // The key matched; this is what makes that enough. A collision now costs a miss instead of
+        // serving one conversation another's context.
+        if (h->magic != kBlockMagic || h->fingerprint != fp_ || h->n_tokens != B ||
+            std::memcmp(tok, ids + (size_t)(b0 + i) * B, (size_t)B * sizeof(uint32_t))) {
+          ++st_.verify_misses;
+          drop(s, false);          // or this prefix reports a hit and prefills from scratch forever
+          if (err) *err = "prefix cache: a block failed verification";
+          return false;
+        }
+        st_.bytes_read += blk_slot_;
+        used[b0 + i] = (uint32_t)s;
       }
-      st_.bytes_read += blk_slot_;
-      used[b0 + i] = (uint32_t)s;
     }
     // Region by region across the whole batch, so the cards see one transfer per region rather than
     // one per region per block. At a 1M restore that is the difference between ten thousand
     // transfers and ten million. Each region owns a disjoint slice of `impl_->gather` so async
     // loads across all regions and ranks can share a single sync_all per batch.
+    const uint64_t total_copies = (uint64_t)app_.size() * kSavedRanks * g;
+    if (par_restore && (uint64_t)g * blk_payload_ >= (256ull << 10) && total_copies >= 2) {
+      parallel_for(total_copies, 2, [&](uint64_t lo, uint64_t hi) {
+        for (uint64_t job = lo; job < hi; ++job) {
+          const uint32_t ri = (uint32_t)(job / ((uint64_t)kSavedRanks * g));
+          const uint64_t rem = job % ((uint64_t)kSavedRanks * g);
+          const uint32_t src_rk = (uint32_t)(rem / g);
+          const uint32_t i = (uint32_t)(rem % g);
+          const RegionGatherMeta& m = reg_meta[ri];
+          uint8_t* dst = impl_->gather + (uint64_t)g * m.off +
+                         (uint64_t)src_rk * g * m.seg + (uint64_t)i * m.seg;
+          const uint8_t* src = impl_->rbuf[i] + hdr + m.off + (uint64_t)src_rk * m.seg;
+          std::memcpy(dst, src, (size_t)m.seg);
+        }
+      });
+    } else {
+      for (uint32_t ri = 0; ri < app_.size(); ++ri) {
+        const RegionGatherMeta& m = reg_meta[ri];
+        uint8_t* dst_ri = impl_->gather + (uint64_t)g * m.off;
+        // The batch's rows for this region, contiguous: the slots hold one block each and the cards
+        // want one run across all of them.
+        for (uint32_t src_rk = 0; src_rk < kSavedRanks; ++src_rk) {
+          uint8_t* dst_rk = dst_ri + (uint64_t)src_rk * g * m.seg;
+          for (uint32_t i = 0; i < g; ++i)
+            std::memcpy(dst_rk + (uint64_t)i * m.seg,
+                        impl_->rbuf[i] + hdr + m.off + (uint64_t)src_rk * m.seg, (size_t)m.seg);
+        }
+      }
+    }
     bool batch_async_queued = false;
     for (uint32_t ri = 0; ri < app_.size(); ++ri) {
       const KvRegion& r = app_[ri];
-      const uint64_t rpb = B / r.ratio, seg = rpb * r.row_bytes;
-      uint64_t off, row0, nrows;
-      region_span(app_, kSavedRanks, 0, B, ri, &off, &row0, &nrows);
-      uint8_t* dst_ri = impl_->gather + (uint64_t)g * off;
-      // The batch's rows for this region, contiguous: the slots hold one block each and the cards
-      // want one run across all of them.
-      for (uint32_t src_rk = 0; src_rk < kSavedRanks; ++src_rk) {
-        uint8_t* dst_rk = dst_ri + (uint64_t)src_rk * g * seg;
-        for (uint32_t i = 0; i < g; ++i)
-          std::memcpy(dst_rk + (uint64_t)i * seg,
-                      impl_->rbuf[i] + hdr + off + (uint64_t)src_rk * seg, (size_t)seg);
-      }
+      const RegionGatherMeta& m = reg_meta[ri];
+      const uint8_t* dst_ri = impl_->gather + (uint64_t)g * m.off;
       for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
         const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
-        const uint8_t* src_ptr = dst_ri + (uint64_t)src_rk * g * seg;
+        const uint8_t* src_ptr = dst_ri + (uint64_t)src_rk * g * m.seg;
         const bool ok = impl_->use_async_load
-            ? io_.load_async(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * rpb,
-                             (uint64_t)g * rpb, src_ptr)
-            : io_.load(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * rpb,
-                       (uint64_t)g * rpb, src_ptr);
+            ? io_.load_async(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * m.rpb,
+                             (uint64_t)g * m.rpb, src_ptr)
+            : io_.load(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * m.rpb,
+                       (uint64_t)g * m.rpb, src_ptr);
         if (!ok) {
           if (batch_async_queued) (void)io_.sync_all(io_.ctx);
           if (err) *err = "prefix cache: the engine refused a restored block";

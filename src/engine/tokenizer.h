@@ -8,11 +8,14 @@
 // merge table whitespace-delimited words instead produces ids the model never saw in training —
 // the text still round-trips, so the damage is invisible until generation quality is measured.
 #pragma once
+#include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -39,18 +42,52 @@ private:
   std::vector<std::string> byte_to_unicode_;               // 256 entries
   std::unordered_map<std::string, uint8_t> unicode_to_byte_;
   void build_byte_maps();
+  void build_fast_bpe();
+  struct Span {
+    uint32_t off = 0;
+    uint32_t len = 0;
+  };
+  static void pretokenize_spans(std::string_view text, std::vector<Span>& out,
+                                std::vector<Span>& stage1, std::vector<Span>& stage2);
+  bool bpe_fast(std::string_view piece, std::vector<uint32_t>& out) const;
   std::vector<std::string> bpe(const std::string& piece) const;
   std::vector<std::string> pretokenize(const std::string& text) const;
   // added_tokens, longest-match-first so multi-byte markers like <｜User｜> map to their own id
   // instead of being byte-BPE'd into a dozen pieces.
   std::vector<std::pair<std::string, uint32_t>> added_;
   uint8_t added_lead_[256] = {};
+  uint8_t added_len1_[256] = {};
+  uint64_t added_lead2_[1024] = {};   // 64K-bit (8 KiB) 2-byte lead filter for added_tokens
   size_t max_added_len_ = 0;
 
+  // Flat open-addressed merge hash table: ((uint64_t)left << 32) | right -> (rank, merged_id).
+  static constexpr uint32_t kNoTokId = UINT32_MAX;
+  struct MergeSlot {
+    uint64_t key = UINT64_MAX;
+    uint32_t rank = UINT32_MAX;
+    uint32_t merged = UINT32_MAX;
+  };
+  std::vector<MergeSlot> merge_table_;
+  uint32_t merge_mask_ = 0;
+  std::array<uint32_t, 256> byte_to_id_{};
+  uint32_t synth_base_ = 0;
+  bool fast_bpe_ready_ = false;
+
+  const MergeSlot* find_merge(uint32_t left, uint32_t right) const noexcept;
+
   // Bounded thread-safe per-piece BPE memoization cache (piece -> token IDs).
+  struct StringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const noexcept {
+      return std::hash<std::string_view>{}(sv);
+    }
+    size_t operator()(const std::string& s) const noexcept {
+      return std::hash<std::string_view>{}(s);
+    }
+  };
   static constexpr size_t kBpeCacheMax = 32768;
   mutable std::shared_mutex bpe_mu_;
-  mutable std::unordered_map<std::string, std::vector<uint32_t>> bpe_cache_;
+  mutable std::unordered_map<std::string, std::vector<uint32_t>, StringHash, std::equal_to<>> bpe_cache_;
   mutable std::deque<std::string> bpe_fifo_;
 
   // Bounded turn-boundary LCP prefix token cache.

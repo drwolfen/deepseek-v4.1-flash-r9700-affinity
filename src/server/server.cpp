@@ -17,6 +17,9 @@
 #include <cstring>
 #include <ctime>
 #include <thread>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 namespace aff {
 
@@ -346,11 +349,50 @@ std::string sanitize_utf8(const std::string& s) {
   return o;
 }
 
+#ifdef __AVX2__
+// Scans clean 7-bit ASCII [0x20, 0x7F] excluding '"' and '\\' in 32-byte YMM chunks (no 512-bit ZMM).
+static inline size_t avx2_scan_clean_ascii(const char* p, size_t i, size_t n) {
+  const __m256i v_1f = _mm256_set1_epi8(0x1F);
+  const __m256i v_quote = _mm256_set1_epi8('"');
+  const __m256i v_bslash = _mm256_set1_epi8('\\');
+  while (i + 32 <= n) {
+    const __m256i chunk = _mm256_loadu_si256((const __m256i*)(p + i));
+    const __m256i in_range = _mm256_cmpgt_epi8(chunk, v_1f);
+    const __m256i bad_ch = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v_quote),
+                                           _mm256_cmpeq_epi8(chunk, v_bslash));
+    const __m256i clean = _mm256_andnot_si256(bad_ch, in_range);
+    const uint32_t clean_mask = (uint32_t)_mm256_movemask_epi8(clean);
+    if (clean_mask != 0xFFFFFFFFu) {
+      i += (size_t)__builtin_ctz(~clean_mask);
+      break;
+    }
+    i += 32;
+  }
+  return i;
+}
+#endif
+
 std::string json_escape(const std::string& s) {
-  std::string o;
-  o.reserve(s.size() + 16);
   const size_t n = s.size();
-  for (size_t i = 0; i < n;) {
+  size_t i = 0;
+#ifdef __AVX2__
+  i = avx2_scan_clean_ascii(s.data(), 0, n);
+  if (i == n) return s;
+#endif
+  std::string o;
+  o.reserve(n + 16);
+  if (i > 0) o.append(s.data(), i);
+  while (i < n) {
+#ifdef __AVX2__
+    if (i + 32 <= n) {
+      const size_t start = i;
+      i = avx2_scan_clean_ascii(s.data(), i, n);
+      if (i > start) {
+        o.append(s.data() + start, i - start);
+        if (i >= n) break;
+      }
+    }
+#endif
     const unsigned char c = (unsigned char)s[i];
     if (c < 0x80) {
       switch (c) {

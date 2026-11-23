@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstring>
 #include <set>
+#include <string_view>
 
 namespace aff {
 
@@ -1047,71 +1048,71 @@ size_t ToolBlockScanState::scan(const std::string& s, size_t at) {
     pos = at;
     initialized = true;
   }
-  const std::string ds(kDsml);
-  const std::string calls_o1 = "<" + ds + " calls";
-  const std::string calls_o2 = "<" + ds + "tool_calls";
-  const std::string calls_o3 = "<" + ds + "calls>";
-  const std::string calls_o4 = "<" + ds + ">";
+  static constexpr std::string_view calls_o1 = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" " calls";
+  static constexpr std::string_view calls_o2 = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" "tool_calls";
+  static constexpr std::string_view calls_o3 = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" "calls>";
+  static constexpr std::string_view calls_o4 = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" ">";
 
-  const std::string inv_o1 = "<" + ds + " invoke";
-  const std::string inv_o2 = "<" + ds + "invoke";
-  const std::string inv_o3 = "<invoke";
+  static constexpr std::string_view inv_o1 = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" " invoke";
+  static constexpr std::string_view inv_o2 = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" "invoke";
+  static constexpr std::string_view inv_o3 = "<invoke";
 
-  const std::string par_o1 = "<" + ds + " parameter";
-  const std::string par_o2 = "<" + ds + "parameter";
-  const std::string par_o3 = "<parameter";
+  static constexpr std::string_view par_o1 = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" " parameter";
+  static constexpr std::string_view par_o2 = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c" "parameter";
+  static constexpr std::string_view par_o3 = "<parameter";
 
-  const std::string par_c1 = "</" + ds + " parameter>";
-  const std::string par_c2 = "</" + ds + "parameter>";
-  const std::string par_c3 = "</parameter>";
+  static constexpr std::string_view par_c1 = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c" " parameter>";
+  static constexpr std::string_view par_c2 = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c" "parameter>";
+  static constexpr std::string_view par_c3 = "</parameter>";
 
-  const std::string inv_c1 = "</" + ds + " invoke>";
-  const std::string inv_c2 = "</" + ds + "invoke>";
-  const std::string inv_c3 = "</invoke>";
+  static constexpr std::string_view inv_c1 = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c" " invoke>";
+  static constexpr std::string_view inv_c2 = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c" "invoke>";
+  static constexpr std::string_view inv_c3 = "</invoke>";
 
-  const std::string calls_c1 = "</" + ds + " calls>";
-  const std::string calls_c2 = "</" + ds + "tool_calls>";
-  const std::string calls_c3 = "</" + ds + "calls>";
-  const std::string calls_c4 = "</" + ds + ">";
+  static constexpr std::string_view calls_c1 = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c" " calls>";
+  static constexpr std::string_view calls_c2 = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c" "tool_calls>";
+  static constexpr std::string_view calls_c3 = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c" "calls>";
+  static constexpr std::string_view calls_c4 = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c" ">";
 
-  const std::string* all_tags[] = {
-      &calls_o1, &calls_o2, &calls_o3, &calls_o4,
-      &inv_o1,   &inv_o2,   &inv_o3,
-      &par_o1,   &par_o2,   &par_o3,
-      &par_c1,   &par_c2,   &par_c3,
-      &inv_c1,   &inv_c2,   &inv_c3,
-      &calls_c1, &calls_c2, &calls_c3, &calls_c4,
+  static constexpr std::string_view all_tags[] = {
+      calls_o1, calls_o2, calls_o3, calls_o4,
+      inv_o1,   inv_o2,   inv_o3,
+      par_o1,   par_o2,   par_o3,
+      par_c1,   par_c2,   par_c3,
+      inv_c1,   inv_c2,   inv_c3,
+      calls_c1, calls_c2, calls_c3, calls_c4,
   };
 
   auto is_ws_or_gt = [](char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>';
   };
 
-  while (pos < s.size()) {
-    const size_t lt = s.find('<', pos);
-    if (lt == std::string::npos) {
-      pos = s.size();
+  const std::string_view sv(s);
+  while (pos < sv.size()) {
+    const size_t lt = sv.find('<', pos);
+    if (lt == std::string_view::npos) {
+      pos = sv.size();
       return std::string::npos;
     }
     pos = lt;
-    const size_t rem = s.size() - lt;
+    const size_t rem = sv.size() - lt;
 
     // Hold at `lt` if the tail of `s` is a strict prefix of any tracked tag so a tag split
     // across tokens is never skipped.
-    for (const std::string* tag : all_tags) {
-      if (rem < tag->size() && tag->compare(0, rem, s, lt, rem) == 0) {
+    for (const std::string_view tag : all_tags) {
+      if (rem < tag.size() && tag.substr(0, rem) == sv.substr(lt, rem)) {
         return std::string::npos;
       }
     }
 
-    auto match_open_delim = [&](const std::string& tag, bool allow_eq, bool* need_more) -> bool {
-      if (rem < tag.size() || s.compare(lt, tag.size(), tag) != 0) return false;
+    auto match_open_delim = [&](std::string_view tag, bool allow_eq, bool* need_more) -> bool {
+      if (rem < tag.size() || sv.substr(lt, tag.size()) != tag) return false;
       if (rem == tag.size()) { *need_more = true; return false; }
-      const char nxt = s[lt + tag.size()];
+      const char nxt = sv[lt + tag.size()];
       return is_ws_or_gt(nxt) || (allow_eq && nxt == '=');
     };
-    auto match_exact = [&](const std::string& tag) -> bool {
-      return rem >= tag.size() && s.compare(lt, tag.size(), tag) == 0;
+    auto match_exact = [&](std::string_view tag) -> bool {
+      return rem >= tag.size() && sv.substr(lt, tag.size()) == tag;
     };
 
     bool need_more = false;
@@ -1167,25 +1168,24 @@ size_t ToolBlockScanState::scan(const std::string& s, size_t at) {
     if (par_clen) {
       if (param_depth > 0) {
         const size_t after = skip_ws_local(s, lt + par_clen);
-        if (after == s.size()) return std::string::npos;
-        const size_t arem = s.size() - after;
-        const std::string ds_open = "<" + ds;
-        const std::string ds_close = "</" + ds;
-        if (arem < ds_open.size() && ds_open.compare(0, arem, s, after, arem) == 0)
+        if (after == sv.size()) return std::string::npos;
+        const size_t arem = sv.size() - after;
+        static constexpr std::string_view ds_open = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c";
+        static constexpr std::string_view ds_close = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c";
+        if (arem < ds_open.size() && ds_open.substr(0, arem) == sv.substr(after, arem))
           return std::string::npos;
-        if (arem < ds_close.size() && ds_close.compare(0, arem, s, after, arem) == 0)
+        if (arem < ds_close.size() && ds_close.substr(0, arem) == sv.substr(after, arem))
           return std::string::npos;
-        if (s.compare(after, ds_open.size(), ds_open) == 0 ||
-            s.compare(after, ds_close.size(), ds_close) == 0) {
+        if ((arem >= ds_open.size() && sv.substr(after, ds_open.size()) == ds_open) ||
+            (arem >= ds_close.size() && sv.substr(after, ds_close.size()) == ds_close)) {
           --param_depth;
         } else {
-          const char* next_tags[] = {"<parameter", "</parameter>", "</invoke>",
-                                     "</tool_call>", "</function>"};
-          for (const char* nt : next_tags) {
-            const size_t nlen = std::strlen(nt);
-            if (arem < nlen && std::strncmp(s.data() + after, nt, arem) == 0)
+          static constexpr std::string_view next_tags[] = {
+              "<parameter", "</parameter>", "</invoke>", "</tool_call>", "</function>"};
+          for (const std::string_view nt : next_tags) {
+            if (arem < nt.size() && nt.substr(0, arem) == sv.substr(after, arem))
               return std::string::npos;
-            if (arem >= nlen && s.compare(after, nlen, nt) == 0) {
+            if (arem >= nt.size() && sv.substr(after, nt.size()) == nt) {
               --param_depth;
               break;
             }

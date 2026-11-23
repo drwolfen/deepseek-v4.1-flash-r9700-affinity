@@ -68,11 +68,28 @@ inline bool mover_ev_wait_enabled() { return env_default_on("AFF_MOVER_EV_WAIT")
 inline bool hybrid_tile128_enabled() { return env_default_on("AFF_HYBRID_TILE128"); }
 } // namespace
 
+bool bonus_d2d_enabled() { return env_default_on("AFF_BONUS_D2D"); }
+
 struct StaticPlacement::Impl {
   // One big slab per card rather than 7000 small allocations: the expert stride is uniform, so a
   // slot index is arithmetic, and hipMalloc is slow enough that per-expert calls dominate load.
   std::vector<uint8_t*> slab;
   std::vector<uint8_t*> bonus_slab;  // optional asymmetric extra resident shards per card
+  std::vector<uint64_t> bonus_slots; // per card: slot capacity of bonus_slab[dv]
+  std::vector<std::vector<uint32_t>> bonus_owner; // [card][bslot] -> global idx or UINT32_MAX
+  std::vector<std::vector<uint8_t>>  bonus_busy;  // [card][bslot] -> 1 while in Move/Retire
+  std::vector<std::vector<uint64_t>> free_bonus;  // [card] -> quarantined free bslot indices
+  mutable std::mutex bonus_mu;                    // guards bonus_off_, bonus_owner, free_bonus
+  struct BonusRetire {
+    bool active = false;
+    bool pending_record = false;
+    size_t dv = 0;
+    uint64_t bslot = 0;
+    hipEvent_t ev = nullptr;
+  };
+  std::vector<BonusRetire> bonus_retires;
+  std::vector<float>   bonus_evict_heat;
+  std::vector<uint8_t> bonus_evict_want;
   std::vector<float*>   d_cb;        // codebook, per card
   std::vector<hipStream_t> stream;
   // ---- the hybrid stream ------------------------------------------------------------------------
@@ -131,6 +148,9 @@ struct StaticPlacement::Impl {
     uint32_t idx = 0;                       // layer * n_expert + expert
     uint64_t slab_slot = 0;                 // promote: written. demote: read, then freed.
     int64_t  pool_slot = -1;                // promote: read, then freed. demote: written.
+    int64_t  bonus_src[8] = {-1, -1, -1, -1, -1, -1, -1, -1}; // promote: bslot read via D2D
+    int64_t  bonus_dst[8] = {-1, -1, -1, -1, -1, -1, -1, -1}; // demote: bslot written via D2D
+    bool     copy_issued[8] = {};           // per-card copy issued on mv[dv] in Copying state
     hipEvent_t ev[8] = {};
   };
   std::vector<Move> moves;
@@ -237,6 +257,12 @@ StaticPlacement::~StaticPlacement() {
   for (auto& m : impl_->moves)
     for (size_t i = 0; i < devs_.size(); ++i)
       if (m.ev[i]) (void)hipEventDestroy(m.ev[i]);
+  for (auto& br : impl_->bonus_retires) {
+    if (br.ev && br.dv < devs_.size()) {
+      (void)hipSetDevice(devs_[br.dv]);
+      (void)hipEventDestroy(br.ev);
+    }
+  }
   for (size_t i = 0; i < impl_->slab.size(); ++i) {
     (void)hipSetDevice(devs_[i]);
     (void)hipFree(impl_->slab[i]);
@@ -401,12 +427,17 @@ void StaticPlacement::publish_base(size_t idx, PlcPatch* sink) {
     // it fixes `uniq`'s resident-before-pooled order, which fixes `start[e]` and therefore the bits.
     // One word rather than an address table plus a tier table, so there is one thing to publish and
     // one thing that can be stale.
+    uint64_t boff = UINT64_MAX;
+    if (impl_ && dv < impl_->bonus_slab.size() && impl_->bonus_slab[dv] &&
+        dv * n + idx < bonus_off_.size()) {
+      std::lock_guard<std::mutex> lk(impl_->bonus_mu);
+      boff = bonus_off_[dv * n + idx];
+    }
     uint64_t a = 0;
     if (device_of_[idx] >= 0 && (tp_parts_ > 1 || device_of_[idx] == (int)dv))
       a = (uint64_t)(uintptr_t)(impl_->slab[dv] + offset_of_[idx]) | kPlcResident;
-    else if (dv < impl_->bonus_slab.size() && impl_->bonus_slab[dv] &&
-             dv * n + idx < bonus_off_.size() && bonus_off_[dv * n + idx] != UINT64_MAX)
-      a = (uint64_t)(uintptr_t)(impl_->bonus_slab[dv] + bonus_off_[dv * n + idx]) | kPlcResident;
+    else if (boff != UINT64_MAX)
+      a = (uint64_t)(uintptr_t)(impl_->bonus_slab[dv] + boff) | kPlcResident;
     else if (const uint8_t* p = pool_shard_dev(layer, e, dv))
       a = (uint64_t)(uintptr_t)p;
     if (sink) {
@@ -1235,6 +1266,10 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
 
   I.slab.resize(devs_.size());
   I.bonus_slab.assign(devs_.size(), nullptr);
+  I.bonus_slots.assign(devs_.size(), 0);
+  I.bonus_owner.assign(devs_.size(), {});
+  I.bonus_busy.assign(devs_.size(), {});
+  I.free_bonus.assign(devs_.size(), {});
   bonus_off_.assign(devs_.size() * order.size(), UINT64_MAX);
   I.d_cb.resize(devs_.size());
   I.stream.resize(devs_.size());
@@ -1268,6 +1303,9 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
           std::min<uint64_t>(raw_per_gpu[i] - total_slots, order.size() - n_resident);
       if (hipMalloc(&I.bonus_slab[i], bslots * slot_stride + 4096) == hipSuccess) {
         bonus_slots[i] = bslots;
+        I.bonus_slots[i] = bslots;
+        I.bonus_owner[i].assign(bslots, UINT32_MAX);
+        I.bonus_busy[i].assign(bslots, 0u);
         aff::ui::err("bonus slab: card %zu holds %llu asymmetric extra expert shards (%.1f MiB)\n",
                      i, (unsigned long long)bslots, (double)bslots * slot_stride / 1048576.0);
       } else {
@@ -1465,6 +1503,7 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
                               hipMemcpyHostToDevice, st[d]), "hipMemcpyAsync(bonus)", d, bslot);
           note(hipStreamSynchronize(st[d]), "hipStreamSynchronize(bonus)", d, bslot);
           bonus_off_[d * order.size() + idx] = bslot * shard_.stride;
+          I.bonus_owner[d][bslot] = idx;
         }
         for (size_t d = 0; d < devs_.size(); ++d) {
           (void)hipSetDevice(devs_[d]);
@@ -2729,6 +2768,30 @@ bool StaticPlacement::placement_engine_init(HostExpertPool* pool,
     }
   }
 
+  I.bonus_evict_heat.assign(R, 0.0f);
+  I.bonus_evict_want.assign(R, 0u);
+  for (auto& br : I.bonus_retires) {
+    if (br.ev && br.dv < R) {
+      (void)hipSetDevice(devs_[br.dv]);
+      (void)hipEventDestroy(br.ev);
+    }
+  }
+  I.bonus_retires.clear();
+  for (size_t i = 0; i < R; ++i) {
+    if (i < I.bonus_slots.size() && I.bonus_slots[i] > 0) {
+      std::fill(I.bonus_busy[i].begin(), I.bonus_busy[i].end(), 0u);
+      I.free_bonus[i].clear();
+      if (hipSetDevice(devs_[i]) != hipSuccess) return fail("hipSetDevice failed for bonus retire");
+      constexpr uint32_t kBonusRetireEvents = 16u;
+      for (uint32_t k = 0; k < kBonusRetireEvents; ++k) {
+        Impl::BonusRetire br;
+        br.dv = i;
+        if (hipEventCreateWithFlags(&br.ev, hipEventDisableTiming) != hipSuccess)
+          return fail("could not create a bonus retire event");
+        I.bonus_retires.push_back(br);
+      }
+    }
+  }
 
   engine_on_ = true;
   aff::ui::err(// The strategy BY NAME: a banner that says "heat" whatever is running is how a
@@ -2877,46 +2940,103 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
   M.zero_d2h = false;
 
   if (promote) {
+    if (I.free_slab.empty()) return false;
     const int64_t ps = pool_mut_->slot_of(l, e);
     uint8_t* src = pool_mut_->slot_base(ps);
     if (!src) return false;                       // on the ssd tier: not ours to move, see pick()
-    if (!mover_ev_wait) ensure_ev_layer();
+    const bool bonus_d2d = bonus_d2d_enabled();
+    const size_t n_total = (size_t)n_layer_ * n_expert_;
+    bool any_h2d = false;
+    for (size_t dv = 0; dv < R; ++dv) {
+      M.bonus_src[dv] = -1;
+      M.bonus_dst[dv] = -1;
+      M.copy_issued[dv] = false;
+      if (bonus_d2d && dv < I.bonus_slab.size() && I.bonus_slab[dv] && I.bonus_slots[dv] > 0) {
+        std::lock_guard<std::mutex> lk(I.bonus_mu);
+        const uint64_t boff =
+            (dv * n_total + idx < bonus_off_.size()) ? bonus_off_[dv * n_total + idx] : UINT64_MAX;
+        if (boff != UINT64_MAX) {
+          const uint64_t bs = boff / ss;
+          if (bs < I.bonus_slots[dv] && !I.bonus_busy[dv][bs]) {
+            M.bonus_src[dv] = (int64_t)bs;
+            I.bonus_busy[dv][bs] = 1u;
+          }
+        }
+      }
+      if (M.bonus_src[dv] < 0) any_h2d = true;
+    }
+    if (!mover_ev_wait && any_h2d) ensure_ev_layer();
     M.pool_slot = ps;
     M.slab_slot = I.free_slab.back();
     I.free_slab.pop_back();
     for (size_t dv = 0; dv < R; ++dv) {
       AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
-      if (mover_ev_wait) {
-        if (dv < I.last_ev_dn.size() && I.last_ev_dn[dv])
-          AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.last_ev_dn[dv], 0));
+      if (M.bonus_src[dv] >= 0) {
+        // M.slab_slot already cleared quarantine before entering free_slab, and bonus_slab[dv]+bs
+        // stays read-only until M's own quarantine finishes; local VRAM D2D avoids PCIe contention.
+        const uint64_t bs = (uint64_t)M.bonus_src[dv];
+        AFF_HIP_CHECK(hipMemcpyAsync(I.slab[dv] + M.slab_slot * ss, I.bonus_slab[dv] + bs * ss,
+                                     ss, hipMemcpyDeviceToDevice, I.mv[dv]));
+        ++estats_.bonus_d2d_promotes;
+        estats_.bonus_d2d_bytes += ss;
       } else {
-        AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.ev_layer[dv], 0));
+        if (mover_ev_wait) {
+          if (dv < I.last_ev_dn.size() && I.last_ev_dn[dv])
+            AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.last_ev_dn[dv], 0));
+        } else {
+          AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.ev_layer[dv], 0));
+        }
+        // AFF_MOVER_DUP re-issues this copy, which prices the mover's bytes without touching the
+        // policy: the repeats write the same bytes to the same slot, so residency, routing and the
+        // emitted text are all identical and the only thing that moves is link traffic. A slope of
+        // zero means the mover is already hidden behind compute and there is nothing to win by
+        // issuing it earlier.
+        for (uint32_t rep = 0; rep < mover_dup(true); ++rep)
+          AFF_HIP_CHECK(hipMemcpyAsync(I.slab[dv] + M.slab_slot * ss, src + (size_t)dv * ss, ss,
+                                       hipMemcpyHostToDevice, I.mv[dv]));
+        estats_.h2d_bytes += ss;
       }
-      // AFF_MOVER_DUP re-issues this copy, which prices the mover's bytes without touching the
-      // policy: the repeats write the same bytes to the same slot, so residency, routing and the
-      // emitted text are all identical and the only thing that moves is link traffic. A slope of
-      // zero means the mover is already hidden behind compute and there is nothing to win by
-      // issuing it earlier.
-      for (uint32_t rep = 0; rep < mover_dup(true); ++rep)
-        AFF_HIP_CHECK(hipMemcpyAsync(I.slab[dv] + M.slab_slot * ss, src + (size_t)dv * ss, ss,
-                                     hipMemcpyHostToDevice, I.mv[dv]));
       AFF_HIP_CHECK(hipEventRecord(M.ev[dv], I.mv[dv]));
+      M.copy_issued[dv] = true;
     }
-    estats_.h2d_bytes += (uint64_t)R * ss;
-  } else if (pool_full_) {
-    const int64_t ps = pool_mut_->slot_of(l, e);
-    if (ps < 0) return false;
-    M.pool_slot = ps;
-    M.slab_slot = offset_of_[idx] / ss;
-    M.zero_d2h = true;
   } else {
-    const int64_t g = I.free_pool.back();
-    uint8_t* dst = pool_mut_->slot_base(g);
-    if (!dst) return false;
-    ensure_ev_layer();
-    I.free_pool.pop_back();
+    const bool bonus_d2d = bonus_d2d_enabled();
+    int64_t g = -1;
+    uint8_t* dst = nullptr;
+    if (pool_full_) {
+      const int64_t ps = pool_mut_->slot_of(l, e);
+      if (ps < 0) return false;
+      g = ps;
+      M.zero_d2h = true;
+    } else {
+      if (I.free_pool.empty()) return false;
+      g = I.free_pool.back();
+      dst = pool_mut_->slot_base(g);
+      if (!dst) return false;
+      ensure_ev_layer();
+      I.free_pool.pop_back();
+      M.zero_d2h = false;
+    }
     M.pool_slot = g;
     M.slab_slot = offset_of_[idx] / ss;
+    for (size_t dv = 0; dv < R; ++dv) {
+      M.bonus_src[dv] = -1;
+      M.bonus_dst[dv] = -1;
+      M.copy_issued[dv] = false;
+      if (bonus_d2d && dv < I.bonus_slab.size() && I.bonus_slab[dv] && I.bonus_slots[dv] > 0) {
+        std::lock_guard<std::mutex> lk(I.bonus_mu);
+        if (!I.free_bonus[dv].empty()) {
+          const uint64_t bs = I.free_bonus[dv].back();
+          I.free_bonus[dv].pop_back();
+          I.bonus_busy[dv][bs] = 1u;
+          M.bonus_dst[dv] = (int64_t)bs;
+        } else {
+          const float h_down = heat_.heat(idx);
+          if (h_down > I.bonus_evict_heat[dv]) I.bonus_evict_heat[dv] = h_down;
+          I.bonus_evict_want[dv] = 1u;
+        }
+      }
+    }
     // D2H out of the slab. The slab layout IS the pool layout, so this is a straight copy with no
     // CPU transform.
     //
@@ -2930,14 +3050,29 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
     // shards at ~0.12 ms each against a miss's ~0.17, so it has to repay 1.4 future hits, not the
     // 0.74 a half-price demotion would imply.
     for (size_t dv = 0; dv < R; ++dv) {
+      const bool do_d2h = !M.zero_d2h;
+      const bool do_d2d = M.bonus_dst[dv] >= 0;
+      if (!do_d2h && !do_d2d) continue;
       AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
-      AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.ev_layer[dv], 0));
-      for (uint32_t rep = 0; rep < mover_dup(false); ++rep)
-        AFF_HIP_CHECK(hipMemcpyAsync(dst + (size_t)dv * ss, I.slab[dv] + offset_of_[idx], ss,
-                                     hipMemcpyDeviceToHost, I.mv[dv]));
+      if (do_d2h) {
+        AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.ev_layer[dv], 0));
+        for (uint32_t rep = 0; rep < mover_dup(false); ++rep)
+          AFF_HIP_CHECK(hipMemcpyAsync(dst + (size_t)dv * ss, I.slab[dv] + offset_of_[idx], ss,
+                                       hipMemcpyDeviceToHost, I.mv[dv]));
+        estats_.d2h_bytes += ss;
+      }
+      if (do_d2d) {
+        // M.slab_slot remains live and read-only until M finishes quarantine, and bs passed
+        // quarantine before entering free_bonus[dv], so D2D into bonus_slab[dv]+bs is race-free.
+        const uint64_t bs = (uint64_t)M.bonus_dst[dv];
+        AFF_HIP_CHECK(hipMemcpyAsync(I.bonus_slab[dv] + bs * ss, I.slab[dv] + offset_of_[idx], ss,
+                                     hipMemcpyDeviceToDevice, I.mv[dv]));
+        ++estats_.bonus_d2d_demotes;
+        estats_.bonus_d2d_bytes += ss;
+      }
       AFF_HIP_CHECK(hipEventRecord(M.ev[dv], I.mv[dv]));
+      M.copy_issued[dv] = true;
     }
-    estats_.d2h_bytes += (uint64_t)R * ss;
   }
   heat_.set_busy(idx, true);
   M.state = Impl::Move::State::Copying;
@@ -2947,15 +3082,36 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
 void StaticPlacement::engine_retire(void* const* streams) {
   Impl& I = *impl_;
   const size_t R = devs_.size();
+  const size_t n_total = (size_t)n_layer_ * n_expert_;
+  const uint64_t ss = slot_stride();
+  auto recount_bonus_locked = [&] {
+    uint64_t cnt = 0;
+    for (const auto& owners : I.bonus_owner)
+      for (uint32_t o : owners)
+        if (o != UINT32_MAX) ++cnt;
+    bonus_shards_ = cnt;
+  };
   auto landed = [&](Impl::Move& M) {
     for (size_t dv = 0; dv < R; ++dv)
       if (M.ev[dv] && hipEventQuery(M.ev[dv]) != hipSuccess) return false;
     return true;
   };
   auto landed_copy = [&](Impl::Move& M) {
-    if (M.zero_d2h) return true;
-    return landed(M);
+    for (size_t dv = 0; dv < R; ++dv)
+      if (M.copy_issued[dv] && M.ev[dv] && hipEventQuery(M.ev[dv]) != hipSuccess) return false;
+    return true;
   };
+
+  for (auto& br : I.bonus_retires) {
+    if (!br.active) continue;
+    if (hipEventQuery(br.ev) != hipSuccess) continue;
+    {
+      std::lock_guard<std::mutex> lk(I.bonus_mu);
+      I.bonus_busy[br.dv][br.bslot] = 0u;
+      I.free_bonus[br.dv].push_back(br.bslot);
+    }
+    br.active = false;
+  }
 
   // This tick's edits, one patch a card, applied on the compute streams below. Collected rather than
   // stored because the CARDS read the table when they RUN: a plain store lands in the middle of
@@ -3022,7 +3178,21 @@ void StaticPlacement::engine_retire(void* const* streams) {
                            (unsigned)(j % n_expert_), l, e);
         }
         device_of_[M.idx] = 0;                        // sharded: "which card" is not a question
-        offset_of_[M.idx] = M.slab_slot * slot_stride();
+        offset_of_[M.idx] = M.slab_slot * ss;
+        {
+          std::lock_guard<std::mutex> lk(I.bonus_mu);
+          bool touched = false;
+          for (size_t dv = 0; dv < R; ++dv) {
+            if (M.bonus_src[dv] >= 0) {
+              const uint64_t bs = (uint64_t)M.bonus_src[dv];
+              if (dv * n_total + M.idx < bonus_off_.size()) bonus_off_[dv * n_total + M.idx] = UINT64_MAX;
+              if (dv < I.bonus_owner.size() && bs < I.bonus_owner[dv].size())
+                I.bonus_owner[dv][bs] = UINT32_MAX;
+              touched = true;
+            }
+          }
+          if (touched) recount_bonus_locked();
+        }
         if (!pool_full_) pool_mut_->bind(l, e, -1);
         heat_.set_tier(M.idx, ExpertTier::Vram);
         ++resident_now_;
@@ -3036,30 +3206,62 @@ void StaticPlacement::engine_retire(void* const* streams) {
         static const bool kMoveVerifyD = std::getenv("AFF_MOVE_VERIFY") != nullptr;
         if (kMoveVerifyD) {
           const uint64_t ss_v = slot_stride();
-          const uint8_t* dst_v = pool_mut_->slot_base(M.pool_slot);
-          static std::vector<uint8_t> rb2;
+          const uint8_t* dst_v = M.zero_d2h ? nullptr : pool_mut_->slot_base(M.pool_slot);
+          static std::vector<uint8_t> rb2, rb_b;
           if (rb2.size() < ss_v) rb2.resize(ss_v);
-          for (size_t dv = 0; dv < R && dst_v; ++dv) {
+          for (size_t dv = 0; dv < R; ++dv) {
+            if (!dst_v && M.bonus_dst[dv] < 0) continue;
             AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
             AFF_HIP_CHECK(hipMemcpy(rb2.data(), I.slab[dv] + M.slab_slot * ss_v, ss_v, hipMemcpyDeviceToHost));
-            ++mv_verified_;
-            if (std::memcmp(rb2.data(), dst_v + (size_t)dv * ss_v, ss_v) != 0) {
-              ++mv_bad_;
-              size_t first = 0; while (first < ss_v && rb2[first] == dst_v[(size_t)dv * ss_v + first]) ++first;
-              aff::ui::err("DEMOTE-MISMATCH #%llu: layer %u expert %u slab slot %llu -> pool slot %lld card %zu, first bad byte %zu of %llu\n",
-                           (unsigned long long)mv_bad_, l, e, (unsigned long long)M.slab_slot, (long long)M.pool_slot, dv, first,
-                           (unsigned long long)ss_v);
+            if (dst_v) {
+              ++mv_verified_;
+              if (std::memcmp(rb2.data(), dst_v + (size_t)dv * ss_v, ss_v) != 0) {
+                ++mv_bad_;
+                size_t first = 0; while (first < ss_v && rb2[first] == dst_v[(size_t)dv * ss_v + first]) ++first;
+                aff::ui::err("DEMOTE-MISMATCH #%llu: layer %u expert %u slab slot %llu -> pool slot %lld card %zu, first bad byte %zu of %llu\n",
+                             (unsigned long long)mv_bad_, l, e, (unsigned long long)M.slab_slot, (long long)M.pool_slot, dv, first,
+                             (unsigned long long)ss_v);
+              }
+            }
+            if (M.bonus_dst[dv] >= 0) {
+              if (rb_b.size() < ss_v) rb_b.resize(ss_v);
+              AFF_HIP_CHECK(hipMemcpy(rb_b.data(), I.bonus_slab[dv] + (uint64_t)M.bonus_dst[dv] * ss_v,
+                                      ss_v, hipMemcpyDeviceToHost));
+              ++mv_verified_;
+              if (std::memcmp(rb2.data(), rb_b.data(), ss_v) != 0) {
+                ++mv_bad_;
+                size_t first = 0; while (first < ss_v && rb2[first] == rb_b[first]) ++first;
+                aff::ui::err("BONUS-D2D-MISMATCH #%llu: layer %u expert %u slab slot %llu -> bonus slot %lld card %zu, first bad byte %zu of %llu\n",
+                             (unsigned long long)mv_bad_, l, e, (unsigned long long)M.slab_slot, (long long)M.bonus_dst[dv], dv, first,
+                             (unsigned long long)ss_v);
+              }
             }
           }
           // pool owner map: no other expert may currently be bound to this pool slot
-          for (uint32_t ll = 0; ll < n_layer_; ++ll)
-            for (uint32_t ee = 0; ee < n_expert_; ++ee)
-              if (!(ll == l && ee == e) && pool_mut_->slot_of(ll, ee) == M.pool_slot)
-                aff::ui::err("POOL-DOUBLE-MAP: pool slot %lld already bound to layer %u expert %u while demoting layer %u expert %u\n",
-                             (long long)M.pool_slot, ll, ee, l, e);
+          if (!pool_full_) {
+            for (uint32_t ll = 0; ll < n_layer_; ++ll)
+              for (uint32_t ee = 0; ee < n_expert_; ++ee)
+                if (!(ll == l && ee == e) && pool_mut_->slot_of(ll, ee) == M.pool_slot)
+                  aff::ui::err("POOL-DOUBLE-MAP: pool slot %lld already bound to layer %u expert %u while demoting layer %u expert %u\n",
+                               (long long)M.pool_slot, ll, ee, l, e);
+          }
         }
         if (!pool_full_) pool_mut_->bind(l, e, M.pool_slot);
         device_of_[M.idx] = -1;
+        {
+          std::lock_guard<std::mutex> lk(I.bonus_mu);
+          bool touched = false;
+          for (size_t dv = 0; dv < R; ++dv) {
+            if (M.bonus_dst[dv] >= 0) {
+              const uint64_t bs = (uint64_t)M.bonus_dst[dv];
+              if (dv * n_total + M.idx < bonus_off_.size()) bonus_off_[dv * n_total + M.idx] = bs * ss;
+              if (dv < I.bonus_owner.size() && bs < I.bonus_owner[dv].size())
+                I.bonus_owner[dv][bs] = M.idx;
+              touched = true;
+            }
+          }
+          if (touched) recount_bonus_locked();
+        }
         heat_.set_tier(M.idx, ExpertTier::Pool);
         --resident_now_;
         ++estats_.demotions;
@@ -3088,10 +3290,100 @@ void StaticPlacement::engine_retire(void* const* streams) {
     if (M.state == Impl::Move::State::Published) continue;   // this tick's; handled below
 
     if (!landed(M)) continue;
-    if (M.promote) { if (!pool_full_) I.free_pool.push_back(M.pool_slot); }
-    else           I.free_slab.push_back(M.slab_slot);
+    if (M.promote) {
+      if (!pool_full_) I.free_pool.push_back(M.pool_slot);
+      std::lock_guard<std::mutex> lk(I.bonus_mu);
+      for (size_t dv = 0; dv < R; ++dv) {
+        if (M.bonus_src[dv] >= 0) {
+          const uint64_t bs = (uint64_t)M.bonus_src[dv];
+          if (dv < I.bonus_busy.size() && bs < I.bonus_busy[dv].size()) I.bonus_busy[dv][bs] = 0u;
+          if (dv < I.free_bonus.size()) I.free_bonus[dv].push_back(bs);
+          M.bonus_src[dv] = -1;
+        }
+      }
+    } else {
+      I.free_slab.push_back(M.slab_slot);
+      std::lock_guard<std::mutex> lk(I.bonus_mu);
+      for (size_t dv = 0; dv < R; ++dv) {
+        if (M.bonus_dst[dv] >= 0) {
+          const uint64_t bs = (uint64_t)M.bonus_dst[dv];
+          if (dv < I.bonus_busy.size() && bs < I.bonus_busy[dv].size()) I.bonus_busy[dv][bs] = 0u;
+          M.bonus_dst[dv] = -1;
+        }
+      }
+    }
     M.zero_d2h = false;
+    for (size_t dv = 0; dv < 8; ++dv) {
+      M.bonus_src[dv] = -1;
+      M.bonus_dst[dv] = -1;
+      M.copy_issued[dv] = false;
+    }
     M.state = Impl::Move::State::Free;
+  }
+
+  // If a demotion needed a bonus slot and none is free or already retiring from a bonus promotion,
+  // evict a colder replaceable bonus occupant via compute-stream quarantine so future demotions
+  // keep all bonus slots live with the hottest non-primary experts.
+  if (bonus_d2d_enabled()) {
+    for (size_t dv = 0; dv < R; ++dv) {
+      if (dv >= I.bonus_evict_want.size() || !I.bonus_evict_want[dv]) continue;
+      I.bonus_evict_want[dv] = 0u;
+      const float want_heat = I.bonus_evict_heat[dv];
+      I.bonus_evict_heat[dv] = 0.0f;
+      if (dv >= I.bonus_slots.size() || !I.bonus_slots[dv]) continue;
+      bool has_pending_bonus_free = !I.free_bonus[dv].empty();
+      if (!has_pending_bonus_free) {
+        for (const Impl::Move& M : I.moves) {
+          if (M.state != Impl::Move::State::Free && M.bonus_src[dv] >= 0) {
+            has_pending_bonus_free = true;
+            break;
+          }
+        }
+      }
+      if (has_pending_bonus_free) continue;
+      Impl::BonusRetire* br_slot = nullptr;
+      for (auto& br : I.bonus_retires) {
+        if (!br.active && !br.pending_record && br.dv == dv) { br_slot = &br; break; }
+      }
+      if (!br_slot) continue;
+
+      uint64_t best_bs = UINT64_MAX;
+      uint32_t best_idx = UINT32_MAX;
+      float best_heat = 0.0f;
+      {
+        std::lock_guard<std::mutex> lk(I.bonus_mu);
+        for (uint64_t bs = 0; bs < I.bonus_slots[dv]; ++bs) {
+          if (I.bonus_busy[dv][bs]) continue;
+          const uint32_t cidx = I.bonus_owner[dv][bs];
+          if (cidx == UINT32_MAX || device_of_[cidx] >= 0) continue;
+          if (is_v41_massive_expert(n_layer_, n_expert_, cidx)) continue;
+          const uint32_t cl = cidx / n_expert_, ce = cidx % n_expert_;
+          if (!pool_shard_dev(cl, ce, dv)) continue;
+          const float ch = heat_.heat(cidx);
+          if (best_bs == UINT64_MAX || ch < best_heat) {
+            best_bs = bs;
+            best_idx = cidx;
+            best_heat = ch;
+          }
+        }
+        if (best_bs != UINT64_MAX && want_heat > best_heat * 1.25f + 0.5f) {
+          I.bonus_busy[dv][best_bs] = 1u;
+          if (dv * n_total + best_idx < bonus_off_.size())
+            bonus_off_[dv * n_total + best_idx] = UINT64_MAX;
+          I.bonus_owner[dv][best_bs] = UINT32_MAX;
+          recount_bonus_locked();
+        } else {
+          best_bs = UINT64_MAX;
+        }
+      }
+      if (best_bs != UINT64_MAX) {
+        for (size_t c = 0; c < R; ++c)
+          if (patch[c].n == kPlcPatchMax) { flush(); break; }
+        publish_base(best_idx, patch);
+        br_slot->bslot = best_bs;
+        br_slot->pending_record = true;
+      }
+    }
   }
 
   flush();
@@ -3122,6 +3414,18 @@ void StaticPlacement::engine_retire(void* const* streams) {
       AFF_HIP_CHECK(hipEventRecord(M.ev[dv], (hipStream_t)streams[dv]));
     }
     M.state = Impl::Move::State::Quarantine;
+  }
+  for (auto& br : I.bonus_retires) {
+    if (!br.pending_record) continue;
+    if (!streams[br.dv]) {
+      aff::ui::fatal("fatal: the placement engine has no compute stream for card %zu and "
+                   "cannot quarantine the bonus slot it just evicted.\n", br.dv);
+      std::abort();
+    }
+    AFF_HIP_CHECK(hipSetDevice(devs_[br.dv]));
+    AFF_HIP_CHECK(hipEventRecord(br.ev, (hipStream_t)streams[br.dv]));
+    br.pending_record = false;
+    br.active = true;
   }
 }
 
@@ -3239,6 +3543,12 @@ void StaticPlacement::engine_report() const {
               (unsigned long long)estats_.ticks, (unsigned long long)estats_.promotions,
               (unsigned long long)estats_.demotions, (double)estats_.h2d_bytes * gib,
               (double)estats_.d2h_bytes * gib);
+  if (estats_.bonus_d2d_promotes || estats_.bonus_d2d_demotes) {
+    aff::ui::err("  bonus_slab D2D: %llu promotes, %llu demotes (%.2f GiB D2D, %llu live shards)\n",
+                 (unsigned long long)estats_.bonus_d2d_promotes,
+                 (unsigned long long)estats_.bonus_d2d_demotes,
+                 (double)estats_.bonus_d2d_bytes * gib, (unsigned long long)bonus_shards_);
+  }
   aff::ui::err("  %llu ticks declined on hysteresis, %llu starved of a slab slot, %llu of a pool "
               "slot; %llu resident now against %llu at load\n",
               (unsigned long long)estats_.refused, (unsigned long long)estats_.starved_slab,
@@ -3325,9 +3635,19 @@ void aff::StaticPlacement::verify_plc(const char* tag) const {
       if (v == 0) { snprintf(out, cap, "ssd(0)"); return; }
       const uint64_t a = v & kPlcAddrMask;
       if (v & kPlcResident) {
-        const int64_t off = (int64_t)((uintptr_t)a - (uintptr_t)impl_->slab[dv]);
-        snprintf(out, cap, "slab+%lld(slot %lld%s)", (long long)off, (long long)(ss ? off / (int64_t)ss : -1),
-                 (ss && (off % (int64_t)ss)) ? " UNALIGNED" : "");
+        if (dv < impl_->bonus_slab.size() && impl_->bonus_slab[dv] &&
+            dv < impl_->bonus_slots.size() && impl_->bonus_slots[dv] && ss &&
+            a >= (uintptr_t)impl_->bonus_slab[dv] &&
+            a < (uintptr_t)(impl_->bonus_slab[dv] + impl_->bonus_slots[dv] * ss)) {
+          const int64_t boff = (int64_t)((uintptr_t)a - (uintptr_t)impl_->bonus_slab[dv]);
+          snprintf(out, cap, "bonus+%lld(slot %lld%s)", (long long)boff,
+                   (long long)(boff / (int64_t)ss), (boff % (int64_t)ss) ? " UNALIGNED" : "");
+        } else {
+          const int64_t off = (int64_t)((uintptr_t)a - (uintptr_t)impl_->slab[dv]);
+          snprintf(out, cap, "slab+%lld(slot %lld%s)", (long long)off,
+                   (long long)(ss ? off / (int64_t)ss : -1),
+                   (ss && (off % (int64_t)ss)) ? " UNALIGNED" : "");
+        }
       } else {
         snprintf(out, cap, "pool 0x%llx", (unsigned long long)a);
       }

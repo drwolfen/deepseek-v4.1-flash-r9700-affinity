@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(affinity-engine VERSION 5.7.0 LANGUAGES CXX)
+project(affinity-engine VERSION 5.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -177,6 +177,33 @@ endif()
 # Cross-rank/host-device bitwise determinism: never let the compiler fuse multiplies
 # differently between build units.
 target_compile_options(aff_format PRIVATE -ffp-contract=off)
+
+option(AFF_RUST "Enable Rust acceleration staticlib (libaff_rust_accel.a)" ON)
+if(AFF_RUST AND EXISTS "${CMAKE_SOURCE_DIR}/src/rust_accel/lib.rs")
+  find_program(AFF_RUSTC rustc HINTS /usr/bin /root/.cargo/bin $ENV{HOME}/.cargo/bin)
+  if(AFF_RUSTC)
+    set(AFF_RUST_LIB "${CMAKE_BINARY_DIR}/libaff_rust_accel.a")
+    set(AFF_RUST_CPU_FLAG "")
+    if(AFF_NATIVE)
+      set(AFF_RUST_CPU_FLAG -C target-cpu=native)
+    endif()
+    add_custom_command(
+      OUTPUT "${AFF_RUST_LIB}"
+      COMMAND "${AFF_RUSTC}" --edition=2021 --crate-type=staticlib
+              -C opt-level=3 ${AFF_RUST_CPU_FLAG} -C codegen-units=1 -C panic=abort
+              "${CMAKE_SOURCE_DIR}/src/rust_accel/lib.rs" -o "${AFF_RUST_LIB}"
+      DEPENDS "${CMAKE_SOURCE_DIR}/src/rust_accel/lib.rs"
+      COMMENT "Building Rust staticlib libaff_rust_accel.a"
+    )
+    add_custom_target(aff_rust_accel DEPENDS "${AFF_RUST_LIB}")
+    add_dependencies(aff_format aff_rust_accel)
+    target_link_libraries(aff_format PUBLIC "${AFF_RUST_LIB}")
+    target_compile_definitions(aff_format PUBLIC AFF_WITH_RUST=1)
+    message(STATUS "Rust accel enabled: ${AFF_RUSTC}")
+  else()
+    message(STATUS "Rust accel disabled (rustc not found) — C++ fallback")
+  endif()
+endif()
 
 enable_testing()
 

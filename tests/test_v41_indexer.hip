@@ -359,6 +359,308 @@ int main() {
     std::printf("PASS: Test 3 - Ragged causal prefill & pos0 + r + 1 <= 512 fast-path verified\n");
   }
 
+  // ------------------------------------------------------------------------------------------------
+  // Test 4 (W3-2a): Gather-only candidate indexer parity vs legacy full-score + idx_apply_cand_hip
+  // Covers toggle, uint16_t overflow guard, causal prefill, short prefix, single-token decode, and
+  // multi-token decode with cand_block in {8, 16}, TopkScratch spread, adm & dense mask outputs.
+  // ------------------------------------------------------------------------------------------------
+  {
+    const char* prev_cg = std::getenv("AFF_IDX_CAND_GATHER");
+    std::string prev_cg_val = prev_cg ? prev_cg : "";
+    const char* prev_nr = std::getenv("AFF_IDX_NARROW");
+    std::string prev_nr_val = prev_nr ? prev_nr : "";
+
+    unsetenv("AFF_IDX_CAND_GATHER");
+    assert(idx_cand_gather_enabled() == true);
+    setenv("AFF_IDX_CAND_GATHER", "1", 1);
+    assert(idx_cand_gather_enabled() == true);
+    setenv("AFF_IDX_CAND_GATHER", "0", 1);
+    assert(idx_cand_gather_enabled() == false);
+    if (prev_cg) setenv("AFF_IDX_CAND_GATHER", prev_cg_val.c_str(), 1);
+    else unsetenv("AFF_IDX_CAND_GATHER");
+
+    assert(idx_cand_blocks_fit_u16(65535u) == true);
+    assert(idx_cand_blocks_fit_u16(65536u) == false);
+    {
+      uint16_t dummy_id = 0;
+      uint32_t dummy_n = 0;
+      float dummy_f = 0.0f;
+      assert(idx_topk_mask_cand_emit_hip(&dummy_f, nullptr, nullptr, 1, 65536u, 65536u, 65536u,
+                                         1024u, &dummy_id, &dummy_n, 1024u, nullptr) == false);
+    }
+
+    struct CandCase {
+      const char* name;
+      uint32_t nb;
+      uint32_t pos0;
+      uint32_t n_keys;
+      uint32_t mlen;
+      uint32_t n_head;
+      uint32_t cand_block;
+      uint32_t cand_topk_blocks;
+      uint32_t topk;
+      bool causal_nkeys;
+      bool use_scratch;
+      const char* narrow_env;
+      bool unaligned_bstride;
+      bool force_ties;
+    };
+    const CandCase cases[] = {
+      {"prefill-c16-causal",    32u, 16500u, 16532u, 16600u, 64u, 16u, 256u, 512u, true,  false, "1", false, true},
+      {"prefill-c8-short",      24u,     0u,    24u,    64u, 64u,  8u, 256u, 512u, true,  false, "1", false, false},
+      {"decode-1tok-c16-nosp",   1u,     0u, 17003u, 17150u, 64u, 16u, 320u, 512u, false, false, "1", false, true},
+      {"decode-1tok-c16-spread", 1u,     0u, 17003u, 17150u, 64u, 16u, 320u, 512u, false, true,  "1", false, true},
+      {"decode-4tok-c8-narrow1", 4u,     0u, 17003u, 17003u, 64u,  8u, 512u, 512u, false, true,  "1", false, false},
+      {"decode-4tok-c8-narrow0", 4u,     0u, 17003u, 17003u, 64u,  8u, 512u, 512u, false, false, "0", false, false},
+      {"decode-2tok-c12-unalign",2u,     0u, 10003u, 10003u, 64u, 12u, 350u, 512u, false, true,  "1", true,  true},
+    };
+
+    for (const CandCase& tc : cases) {
+      setenv("AFF_IDX_NARROW", tc.narrow_env, 1);
+      const uint32_t nb = tc.nb, n_keys = tc.n_keys, mlen = tc.mlen, n_head = tc.n_head;
+      const uint32_t dim = kIdxDim;
+      const uint32_t nblk = (n_keys + tc.cand_block - 1u) / tc.cand_block;
+      const uint32_t bstride = tc.unaligned_bstride ? nblk : (((nblk + 7u) / 8u) * 8u);
+      const uint32_t cand_stride = tc.cand_topk_blocks;
+      const uint32_t cand_max_blocks = std::min(nblk, tc.cand_topk_blocks);
+      const uint32_t compact_stride = cand_max_blocks * tc.cand_block;
+      const uint32_t adm_stride = tc.topk;
+
+      std::vector<float> h_q((size_t)nb * n_head * dim);
+      std::vector<float> h_q_tgt((size_t)nb * n_head * dim);
+      std::vector<float> h_k((size_t)n_keys * dim);
+      std::vector<float> h_hw_src((size_t)nb * n_head);
+      std::vector<float> h_hw_tgt((size_t)nb * n_head);
+      for (size_t i = 0; i < h_q.size(); ++i) {
+        h_q[i] = std::sin((float)(i + nb * 7u) * 0.031f) * 0.6f;
+        h_q_tgt[i] = std::cos((float)(i + nb * 13u) * 0.027f) * 0.6f;
+      }
+      for (size_t i = 0; i < h_k.size(); ++i) h_k[i] = std::sin((float)i * 0.019f) * 0.55f;
+      if (tc.force_ties && n_keys > 64u) {
+        for (uint32_t s = 17u; s < n_keys; s += 29u) {
+          std::copy(&h_k[17u * dim], &h_k[18u * dim], &h_k[(size_t)s * dim]);
+        }
+      }
+      for (size_t i = 0; i < h_hw_src.size(); ++i) {
+        h_hw_src[i] = 0.4f + 0.5f * std::cos((float)i * 0.11f);
+        h_hw_tgt[i] = 0.5f + 0.4f * std::sin((float)i * 0.17f);
+      }
+
+      std::vector<uint8_t> h_q8_src(h_q.size()), h_q8_tgt(h_q_tgt.size()), h_k8(h_k.size());
+      std::vector<float> h_qs_src(nb), h_qs_tgt(nb), h_ks(n_keys);
+      idx_encode_rows(h_q.data(), h_q8_src.data(), h_qs_src.data(), nb, n_head * dim);
+      idx_encode_rows(h_q_tgt.data(), h_q8_tgt.data(), h_qs_tgt.data(), nb, n_head * dim);
+      idx_encode_rows(h_k.data(), h_k8.data(), h_ks.data(), n_keys, dim);
+
+      std::vector<uint32_t> h_nkeys(nb), h_nblk(nb);
+      for (uint32_t t = 0; t < nb; ++t) {
+        h_nkeys[t] = tc.causal_nkeys ? (tc.pos0 + t + 1u) : n_keys;
+        h_nblk[t] = (h_nkeys[t] + tc.cand_block - 1u) / tc.cand_block;
+      }
+
+      uint8_t *d_q8s = nullptr, *d_q8t = nullptr, *d_k8 = nullptr;
+      float *d_qss = nullptr, *d_qst = nullptr, *d_ks = nullptr, *d_hws = nullptr, *d_hwt = nullptr;
+      float *d_sc_leg = nullptr, *d_bsc = nullptr, *d_sc_cand = nullptr;
+      uint32_t *d_nk = nullptr, *d_nbk = nullptr;
+      uint8_t *d_cand_mask = nullptr, *d_mask_leg = nullptr, *d_mask_cand = nullptr;
+      uint16_t *d_cand_ids = nullptr, *d_cand_ids_opt = nullptr;
+      uint32_t *d_cand_n = nullptr, *d_cand_n_opt = nullptr;
+      uint32_t *d_adm_leg = nullptr, *d_admn_leg = nullptr;
+      uint32_t *d_adm_cand = nullptr, *d_admn_cand = nullptr;
+      uint32_t *d_adm_both = nullptr, *d_admn_both = nullptr;
+
+      assert(hipMalloc(&d_q8s, h_q8_src.size()) == hipSuccess);
+      assert(hipMalloc(&d_q8t, h_q8_tgt.size()) == hipSuccess);
+      assert(hipMalloc(&d_k8, h_k8.size()) == hipSuccess);
+      assert(hipMalloc(&d_qss, (size_t)nb * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_qst, (size_t)nb * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_ks, (size_t)n_keys * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_hws, (size_t)nb * n_head * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_hwt, (size_t)nb * n_head * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_sc_leg, (size_t)nb * n_keys * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_bsc, (size_t)nb * bstride * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_sc_cand, (size_t)nb * compact_stride * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_nk, (size_t)nb * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_nbk, (size_t)nb * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_cand_mask, (size_t)nb * bstride) == hipSuccess);
+      assert(hipMalloc(&d_mask_leg, (size_t)nb * mlen) == hipSuccess);
+      assert(hipMalloc(&d_mask_cand, (size_t)nb * mlen) == hipSuccess);
+      assert(hipMalloc(&d_cand_ids, (size_t)nb * cand_stride * sizeof(uint16_t)) == hipSuccess);
+      assert(hipMalloc(&d_cand_ids_opt, (size_t)nb * cand_stride * sizeof(uint16_t)) == hipSuccess);
+      assert(hipMalloc(&d_cand_n, (size_t)nb * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_cand_n_opt, (size_t)nb * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_adm_leg, (size_t)nb * adm_stride * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_admn_leg, (size_t)nb * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_adm_cand, (size_t)nb * adm_stride * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_admn_cand, (size_t)nb * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_adm_both, (size_t)nb * adm_stride * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_admn_both, (size_t)nb * sizeof(uint32_t)) == hipSuccess);
+
+      assert(hipMemcpy(d_q8s, h_q8_src.data(), h_q8_src.size(), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_q8t, h_q8_tgt.data(), h_q8_tgt.size(), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_k8, h_k8.data(), h_k8.size(), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_qss, h_qs_src.data(), (size_t)nb * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_qst, h_qs_tgt.data(), (size_t)nb * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_ks, h_ks.data(), (size_t)n_keys * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_hws, h_hw_src.data(), h_hw_src.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_hwt, h_hw_tgt.data(), h_hw_tgt.size() * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_nk, h_nkeys.data(), (size_t)nb * sizeof(uint32_t), hipMemcpyHostToDevice) == hipSuccess);
+      assert(hipMemcpy(d_nbk, h_nblk.data(), (size_t)nb * sizeof(uint32_t), hipMemcpyHostToDevice) == hipSuccess);
+      // Legacy idx_topk_mask_hip with nkeys==nullptr reads up to `bstride`; pad [nblk, bstride) to -inf.
+      std::vector<float> h_bsc_init((size_t)nb * bstride, -INFINITY);
+      assert(hipMemcpy(d_bsc, h_bsc_init.data(), h_bsc_init.size() * sizeof(float),
+                       hipMemcpyHostToDevice) == hipSuccess);
+      // Pre-poison dense mask buffers to ensure clearing covers all [0, mlen) including padding
+      assert(hipMemset(d_mask_leg, 0xA5, (size_t)nb * mlen) == hipSuccess);
+      assert(hipMemset(d_mask_cand, 0x5A, (size_t)nb * mlen) == hipSuccess);
+
+      TopkScratch sp{};
+      if (tc.use_scratch) {
+        sp.tok_cap = nb;
+        uint64_t sb = 0, tb = 0;
+        const uint64_t hb = idx_topk_scratch_bytes(nb, &sb, &tb);
+        assert(hipMalloc(&sp.hist, hb) == hipSuccess);
+        assert(hipMalloc(&sp.state, sb) == hipSuccess);
+        assert(hipMalloc(&sp.tie, tb) == hipSuccess);
+        assert(hipMemset(sp.hist, 0, hb) == hipSuccess);
+        assert(hipMemset(sp.state, 0, sb) == hipSuccess);
+        assert(hipMemset(sp.tie, 0, tb) == hipSuccess);
+      }
+      const TopkScratch* spp = tc.use_scratch ? &sp : nullptr;
+      const uint32_t* nk_arg = tc.causal_nkeys ? d_nk : nullptr;
+      const uint32_t* nbk_arg = tc.causal_nkeys ? d_nbk : nullptr;
+
+      // 1) Legacy Layer 20: score + block_max + topk -> d_cand_mask
+      indexer_scores_hip(d_q8s, d_qss, d_k8, d_ks, d_hws, d_sc_leg, nb, n_keys, n_head, nullptr);
+      idx_block_max_hip(d_sc_leg, d_bsc, nk_arg, nb, n_keys, bstride, nblk, tc.cand_block, n_keys,
+                        nullptr);
+      idx_topk_mask_hip(d_bsc, d_cand_mask, nbk_arg, nb, bstride, bstride, nblk,
+                        tc.cand_topk_blocks, nullptr, spp);
+
+      // 2) Legacy Consumer Layer 24: full score -> apply_cand -> topk (adm + dense mask)
+      indexer_scores_hip(d_q8t, d_qst, d_k8, d_ks, d_hwt, d_sc_leg, nb, n_keys, n_head, nullptr);
+      // Save unmasked legacy scores for score-level bit-exact check
+      std::vector<float> h_sc_unmasked((size_t)nb * n_keys);
+      assert(hipDeviceSynchronize() == hipSuccess);
+      assert(hipMemcpy(h_sc_unmasked.data(), d_sc_leg, h_sc_unmasked.size() * sizeof(float),
+                       hipMemcpyDeviceToHost) == hipSuccess);
+
+      idx_apply_cand_hip(d_sc_leg, d_cand_mask, nk_arg, nb, n_keys, bstride, n_keys, tc.cand_block,
+                         n_keys, nullptr);
+      idx_topk_mask_hip(d_sc_leg, d_mask_leg, nk_arg, nb, n_keys, mlen, mlen, tc.topk, nullptr, spp,
+                        d_adm_leg, d_admn_leg, adm_stride);
+
+      // 3) W3-2a Layer 20 publisher: compact uint16_t candidate blocks (skip dense cand_mask)
+      assert(idx_topk_mask_cand_emit_hip(d_bsc, nullptr, nbk_arg, nb, bstride, bstride, nblk,
+                                         tc.cand_topk_blocks, d_cand_ids, d_cand_n, cand_stride,
+                                         nullptr, spp));
+      // Also verify optional cand_ids_out parameter on idx_topk_mask_hip directly
+      idx_topk_mask_hip(d_bsc, nullptr, nbk_arg, nb, bstride, bstride, nblk, tc.cand_topk_blocks,
+                        nullptr, spp, nullptr, nullptr, 0u, d_cand_ids_opt, d_cand_n_opt,
+                        cand_stride);
+
+      // 4) W3-2a Consumer Layer 24: gather score + gather topk (adm-only AND mask+adm)
+      indexer_scores_cand_hip(d_q8t, d_qst, d_k8, d_ks, d_hwt, d_cand_ids, d_cand_n, nk_arg,
+                              d_sc_cand, nb, n_keys, n_head, cand_stride, tc.cand_block,
+                              cand_max_blocks, compact_stride, nullptr);
+      idx_topk_mask_cand_hip(d_sc_cand, nullptr, d_cand_ids, d_cand_n, nb, compact_stride,
+                             cand_stride, tc.cand_block, cand_max_blocks, mlen, mlen, tc.topk,
+                             nullptr, spp, d_adm_cand, d_admn_cand, adm_stride);
+      idx_topk_mask_cand_hip(d_sc_cand, d_mask_cand, d_cand_ids, d_cand_n, nb, compact_stride,
+                             cand_stride, tc.cand_block, cand_max_blocks, mlen, mlen, tc.topk,
+                             nullptr, spp, d_adm_both, d_admn_both, adm_stride);
+      assert(hipDeviceSynchronize() == hipSuccess);
+
+      // Verify candidate block publish parity
+      std::vector<uint8_t> h_cand_mask((size_t)nb * bstride);
+      std::vector<uint16_t> h_cand_ids((size_t)nb * cand_stride), h_cand_ids_opt((size_t)nb * cand_stride);
+      std::vector<uint32_t> h_cand_n(nb), h_cand_n_opt(nb);
+      assert(hipMemcpy(h_cand_mask.data(), d_cand_mask, h_cand_mask.size(), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_cand_ids.data(), d_cand_ids, h_cand_ids.size() * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_cand_ids_opt.data(), d_cand_ids_opt, h_cand_ids_opt.size() * sizeof(uint16_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_cand_n.data(), d_cand_n, h_cand_n.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_cand_n_opt.data(), d_cand_n_opt, h_cand_n_opt.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+
+      for (uint32_t t = 0; t < nb; ++t) {
+        std::vector<uint16_t> expected_blocks;
+        for (uint32_t b = 0; b < h_nblk[t]; ++b) {
+          if (h_cand_mask[(size_t)t * bstride + b]) expected_blocks.push_back((uint16_t)b);
+        }
+        assert(h_cand_n[t] == expected_blocks.size());
+        assert(h_cand_n[t] <= tc.cand_topk_blocks);
+        for (uint32_t j = 0; j < h_cand_n[t]; ++j) {
+          assert(h_cand_ids[(size_t)t * cand_stride + j] == expected_blocks[j]);
+          if (j > 0) assert(h_cand_ids[(size_t)t * cand_stride + j] > h_cand_ids[(size_t)t * cand_stride + j - 1u]);
+        }
+        if (!tc.causal_nkeys && bstride == nblk) {
+          assert(h_cand_n_opt[t] == h_cand_n[t]);
+          for (uint32_t j = 0; j < h_cand_n[t]; ++j)
+            assert(h_cand_ids_opt[(size_t)t * cand_stride + j] == h_cand_ids[(size_t)t * cand_stride + j]);
+        }
+      }
+
+      // Verify gather score bit-for-bit parity vs legacy full scores
+      std::vector<float> h_sc_cand((size_t)nb * compact_stride);
+      assert(hipMemcpy(h_sc_cand.data(), d_sc_cand, h_sc_cand.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+      for (uint32_t t = 0; t < nb; ++t) {
+        for (uint32_t j = 0; j < h_cand_n[t]; ++j) {
+          const uint32_t b = h_cand_ids[(size_t)t * cand_stride + j];
+          for (uint32_t r = 0; r < tc.cand_block; ++r) {
+            const uint32_t u = j * tc.cand_block + r;
+            const uint32_t g = b * tc.cand_block + r;
+            const float got = h_sc_cand[(size_t)t * compact_stride + u];
+            if (g < h_nkeys[t]) {
+              const float ref = h_sc_unmasked[(size_t)t * n_keys + g];
+              assert(std::memcmp(&got, &ref, sizeof(float)) == 0);
+            } else {
+              assert(got == -INFINITY);
+            }
+          }
+        }
+      }
+
+      // Verify admitted list & dense mask exact parity vs legacy
+      std::vector<uint32_t> h_adm_leg((size_t)nb * adm_stride), h_admn_leg(nb);
+      std::vector<uint32_t> h_adm_cand((size_t)nb * adm_stride), h_admn_cand(nb);
+      std::vector<uint32_t> h_adm_both((size_t)nb * adm_stride), h_admn_both(nb);
+      std::vector<uint8_t> h_mask_leg((size_t)nb * mlen), h_mask_cand((size_t)nb * mlen);
+      assert(hipMemcpy(h_adm_leg.data(), d_adm_leg, h_adm_leg.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_admn_leg.data(), d_admn_leg, h_admn_leg.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_adm_cand.data(), d_adm_cand, h_adm_cand.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_admn_cand.data(), d_admn_cand, h_admn_cand.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_adm_both.data(), d_adm_both, h_adm_both.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_admn_both.data(), d_admn_both, h_admn_both.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_mask_leg.data(), d_mask_leg, h_mask_leg.size(), hipMemcpyDeviceToHost) == hipSuccess);
+      assert(hipMemcpy(h_mask_cand.data(), d_mask_cand, h_mask_cand.size(), hipMemcpyDeviceToHost) == hipSuccess);
+
+      for (uint32_t t = 0; t < nb; ++t) {
+        assert(h_admn_cand[t] == h_admn_leg[t]);
+        assert(h_admn_both[t] == h_admn_leg[t]);
+        for (uint32_t i = 0; i < h_admn_leg[t]; ++i) {
+          assert(h_adm_cand[(size_t)t * adm_stride + i] == h_adm_leg[(size_t)t * adm_stride + i]);
+          assert(h_adm_both[(size_t)t * adm_stride + i] == h_adm_leg[(size_t)t * adm_stride + i]);
+        }
+      }
+      assert(std::memcmp(h_mask_cand.data(), h_mask_leg.data(), h_mask_leg.size()) == 0);
+      std::printf("  cand gather [%s]: PASS (bit-exact scores, adm, dense mask)\n", tc.name);
+
+      if (tc.use_scratch) {
+        (void)hipFree(sp.hist); (void)hipFree(sp.state); (void)hipFree(sp.tie);
+      }
+      for (void* p : {(void*)d_q8s, (void*)d_q8t, (void*)d_k8, (void*)d_qss, (void*)d_qst,
+                      (void*)d_ks, (void*)d_hws, (void*)d_hwt, (void*)d_sc_leg, (void*)d_bsc,
+                      (void*)d_sc_cand, (void*)d_nk, (void*)d_nbk, (void*)d_cand_mask,
+                      (void*)d_mask_leg, (void*)d_mask_cand, (void*)d_cand_ids,
+                      (void*)d_cand_ids_opt, (void*)d_cand_n, (void*)d_cand_n_opt, (void*)d_adm_leg,
+                      (void*)d_admn_leg, (void*)d_adm_cand, (void*)d_admn_cand, (void*)d_adm_both,
+                      (void*)d_admn_both})
+        (void)hipFree(p);
+    }
+    if (prev_nr) setenv("AFF_IDX_NARROW", prev_nr_val.c_str(), 1);
+    else unsetenv("AFF_IDX_NARROW");
+    std::printf("PASS: Test 4 - W3-2a gather-only candidate indexer bit-exact parity\n");
+  }
+
   std::printf("ALL TEST_V41_INDEXER CHECKS PASSED SUCCESSFULLY!\n");
   return 0;
 }

@@ -361,6 +361,7 @@ struct DenseGpu::Impl {
     // BYTE a block, not a bit: the produce side is `idx_topk_mask_hip`, which writes a byte mask,
     // and reusing that select verbatim is worth more than the 8x. Decode holds one token's worth.
     uint8_t* a_cand = nullptr;
+    uint16_t* a_cand_ids = nullptr; uint32_t* a_cand_n = nullptr;
     float*   i_bsc = nullptr;                             // the block scores it selects over
     uint32_t* i_ncb = nullptr; uint32_t* hi_ncb = nullptr;  // per-token block counts
 
@@ -458,6 +459,7 @@ struct DenseGpu::Impl {
     float* h_tm = nullptr;                                // pinned, b_mid_ * b_cap_ floats
     uint8_t* b_allow = nullptr;                           // device, the same plane
     uint8_t* b_cand = nullptr;                            // the chunk's candidate blocks
+    uint16_t* b_cand_ids = nullptr; uint32_t* b_cand_n = nullptr; // compact W3-2a candidate list
     // Engram. `e_in` is the dequantised table lookup, dim-major [n_cols*head_dim][tile]; `e_out`
     // the wkv result, [(n_hc+1)*n_embd][tile]. Their own buffers rather than a band of b_y: the
     // wkv output is 25,600 rows, which is wider than the widest intermediate that arena is sized
@@ -847,7 +849,8 @@ DenseGpu::~DenseGpu() {
     }
     if (D.i_q8 && !D.is_bq_alias(D.i_q8)) (void)hipFree(D.i_q8);
     D.i_q8 = nullptr;
-    for (void* p : {(void*)D.i_bsc, (void*)D.i_nc, (void*)D.i_ncb})
+    for (void* p : {(void*)D.i_bsc, (void*)D.i_nc, (void*)D.i_ncb, (void*)D.a_cand, (void*)D.b_cand,
+                    (void*)D.a_cand_ids, (void*)D.a_cand_n, (void*)D.b_cand_ids, (void*)D.b_cand_n})
       if (p) (void)hipFree(p);
     float* const bufs[] = {
       D.d_g, D.d_u, D.d_a, D.d_p, D.d_x, D.d_y,
@@ -4682,7 +4685,8 @@ bool DenseGpu::ensure_btm(uint32_t need_rows, std::string* err) {
 
 bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_t width,
                                uint32_t idx_dim, uint32_t idx_heads, std::string* err,
-                               const uint8_t* key_layers, uint32_t cand_block) {
+                               const uint8_t* key_layers, uint32_t cand_block,
+                               uint32_t cand_topk_blocks) {
   if (!impl_ || impl_->dev.empty()) { if (err) *err = "no device"; return false; }
   if (!attn_ok_) { if (err) *err = "attn_init must run first"; return false; }
   if (!ratios) { if (err) *err = "no per-layer ratios"; return false; }
@@ -4753,11 +4757,30 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
       cand_block_ = cand_block;
       cand_blocks_cap_ = (a_maxcomp_ + cand_block - 1u) / cand_block;
       const size_t bc = cand_blocks_cap_ ? cand_blocks_cap_ : 1u;
-      if (!hip_try(hipMalloc(&D.a_cand, bc), "candidate blocks (decode)", err)) return false;
+      const bool use_gather_cand = idx_cand_gather_enabled() && cand_topk_blocks > 0u &&
+                                   idx_cand_blocks_fit_u16(cand_blocks_cap_) &&
+                                   (uint64_t)cand_topk_blocks * cand_block <= a_maxcomp_;
+      cand_topk_cap_ = use_gather_cand ? cand_topk_blocks : 0u;
       if (!hip_try(hipMalloc(&D.i_bsc, (size_t)i_tile_ * bc * sizeof(float)), "block scores", err))
         return false;
-      if (b_cap_ && !hip_try(hipMalloc(&D.b_cand, (size_t)b_cap_ * bc), "candidate blocks", err))
-        return false;
+      if (use_gather_cand) {
+        if (!hip_try(hipMalloc(&D.a_cand_ids, (size_t)cand_topk_cap_ * sizeof(uint16_t)),
+                     "candidate block ids (decode)", err) ||
+            !hip_try(hipMalloc(&D.a_cand_n, sizeof(uint32_t)),
+                     "candidate block count (decode)", err))
+          return false;
+        if (b_cap_ &&
+            (!hip_try(hipMalloc(&D.b_cand_ids,
+                                (size_t)b_cap_ * cand_topk_cap_ * sizeof(uint16_t)),
+                      "candidate block ids", err) ||
+             !hip_try(hipMalloc(&D.b_cand_n, (size_t)b_cap_ * sizeof(uint32_t)),
+                      "candidate block counts", err)))
+          return false;
+      } else {
+        if (!hip_try(hipMalloc(&D.a_cand, bc), "candidate blocks (decode)", err)) return false;
+        if (b_cap_ && !hip_try(hipMalloc(&D.b_cand, (size_t)b_cap_ * bc), "candidate blocks", err))
+          return false;
+      }
     }
     // The flash key split. kSplitTok is the launch size above which the natural grid already fills
     // the device, so the arena never has to hold a prefill chunk: at 32 heads a card and 512 dims a
@@ -6210,39 +6233,66 @@ bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
     idx_rope_qat_hip(D.i_q, 1, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
                      a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
     idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head * a.dim, st);
-    indexer_scores_hip(D.i_q8, D.i_qs, D.a_idx8_s[slot_][kl], D.a_idxs_s[slot_][kl], D.i_w, D.i_sc, 1, a.n_keys,
-                       n_head, st);
-    // ---- the candidate pre-filter, both levels -------------------------------------------------
-    //
-    // The SOURCE publishes from its own unmasked scores and then takes its own top-k over those
-    // same unmasked scores — the reference's `if is_candidate_source: ... elif uses_candidates:`,
-    // which is an either/or and never both. A layer BEFORE the source does neither.
-    if (cand_block_ && a.cand_source >= 0 && D.a_cand) {
-      const uint32_t nblk = (a.n_keys + cand_block_ - 1u) / cand_block_;
-      if (nblk > cand_blocks_cap_) return false;
-      if ((int64_t)layer > (int64_t)a.cand_source) {
-        // Level two. Only inside what the source published — and only if it actually published for
-        // THIS token: a stale set from the previous one would be a plausible wrong answer.
-        if (a_cand_src_[slot_] != (int64_t)a.cand_source) return false;
-        idx_apply_cand_hip(D.i_sc, D.a_cand, nullptr, 1, a.n_keys, cand_blocks_cap_, a.n_keys,
-                           cand_block_, a.n_keys, st);
-      } else if (layer == (uint32_t)a.cand_source) {
-        // Level one, into the byte mask the layers after this one read.
-        cand_note(layer, a.n_keys, nblk, a.cand_topk_blocks);
-        idx_block_max_hip(D.i_sc, D.i_bsc, nullptr, 1, a.n_keys, cand_blocks_cap_, nblk,
-                          cand_block_, a.n_keys, st);
-        idx_topk_mask_hip(D.i_bsc, D.a_cand, nullptr, 1, cand_blocks_cap_, cand_blocks_cap_, nblk,
-                          a.cand_topk_blocks, st);
-      }
-    }
-    // Null counts: at one token the score row IS its own prefix. The clear is over `n_mask`, the
-    // attention's own row count for this token, and NOT over the plane's pitch: the pitch comes
-    // from the cache's capacity, so at a 1M cache it is 262146 bytes however short the context is.
     const bool gather = topk <= kAdmCap;
     const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
-    idx_topk_mask_hip(D.i_sc, (gather && flash_ok) ? nullptr : D.a_allow, nullptr, 1, a.n_keys,
-                      a_maxcomp_, a.n_mask > a_maxcomp_ ? a_maxcomp_ : a.n_mask, topk, st, &D.topk,
-                      gather ? D.a_adm : nullptr, gather ? D.a_admn : nullptr, kAdmCap);
+    const uint32_t mlen = a.n_mask > a_maxcomp_ ? a_maxcomp_ : a.n_mask;
+    const bool use_gather_cand = idx_cand_gather_enabled() && cand_block_ && cand_topk_cap_ &&
+                                 a.cand_source >= 0 && D.a_cand_ids && D.a_cand_n &&
+                                 a.cand_topk_blocks <= cand_topk_cap_ &&
+                                 (uint64_t)a.cand_topk_blocks * cand_block_ <= a_maxcomp_;
+    if (use_gather_cand && (int64_t)layer > (int64_t)a.cand_source) {
+      const uint32_t nblk = (a.n_keys + cand_block_ - 1u) / cand_block_;
+      if (nblk > cand_blocks_cap_ || !idx_cand_blocks_fit_u16(nblk)) return false;
+      if (a_cand_src_[slot_] != (int64_t)a.cand_source) return false;
+      const uint32_t cand_keys_stride = a.cand_topk_blocks * cand_block_;
+      indexer_scores_cand_hip(D.i_q8, D.i_qs, D.a_idx8_s[slot_][kl], D.a_idxs_s[slot_][kl], D.i_w,
+                              D.a_cand_ids, D.a_cand_n, nullptr, D.i_sc, 1, a.n_keys, n_head,
+                              cand_topk_cap_, cand_block_, a.cand_topk_blocks, cand_keys_stride, st);
+      idx_topk_mask_cand_hip(D.i_sc, (gather && flash_ok) ? nullptr : D.a_allow, D.a_cand_ids,
+                             D.a_cand_n, 1, cand_keys_stride, cand_topk_cap_, cand_block_,
+                             a.cand_topk_blocks, a_maxcomp_, mlen, topk, st, &D.topk,
+                             gather ? D.a_adm : nullptr, gather ? D.a_admn : nullptr, kAdmCap);
+    } else {
+      indexer_scores_hip(D.i_q8, D.i_qs, D.a_idx8_s[slot_][kl], D.a_idxs_s[slot_][kl], D.i_w,
+                         D.i_sc, 1, a.n_keys, n_head, st);
+      // ---- the candidate pre-filter, both levels -----------------------------------------------
+      //
+      // The SOURCE publishes from its own unmasked scores and then takes its own top-k over those
+      // same unmasked scores — the reference's `if is_candidate_source: ... elif uses_candidates:`,
+      // which is an either/or and never both. A layer BEFORE the source does neither.
+      if (cand_block_ && a.cand_source >= 0) {
+        const uint32_t nblk = (a.n_keys + cand_block_ - 1u) / cand_block_;
+        if (nblk > cand_blocks_cap_) return false;
+        if (use_gather_cand && layer == (uint32_t)a.cand_source) {
+          if (!idx_cand_blocks_fit_u16(nblk)) return false;
+          cand_note(layer, a.n_keys, nblk, a.cand_topk_blocks);
+          idx_block_max_hip(D.i_sc, D.i_bsc, nullptr, 1, a.n_keys, cand_blocks_cap_, nblk,
+                            cand_block_, a.n_keys, st);
+          if (!idx_topk_mask_cand_emit_hip(D.i_bsc, nullptr, nullptr, 1, cand_blocks_cap_,
+                                           cand_blocks_cap_, nblk, a.cand_topk_blocks, D.a_cand_ids,
+                                           D.a_cand_n, cand_topk_cap_, st, &D.topk))
+            return false;
+        } else if (D.a_cand) {
+          if ((int64_t)layer > (int64_t)a.cand_source) {
+            if (a_cand_src_[slot_] != (int64_t)a.cand_source) return false;
+            idx_apply_cand_hip(D.i_sc, D.a_cand, nullptr, 1, a.n_keys, cand_blocks_cap_, a.n_keys,
+                               cand_block_, a.n_keys, st);
+          } else if (layer == (uint32_t)a.cand_source) {
+            cand_note(layer, a.n_keys, nblk, a.cand_topk_blocks);
+            idx_block_max_hip(D.i_sc, D.i_bsc, nullptr, 1, a.n_keys, cand_blocks_cap_, nblk,
+                              cand_block_, a.n_keys, st);
+            idx_topk_mask_hip(D.i_bsc, D.a_cand, nullptr, 1, cand_blocks_cap_, cand_blocks_cap_,
+                              nblk, a.cand_topk_blocks, st);
+          }
+        }
+      }
+      // Null counts: at one token the score row IS its own prefix. The clear is over `n_mask`, the
+      // attention's own row count for this token, and NOT over the plane's pitch: the pitch comes
+      // from the cache's capacity, so at a 1M cache it is 262146 bytes however short the context is.
+      idx_topk_mask_hip(D.i_sc, (gather && flash_ok) ? nullptr : D.a_allow, nullptr, 1, a.n_keys,
+                        a_maxcomp_, mlen, topk, st, &D.topk,
+                        gather ? D.a_adm : nullptr, gather ? D.a_admn : nullptr, kAdmCap);
+    }
   }
   if (cand_block_ && a.cand_source >= 0 && layer == (uint32_t)a.cand_source) a_cand_src_[slot_] = (int64_t)a.cand_source;
   // Stamped with the layer that OWNS these admissions, which on V4.1 is the index source and on
@@ -6320,46 +6370,77 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
     // launches, same arithmetic, same answer as before.
     //
     // Each token's row is independent, so tiling cannot move a score or a tie.
+    const bool gather = topk <= kAdmCap;
+    const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
+    if (!(gather && flash_ok) && !D.b_allow) return false;
+    const uint32_t nblk = cand_block_ ? (n_keys + cand_block_ - 1u) / cand_block_ : 0u;
+    const bool use_gather_cand = idx_cand_gather_enabled() && cand_block_ && cand_topk_cap_ &&
+                                 a.cand_source >= 0 && D.b_cand_ids && D.b_cand_n &&
+                                 a.cand_topk_blocks <= cand_topk_cap_ &&
+                                 (uint64_t)a.cand_topk_blocks * cand_block_ <= a_maxcomp_;
+    if (use_gather_cand) {
+      if (nblk > cand_blocks_cap_ || !idx_cand_blocks_fit_u16(nblk)) return false;
+      if ((int64_t)layer > (int64_t)a.cand_source && b_cand_src_[slot_] != (int64_t)a.cand_source)
+        return false;
+    }
     for (uint32_t t0 = 0; t0 < n; t0 += i_tile_) {
       const uint32_t nt = std::min(i_tile_, n - t0);
-      indexer_scores_hip(D.i_q8 + (size_t)t0 * n_head * a.dim, D.i_qs + t0, D.a_idx8_s[slot_][kl],
-                         D.a_idxs_s[slot_][kl], D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys,
-                         n_head, st);
-      // The candidate pre-filter, per tile. The mask is indexed by the CHUNK's own token number, so
-      // a tile writes and reads its own slice of it and the tiling cannot move a block — the same
-      // argument as the score plane above. See indexer_one for which layer does which level.
-      if (cand_block_ && a.cand_source >= 0 && D.b_cand) {
-        uint8_t* cand = D.b_cand + (size_t)t0 * cand_blocks_cap_;
-        const uint32_t nblk = (n_keys + cand_block_ - 1u) / cand_block_;
-        if (nblk > cand_blocks_cap_) return false;
-        if ((int64_t)layer > (int64_t)a.cand_source) {
-          if (b_cand_src_[slot_] != (int64_t)a.cand_source) return false;
-          idx_apply_cand_hip(D.i_sc, cand, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, n_keys,
-                             cand_block_, n_keys, st);
-        } else if (layer == (uint32_t)a.cand_source) {
-          cand_note(layer, n_keys, nblk, a.cand_topk_blocks);
-          idx_block_max_hip(D.i_sc, D.i_bsc, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, nblk,
-                            cand_block_, n_keys, st);
-          idx_topk_mask_hip(D.i_bsc, cand, D.i_ncb + t0, nt, cand_blocks_cap_, cand_blocks_cap_,
-                            nblk, a.cand_topk_blocks, st);
-        }
-      }
-      // Straight into b_allow at the CHUNK's own token indexing; batch_attend then offsets by its
-      // sub-batch. The mask never leaves the card.
-      const bool gather = topk <= kAdmCap;
-      const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
-      if (!(gather && flash_ok) && !D.b_allow) return false;
-      // The byte mask is consumed by compact_row inside this launch unless attention gathers from
-      // b_adm/b_admn on the flash path, in which case mask writes are skipped completely.
       uint8_t* const mrow = (gather && flash_ok)
                                 ? nullptr
                                 : (D.b_allow ? (b_allow_dense_ ? D.b_allow + (size_t)t0 * a_maxcomp_
                                                                : D.b_allow)
                                              : nullptr);
-      idx_topk_mask_hip(D.i_sc, mrow, D.i_nc + t0, nt, n_keys,
-                        a_maxcomp_, n_mask, topk, st, nullptr,
-                        gather ? D.b_adm + (size_t)t0 * kAdmCap : nullptr,
-                        gather ? D.b_admn + t0 : nullptr, kAdmCap);
+      if (use_gather_cand && (int64_t)layer > (int64_t)a.cand_source) {
+        const uint32_t cand_keys_stride = a.cand_topk_blocks * cand_block_;
+        const uint16_t* cids = D.b_cand_ids + (size_t)t0 * cand_topk_cap_;
+        const uint32_t* cn = D.b_cand_n + t0;
+        indexer_scores_cand_hip(D.i_q8 + (size_t)t0 * n_head * a.dim, D.i_qs + t0,
+                                D.a_idx8_s[slot_][kl], D.a_idxs_s[slot_][kl],
+                                D.i_w + (size_t)t0 * n_head, cids, cn, D.i_nc + t0, D.i_sc, nt,
+                                n_keys, n_head, cand_topk_cap_, cand_block_, a.cand_topk_blocks,
+                                cand_keys_stride, st);
+        idx_topk_mask_cand_hip(D.i_sc, mrow, cids, cn, nt, cand_keys_stride, cand_topk_cap_,
+                               cand_block_, a.cand_topk_blocks, a_maxcomp_, n_mask, topk, st,
+                               nullptr, gather ? D.b_adm + (size_t)t0 * kAdmCap : nullptr,
+                               gather ? D.b_admn + t0 : nullptr, kAdmCap);
+      } else {
+        indexer_scores_hip(D.i_q8 + (size_t)t0 * n_head * a.dim, D.i_qs + t0,
+                           D.a_idx8_s[slot_][kl], D.a_idxs_s[slot_][kl],
+                           D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys, n_head, st);
+        // The candidate pre-filter, per tile.
+        if (cand_block_ && a.cand_source >= 0) {
+          if (nblk > cand_blocks_cap_) return false;
+          if (use_gather_cand && layer == (uint32_t)a.cand_source) {
+            cand_note(layer, n_keys, nblk, a.cand_topk_blocks);
+            idx_block_max_hip(D.i_sc, D.i_bsc, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, nblk,
+                              cand_block_, n_keys, st);
+            if (!idx_topk_mask_cand_emit_hip(D.i_bsc, nullptr, D.i_ncb + t0, nt, cand_blocks_cap_,
+                                             cand_blocks_cap_, nblk, a.cand_topk_blocks,
+                                             D.b_cand_ids + (size_t)t0 * cand_topk_cap_,
+                                             D.b_cand_n + t0, cand_topk_cap_, st, nullptr))
+              return false;
+          } else if (D.b_cand) {
+            uint8_t* cand = D.b_cand + (size_t)t0 * cand_blocks_cap_;
+            if ((int64_t)layer > (int64_t)a.cand_source) {
+              if (b_cand_src_[slot_] != (int64_t)a.cand_source) return false;
+              idx_apply_cand_hip(D.i_sc, cand, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, n_keys,
+                                 cand_block_, n_keys, st);
+            } else if (layer == (uint32_t)a.cand_source) {
+              cand_note(layer, n_keys, nblk, a.cand_topk_blocks);
+              idx_block_max_hip(D.i_sc, D.i_bsc, D.i_nc + t0, nt, n_keys, cand_blocks_cap_, nblk,
+                                cand_block_, n_keys, st);
+              idx_topk_mask_hip(D.i_bsc, cand, D.i_ncb + t0, nt, cand_blocks_cap_, cand_blocks_cap_,
+                                nblk, a.cand_topk_blocks, st);
+            }
+          }
+        }
+        // Straight into b_allow at the CHUNK's own token indexing; batch_attend then offsets by its
+        // sub-batch. The mask never leaves the card.
+        idx_topk_mask_hip(D.i_sc, mrow, D.i_nc + t0, nt, n_keys,
+                          a_maxcomp_, n_mask, topk, st, nullptr,
+                          gather ? D.b_adm + (size_t)t0 * kAdmCap : nullptr,
+                          gather ? D.b_admn + t0 : nullptr, kAdmCap);
+      }
     }
   }
   if (cand_block_ && a.cand_source >= 0 && layer == (uint32_t)a.cand_source)
@@ -7703,14 +7784,18 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
   // longer than the staging buffer.
   uint32_t n_pen = 0;
   if (repeat_penalty != 1.0f && penalty_ids && n_penalty_ids) {
+    if (pen_seen_.size() < vocab) pen_seen_.assign((size_t)vocab, 0u);
+    if (++pen_epoch_ == 0u) {
+      std::fill(pen_seen_.begin(), pen_seen_.end(), 0u);
+      pen_epoch_ = 1u;
+    }
     const uint32_t first = n_penalty_ids > kPenaltyCap ? n_penalty_ids - kPenaltyCap : 0;
     for (uint32_t i = first; i < n_penalty_ids; ++i) {
       const uint32_t id = penalty_ids[i];
       if (id >= vocab) continue;
-      bool seen = false;
-      for (uint32_t j = 0; j < n_pen; ++j)
-        if (h_ctrl->tail[j] == id) { seen = true; break; }
-      if (!seen) h_ctrl->tail[n_pen++] = id;
+      if (pen_seen_[id] == pen_epoch_) continue;
+      pen_seen_[id] = pen_epoch_;
+      h_ctrl->tail[n_pen++] = id;
     }
   }
   // ---- DRY ------------------------------------------------------------------------------------

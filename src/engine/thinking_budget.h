@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <unordered_map>
 #include <vector>
 
 namespace aff {
@@ -85,11 +84,12 @@ public:
       loop_ring_.assign((size_t)hook_->loop_span, 0);
       loop_drop_ = 1;
       for (int i = 1; i < hook_->loop_span; ++i) loop_drop_ *= kLoopBase;
+      loop_windows_.reserve(128);
     }
     if (hook_ && !hook_->close_token_ids.empty() &&
         hook_->freeze_enabled && hook_->freeze_window > 0) {
       freeze_ring_.assign((size_t)hook_->freeze_window, 0);
-      freeze_counts_.reserve((size_t)hook_->freeze_window * 2);
+      freeze_counts_.reserve((size_t)hook_->freeze_window);
     }
     if (hook_ && !hook_->close_token_ids.empty() &&
         hook_->short_loop_span > 0 && hook_->short_loop_repeats > 1 &&
@@ -98,15 +98,15 @@ public:
       short_loop_ring_.assign((size_t)hook_->short_loop_window, 0);
       short_loop_drop_ = 1;
       for (int i = 1; i < hook_->short_loop_span; ++i) short_loop_drop_ *= kLoopBase;
-      short_loop_counts_.reserve((size_t)hook_->short_loop_window * 2);
+      short_loop_counts_.reserve((size_t)hook_->short_loop_window);
     }
     if (hook_ && !hook_->close_token_ids.empty() && hook_->novelty_window > 0) {
       novelty_ring_.assign((size_t)hook_->novelty_window, 0);
-      novelty_counts_.reserve((size_t)hook_->novelty_window * 2);
+      novelty_counts_.reserve((size_t)hook_->novelty_window);
     }
     if (hook_ && !hook_->close_token_ids.empty() && hook_->short_novelty_window > 0) {
       short_novelty_ring_.assign((size_t)hook_->short_novelty_window, 0);
-      short_novelty_counts_.reserve((size_t)hook_->short_novelty_window * 2);
+      short_novelty_counts_.reserve((size_t)hook_->short_novelty_window);
     }
   }
   ThinkingBudget(BudgetHook&&, int) = delete;
@@ -236,6 +236,98 @@ private:
     return true;
   }
 
+  // Open-addressed flat counter map with backward-shift deletion (zero per-token heap churn).
+  template <typename Key>
+  class FlatCountMap {
+  public:
+    void reserve(size_t expected_items) {
+      size_t want = 16;
+      const size_t min_slots = std::max<size_t>(16, expected_items * 2);
+      while (want < min_slots) want <<= 1;
+      if (want > slots_.size()) rehash(want);
+    }
+
+    int inc(Key key) {
+      if (slots_.empty()) rehash(64);
+      if ((size_ + 1) * 10 > slots_.size() * 6) rehash(slots_.size() * 2);
+      const size_t mask = slots_.size() - 1;
+      size_t idx = hash_key(key) & mask;
+      for (;;) {
+        Slot& s = slots_[idx];
+        if (s.count == 0) {
+          s.key = key;
+          s.count = 1;
+          ++size_;
+          return 1;
+        }
+        if (s.key == key) return ++s.count;
+        idx = (idx + 1) & mask;
+      }
+    }
+
+    void dec_erase(Key key) {
+      if (slots_.empty()) return;
+      const size_t mask = slots_.size() - 1;
+      size_t idx = hash_key(key) & mask;
+      for (;;) {
+        Slot& s = slots_[idx];
+        if (s.count == 0) return;
+        if (s.key == key) {
+          if (--s.count > 0) return;
+          // Backward-shift deletion preserves probe chains without tombstones.
+          size_t empty = idx;
+          size_t j = (idx + 1) & mask;
+          while (slots_[j].count > 0) {
+            const size_t natural = hash_key(slots_[j].key) & mask;
+            if (((j - natural) & mask) >= ((j - empty) & mask)) {
+              slots_[empty] = slots_[j];
+              empty = j;
+            }
+            j = (j + 1) & mask;
+          }
+          slots_[empty].count = 0;
+          --size_;
+          return;
+        }
+        idx = (idx + 1) & mask;
+      }
+    }
+
+    size_t size() const noexcept { return size_; }
+
+  private:
+    struct Slot {
+      Key key{};
+      int count = 0;  // 0 = empty
+    };
+
+    static inline size_t hash_key(uint64_t x) noexcept {
+      x += 0x9e3779b97f4a7c15ULL;
+      x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+      x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+      return static_cast<size_t>(x ^ (x >> 31));
+    }
+
+    static inline size_t hash_key(int32_t k) noexcept {
+      return hash_key(static_cast<uint64_t>(static_cast<uint32_t>(k)));
+    }
+
+    void rehash(size_t new_cap) {
+      std::vector<Slot> next(new_cap);
+      const size_t mask = new_cap - 1;
+      for (const Slot& s : slots_) {
+        if (s.count == 0) continue;
+        size_t idx = hash_key(s.key) & mask;
+        while (next[idx].count > 0) idx = (idx + 1) & mask;
+        next[idx] = s;
+      }
+      slots_.swap(next);
+    }
+
+    std::vector<Slot> slots_;
+    size_t size_ = 0;
+  };
+
   // Counts each loop_span-token window of thinking by a rolling hash.
   bool repeats(int32_t token) {
     const size_t span = loop_ring_.size();
@@ -245,7 +337,7 @@ private:
     loop_hash_ = loop_hash_ * kLoopBase + (uint64_t)(uint32_t)token;
     loop_ring_[at] = token;
     if (++loop_seen_ < (long long)span) return false;
-    return ++loop_windows_[loop_hash_] >= hook_->loop_repeats;
+    return loop_windows_.inc(loop_hash_) >= hook_->loop_repeats;
   }
 
   bool is_nl_token(int32_t token) const {
@@ -264,15 +356,12 @@ private:
     if (freeze_seen_ >= w) {
       const int32_t old = freeze_ring_[at];
       if (is_nl_token(old)) --freeze_nl_count_;
-      auto it = freeze_counts_.find(old);
-      if (it != freeze_counts_.end()) {
-        if (--(it->second) <= 0) freeze_counts_.erase(it);
-      }
+      freeze_counts_.dec_erase(old);
     }
     freeze_ring_[at] = token;
     ++freeze_seen_;
     if (is_nl_token(token)) ++freeze_nl_count_;
-    ++freeze_counts_[token];
+    freeze_counts_.inc(token);
     return thought_tokens_ >= hook_->freeze_min_tokens &&
            freeze_seen_ >= w &&
            freeze_nl_count_ >= hook_->freeze_nl_thresh &&
@@ -292,20 +381,16 @@ private:
     const size_t w = short_loop_ring_.size();
     const size_t wat = short_loop_seen_ % w;
     if (short_loop_seen_ >= w) {
-      const uint64_t old_h = short_loop_ring_[wat];
-      auto it = short_loop_counts_.find(old_h);
-      if (it != short_loop_counts_.end()) {
-        if (--(it->second) <= 0) short_loop_counts_.erase(it);
-      }
+      short_loop_counts_.dec_erase(short_loop_ring_[wat]);
     }
     short_loop_ring_[wat] = short_token_hash_;
     ++short_loop_seen_;
-    return ++short_loop_counts_[short_token_hash_] >= hook_->short_loop_repeats;
+    return short_loop_counts_.inc(short_token_hash_) >= hook_->short_loop_repeats;
   }
 
   // Tracks distinct token bigrams over a sliding ring buffer.
   static bool update_bigram_novelty(int32_t token, std::vector<uint64_t>& ring,
-                                    std::unordered_map<uint64_t, int>& counts, size_t& seen,
+                                    FlatCountMap<uint64_t>& counts, size_t& seen,
                                     int32_t& prev_tok, bool& has_prev, int min_tokens,
                                     float min_ratio, int thought_tokens) {
     if (!has_prev) {
@@ -318,15 +403,11 @@ private:
     const size_t w = ring.size();
     const size_t at = seen % w;
     if (seen >= w) {
-      const uint64_t old_bg = ring[at];
-      auto it = counts.find(old_bg);
-      if (it != counts.end()) {
-        if (--(it->second) <= 0) counts.erase(it);
-      }
+      counts.dec_erase(ring[at]);
     }
     ring[at] = bg;
     ++seen;
-    ++counts[bg];
+    counts.inc(bg);
     return thought_tokens >= min_tokens &&
            seen >= w &&
            (float)counts.size() < min_ratio * (float)w;
@@ -368,30 +449,30 @@ private:
   std::vector<int32_t> marker_tail_;
   static constexpr uint64_t kLoopBase = 0x9E3779B97F4A7C15ull;
   std::vector<int32_t> loop_ring_;
-  std::unordered_map<uint64_t, int> loop_windows_;
+  FlatCountMap<uint64_t> loop_windows_;
   uint64_t loop_hash_ = 0;
   uint64_t loop_drop_ = 0;
   long long loop_seen_ = 0;
   bool looping_ = false;
   bool loop_armed_ = false;
   std::vector<int32_t> freeze_ring_;
-  std::unordered_map<int32_t, int> freeze_counts_;
+  FlatCountMap<int32_t> freeze_counts_;
   size_t freeze_seen_ = 0;
   int freeze_nl_count_ = 0;
   std::vector<int32_t> short_token_ring_;
   std::vector<uint64_t> short_loop_ring_;
-  std::unordered_map<uint64_t, int> short_loop_counts_;
+  FlatCountMap<uint64_t> short_loop_counts_;
   uint64_t short_token_hash_ = 0;
   uint64_t short_loop_drop_ = 0;
   size_t short_token_seen_ = 0;
   size_t short_loop_seen_ = 0;
   std::vector<uint64_t> novelty_ring_;
-  std::unordered_map<uint64_t, int> novelty_counts_;
+  FlatCountMap<uint64_t> novelty_counts_;
   size_t novelty_seen_ = 0;
   int32_t prev_tok_ = 0;
   bool has_prev_tok_ = false;
   std::vector<uint64_t> short_novelty_ring_;
-  std::unordered_map<uint64_t, int> short_novelty_counts_;
+  FlatCountMap<uint64_t> short_novelty_counts_;
   size_t short_novelty_seen_ = 0;
   int32_t short_prev_tok_ = 0;
   bool short_has_prev_tok_ = false;

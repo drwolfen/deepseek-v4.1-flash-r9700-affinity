@@ -2,8 +2,8 @@ ARG BASE_IMAGE=docker.io/rocm/dev-ubuntu-24.04:10.1.0-full
 FROM ${BASE_IMAGE}
 ARG JOBS=16
 ARG AFF_GIT_SHA=unknown
-ARG AFF_VERSION=v5.7.0
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build git bash sudo passwd python3 procps iproute2 curl ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG AFF_VERSION=v5.8.0
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build git bash sudo passwd python3 procps iproute2 curl ca-certificates rustc && rm -rf /var/lib/apt/lists/*
 COPY . /opt/affinity-src
 RUN ln -s /opt/affinity-src /opt/affinity
 ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm PATH=/opt/affinity-src/build:/opt/rocm/bin:$PATH LD_LIBRARY_PATH=/opt/rocm/lib

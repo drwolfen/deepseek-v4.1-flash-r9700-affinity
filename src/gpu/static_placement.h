@@ -128,7 +128,12 @@ struct PlacementEngineStats {
   // complement and some dispatches blocked on a pread plus a transform before they could launch. It
   // is a correctness path; a run that leans on it is a run to re-budget.
   uint64_t ssd_staged = 0;
+  // W3-2b: GPU bonus_slab D2D promotion/demotion counters.
+  uint64_t bonus_d2d_promotes = 0, bonus_d2d_demotes = 0, bonus_d2d_bytes = 0;
 };
+
+// Runtime toggle (`AFF_BONUS_D2D`, default ON unless "0") for GPU bonus_slab D2D promote/evict.
+bool bonus_d2d_enabled();
 
 // What placement DID, not what dispatch is doing. Every field here is written once, by init().
 //

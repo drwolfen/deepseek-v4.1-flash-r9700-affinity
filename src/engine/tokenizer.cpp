@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace aff {
@@ -75,7 +76,7 @@ inline size_t utf8_len(unsigned char c) {
   if (c >= 0xC0) return 2;
   return 1;
 }
-inline uint32_t utf8_cp(const std::string& s, size_t i, size_t len) {
+inline uint32_t utf8_cp(std::string_view s, size_t i, size_t len) {
   const unsigned char c = (unsigned char)s[i];
   if (len == 1) return c;
   uint32_t cp = c & (0xFFu >> (len + 1));
@@ -98,8 +99,25 @@ inline bool is_letter_cp(uint32_t c) {
 inline bool is_punct_cp(uint32_t c) {
   return c < 0x80 && !is_space_cp(c) && !is_digit_cp(c) && !is_letter_cp(c);
 }
-inline bool is_ascii_punct_class(char c) {   // the explicit set in rule A
-  return std::strchr("!\"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~", c) != nullptr;
+inline constexpr auto kAsciiPunctLut = []() {
+  std::array<uint8_t, 256> t{};
+  const char* s = "!\"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~";
+  for (size_t i = 0;; ++i) {
+    t[(unsigned char)s[i]] = 1;
+    if (s[i] == '\0') break;
+  }
+  return t;
+}();
+inline bool is_ascii_punct_class(char c) {   // the explicit set in rule A (including '\0' parity with strchr)
+  return kAsciiPunctLut[(unsigned char)c] != 0;
+}
+inline uint32_t hash_pair(uint64_t k) noexcept {
+  k ^= k >> 33;
+  k *= 0xff51afd7ed558ccdULL;
+  k ^= k >> 33;
+  k *= 0xc4ceb9fe1a85ec53ULL;
+  k ^= k >> 33;
+  return (uint32_t)k;
 }
 
 } // namespace
@@ -128,7 +146,14 @@ bool Tokenizer::load(const std::string& path, std::string* err) {
   special_.clear();
   added_.clear();
   std::memset(added_lead_, 0, sizeof(added_lead_));
+  std::memset(added_len1_, 0, sizeof(added_len1_));
+  std::memset(added_lead2_, 0, sizeof(added_lead2_));
   max_added_len_ = 0;
+  merge_table_.clear();
+  merge_mask_ = 0;
+  byte_to_id_.fill(kNoTokId);
+  synth_base_ = 0;
+  fast_bpe_ready_ = false;
   bos_ = -1;
   eos_ = -1;
   {
@@ -227,7 +252,18 @@ bool Tokenizer::load(const std::string& path, std::string* err) {
       for (const auto& [content, id] : added_) {
         (void)id;
         if (!content.empty()) {
-          added_lead_[(uint8_t)content[0]] = 1;
+          const uint8_t b0 = (uint8_t)content[0];
+          added_lead_[b0] = 1;
+          if (content.size() == 1) {
+            added_len1_[b0] = 1;
+            for (uint32_t b1 = 0; b1 < 256; ++b1) {
+              const uint32_t pair = ((uint32_t)b0 << 8) | b1;
+              added_lead2_[pair >> 6] |= (1ULL << (pair & 63));
+            }
+          } else {
+            const uint32_t pair = ((uint32_t)b0 << 8) | (uint8_t)content[1];
+            added_lead2_[pair >> 6] |= (1ULL << (pair & 63));
+          }
           if (content.size() > max_added_len_) max_added_len_ = content.size();
         }
       }
@@ -268,7 +304,212 @@ bool Tokenizer::load(const std::string& path, std::string* err) {
   };
   bos_ = find_named({"<｜begin▁of▁sentence｜>", "<s>", "<|begin_of_text|>"});
   eos_ = find_named({"<｜end▁of▁sentence｜>", "</s>", "<|end_of_text|>", "<|eot_id|>"});
+  build_fast_bpe();
   return !id_to_tok_.empty();
+}
+
+void Tokenizer::build_fast_bpe() {
+  fast_bpe_ready_ = false;
+  merge_table_.clear();
+  merge_mask_ = 0;
+  byte_to_id_.fill(kNoTokId);
+  synth_base_ = (uint32_t)id_to_tok_.size();
+  if (id_to_tok_.size() >= (size_t)(kNoTokId - 1000000u)) return;
+
+  for (uint32_t b = 0; b < 256; ++b) {
+    auto it = tok_to_id_.find(byte_to_unicode_[b]);
+    if (it == tok_to_id_.end() || it->second >= synth_base_) return;
+    byte_to_id_[b] = it->second;
+  }
+
+  if (merge_rank_.empty()) {
+    fast_bpe_ready_ = true;
+    return;
+  }
+
+  std::unordered_map<std::string, uint32_t> synth_map;
+  uint32_t next_synth = synth_base_;
+  auto resolve_sym = [&](const std::string& s) -> uint32_t {
+    auto it = tok_to_id_.find(s);
+    if (it != tok_to_id_.end()) return it->second;
+    auto sit = synth_map.find(s);
+    if (sit != synth_map.end()) return sit->second;
+    if (next_synth >= kNoTokId - 1u) return kNoTokId;
+    const uint32_t sid = next_synth++;
+    synth_map.emplace(s, sid);
+    return sid;
+  };
+
+  size_t cap = 16;
+  while (cap < merge_rank_.size() * 2) cap <<= 1;
+  merge_table_.assign(cap, MergeSlot{});
+  merge_mask_ = (uint32_t)(cap - 1);
+
+  for (const auto& [pair_str, rank] : merge_rank_) {
+    const size_t sp = pair_str.find(' ');
+    if (sp == std::string::npos || sp == 0 || sp + 1 >= pair_str.size()) {
+      merge_table_.clear();
+      return;
+    }
+    size_t chosen_sp = sp;
+    if (pair_str.find(' ', sp + 1) != std::string::npos) {
+      bool found = false;
+      for (size_t pos = sp; pos != std::string::npos; pos = pair_str.find(' ', pos + 1)) {
+        if (pos == 0 || pos + 1 >= pair_str.size()) continue;
+        if (tok_to_id_.count(pair_str.substr(0, pos)) &&
+            tok_to_id_.count(pair_str.substr(pos + 1))) {
+          chosen_sp = pos;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        merge_table_.clear();
+        return;
+      }
+    }
+    const std::string left_s = pair_str.substr(0, chosen_sp);
+    const std::string right_s = pair_str.substr(chosen_sp + 1);
+    const uint32_t lid = resolve_sym(left_s);
+    const uint32_t rid = resolve_sym(right_s);
+    const uint32_t mid = resolve_sym(left_s + right_s);
+    if (lid == kNoTokId || rid == kNoTokId || mid == kNoTokId) {
+      merge_table_.clear();
+      return;
+    }
+    const uint64_t key = ((uint64_t)lid << 32) | (uint64_t)rid;
+    uint32_t idx = hash_pair(key) & merge_mask_;
+    while (merge_table_[idx].key != UINT64_MAX && merge_table_[idx].key != key) {
+      idx = (idx + 1) & merge_mask_;
+    }
+    merge_table_[idx] = MergeSlot{key, rank, mid};
+  }
+  fast_bpe_ready_ = true;
+}
+
+const Tokenizer::MergeSlot* Tokenizer::find_merge(uint32_t left, uint32_t right) const noexcept {
+  if (merge_table_.empty()) return nullptr;
+  const uint64_t key = ((uint64_t)left << 32) | (uint64_t)right;
+  uint32_t idx = hash_pair(key) & merge_mask_;
+  for (;;) {
+    const MergeSlot& s = merge_table_[idx];
+    if (s.key == key) return &s;
+    if (s.key == UINT64_MAX) return nullptr;
+    idx = (idx + 1) & merge_mask_;
+  }
+}
+
+bool Tokenizer::bpe_fast(std::string_view piece, std::vector<uint32_t>& out) const {
+  if (!fast_bpe_ready_) return false;
+  const size_t n = piece.size();
+  if (n == 0) return true;
+  if (n == 1) {
+    const uint32_t id = byte_to_id_[(uint8_t)piece[0]];
+    if (id == kNoTokId) return false;
+    out.push_back(id);
+    return true;
+  }
+  if (n == 2) {
+    const uint32_t id0 = byte_to_id_[(uint8_t)piece[0]];
+    const uint32_t id1 = byte_to_id_[(uint8_t)piece[1]];
+    if (id0 == kNoTokId || id1 == kNoTokId) return false;
+    if (const MergeSlot* ms = find_merge(id0, id1)) {
+      if (ms->merged >= synth_base_) return false;
+      out.push_back(ms->merged);
+    } else {
+      out.push_back(id0);
+      out.push_back(id1);
+    }
+    return true;
+  }
+  if (n >= 0xFFFFFFFEu) return false;
+
+  struct BpeNode {
+    uint32_t sym;
+    uint32_t ver;
+    uint32_t prev;
+    uint32_t next;
+  };
+  struct BpeCand {
+    uint32_t rank;
+    uint32_t left;
+    uint32_t right;
+    uint32_t ver_l;
+    uint32_t ver_r;
+    uint32_t merged;
+    bool operator>(const BpeCand& o) const noexcept {
+      // Lower rank wins; identical ranks break leftmost-first via strictly monotonic left index.
+      if (rank != o.rank) return rank > o.rank;
+      return left > o.left;
+    }
+  };
+  struct BpeWorkspace {
+    std::vector<BpeNode> nodes;
+    std::vector<BpeCand> heap;
+  };
+  thread_local BpeWorkspace ws;
+
+  const uint32_t m = (uint32_t)n;
+  ws.nodes.resize(m);
+  for (uint32_t i = 0; i < m; ++i) {
+    const uint32_t id = byte_to_id_[(uint8_t)piece[i]];
+    if (id == kNoTokId) return false;
+    ws.nodes[i] = BpeNode{
+        id,
+        0u,
+        i == 0 ? kNoTokId : i - 1,
+        i + 1 == m ? kNoTokId : i + 1
+    };
+  }
+
+  ws.heap.clear();
+  for (uint32_t i = 0; i + 1 < m; ++i) {
+    if (const MergeSlot* ms = find_merge(ws.nodes[i].sym, ws.nodes[i + 1].sym)) {
+      ws.heap.push_back(BpeCand{ms->rank, i, i + 1, 0u, 0u, ms->merged});
+    }
+  }
+  std::make_heap(ws.heap.begin(), ws.heap.end(), std::greater<>{});
+
+  while (!ws.heap.empty()) {
+    std::pop_heap(ws.heap.begin(), ws.heap.end(), std::greater<>{});
+    const BpeCand top = ws.heap.back();
+    ws.heap.pop_back();
+    BpeNode& nl = ws.nodes[top.left];
+    BpeNode& nr = ws.nodes[top.right];
+    if (nl.ver != top.ver_l || nr.ver != top.ver_r) continue;
+
+    // Absorb right node into left so surviving node indices stay strictly increasing left-to-right.
+    nl.sym = top.merged;
+    ++nl.ver;
+    nr.ver = kNoTokId;
+    const uint32_t next_r = nr.next;
+    nl.next = next_r;
+    if (next_r != kNoTokId) ws.nodes[next_r].prev = top.left;
+
+    if (nl.prev != kNoTokId) {
+      if (const MergeSlot* ms = find_merge(ws.nodes[nl.prev].sym, nl.sym)) {
+        ws.heap.push_back(BpeCand{ms->rank, nl.prev, top.left, ws.nodes[nl.prev].ver, nl.ver, ms->merged});
+        std::push_heap(ws.heap.begin(), ws.heap.end(), std::greater<>{});
+      }
+    }
+    if (nl.next != kNoTokId) {
+      if (const MergeSlot* ms = find_merge(nl.sym, ws.nodes[nl.next].sym)) {
+        ws.heap.push_back(BpeCand{ms->rank, top.left, nl.next, nl.ver, ws.nodes[nl.next].ver, ms->merged});
+        std::push_heap(ws.heap.begin(), ws.heap.end(), std::greater<>{});
+      }
+    }
+  }
+
+  const size_t base_out = out.size();
+  for (uint32_t cur = 0; cur != kNoTokId; cur = ws.nodes[cur].next) {
+    const uint32_t sym = ws.nodes[cur].sym;
+    if (sym >= synth_base_) {
+      out.resize(base_out);
+      return false;
+    }
+    out.push_back(sym);
+  }
+  return true;
 }
 
 std::vector<std::string> Tokenizer::bpe(const std::string& piece) const {
@@ -296,26 +537,33 @@ std::vector<std::string> Tokenizer::bpe(const std::string& piece) const {
 // The character classes are exact for ASCII; non-ASCII non-space is treated as a letter, which
 // matches the pattern's behaviour for every script that actually reaches stage 3 (CJK having been
 // removed by stage 2).
-std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
-  std::vector<std::string> stage1, stage2, out;
+void Tokenizer::pretokenize_spans(std::string_view text, std::vector<Span>& out,
+                                  std::vector<Span>& stage1, std::vector<Span>& stage2) {
+  out.clear();
+  stage1.clear();
+  stage2.clear();
+  if (text.empty()) return;
 
   // Stage 1: isolate digit runs in groups of <= 3.
   for (size_t i = 0; i < text.size(); ) {
     if (is_digit_cp((unsigned char)text[i])) {
       size_t j = i;
       while (j < text.size() && is_digit_cp((unsigned char)text[j])) ++j;
-      for (size_t k = i; k < j; k += 3) stage1.push_back(text.substr(k, std::min<size_t>(3, j - k)));
+      for (size_t k = i; k < j; k += 3) {
+        stage1.push_back(Span{(uint32_t)k, (uint32_t)std::min<size_t>(3, j - k)});
+      }
       i = j;
     } else {
       size_t j = i;
       while (j < text.size() && !is_digit_cp((unsigned char)text[j])) ++j;
-      stage1.push_back(text.substr(i, j - i));
+      stage1.push_back(Span{(uint32_t)i, (uint32_t)(j - i)});
       i = j;
     }
   }
 
   // Stage 2: isolate CJK runs.
-  for (const std::string& seg : stage1) {
+  for (const Span sp : stage1) {
+    const std::string_view seg = text.substr(sp.off, sp.len);
     size_t i = 0;
     while (i < seg.size()) {
       const size_t len = utf8_len((unsigned char)seg[i]);
@@ -326,7 +574,8 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         if (is_cjk_cp(utf8_cp(seg, j, l2)) != cjk) break;
         j += l2;
       }
-      stage2.push_back(seg.substr(i, j - i));
+      const size_t j_end = std::min(j, seg.size());
+      stage2.push_back(Span{sp.off + (uint32_t)i, (uint32_t)(j_end - i)});
       i = j;
     }
   }
@@ -335,10 +584,11 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
   // pieces too, so unmatched characters must coalesce into one piece rather than one piece each.
   // The pattern has no digit alternative, so a "123" segment from stage 1 has to arrive at the
   // merge table whole -- splitting it per digit is why 12345 tokenised as five ids instead of two.
-  for (const std::string& seg : stage2) {
+  for (const Span sp : stage2) {
+    const std::string_view seg = text.substr(sp.off, sp.len);
     size_t i = 0, pending = 0;
     auto flush_pending = [&](size_t upto) {
-      if (upto > pending) out.push_back(seg.substr(pending, upto - pending));
+      if (upto > pending) out.push_back(Span{sp.off + (uint32_t)pending, (uint32_t)(upto - pending)});
     };
     while (i < seg.size()) {
       const size_t start = i;
@@ -351,7 +601,7 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         size_t j = i + 1;
         while (j < seg.size() && (unsigned char)seg[j] < 0x80 && is_letter_cp((unsigned char)seg[j])) ++j;
         flush_pending(i);
-        out.push_back(seg.substr(i, j - i));
+        out.push_back(Span{sp.off + (uint32_t)i, (uint32_t)(j - i)});
         i = pending = j;
         continue;
       }
@@ -365,7 +615,13 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
           if (!is_letter_cp(utf8_cp(seg, k, l2))) break;
           k += l2;
         }
-        if (k > j) { flush_pending(i); out.push_back(seg.substr(i, k - i)); i = pending = k; continue; }
+        if (k > j) {
+          const size_t k_end = std::min(k, seg.size());
+          flush_pending(i);
+          out.push_back(Span{sp.off + (uint32_t)i, (uint32_t)(k_end - i)});
+          i = pending = k;
+          continue;
+        }
       }
       // C: an optional leading space then a punctuation/symbol run, then any newlines.
       {
@@ -376,7 +632,7 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         if (k > j) {
           while (k < seg.size() && is_nl_cp((unsigned char)seg[k])) ++k;
           flush_pending(i);
-          out.push_back(seg.substr(i, k - i));
+          out.push_back(Span{sp.off + (uint32_t)i, (uint32_t)(k - i)});
           i = pending = k;
           continue;
         }
@@ -387,7 +643,12 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         while (j < seg.size() && is_space_cp((unsigned char)seg[j]) && !is_nl_cp((unsigned char)seg[j])) ++j;
         size_t k = j;
         while (k < seg.size() && is_nl_cp((unsigned char)seg[k])) ++k;
-        if (k > j) { flush_pending(i); out.push_back(seg.substr(i, k - i)); i = pending = k; continue; }
+        if (k > j) {
+          flush_pending(i);
+          out.push_back(Span{sp.off + (uint32_t)i, (uint32_t)(k - i)});
+          i = pending = k;
+          continue;
+        }
       }
       // E/F: a whitespace run. When more text follows, the pattern's (?!\S) lookahead leaves the
       // final space attached to the NEXT segment, which is what makes " word" a single token.
@@ -397,7 +658,7 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         if (j > i) {
           if (j < seg.size() && j - i > 1) --j;
           flush_pending(i);
-          out.push_back(seg.substr(i, j - i));
+          out.push_back(Span{sp.off + (uint32_t)i, (uint32_t)(j - i)});
           i = pending = j;
           continue;
         }
@@ -406,6 +667,14 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
     }
     flush_pending(seg.size());
   }
+}
+
+std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
+  std::vector<Span> spans, stage1, stage2;
+  pretokenize_spans(text, spans, stage1, stage2);
+  std::vector<std::string> out;
+  out.reserve(spans.size());
+  for (const Span sp : spans) out.emplace_back(text, sp.off, sp.len);
   return out;
 }
 
@@ -470,9 +739,18 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text, bool add_bos) c
 
   if (resume_byte == 0 && add_bos && bos_ >= 0) out.push_back((uint32_t)bos_);
 
+  const char* fast_bpe_env = std::getenv("AFF_FAST_BPE");
+  const bool use_fast_bpe = (!fast_bpe_env || !*fast_bpe_env || std::strcmp(fast_bpe_env, "0") != 0) &&
+                            fast_bpe_ready_;
+
   // Added tokens are matched on the RAW text before pre-tokenisation, longest first, and the
   // spans between them go through the normal path.
-  auto encode_piece = [&](const std::string& piece) {
+  std::vector<uint32_t> pids;
+  auto encode_piece = [&](std::string_view piece) {
+    if (use_fast_bpe && piece.size() == 1) {
+      out.push_back(byte_to_id_[(uint8_t)piece[0]]);
+      return;
+    }
     if (piece.size() <= 128) {
       std::shared_lock<std::shared_mutex> slk(bpe_mu_);
       auto it = bpe_cache_.find(piece);
@@ -481,14 +759,17 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text, bool add_bos) c
         return;
       }
     }
-    std::vector<uint32_t> pids;
-    for (const std::string& sym : bpe(piece)) {
-      auto it = tok_to_id_.find(sym);
-      if (it != tok_to_id_.end()) { pids.push_back(it->second); continue; }
-      // The byte alphabet covers all 256 values, so this only fires on a truncated vocab.
-      for (unsigned char ch : sym) {
-        auto b = tok_to_id_.find(byte_to_unicode_[ch]);
-        if (b != tok_to_id_.end()) pids.push_back(b->second);
+    pids.clear();
+    if (!use_fast_bpe || !bpe_fast(piece, pids)) {
+      pids.clear();
+      for (const std::string& sym : bpe(std::string(piece))) {
+        auto it = tok_to_id_.find(sym);
+        if (it != tok_to_id_.end()) { pids.push_back(it->second); continue; }
+        // The byte alphabet covers all 256 values, so this only fires on a truncated vocab.
+        for (unsigned char ch : sym) {
+          auto b = tok_to_id_.find(byte_to_unicode_[ch]);
+          if (b != tok_to_id_.end()) pids.push_back(b->second);
+        }
       }
     }
     out.insert(out.end(), pids.begin(), pids.end());
@@ -499,26 +780,49 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text, bool add_bos) c
           bpe_cache_.erase(bpe_fifo_.front());
           bpe_fifo_.pop_front();
         }
-        bpe_fifo_.push_back(piece);
-        bpe_cache_.emplace(piece, std::move(pids));
+        std::string key(piece);
+        bpe_fifo_.push_back(key);
+        bpe_cache_.emplace(std::move(key), pids);
       }
     }
   };
 
   size_t at = resume_byte;
+  std::vector<Span> s1, s2, spans;
   auto flush = [&](size_t from, size_t to) {
     if (to <= from) return;
-    for (const std::string& piece : pretokenize(text.substr(from, to - from)))
-      encode_piece(piece);
+    if (to - from >= 0xFFFFFFFEu) {
+      for (const std::string& piece : pretokenize(text.substr(from, to - from))) {
+        encode_piece(piece);
+      }
+      return;
+    }
+    const std::string_view chunk(text.data() + from, to - from);
+    pretokenize_spans(chunk, spans, s1, s2);
+    for (const Span sp : spans) encode_piece(chunk.substr(sp.off, sp.len));
   };
+  const size_t tlen = text.size();
   size_t i = resume_byte;
-  while (i < text.size()) {
+  while (i < tlen) {
     size_t hit_len = 0;
     uint32_t hit_id = 0;
-    if (added_lead_[(uint8_t)text[i]]) {
-      for (const auto& [content, id] : added_) {
-        if (!content.empty() && text.compare(i, content.size(), content) == 0) {
-          hit_len = content.size(); hit_id = id; break;      // added_ is sorted longest-first
+    const uint8_t b0 = (uint8_t)text[i];
+    if (added_lead_[b0]) {
+      bool pass2 = false;
+      if (i + 1 < tlen) {
+        const uint32_t pair = ((uint32_t)b0 << 8) | (uint8_t)text[i + 1];
+        pass2 = ((added_lead2_[pair >> 6] >> (pair & 63)) & 1ULL) != 0;
+      } else {
+        pass2 = added_len1_[b0] != 0;
+      }
+      if (pass2) {
+        const size_t rem = tlen - i;
+        for (const auto& [content, id] : added_) {
+          if (!content.empty() && content.size() <= rem && content[0] == text[i] &&
+              (content.size() == 1 || content[1] == text[i + 1]) &&
+              std::memcmp(text.data() + i, content.data(), content.size()) == 0) {
+            hit_len = content.size(); hit_id = id; break;      // added_ is sorted longest-first
+          }
         }
       }
     }
