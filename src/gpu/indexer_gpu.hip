@@ -629,7 +629,8 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
         row[i] = valid ? 1u : 0u;
       }
       if (adm) {
-        __syncthreads();
+        // Each thread reads only the row[i] entries it wrote above; compact_row syncs LDS first.
+        lds_barrier();
         compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);
         if (tid == 0) admn[t] = s_base < adm_stride ? s_base : adm_stride;
       }
@@ -904,7 +905,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
   const uint32_t need = state[(size_t)t * 4u + 1u];
   if (row) {
     tie_admit(s_tie, nt, need, tid, sc, row, n_keys, T);
-    __syncthreads();
+    __syncthreads();  // cross-wave global store visibility from tie_admit before compact_row
     if (tid == 0) g_t[0] = 0;                          // back to empty for the next call
     if (adm) {
       compact_row(row, n_keys, tid, adm + (size_t)t * adm_stride, adm_stride, s_wc, &s_base);

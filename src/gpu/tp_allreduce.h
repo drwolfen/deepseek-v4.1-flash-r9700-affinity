@@ -111,6 +111,7 @@ struct TpContext {
   unsigned* flags[kTpMaxRanks] = {};
   unsigned* seq[kTpMaxRanks] = {};            // device-resident per-block counters
   size_t max_floats = 0;                      // per sub-slot, i.e. one whole message
+  size_t scratch_peer_bytes = 0;              // physical bytes allocated per [slot][peer] sub-slot
   int last_scratch_nb = 0;                    // last gridDim.x on scratch; guards slot parity across width changes
   bool ready = false;
 

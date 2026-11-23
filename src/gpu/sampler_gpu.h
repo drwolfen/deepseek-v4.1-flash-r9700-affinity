@@ -85,4 +85,11 @@ bool apply_dry_penalty_hip(float* logits, uint32_t vocab, uint32_t n,
                            uint32_t row_stride, uint32_t col_stride,
                            const uint32_t* d_ids, uint32_t n_ids, float delta, void* stream);
 
+// Fused repetition + DRY penalty pass, semantically identical to calling
+// `apply_repeat_penalty_hip` followed by `apply_dry_penalty_hip`.
+bool apply_penalties_hip(float* logits, uint32_t vocab, uint32_t n, uint32_t row_stride,
+                         uint32_t col_stride, const uint32_t* d_repeat_ids, uint32_t n_repeat,
+                         float repeat_penalty, const uint32_t* d_dry_ids, uint32_t n_dry,
+                         float dry_delta, void* stream);
+
 } // namespace aff

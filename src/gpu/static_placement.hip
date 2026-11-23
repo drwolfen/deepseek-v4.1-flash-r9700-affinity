@@ -57,6 +57,15 @@ bool is_v41_massive_expert(uint32_t n_layer, uint32_t n_expert, uint32_t idx) {
   for (const auto& p : kMassiveTail) if (p[0] == l && p[1] == e) return true;
   return false;
 }
+
+inline bool env_default_on(const char* name) {
+  const char* s = std::getenv(name);
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
+inline bool batch_arena_alias_enabled() { return env_default_on("AFF_BATCH_ARENA_ALIAS"); }
+inline bool skip_bounce_pin_enabled() { return env_default_on("AFF_SKIP_BOUNCE_PIN"); }
+inline bool mover_ev_wait_enabled() { return env_default_on("AFF_MOVER_EV_WAIT"); }
+inline bool hybrid_tile128_enabled() { return env_default_on("AFF_HYBRID_TILE128"); }
 } // namespace
 
 struct StaticPlacement::Impl {
@@ -102,6 +111,7 @@ struct StaticPlacement::Impl {
   // last read by a kernel launched before this record, so ordering behind it is ordering behind
   // every reader. It is recorded lazily — a tick that moves nothing pays nothing.
   std::vector<hipEvent_t> ev_layer;
+  std::vector<hipEvent_t> last_ev_dn; // per-card ev_dn recorded in current dispatch (non-owning)
   // The lead gate's event ring, `kLeadRing` blocks deep, R events a block.
   std::vector<hipEvent_t> lead_ev;
   uint64_t lead_blk = 0;
@@ -180,7 +190,43 @@ struct StaticPlacement::Impl {
 
 };
 
+void StaticPlacement::free_batch_arenas() {
+  int prev = 0;
+  const bool have_prev = hipGetDevice(&prev) == hipSuccess;
+  for (size_t i = 0; i < devs_.size() && i < 8; ++i) {
+    (void)hipSetDevice(devs_[i]);
+    // Interior pointers aliased into bydn_[i] must NEVER be passed to hipFree().
+    if (!barena_aliased_[i]) {
+      for (void* p : {bg_[i], bu_[i], bq8_[i], bqs_[i]})
+        if (p) (void)hipFree(p);
+    }
+    for (void* p : {ba8_[i], bas_[i], bydn_[i], bpack_[i]})
+      if (p) (void)hipFree(p);
+    bg_[i] = bu_[i] = bq8_[i] = bqs_[i] = nullptr;
+    ba8_[i] = bas_[i] = bydn_[i] = bpack_[i] = nullptr;
+    btok_[i] = bwt_[i] = bord_[i] = brun_[i] = btiles_[i] = nullptr;
+    barena_aliased_[i] = false;
+    barena_bytes_[i] = 0;
+    bpack_n_[i] = 0;
+    bcap_slot_[i] = bcap_tile_[i] = bcap_nb_[i] = bcap_tok_[i] = 0;
+    if (bpin_[i]) {
+      (void)hipHostFree(bpin_[i]);
+      bpin_[i] = nullptr;
+    }
+    bpin_stride_[i] = 0;
+    bpin_next_[i] = 0;
+    for (uint32_t s = 0; s < kPinSlots; ++s) {
+      if (bpin_ev_[i][s]) {
+        (void)hipEventDestroy((hipEvent_t)bpin_ev_[i][s]);
+        bpin_ev_[i][s] = nullptr;
+      }
+    }
+  }
+  if (have_prev) (void)hipSetDevice(prev);
+}
+
 StaticPlacement::~StaticPlacement() {
+  free_batch_arenas();
   if (!impl_) return;
   for (size_t i = 0; i < impl_->mv.size(); ++i) {
     if (i < devs_.size()) (void)hipSetDevice(devs_[i]);
@@ -1026,13 +1072,21 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   if (batch_tok && k) {
     const uint64_t bound = (uint64_t)batch_tok * k;
     const uint32_t inter_shard = (tp_parts_ > 1) ? shard_.rows[0] : inter;
-    const uint32_t n_tiles_init =
-        (uint32_t)std::max<uint64_t>(bound, 8ull * aff::moe_plan_tile_cap(batch_tok, k, n_expert));
+    uint32_t n_tiles_init = 0;
+    if (mover_ev_wait_enabled()) {
+      uint32_t gcap[8] = {};
+      n_tiles_init =
+          aff::moe_plan_bucket_caps(batch_tok, k, n_expert, hybrid_tile128_enabled(), gcap);
+    } else {
+      n_tiles_init = (uint32_t)std::max<uint64_t>(
+          bound, 8ull * aff::moe_plan_tile_cap(batch_tok, k, n_expert));
+    }
     for (size_t i = 0; i < devs_.size(); ++i) {
       AFF_HIP_CHECK(hipSetDevice(devs_[i]));
       if (!grow_w8a8(i, (uint32_t)bound, n_tiles_init, batch_tok, hidden, inter_shard, batch_tok,
-                     /*exact_cap=*/true)) {
+                     /*exact_cap=*/true, /*need_bpin=*/false)) {
         if (err) *err = "no VRAM for the batched routed arena at this prefill chunk";
+        free_batch_arenas();
         delete impl_; impl_ = nullptr;
         return false;
       }
@@ -1534,7 +1588,7 @@ inline PinLayout pin_layout(uint32_t cap_tok, uint32_t cap_slot, uint32_t cap_nb
 
 bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uint32_t nb_tok,
                                 uint32_t hidden, uint32_t inter, uint32_t nb_stride,
-                                bool exact_cap) {
+                                bool exact_cap, bool need_bpin) {
   // ---- A GROWTH FREES MEMORY THE CARDS ARE STILL READING -----------------------------------------
   //
   // Every buffer below is named by tiles and launch arguments of dispatches already in flight, and
@@ -1546,16 +1600,19 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
   // handful of synchronises for the life of the process. Draining here is not on the hot path in any
   // sense — reaching it at all means the shape changed.
   bool grew = false;
+  auto sync_all_devs = [&] {
+    if (!grew) {
+      grew = true;
+      for (size_t i = 0; i < devs_.size(); ++i) {
+        if (hipSetDevice(devs_[i]) != hipSuccess) continue;
+        AFF_BLOCK_AT(aff::BlockSite::ArenaGrow, (void)hipDeviceSynchronize());
+      }
+      AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
+    }
+  };
   auto grow = [&](void** p, size_t bytes) {
     if (*p) {
-      if (!grew) {
-        grew = true;
-        for (size_t i = 0; i < devs_.size(); ++i) {
-          if (hipSetDevice(devs_[i]) != hipSuccess) continue;
-          AFF_BLOCK_AT(aff::BlockSite::ArenaGrow, (void)hipDeviceSynchronize());
-        }
-        AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
-      }
+      sync_all_devs();
       AFF_HIP_CHECK(hipFree(*p));
     }
     *p = nullptr;
@@ -1563,17 +1620,104 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
   };
   // Slack on every growth: layers differ in how many slots land on a card, and a realloc a layer
   // would serialise the stream on the free.
-  if (bcap_slot_[dv] < taken) {
-    const uint32_t cap = exact_cap ? taken : (taken + (taken >> 1) + 64);
-    // bf16: gate/up are read once by the SwiGLU, which requantises to E4M3 immediately, and `down`
-    // once by the scatter, which sums into an f32 block. Both consumers run close to their DRAM
-    // roofline over hundreds of MB a call, so the element width is most of what they cost.
-    if (!grow(&bg_[dv], (size_t)inter * cap * sizeof(uint16_t))) return false;
-    if (!grow(&bu_[dv], (size_t)inter * cap * sizeof(uint16_t))) return false;
-    if (!grow(&ba8_[dv], (size_t)cap * inter)) return false;
-    if (!grow(&bas_[dv], (size_t)cap * (inter / 128u) * sizeof(float))) return false;
-    if (!grow(&bydn_[dv], (size_t)hidden * cap * sizeof(uint16_t))) return false;
-    bcap_slot_[dv] = cap;
+  //
+  // Phase lifetimes inside one layer dispatch on (st, hyb) when !imat_on_:
+  //   Phase 1/2: batch_quant_fp8 writes (bq8_, bqs_), Gate/Up GEMMs read them and write (bg_, bu_),
+  //              expert_swiglu_quant reads (bg_, bu_) and writes separate (ba8_, bas_), followed by
+  //              ev_gu/ev_sw stream barriers.
+  //   Phase 3:   Down GEMMs read (ba8_, bas_) and write (bydn_), then scatter reads (bydn_).
+  // Thus (bg_, bu_, bq8_, bqs_) and (bydn_) are strictly disjoint in lifetime and can share one
+  // backing allocation at `bydn_[dv]` (saving ~19.6-78.4 MiB/card). `ba8_`/`bas_` overlap both
+  // phases and stay separate allocations.
+  const bool want_alias = batch_arena_alias_enabled() && !imat_on_;
+  if (want_alias) {
+    if (!barena_aliased_[dv]) {
+      for (void** p : {&bg_[dv], &bu_[dv], &bq8_[dv], &bqs_[dv]}) {
+        if (*p) {
+          sync_all_devs();
+          AFF_HIP_CHECK(hipFree(*p));
+          *p = nullptr;
+        }
+      }
+    }
+    const bool need_slot_grow = (bcap_slot_[dv] < taken);
+    const bool need_nb_grow = (bcap_nb_[dv] < nb_stride);
+    if (need_slot_grow || need_nb_grow || !barena_aliased_[dv] || !bydn_[dv]) {
+      const uint32_t slot_cap =
+          need_slot_grow ? (exact_cap ? taken : (taken + (taken >> 1) + 64u)) : bcap_slot_[dv];
+      const uint32_t nb_cap = need_nb_grow ? nb_stride : bcap_nb_[dv];
+
+      if (need_slot_grow) {
+        if (!grow(&ba8_[dv], (size_t)slot_cap * inter)) return false;
+        if (!grow(&bas_[dv], (size_t)slot_cap * (inter / 128u) * sizeof(float))) return false;
+      }
+
+      auto align256 = [](size_t n) { return (n + 255u) & ~(size_t)255u; };
+      const size_t dn_bytes  = (size_t)hidden * slot_cap * sizeof(uint16_t);
+      const size_t bg_bytes  = (size_t)inter * slot_cap * sizeof(uint16_t);
+      const size_t bu_bytes  = (size_t)inter * slot_cap * sizeof(uint16_t);
+      const size_t bq8_bytes = (size_t)nb_cap * hidden;
+      const size_t bqs_bytes = (size_t)nb_cap * (hidden / 128u) * sizeof(float);
+      const size_t off_bg    = 0u;
+      const size_t off_bu    = align256(off_bg + bg_bytes);
+      const size_t off_bq8   = align256(off_bu + bu_bytes);
+      const size_t off_bqs   = align256(off_bq8 + bq8_bytes);
+      const size_t need_arena = std::max(dn_bytes, off_bqs + bqs_bytes);
+
+      if (!bydn_[dv] || need_arena > barena_bytes_[dv]) {
+        // Clear interior aliases before grow() frees bydn_[dv] so OOM never leaves dangling aliases.
+        if (barena_aliased_[dv]) {
+          bg_[dv] = bu_[dv] = bq8_[dv] = bqs_[dv] = nullptr;
+          barena_aliased_[dv] = false;
+        }
+        if (!grow(&bydn_[dv], need_arena)) {
+          barena_bytes_[dv] = 0;
+          bcap_slot_[dv] = 0;
+          bcap_nb_[dv] = 0;
+          return false;
+        }
+        barena_bytes_[dv] = need_arena;
+      } else if (barena_aliased_[dv]) {
+        sync_all_devs();
+      }
+
+      uint8_t* const base = (uint8_t*)bydn_[dv];
+      bg_[dv]  = base + off_bg;
+      bu_[dv]  = base + off_bu;
+      bq8_[dv] = base + off_bq8;
+      bqs_[dv] = base + off_bqs;
+      barena_aliased_[dv] = true;
+      bcap_slot_[dv] = slot_cap;
+      bcap_nb_[dv] = nb_cap;
+    }
+  } else {
+    if (barena_aliased_[dv]) {
+      // Never hipFree interior alias pointers when switching back to standalone allocations.
+      sync_all_devs();
+      bg_[dv] = bu_[dv] = bq8_[dv] = bqs_[dv] = nullptr;
+      barena_aliased_[dv] = false;
+      bcap_slot_[dv] = 0;
+      bcap_nb_[dv] = 0;
+    }
+    if (bcap_slot_[dv] < taken) {
+      const uint32_t cap = exact_cap ? taken : (taken + (taken >> 1) + 64);
+      // bf16: gate/up are read once by the SwiGLU, which requantises to E4M3 immediately, and `down`
+      // once by the scatter, which sums into an f32 block. Both consumers run close to their DRAM
+      // roofline over hundreds of MB a call, so the element width is most of what they cost.
+      if (!grow(&bg_[dv], (size_t)inter * cap * sizeof(uint16_t))) return false;
+      if (!grow(&bu_[dv], (size_t)inter * cap * sizeof(uint16_t))) return false;
+      if (!grow(&ba8_[dv], (size_t)cap * inter)) return false;
+      if (!grow(&bas_[dv], (size_t)cap * (inter / 128u) * sizeof(float))) return false;
+      const size_t dn_bytes = (size_t)hidden * cap * sizeof(uint16_t);
+      if (!grow(&bydn_[dv], dn_bytes)) { barena_bytes_[dv] = 0; return false; }
+      barena_bytes_[dv] = dn_bytes;
+      bcap_slot_[dv] = cap;
+    }
+    if (bcap_nb_[dv] < nb_stride) {
+      if (!grow(&bq8_[dv], (size_t)nb_stride * hidden)) return false;
+      if (!grow(&bqs_[dv], (size_t)nb_stride * (hidden / 128u) * sizeof(float))) return false;
+      bcap_nb_[dv] = nb_stride;
+    }
   }
   if (bcap_tok_[dv] < taken * 2u) {
     const uint32_t cap = exact_cap ? (taken * 2u) : (taken * 2u + taken + 64);
@@ -1582,11 +1726,6 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
   if (bcap_tile_[dv] < n_tiles) {
     const uint32_t cap = exact_cap ? n_tiles : (n_tiles + (n_tiles >> 1) + 16);
     bcap_tile_[dv] = cap;
-  }
-  if (bcap_nb_[dv] < nb_stride) {
-    if (!grow(&bq8_[dv], (size_t)nb_stride * hidden)) return false;
-    if (!grow(&bqs_[dv], (size_t)nb_stride * (hidden / 128u) * sizeof(float))) return false;
-    bcap_nb_[dv] = nb_stride;
   }
   // ONE device buffer for the five uploads, laid out exactly like the pinned slot, so the layer's
   // whole argument block is a single copy. ROCm runs a copyBuffer KERNEL for small host-to-device
@@ -1604,23 +1743,31 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
     brun_[dv] = P + PL.run; btiles_[dv] = P + PL.tiles;
   }
   // The pinned ring, sized from the caps just settled so a slot always holds a whole layer.
+  // When AFF_SKIP_BOUNCE_PIN is enabled, defer allocation until host-build (!plan_on) needs it,
+  // and skip entirely when AFF_POOL_FULL=1 / registered pinned host pool is in effect.
   {
-    const size_t need =
-        pin_layout(bcap_tok_[dv], bcap_slot_[dv], bcap_nb_[dv], bcap_tile_[dv]).total;
-    if (need > bpin_stride_[dv]) {
-      if (bpin_[dv]) {
-        AFF_BLOCK_AT(aff::BlockSite::ArenaGrow, (void)hipDeviceSynchronize());
-        AFF_HIP_CHECK(hipHostFree(bpin_[dv]));
-      }
-      bpin_[dv] = nullptr;
-      if (hipHostMalloc(&bpin_[dv], need * kPinSlots, hipHostMallocDefault) != hipSuccess)
-        return false;
-      bpin_stride_[dv] = need;
-      for (uint32_t s = 0; s < kPinSlots; ++s)
-        if (!bpin_ev_[dv][s] &&
-            hipEventCreateWithFlags((hipEvent_t*)&bpin_ev_[dv][s], hipEventDisableTiming) !=
-                hipSuccess)
+    const char* pf_env = std::getenv("AFF_POOL_FULL");
+    const bool pf_set_on = pf_env && *pf_env && std::strcmp(pf_env, "0") != 0;
+    const bool skip_bpin = skip_bounce_pin_enabled() &&
+                           (!need_bpin || pool_full_ || pool_registered_ || pf_set_on);
+    if (!skip_bpin) {
+      const size_t need =
+          pin_layout(bcap_tok_[dv], bcap_slot_[dv], bcap_nb_[dv], bcap_tile_[dv]).total;
+      if (need > bpin_stride_[dv]) {
+        if (bpin_[dv]) {
+          sync_all_devs();
+          AFF_HIP_CHECK(hipHostFree(bpin_[dv]));
+        }
+        bpin_[dv] = nullptr;
+        if (hipHostMalloc(&bpin_[dv], need * kPinSlots, hipHostMallocDefault) != hipSuccess)
           return false;
+        bpin_stride_[dv] = need;
+        for (uint32_t s = 0; s < kPinSlots; ++s)
+          if (!bpin_ev_[dv][s] &&
+              hipEventCreateWithFlags((hipEvent_t*)&bpin_ev_[dv][s], hipEventDisableTiming) !=
+                  hipSuccess)
+            return false;
+      }
     }
   }
   (void)nb_tok;
@@ -1796,6 +1943,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
   }
   // What the launches read, whichever build filled it in.
   struct Groups { ExpertTile* base[8][3] = {}; uint32_t n[8] = {}, max_nt[8] = {}; };
+  I.last_ev_dn.assign(R, nullptr);
 
   for (size_t dv = 0; dv < R; ++dv) {
     if (!d_x[dv] || !d_block[dv] || !streams[dv]) continue;
@@ -1948,10 +2096,21 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         // The tile array is laid out [plane][class][tile_cap] rather than packed, because a host
         // that has not seen the routing cannot know where a packed class would start. `tile_cap` is
         // a function of nb_tok, k and n_expert, all of which it does know.
-        const uint32_t cap = moe_plan_tile_cap(nb_tok, k, n_expert_);
-        if (!grow_w8a8(dv, taken, 8u * cap, nb_tok, hidden, inter, nb_stride)) {
+        const bool hybrid_tile128 = hybrid_tile128_enabled();
+        const bool use_bucket_caps = mover_ev_wait_enabled();
+        uint32_t gcap[8] = {}, goff[8] = {};
+        uint32_t cap = 0, plane_tiles = 0;
+        if (use_bucket_caps) {
+          plane_tiles = moe_plan_bucket_caps(nb_tok, k, n_expert_, hybrid_tile128, gcap);
+          for (uint32_t g = 1; g < 8u; ++g) goff[g] = goff[g - 1] + gcap[g - 1];
+        } else {
+          cap = moe_plan_tile_cap(nb_tok, k, n_expert_);
+          plane_tiles = 8u * cap;
+        }
+        if (!grow_w8a8(dv, taken, plane_tiles, nb_tok, hidden, inter, nb_stride,
+                       /*exact_cap=*/false, /*need_bpin=*/false)) {
           aff::ui::fatal("fatal: the routed arena would not grow to %u slots and %u tiles on "
-                       "card %zu\n", taken, 8u * cap, dv);
+                       "card %zu\n", taken, plane_tiles, dv);
           std::abort();
         }
         if (!plan_scratch(dv, (uint32_t)total)) {
@@ -1990,11 +2149,16 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         A.sparse_act = act_ring_v2;
         A.shard = shard_;
         A.bg = (uint16_t*)bg_[dv]; A.bu = (uint16_t*)bu_[dv]; A.bydn = (uint16_t*)bydn_[dv];
-        A.tile_cap = cap;
-        static const bool hybrid_tile128 = [] {
-          const char* s = std::getenv("AFF_HYBRID_TILE128");
-          return !s || !*s || std::strcmp(s, "0") != 0;
-        }();
+        if (use_bucket_caps) {
+          A.tile_cap = 0u;
+          A.plane_stride = plane_tiles;
+          for (uint32_t g = 0; g < 8u; ++g) {
+            A.group_off[g] = goff[g];
+            A.group_cap[g] = gcap[g];
+          }
+        } else {
+          A.tile_cap = cap;
+        }
         A.pref_slab = d_pref_slab_[dv];
         A.pref_src  = d_pref_src_[dv];
         A.pref_cap  = pref_cap_;
@@ -2020,21 +2184,26 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
             ((dv * n_layer_ + layer) < I.pooled_layer_cnt.size() &&
              I.pooled_layer_cnt[dv * n_layer_ + layer] > 0u);
         const uint32_t n_cls = has_pooled ? 2u : 1u;
+        uint64_t launched_tiles = 0;
         for (uint32_t cls = 0; cls < n_cls; ++cls) {
           const uint32_t last_b = (cls == 0u) ? last_res : last_hyb;
           for (uint32_t b = 0; b <= last_b; ++b) {
             const uint32_t g = cls * 4u + b;
-            GRP.n[g] = cap;
+            const uint32_t gn = use_bucket_caps ? gcap[g] : cap;
+            const uint32_t go = use_bucket_caps ? goff[g] : g * cap;
+            GRP.n[g] = gn;
             GRP.max_nt[g] = moe_plan_group_max_nt(g);
+            launched_tiles += gn;
             for (uint32_t pl = 0; pl < 3u; ++pl)
-              GRP.base[g][pl] = Tg + (size_t)(pl * 8u + g) * cap;
+              GRP.base[g][pl] = Tg + (size_t)pl * plane_tiles + go;
           }
         }
-        n_miss_tiles = has_pooled ? cap : 0u;
+        n_miss_tiles = has_pooled
+                           ? (use_bucket_caps ? (gcap[4] + gcap[5] + gcap[6] + gcap[7]) : cap)
+                           : 0u;
         _xbucket.stop();
         trace::g_xt.taken[dv] += taken;
-        trace::g_xt.tiles[dv] +=
-            (uint64_t)(last_res + 1u + (has_pooled ? (last_hyb + 1u) : 0u)) * cap;
+        trace::g_xt.tiles[dv] += launched_tiles;
       } else {
       // Tiles, split at the kernel's widest token block and ordered by the NT template they need.
       // A tile of 8 tokens launched under NT=8 would stage and multiply 128 columns to use 8, so
@@ -2091,7 +2260,8 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       // kernels later: a failed hipMalloc leaves the sticky error, this path just declines the
       // work, and the next AFF_HIP_CHECK anywhere in the engine is the one that dies.
       //
-      if (!grow_w8a8(dv, taken, nt_tiles, nb_tok, hidden, inter, nb_stride)) {
+      if (!grow_w8a8(dv, taken, nt_tiles, nb_tok, hidden, inter, nb_stride,
+                     /*exact_cap=*/false, /*need_bpin=*/true)) {
         static bool said = false;
         if (!said) {
           said = true;
@@ -2150,34 +2320,45 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         trace::g_xt.padded[dv] += (uint64_t)(bbeg[b + 1] - bbeg[b]) * bmax[b];
 
       { AFF_XTRACE((int)dv, 1, st);
-      // Through the pinned ring, and with NO stream synchronise afterwards. Out of the vectors
-      // directly these were pageable, which means the driver stages each one itself and runs a
-      // copyBuffer KERNEL on the compute stream to do it, and the call blocks the host — so the
-      // code had to drain before it could reuse the vectors on the next card — hundreds of blits a
-      // cycle a rank, plus the gaps between them, plus a second full drain per layer per card beside
-      // the router's. From pinned memory it is a DMA that never touches the compute stream's kernel
-      // slots.
-      const uint32_t ps = bpin_next_[dv];
-      bpin_next_[dv] = (ps + 1) % kPinSlots;
-      AFF_BLOCK_AT(aff::BlockSite::PinRing,
-                   AFF_HIP_CHECK(hipEventSynchronize((hipEvent_t)bpin_ev_[dv][ps])));
-      const PinLayout PL = pin_layout(bcap_tok_[dv], bcap_slot_[dv], bcap_nb_[dv], bcap_tile_[dv]);
-      uint8_t* const slot = (uint8_t*)bpin_[dv] + (size_t)ps * bpin_stride_[dv];
       const size_t n_tok = (size_t)taken * 2 * sizeof(uint32_t);
       const size_t n_wt = (size_t)taken * sizeof(float);
       const size_t n_ord = (size_t)taken * sizeof(uint32_t);
       const size_t n_run = ((size_t)nb_tok + 1) * sizeof(uint32_t);
       const size_t n_tiles_b = h_tiles.size() * sizeof(ExpertTile);
-      std::memcpy(slot + PL.tok, h_tok.data(), n_tok);
-      std::memcpy(slot + PL.wt, gwt.data(), n_wt);
-      std::memcpy(slot + PL.ord, h_ord.data(), n_ord);
-      std::memcpy(slot + PL.run, h_run.data(), n_run);
-      std::memcpy(slot + PL.tiles, h_tiles.data(), n_tiles_b);
-      // ONE copy of the whole slot, padding included: it is ~8 KiB against five dispatches.
-      AFF_HIP_CHECK(hipMemcpyAsync(bpack_[dv], slot, PL.tiles + n_tiles_b, hipMemcpyHostToDevice,
-                                   st));
-      (void)n_tok; (void)n_wt; (void)n_ord; (void)n_run; (void)Tg;
-      AFF_HIP_CHECK(hipEventRecord((hipEvent_t)bpin_ev_[dv][ps], st)); }
+      if (bpin_[dv]) {
+        // Through the pinned ring, and with NO stream synchronise afterwards. Out of the vectors
+        // directly these were pageable, which means the driver stages each one itself and runs a
+        // copyBuffer KERNEL on the compute stream to do it, and the call blocks the host — so the
+        // code had to drain before it could reuse the vectors on the next card — hundreds of blits a
+        // cycle a rank, plus the gaps between them, plus a second full drain per layer per card beside
+        // the router's. From pinned memory it is a DMA that never touches the compute stream's kernel
+        // slots.
+        const uint32_t ps = bpin_next_[dv];
+        bpin_next_[dv] = (ps + 1) % kPinSlots;
+        AFF_BLOCK_AT(aff::BlockSite::PinRing,
+                     AFF_HIP_CHECK(hipEventSynchronize((hipEvent_t)bpin_ev_[dv][ps])));
+        const PinLayout PL = pin_layout(bcap_tok_[dv], bcap_slot_[dv], bcap_nb_[dv], bcap_tile_[dv]);
+        uint8_t* const slot = (uint8_t*)bpin_[dv] + (size_t)ps * bpin_stride_[dv];
+        std::memcpy(slot + PL.tok, h_tok.data(), n_tok);
+        std::memcpy(slot + PL.wt, gwt.data(), n_wt);
+        std::memcpy(slot + PL.ord, h_ord.data(), n_ord);
+        std::memcpy(slot + PL.run, h_run.data(), n_run);
+        std::memcpy(slot + PL.tiles, h_tiles.data(), n_tiles_b);
+        // ONE copy of the whole slot, padding included: it is ~8 KiB against five dispatches.
+        AFF_HIP_CHECK(hipMemcpyAsync(bpack_[dv], slot, PL.tiles + n_tiles_b, hipMemcpyHostToDevice,
+                                     st));
+        AFF_HIP_CHECK(hipEventRecord((hipEvent_t)bpin_ev_[dv][ps], st));
+      } else {
+        // AFF_SKIP_BOUNCE_PIN: bpin_ skipped; copy straight into bpack_ slices and sync before the
+        // thread_local host vectors are reused on the next card.
+        if (n_tok) AFF_HIP_CHECK(hipMemcpyAsync(btok_[dv], h_tok.data(), n_tok, hipMemcpyHostToDevice, st));
+        if (n_wt) AFF_HIP_CHECK(hipMemcpyAsync(bwt_[dv], gwt.data(), n_wt, hipMemcpyHostToDevice, st));
+        if (n_ord) AFF_HIP_CHECK(hipMemcpyAsync(bord_[dv], h_ord.data(), n_ord, hipMemcpyHostToDevice, st));
+        if (n_run) AFF_HIP_CHECK(hipMemcpyAsync(brun_[dv], h_run.data(), n_run, hipMemcpyHostToDevice, st));
+        if (n_tiles_b) AFF_HIP_CHECK(hipMemcpyAsync(btiles_[dv], h_tiles.data(), n_tiles_b, hipMemcpyHostToDevice, st));
+        AFF_HIP_CHECK(hipStreamSynchronize(st));
+      }
+      (void)Tg; }
       }   // the host build ends here; both paths have filled GRP and stopped the bucket scope
 
       // ---- the layer, on two streams -----------------------------------------------------------
@@ -2336,6 +2517,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       if (split) {
         AFF_HIP_CHECK(hipEventRecord(I.ev_dn[dv][es], hyb));
         AFF_HIP_CHECK(hipStreamWaitEvent(st, I.ev_dn[dv][es], 0));
+        if (dv < I.last_ev_dn.size()) I.last_ev_dn[dv] = I.ev_dn[dv][es];
       }
       if (block_wait_ev && block_wait_ev[dv]) {
         AFF_HIP_CHECK(hipStreamWaitEvent(st, (hipEvent_t)block_wait_ev[dv], 0));
@@ -2373,6 +2555,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       engine_tick(layer, sel, total, streams, plan_on);
     }
   }
+  I.last_ev_dn.clear();
 
   // ---- what the card says about the plan, read BEHIND the issue frontier -------------------------
   //
@@ -2670,23 +2853,24 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
   for (uint32_t m = 0; m < I.moves.size(); ++m)
     if (I.moves[m].state == Impl::Move::State::Free) { slot = m; break; }
   if (slot == UINT32_MAX) { ++estats_.no_slot; return false; }
+  for (size_t dv = 0; dv < R; ++dv)
+    if (!streams[dv]) return false;
   Impl::Move& M = I.moves[slot];
 
-  // The gate, recorded ONCE PER TICK and only when a move is actually going out. Everything the
-  // mover issues this tick waits on it, and it is downstream of every launch made up to now —
-  // including the hybrid stream's, which run_batch_device joined back into the compute stream
-  // before the scatter, so one event on the compute stream covers both.
-  //
-  // Once per tick, not once per move: re-recording it per move is a dozen-odd event records a layer
-  // for one event's worth of information, all of them restating the same ordering constraint.
-  if (I.gate_tick != estats_.ticks) {
-    for (size_t dv = 0; dv < R; ++dv) {
-      if (!streams[dv]) return false;
-      AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
-      AFF_HIP_CHECK(hipEventRecord(I.ev_layer[dv], (hipStream_t)streams[dv]));
+  const bool mover_ev_wait = mover_ev_wait_enabled();
+  // The gate, recorded ONCE PER TICK and only when a move needs compute-stream ordering.
+  // With AFF_MOVER_EV_WAIT=1, promote H2D targets a slab slot already cleared by quarantine
+  // (M.ev[dv] signaled on compute stream before entering free_slab) and waits only on this
+  // dispatch's `ev_dn` (if hybrid ran) so H2D does not contend with hybrid's PCIe down GEMM.
+  auto ensure_ev_layer = [&] {
+    if (I.gate_tick != estats_.ticks) {
+      for (size_t dv = 0; dv < R; ++dv) {
+        AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
+        AFF_HIP_CHECK(hipEventRecord(I.ev_layer[dv], (hipStream_t)streams[dv]));
+      }
+      I.gate_tick = estats_.ticks;
     }
-    I.gate_tick = estats_.ticks;
-  }
+  };
 
   M.promote = promote;
   M.idx = idx;
@@ -2696,12 +2880,18 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
     const int64_t ps = pool_mut_->slot_of(l, e);
     uint8_t* src = pool_mut_->slot_base(ps);
     if (!src) return false;                       // on the ssd tier: not ours to move, see pick()
+    if (!mover_ev_wait) ensure_ev_layer();
     M.pool_slot = ps;
     M.slab_slot = I.free_slab.back();
     I.free_slab.pop_back();
     for (size_t dv = 0; dv < R; ++dv) {
       AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
-      AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.ev_layer[dv], 0));
+      if (mover_ev_wait) {
+        if (dv < I.last_ev_dn.size() && I.last_ev_dn[dv])
+          AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.last_ev_dn[dv], 0));
+      } else {
+        AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.ev_layer[dv], 0));
+      }
       // AFF_MOVER_DUP re-issues this copy, which prices the mover's bytes without touching the
       // policy: the repeats write the same bytes to the same slot, so residency, routing and the
       // emitted text are all identical and the only thing that moves is link traffic. A slope of
@@ -2723,6 +2913,7 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
     const int64_t g = I.free_pool.back();
     uint8_t* dst = pool_mut_->slot_base(g);
     if (!dst) return false;
+    ensure_ev_layer();
     I.free_pool.pop_back();
     M.pool_slot = g;
     M.slab_slot = offset_of_[idx] / ss;
@@ -3270,6 +3461,25 @@ bool aff::StaticPlacement::imatrix_init(uint32_t hidden, uint32_t inter_full,
       return false;
     }
     (void)hipMemset(d_imat_w2_[dv], 0, b_w2);
+    // Un-alias phase slices when imatrix is enabled after init() so imatrix_on_ never relies on aliasing.
+    if (barena_aliased_[dv]) {
+      void* n_bg = nullptr; void* n_bu = nullptr; void* n_bq8 = nullptr; void* n_bqs = nullptr;
+      const size_t s_bg  = (size_t)imat_inter_shard_ * bcap_slot_[dv] * sizeof(uint16_t);
+      const size_t s_bu  = s_bg;
+      const size_t s_bq8 = (size_t)bcap_nb_[dv] * imat_hidden_;
+      const size_t s_bqs = (size_t)bcap_nb_[dv] * (imat_hidden_ / 128u) * sizeof(float);
+      if ((s_bg && hipMalloc(&n_bg, s_bg) != hipSuccess) ||
+          (s_bu && hipMalloc(&n_bu, s_bu) != hipSuccess) ||
+          (s_bq8 && hipMalloc(&n_bq8, s_bq8) != hipSuccess) ||
+          (s_bqs && hipMalloc(&n_bqs, s_bqs) != hipSuccess)) {
+        for (void* p : {n_bg, n_bu, n_bq8, n_bqs}) if (p) (void)hipFree(p);
+        (void)hipSetDevice(prev);
+        if (err) *err = "hipMalloc failed un-aliasing batch arena for imatrix on card " + std::to_string(dv);
+        return false;
+      }
+      bg_[dv] = n_bg; bu_[dv] = n_bu; bq8_[dv] = n_bq8; bqs_[dv] = n_bqs;
+      barena_aliased_[dv] = false;
+    }
   }
   (void)hipSetDevice(prev);
   imat_on_ = true;

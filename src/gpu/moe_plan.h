@@ -167,7 +167,7 @@ struct MoePlanArgs {
   uint32_t* ord = nullptr;            // [taken] slots sorted by token
   uint32_t* run = nullptr;            // [nb_tok+1] prefix of per-token slot counts
   uint32_t* slot_col = nullptr;       // [nb_tok*k] scratch: the arena column of each slot
-  ExpertTile* tiles = nullptr;        // [3][8][tile_cap]
+  ExpertTile* tiles = nullptr;        // [3][8][tile_cap] or [3][plane_stride] when plane_stride>0
   uint32_t* counts = nullptr;         // [8] tiles per (class, bucket)
   MoePlanStatus* status = nullptr;
   // The activation ring, or null. One card writes it — the two select the same experts, so a ring
@@ -182,6 +182,12 @@ struct MoePlanArgs {
   uint16_t* bu = nullptr;
   uint16_t* bydn = nullptr;
   uint32_t tile_cap = 0;              // per-class capacity; see moe_plan_tile_cap
+  // Optional per-group tile layout (AFF_MOVER_EV_WAIT=1): when `plane_stride > 0`, plane `pl`
+  // spans `plane_stride` tiles and group `g` occupies `[group_off[g], group_off[g] + group_cap[g])`.
+  // When `plane_stride == 0`, the legacy uniform `[3][8][tile_cap]` layout is used.
+  uint32_t group_off[8] = {};
+  uint32_t group_cap[8] = {};
+  uint32_t plane_stride = 0;
 
   // Optional VRAM prefetch ring for pooled (cls == 1) experts (AFF_PREFETCH_RING=N).
   uint8_t*        pref_slab = nullptr;
@@ -235,6 +241,55 @@ constexpr uint32_t moe_plan_group_max_nt(uint32_t group) { return 16u << (group 
 constexpr uint32_t moe_plan_last_group(uint32_t nb_tok) {
   const uint32_t w = nb_tok < kExpertWmmaTok ? nb_tok : kExpertWmmaTok;
   return w <= 16u ? 0u : w <= 32u ? 1u : 2u;
+}
+
+// Tight per-(class, NT bucket) tile capacities: sizes each bucket by the minimum slots per tile
+// that bucket requires (`>=1`, `>=17`, `>=33`, `>=65`) and zeros unreachable buckets rather than
+// allocating worst-case `tile_cap` uniformly across all 8 groups. Returns total tiles per plane.
+constexpr uint32_t moe_plan_bucket_caps(uint32_t nb_tok, uint32_t k, uint32_t n_expert,
+                                        bool hybrid_tile128, uint32_t cap[8]) {
+  for (uint32_t g = 0; g < 8u; ++g) cap[g] = 0u;
+  if (!nb_tok || !k || !n_expert) return 0u;
+  const uint64_t taken64 = (uint64_t)nb_tok * k;
+  const uint32_t taken = taken64 > 0xffffffffull ? 0xffffffffu : (uint32_t)taken64;
+  const uint32_t distinct = taken < n_expert ? taken : n_expert;
+  const uint32_t last_res = moe_plan_last_group(nb_tok);
+  const uint32_t last_hyb = (hybrid_tile128 && nb_tok > kExpertWmmaTok) ? 3u : last_res;
+
+  cap[0] = distinct;
+  if (last_res >= 1u) {
+    const uint32_t b1 = taken / 17u;
+    cap[1] = distinct < b1 ? distinct : b1;
+  }
+  if (last_res >= 2u) {
+    const uint32_t b2a = taken / 33u;
+    const uint32_t b2b = distinct + taken / kExpertWmmaTok;
+    cap[2] = b2a < b2b ? b2a : b2b;
+  }
+
+  cap[4] = distinct;
+  if (last_hyb >= 1u) {
+    const uint32_t b5 = taken / 17u;
+    cap[5] = distinct < b5 ? distinct : b5;
+  }
+  if (last_hyb >= 2u) {
+    const uint32_t b6a = taken / 33u;
+    if (hybrid_tile128) {
+      cap[6] = distinct < b6a ? distinct : b6a;
+    } else {
+      const uint32_t b6b = distinct + taken / kExpertWmmaTok;
+      cap[6] = b6a < b6b ? b6a : b6b;
+    }
+  }
+  if (last_hyb >= 3u) {
+    const uint32_t b7a = taken / 65u;
+    const uint32_t b7b = distinct + taken / 128u;
+    cap[7] = b7a < b7b ? b7a : b7b;
+  }
+
+  uint32_t sum = 0u;
+  for (uint32_t g = 0; g < 8u; ++g) sum += cap[g];
+  return sum;
 }
 
 } // namespace aff

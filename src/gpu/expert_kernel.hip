@@ -933,7 +933,7 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     for (uint32_t q = 0; q < 8; ++q) {
       const uint32_t row = m0 + (wave * MT + i) * 16 + wmma::acc_row(lane, q);
       if (row >= rows) continue;
-      const float rs = bf16_to_f32_dev(as_global(rscales)[row]) * wscale;
+      const float rs = bf16_to_f32_dev(ld_nt(&as_global(rscales)[row])) * wscale;
 #pragma unroll
       for (uint32_t j = 0; j < NT; ++j) {
         const uint32_t t = tok0 + j * 16;
@@ -1189,6 +1189,7 @@ __global__ void expert_scatter_tokens_summed_kernel(const float* __restrict__ sr
 // Each matrix carries its own activation. The down projections of six experts share an output vector
 // but not an input, so batching them needs this form. `x` is read from global: it is per-matrix, so
 // staging it in LDS would have to be redone for every matrix anyway.
+template <bool NT_LOAD>
 __global__ __launch_bounds__(kThreads) void expert_gemv_multix_kernel(
     BatchPtrs p,
     const float* __restrict__ weights,
@@ -1217,13 +1218,18 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_multix_kernel(
        row += gridDim.x * kWavesPerBlock) {
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     for (uint32_t m = 0; m < n_mats; ++m) {
-      const float rs = bf16_to_f32_dev(p.rscales[m][row]) * weights[m];
+      const float rs = bf16_to_f32_dev(aff::load_nt<NT_LOAD>(&as_global(p.rscales[m])[row])) *
+                       weights[m];
       if (rs == 0.0f) continue;
       const float* xm = p.xs[m];
-      const uint32_t* crow = (const uint32_t*)(p.data[m]) + (size_t)row * code_words_row;
-      const uint32_t* frow = (const uint32_t*)(p.scales[m]) + (size_t)row * field_words_row;
-      for (uint32_t i = lane; i < code_words_row; i += kWave) s_code[wave][i] = crow[i];
-      for (uint32_t i = lane; i < field_words_row; i += kWave) s_field[wave][i] = frow[i];
+      const AFF_GLOBAL uint32_t* crow =
+          as_global((const uint32_t*)(p.data[m]) + (size_t)row * code_words_row);
+      const AFF_GLOBAL uint32_t* frow =
+          as_global((const uint32_t*)(p.scales[m]) + (size_t)row * field_words_row);
+      for (uint32_t i = lane; i < code_words_row; i += kWave)
+        s_code[wave][i] = aff::load_nt<NT_LOAD>(&crow[i]);
+      for (uint32_t i = lane; i < field_words_row; i += kWave)
+        s_field[wave][i] = aff::load_nt<NT_LOAD>(&frow[i]);
       __builtin_amdgcn_s_waitcnt(0);
       __builtin_amdgcn_wave_barrier();
 
@@ -1301,7 +1307,7 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_multix_kernel(
 //
 // `row[r]` are the RB rows this lane owns; they are kWave apart, so each row's 32 lanes still read
 // 32 consecutive `idx` and the code loads stay coalesced.
-template <uint32_t FMT, uint32_t RB>
+template <uint32_t FMT, uint32_t RB, bool NT_LOAD = true>
 __device__ __forceinline__ void tr_mat_dot_rb(const BatchPtrs& p, uint32_t m,
                                               const uint32_t* __restrict__ row,
                                               const bool* __restrict__ live,
@@ -1328,9 +1334,15 @@ __device__ __forceinline__ void tr_mat_dot_rb(const BatchPtrs& p, uint32_t m,
         // the fifth dword of the last lane of the last group is the last dword of the plane —
         // this addressing needs no tail padding, where row-major did.
         const auto* c32 = (const AFF_GLOBAL uint32_t*)(dm + idx * 20);
-        a0[r] = c32[0]; a1[r] = c32[1]; a2[r] = c32[2]; a3[r] = c32[3]; a4[r] = c32[4];
+        a0[r] = aff::load_nt<NT_LOAD>(&c32[0]);
+        a1[r] = aff::load_nt<NT_LOAD>(&c32[1]);
+        a2[r] = aff::load_nt<NT_LOAD>(&c32[2]);
+        a3[r] = aff::load_nt<NT_LOAD>(&c32[3]);
+        a4[r] = aff::load_nt<NT_LOAD>(&c32[4]);
+        // `idx * 3` is 1-byte aligned (odd for odd idx), so read 2+1 bytes via aff_u16_ua.
         const auto* fp = as_global(fm + idx * 3);
-        af[r] = (uint32_t)fp[0] | ((uint32_t)fp[1] << 8) | ((uint32_t)fp[2] << 16);
+        af[r] = (uint32_t)aff::load_nt<NT_LOAD>((const AFF_GLOBAL aff::aff_u16_ua*)fp) |
+                ((uint32_t)aff::load_nt<NT_LOAD>(&fp[2]) << 16);
       }
     }
   };
@@ -1408,17 +1420,17 @@ __device__ __forceinline__ void tr_mat_dot_rb(const BatchPtrs& p, uint32_t m,
 }
 
 // One matrix, one row — the RB=1 case, kept as the name the accumulating kernel calls.
-template <uint32_t FMT>
+template <uint32_t FMT, bool NT_LOAD = true>
 __device__ __forceinline__ float tr_mat_dot(const BatchPtrs& p, uint32_t m, uint32_t row, bool live,
                                             uint32_t g_lo, uint32_t g_hi, uint32_t rows,
                                             const uint32_t* __restrict__ s_lut) {
   float acc = 0.0f;
-  tr_mat_dot_rb<FMT, 1>(p, m, &row, &live, g_lo, g_hi, rows, s_lut, &acc);
+  tr_mat_dot_rb<FMT, 1, NT_LOAD>(p, m, &row, &live, g_lo, g_hi, rows, s_lut, &acc);
   return acc;
 }
 
 // Factored out of the kernel so the accumulating form and the split-output one cannot drift.
-template <uint32_t FMT, uint32_t NW = (uint32_t)kWavesPerBlock>
+template <uint32_t FMT, uint32_t NW = (uint32_t)kWavesPerBlock, bool NT_LOAD = true>
 __device__ __forceinline__ void expert_gemv_tr_body(
     const BatchPtrs& p,
     const float* __restrict__ weights,
@@ -1450,8 +1462,10 @@ __device__ __forceinline__ void expert_gemv_tr_body(
     const bool live = row < rows;
     float acc = 0.0f;
     for (uint32_t m = 0; m < n_mats; ++m) {
-      const float rs = live ? bf16_to_f32_dev(p.rscales[m][row]) * weights[m] : 0.0f;
-      acc = fmaf(rs, tr_mat_dot<FMT>(p, m, row, live, g_lo, g_hi, rows, s_lut), acc);
+      const float rs =
+          live ? bf16_to_f32_dev(aff::load_nt<NT_LOAD>(&as_global(p.rscales[m])[row])) * weights[m]
+               : 0.0f;
+      acc = fmaf(rs, tr_mat_dot<FMT, NT_LOAD>(p, m, row, live, g_lo, g_hi, rows, s_lut), acc);
     }
     // The block's column-partials for this row, summed in wave order and stored once.
     aff::lds_barrier();
@@ -1467,7 +1481,7 @@ __device__ __forceinline__ void expert_gemv_tr_body(
   (void)s_cb;
 }
 
-template <uint32_t FMT, uint32_t NW = (uint32_t)kWavesPerBlock>
+template <uint32_t FMT, uint32_t NW = (uint32_t)kWavesPerBlock, bool NT_LOAD = true>
 __global__ __launch_bounds__(NW * kWave) void expert_gemv_kernel_tr(
     BatchPtrs p,
     const float* __restrict__ weights,
@@ -1475,7 +1489,7 @@ __global__ __launch_bounds__(NW * kWave) void expert_gemv_kernel_tr(
     const float* __restrict__ cb,
     float* __restrict__ y,
     uint32_t rows, uint32_t cols) {
-  expert_gemv_tr_body<FMT, NW>(p, weights, n_mats, cb, y, rows, cols);
+  expert_gemv_tr_body<FMT, NW, NT_LOAD>(p, weights, n_mats, cb, y, rows, cols);
 }
 
 // Split output: n_mats matrices of identical shape, each writing its own vector.
@@ -1488,7 +1502,7 @@ __global__ __launch_bounds__(NW * kWave) void expert_gemv_kernel_tr(
 // multiple of kWave for every expert shape here, so a 32-row block never straddles two matrices and
 // the LDS reduction is unchanged. The store is a store rather than an accumulate, which also retires
 // the memset that had to zero the scratch buffer first.
-template <uint32_t FMT, uint32_t RB, uint32_t NW = (uint32_t)kWavesPerBlock>
+template <uint32_t FMT, uint32_t RB, uint32_t NW = (uint32_t)kWavesPerBlock, bool NT_LOAD = true>
 __device__ __forceinline__ void expert_gemv_tr_split_body(
     const BatchPtrs& p,
     const float* __restrict__ weights,
@@ -1518,9 +1532,12 @@ __device__ __forceinline__ void expert_gemv_tr_split_body(
     for (uint32_t r = 0; r < RB; ++r) {
       row[r] = r0 + r * kWave + lane;
       live[r] = row[r] < rows;
-      rs[r] = live[r] ? bf16_to_f32_dev(p.rscales[m][row[r]]) * weights[m] : 0.0f;
+      rs[r] = live[r]
+                  ? bf16_to_f32_dev(aff::load_nt<NT_LOAD>(&as_global(p.rscales[m])[row[r]])) *
+                        weights[m]
+                  : 0.0f;
     }
-    tr_mat_dot_rb<FMT, RB>(p, m, row, live, g_lo, g_hi, rows, s_lut, sacc);
+    tr_mat_dot_rb<FMT, RB, NT_LOAD>(p, m, row, live, g_lo, g_hi, rows, s_lut, sacc);
     aff::lds_barrier();
 #pragma unroll
     for (uint32_t r = 0; r < RB; ++r) s_part[wave][r * kWave + lane] = rs[r] * sacc[r];
@@ -1537,18 +1554,19 @@ __device__ __forceinline__ void expert_gemv_tr_split_body(
   }
 }
 
-template <uint32_t FMT, uint32_t RB, uint32_t NW = (uint32_t)kWavesPerBlock>
+template <uint32_t FMT, uint32_t RB, uint32_t NW = (uint32_t)kWavesPerBlock, bool NT_LOAD = true>
 __global__ __launch_bounds__(NW * kWave) void expert_gemv_kernel_tr_split(
     BatchPtrs p,
     const float* __restrict__ weights,
     uint32_t n_mats,
     const float* __restrict__ cb,
     uint32_t rows, uint32_t cols) {
-  expert_gemv_tr_split_body<FMT, RB, NW>(p, weights, n_mats, cb, rows, cols);
+  expert_gemv_tr_split_body<FMT, RB, NW, NT_LOAD>(p, weights, n_mats, cb, rows, cols);
 }
 
 // The row-major decode gemv. Only a test or a bench that builds its own planes reaches it — the
 // engine's slab is colgroup-major and takes expert_gemv_kernel_tr.
+template <bool NT_LOAD>
 __global__ __launch_bounds__(kThreads) void expert_gemv_kernel_v8(
     BatchPtrs p,
     const float* __restrict__ weights,
@@ -1579,11 +1597,16 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_kernel_v8(
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     for (uint32_t m = 0; m < n_mats; ++m) {
-      const float rs = bf16_to_f32_dev(p.rscales[m][row]) * weights[m];
-      const uint32_t* crow = (const uint32_t*)(p.data[m]) + (size_t)row * code_words_row;
-      const uint32_t* frow = (const uint32_t*)(p.scales[m]) + (size_t)row * field_words_row;
-      for (uint32_t i = lane; i < code_words_row; i += kWave) s_code[wave][i] = crow[i];
-      for (uint32_t i = lane; i < field_words_row; i += kWave) s_field[wave][i] = frow[i];
+      const float rs = bf16_to_f32_dev(aff::load_nt<NT_LOAD>(&as_global(p.rscales[m])[row])) *
+                       weights[m];
+      const AFF_GLOBAL uint32_t* crow =
+          as_global((const uint32_t*)(p.data[m]) + (size_t)row * code_words_row);
+      const AFF_GLOBAL uint32_t* frow =
+          as_global((const uint32_t*)(p.scales[m]) + (size_t)row * field_words_row);
+      for (uint32_t i = lane; i < code_words_row; i += kWave)
+        s_code[wave][i] = aff::load_nt<NT_LOAD>(&crow[i]);
+      for (uint32_t i = lane; i < field_words_row; i += kWave)
+        s_field[wave][i] = aff::load_nt<NT_LOAD>(&frow[i]);
       __builtin_amdgcn_s_waitcnt(0);
       __builtin_amdgcn_wave_barrier();
       if (rs == 0.0f) continue;
@@ -1799,15 +1822,16 @@ constexpr int kDenseWaves = 8;
 constexpr int kDenseThreads = kDenseWaves * kWave;
 
 // The same for bf16.
-__device__ __forceinline__ float bf16_row_dot(const uint16_t* __restrict__ W,
+template <bool NT_LOAD, class WPtr>
+__device__ __forceinline__ float bf16_row_dot(WPtr W,
                                               const float* __restrict__ xv, uint32_t row,
                                               uint32_t cols, int lane) {
   const uint32_t stride = kWave * 8u;
   const uint32_t full = (cols / stride) * stride;
-  const uint16_t* w = W + (size_t)row * cols;
+  auto w = W + (size_t)row * cols;
   float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
   for (uint32_t c = (uint32_t)lane * 8u; c < full; c += stride) {
-    const uint4 packed = *(const uint4*)(w + c);
+    const uint4 packed = aff::load_uint4_nt<NT_LOAD>(w + c);
     const uint32_t* pw = (const uint32_t*)&packed;
     a0 = fmaf(__uint_as_float((pw[0] & 0xFFFFu) << 16), xv[c + 0], a0);
     a0 = fmaf(__uint_as_float(pw[0] & 0xFFFF0000u),     xv[c + 1], a0);
@@ -1819,12 +1843,13 @@ __device__ __forceinline__ float bf16_row_dot(const uint16_t* __restrict__ W,
     a3 = fmaf(__uint_as_float(pw[3] & 0xFFFF0000u),     xv[c + 7], a3);
   }
   for (uint32_t t = full + (uint32_t)lane; t < cols; t += kWave)
-    a0 = fmaf(__uint_as_float((uint32_t)w[t] << 16), xv[t], a0);
+    a0 = fmaf(__uint_as_float((uint32_t)aff::load_nt<NT_LOAD>(&w[t]) << 16), xv[t], a0);
   return wave_reduce_add((a0 + a1) + (a2 + a3));
 }
 
 
 
+template <bool NT_LOAD>
 __global__ __launch_bounds__(kDenseThreads) void matvec_bf16_tall_kernel(
     const uint16_t* __restrict__ W, const float* __restrict__ x, float* __restrict__ out,
     uint32_t cols) {
@@ -1838,7 +1863,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_bf16_tall_kernel(
   const uint32_t full = (cols / stride) * stride;
   float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
   for (uint32_t c = (uint32_t)tid * 8u; c < full; c += stride) {
-    const uint4 packed = *(const uint4*)(w + c);
+    const uint4 packed = aff::load_uint4_nt<NT_LOAD>(w + c);
     const uint32_t* pw = (const uint32_t*)&packed;
     a0 = fmaf(__uint_as_float((pw[0] & 0xFFFFu) << 16), x[c + 0], a0);
     a0 = fmaf(__uint_as_float(pw[0] & 0xFFFF0000u),     x[c + 1], a0);
@@ -1850,7 +1875,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_bf16_tall_kernel(
     a3 = fmaf(__uint_as_float(pw[3] & 0xFFFF0000u),     x[c + 7], a3);
   }
   for (uint32_t t = full + (uint32_t)tid; t < cols; t += kDenseThreads)
-    a0 = fmaf(__uint_as_float((uint32_t)w[t] << 16), x[t], a0);
+    a0 = fmaf(__uint_as_float((uint32_t)aff::load_nt<NT_LOAD>(&w[t]) << 16), x[t], a0);
 
   const float v = wave_reduce_add((a0 + a1) + (a2 + a3));
   if (lane == 0) red[wave] = v;
@@ -1862,6 +1887,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_bf16_tall_kernel(
   }
 }
 
+template <bool NT_LOAD>
 __global__ __launch_bounds__(kDenseThreads) void matvec_bf16_kernel(
     const uint16_t* __restrict__ W, const float* __restrict__ x,
     float* __restrict__ out, uint32_t rows, uint32_t cols, int stage_x) {
@@ -1879,7 +1905,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_bf16_kernel(
 
   for (uint32_t row = blockIdx.x * kDenseWaves + wave; row < rows;
        row += gridDim.x * kDenseWaves) {
-    const float total = bf16_row_dot(W, xv, row, cols, lane);
+    const float total = bf16_row_dot<NT_LOAD>(W, xv, row, cols, lane);
     if (lane == 0) out[row] = total;
   }
 }
@@ -2004,14 +2030,25 @@ void matvec_bf16_hip(const uint16_t* W, const float* x, uint32_t rows, uint32_t 
   // near-tied selection values are compared against each other and a row landing one ulp lower swaps
   // an expert. A caller that computes different row counts on different paths must pin this, or the
   // two will route differently.
+  const bool nt_load = aff::dense_nt_load_enabled();
   if ((want_tall || blocks < 32u) && cols >= (uint32_t)kDenseThreads * 8u) {
-    hipLaunchKernelGGL(matvec_bf16_tall_kernel, dim3(rows), dim3(kDenseThreads), 0,
-                       (hipStream_t)stream, W, x, out, cols);
+    if (nt_load) {
+      hipLaunchKernelGGL((matvec_bf16_tall_kernel<true>), dim3(rows), dim3(kDenseThreads), 0,
+                         (hipStream_t)stream, W, x, out, cols);
+    } else {
+      hipLaunchKernelGGL((matvec_bf16_tall_kernel<false>), dim3(rows), dim3(kDenseThreads), 0,
+                         (hipStream_t)stream, W, x, out, cols);
+    }
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }
-  hipLaunchKernelGGL(matvec_bf16_kernel, dim3(blocks), dim3(kDenseThreads),
-                     stage ? lds : 0, (hipStream_t)stream, W, x, out, rows, cols, stage);
+  if (nt_load) {
+    hipLaunchKernelGGL((matvec_bf16_kernel<true>), dim3(blocks), dim3(kDenseThreads),
+                       stage ? lds : 0, (hipStream_t)stream, W, x, out, rows, cols, stage);
+  } else {
+    hipLaunchKernelGGL((matvec_bf16_kernel<false>), dim3(blocks), dim3(kDenseThreads),
+                       stage ? lds : 0, (hipStream_t)stream, W, x, out, rows, cols, stage);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -2036,21 +2073,20 @@ void matvec_bf16_hip(const uint16_t* W, const float* x, uint32_t rows, uint32_t 
 //
 // `XV` is anything with `operator[](uint32_t) -> float`. A raw `const float*` satisfies it, and so
 // does `RmsView` below, which is how the RMSNorm folds in without a second copy of this loop.
-template <class XV>
-__device__ __forceinline__ float fp8_row_dot(const uint8_t* __restrict__ W,
-                                             const uint8_t* __restrict__ S,
+template <bool NT_LOAD, class WPtr, class SPtr, class XV>
+__device__ __forceinline__ float fp8_row_dot(WPtr W, SPtr S,
                                              const XV& xv, uint32_t row,
                                              uint32_t cols, uint32_t sc_cols, int lane) {
   const uint32_t stride = kWave * 16u;
   const uint32_t full = (cols / stride) * stride;
-  const uint8_t* w = W + (size_t)row * cols;
-  const uint8_t* srow = S + (size_t)(row >> 7) * sc_cols;
+  auto w = W + (size_t)row * cols;
+  auto srow = S + (size_t)(row >> 7) * sc_cols;
   float acc = 0.0f;
   for (uint32_t c = (uint32_t)lane * 16u; c < full; c += stride) {
-    const uint4 packed = *(const uint4*)(w + c);
+    const uint4 packed = aff::load_uint4_nt<NT_LOAD>(w + c);
     const uint32_t* pw = (const uint32_t*)&packed;
     // UE8M0: value = 2^(e-127). Built directly rather than through exp2f.
-    const uint32_t e = srow[c >> 7];
+    const uint32_t e = aff::load_nt<NT_LOAD>(&srow[c >> 7]);
     const float scale = __uint_as_float(e ? (e << 23) : 0u);
     float a0 = 0.0f, a1 = 0.0f;
     for (int k = 0; k < 4; ++k) {
@@ -2070,8 +2106,9 @@ __device__ __forceinline__ float fp8_row_dot(const uint8_t* __restrict__ W,
   }
   // Tail, when cols is not a multiple of 512. Same per-lane-scale rule, one column at a time.
   for (uint32_t c = full + (uint32_t)lane; c < cols; c += kWave) {
-    const uint32_t e = srow[c >> 7];
-    acc = fmaf(e4m3_decode(w[c]) * xv[c], __uint_as_float(e ? (e << 23) : 0u), acc);
+    const uint32_t e = aff::load_nt<NT_LOAD>(&srow[c >> 7]);
+    acc = fmaf(e4m3_decode(aff::load_nt<NT_LOAD>(&w[c])) * xv[c],
+               __uint_as_float(e ? (e << 23) : 0u), acc);
   }
   return wave_reduce_add(acc);
 }
@@ -2098,7 +2135,7 @@ static uint32_t mv_rb(uint32_t rows, uint32_t cols) {
 // is the point: RB of them issue back to back and are in flight together.
 //
 // Summation order is untouched: each row still accumulates per lane and reduces once at the end.
-template <uint32_t RB, class XV>
+template <uint32_t RB, bool NT_LOAD, class XV>
 __device__ __forceinline__ void fp8_rows_dot(const uint8_t* __restrict__ W,
                                              const uint8_t* __restrict__ S,
                                              const XV& xv, uint32_t row0,
@@ -2119,11 +2156,11 @@ __device__ __forceinline__ void fp8_rows_dot(const uint8_t* __restrict__ W,
   for (uint32_t c = (uint32_t)lane * 16u; c < full; c += stride) {
     uint4 packed[RB];
 #pragma unroll
-    for (uint32_t r = 0; r < RB; ++r) packed[r] = *(const uint4*)(w[r] + c);
+    for (uint32_t r = 0; r < RB; ++r) packed[r] = aff::load_uint4_nt<NT_LOAD>(w[r] + c);
     float xr[16];
 #pragma unroll
     for (int k = 0; k < 16; ++k) xr[k] = xv[c + (uint32_t)k];
-    const uint32_t e = srow[c >> 7];
+    const uint32_t e = aff::load_nt<NT_LOAD>(&srow[c >> 7]);
     const float scale = __uint_as_float(e ? (e << 23) : 0u);
 #pragma unroll
     for (uint32_t r = 0; r < RB; ++r) {
@@ -2146,17 +2183,18 @@ __device__ __forceinline__ void fp8_rows_dot(const uint8_t* __restrict__ W,
     }
   }
   for (uint32_t c = full + (uint32_t)lane; c < cols; c += kWave) {
-    const uint32_t e = srow[c >> 7];
+    const uint32_t e = aff::load_nt<NT_LOAD>(&srow[c >> 7]);
     const float sc = __uint_as_float(e ? (e << 23) : 0u);
     const float xc = xv[c];
 #pragma unroll
-    for (uint32_t r = 0; r < RB; ++r) acc[r] = fmaf(e4m3_decode(w[r][c]) * xc, sc, acc[r]);
+    for (uint32_t r = 0; r < RB; ++r)
+      acc[r] = fmaf(e4m3_decode(aff::load_nt<NT_LOAD>(&w[r][c])) * xc, sc, acc[r]);
   }
 #pragma unroll
   for (uint32_t r = 0; r < RB; ++r) acc[r] = wave_reduce_add(acc[r]);
 }
 
-template <uint32_t RB>
+template <uint32_t RB, bool NT_LOAD>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((RB == 8u ? 12 : 1), (RB == 8u ? 12 : 16))))
 #endif
@@ -2171,7 +2209,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_rb_kernel(
        r0 += step) {
     const uint32_t nr = min(RB, rows - r0);
     float acc[RB];
-    fp8_rows_dot<RB>(W, S, x, r0, nr, cols, sc_cols, lane, acc);
+    fp8_rows_dot<RB, NT_LOAD>(W, S, x, r0, nr, cols, sc_cols, lane, acc);
     if (lane == 0) {
 #pragma unroll
       for (uint32_t r = 0; r < RB; ++r)
@@ -2215,7 +2253,7 @@ __device__ __forceinline__ float rms_inv_256(const float* __restrict__ x, uint32
   return red[0];
 }
 
-template <uint32_t RB>
+template <uint32_t RB, bool NT_LOAD>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((RB == 8u ? 12 : 1), (RB == 8u ? 12 : 16))))
 #endif
@@ -2238,7 +2276,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_rn_kernel(
        r0 += step) {
     const uint32_t nr = min(RB, rows - r0);
     float acc[RB];
-    fp8_rows_dot<RB>(W, S, xv, r0, nr, cols, sc_cols, lane, acc);
+    fp8_rows_dot<RB, NT_LOAD>(W, S, xv, r0, nr, cols, sc_cols, lane, acc);
     if (lane == 0) {
 #pragma unroll
       for (uint32_t r = 0; r < RB; ++r)
@@ -2247,6 +2285,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_rn_kernel(
   }
 }
 
+template <bool NT_LOAD>
 __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, const float* __restrict__ x,
     float* __restrict__ out, uint32_t rows, uint32_t cols, uint32_t sc_cols, int stage_x) {
@@ -2264,7 +2303,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_kernel(
 
   for (uint32_t row = blockIdx.x * kDenseWaves + wave; row < rows;
        row += gridDim.x * kDenseWaves) {
-    const float total = fp8_row_dot(W, S, xv, row, cols, sc_cols, lane);
+    const float total = fp8_row_dot<NT_LOAD>(W, S, xv, row, cols, sc_cols, lane);
     if (lane == 0) out[row] = total;
   }
 }
@@ -2293,7 +2332,7 @@ struct RopeTail {
 };
 constexpr uint32_t kGroupTailMax = 1024;  // floats of LDS for one group's rotated tail
 
-template <bool Rope>
+template <bool Rope, bool NT_LOAD>
 __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_grouped_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, const float* __restrict__ x,
     float* __restrict__ out, uint32_t rows, uint32_t cols, uint32_t sc_cols, uint32_t rank,
@@ -2331,9 +2370,9 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_grouped_kernel(
     const float* xv = x + (size_t)(row / rank) * cols;
     float acc = 0.0f;
     for (uint32_t c = (uint32_t)lane * 16u; c < full; c += stride) {
-      const uint4 packed = *(const uint4*)(w + c);
+      const uint4 packed = aff::load_uint4_nt<NT_LOAD>(w + c);
       const uint32_t* pw = (const uint32_t*)&packed;
-      const uint32_t e = srow[c >> 7];
+      const uint32_t e = aff::load_nt<NT_LOAD>(&srow[c >> 7]);
       const float scale = __uint_as_float(e ? (e << 23) : 0u);
       float xr[16];
       if (Rope && (c & (rt.head_dim - 1u)) >= rt.nope) {
@@ -2362,8 +2401,9 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_grouped_kernel(
     }
     // Rope never gets here: the launcher requires cols % 512 == 0, so `full` is `cols`.
     for (uint32_t c = full + (uint32_t)lane; c < cols; c += kWave) {
-      const uint32_t e = srow[c >> 7];
-      acc = fmaf(e4m3_decode(w[c]) * xv[c], __uint_as_float(e ? (e << 23) : 0u), acc);
+      const uint32_t e = aff::load_nt<NT_LOAD>(&srow[c >> 7]);
+      acc = fmaf(e4m3_decode(aff::load_nt<NT_LOAD>(&w[c])) * xv[c],
+                 __uint_as_float(e ? (e << 23) : 0u), acc);
     }
     const float total = wave_reduce_add(acc);
     if (lane == 0) out[row] = total;
@@ -2373,7 +2413,7 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_grouped_kernel(
 // Row-blocked grouped variant. RB consecutive rows share an activation window only if they are in
 // the same group, which holds exactly when `rank % RB == 0` — r0 is RB-aligned, so the group index
 // r0/rank cannot change inside the block. The launcher checks it rather than assuming.
-template <uint32_t RB>
+template <uint32_t RB, bool NT_LOAD>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((RB == 8u ? 12 : 1), (RB == 8u ? 12 : 16))))
 #endif
@@ -2388,7 +2428,8 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_fp8_grouped_rb_kernel(
        r0 += step) {
     const uint32_t nr = min(RB, rows - r0);
     float acc[RB];
-    fp8_rows_dot<RB>(W, S, x + (size_t)(r0 / rank) * cols, r0, nr, cols, sc_cols, lane, acc);
+    fp8_rows_dot<RB, NT_LOAD>(W, S, x + (size_t)(r0 / rank) * cols, r0, nr, cols, sc_cols, lane,
+                              acc);
     if (lane == 0) {
 #pragma unroll
       for (uint32_t r = 0; r < RB; ++r)
@@ -2401,24 +2442,39 @@ void matvec_fp8_grouped_hip(const uint8_t* W, const uint8_t* S, const float* x, 
                             uint32_t group_dim, uint32_t rank, float* out, void* stream) {
   const uint32_t rows = n_groups * rank;
   const uint32_t rb = mv_rb(rows, group_dim);       // group_dim IS this kernel's row width
+  const bool nt_load = aff::dense_nt_load_enabled();
   if (rb > 1u && rank % rb == 0u) {
     const uint32_t per = kDenseWaves * rb;
     const uint32_t blocks = aff::safe_grid_blocks(
         std::min<uint32_t>(2048u, (rows + per - 1) / per), kDenseWaves);
     const uint32_t sc = (group_dim + 127) / 128;
-#define AFF_MVGRB(N)                                                                          \
-  hipLaunchKernelGGL((matvec_fp8_grouped_rb_kernel<N>), dim3(blocks), dim3(kDenseThreads), 0,  \
-                     (hipStream_t)stream, W, S, x, out, rows, group_dim, sc, rank)
-    if (rb == 2u) { AFF_MVGRB(2); } else if (rb == 4u) { AFF_MVGRB(4); } else { AFF_MVGRB(8); }
+#define AFF_MVGRB(N, NT)                                                                        \
+  hipLaunchKernelGGL((matvec_fp8_grouped_rb_kernel<N, NT>), dim3(blocks), dim3(kDenseThreads), \
+                     0, (hipStream_t)stream, W, S, x, out, rows, group_dim, sc, rank)
+    if (nt_load) {
+      if (rb == 2u) { AFF_MVGRB(2, true); }
+      else if (rb == 4u) { AFF_MVGRB(4, true); }
+      else { AFF_MVGRB(8, true); }
+    } else {
+      if (rb == 2u) { AFF_MVGRB(2, false); }
+      else if (rb == 4u) { AFF_MVGRB(4, false); }
+      else { AFF_MVGRB(8, false); }
+    }
 #undef AFF_MVGRB
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(matvec_fp8_grouped_kernel<false>), dim3(blocks),
-                     dim3(kDenseThreads), 0, (hipStream_t)stream, W, S, x, out, rows, group_dim,
-                     (group_dim + 127) / 128, rank, RopeTail{});
+  if (nt_load) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(matvec_fp8_grouped_kernel<false, true>), dim3(blocks),
+                       dim3(kDenseThreads), 0, (hipStream_t)stream, W, S, x, out, rows, group_dim,
+                       (group_dim + 127) / 128, rank, RopeTail{});
+  } else {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(matvec_fp8_grouped_kernel<false, false>), dim3(blocks),
+                       dim3(kDenseThreads), 0, (hipStream_t)stream, W, S, x, out, rows, group_dim,
+                       (group_dim + 127) / 128, rank, RopeTail{});
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -2446,9 +2502,15 @@ bool matvec_fp8_grouped_rope_hip(const uint8_t* W, const uint8_t* S, const float
 
   const RopeTail rt{head_dim, n_rot,           pos,        log2u(head_dim), log2u(n_rot), nope,
                     freq_scale, theta_scale,   ext_factor, lo,              hi};
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(matvec_fp8_grouped_kernel<true>), dim3(blocks),
-                     dim3(kDenseThreads), 0, (hipStream_t)stream, W, S, x, out, rows, group_dim,
-                     (group_dim + 127) / 128, rank, rt);
+  if (aff::dense_nt_load_enabled()) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(matvec_fp8_grouped_kernel<true, true>), dim3(blocks),
+                       dim3(kDenseThreads), 0, (hipStream_t)stream, W, S, x, out, rows, group_dim,
+                       (group_dim + 127) / 128, rank, rt);
+  } else {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(matvec_fp8_grouped_kernel<true, false>), dim3(blocks),
+                       dim3(kDenseThreads), 0, (hipStream_t)stream, W, S, x, out, rows, group_dim,
+                       (group_dim + 127) / 128, rank, rt);
+  }
   AFF_HIP_CHECK(hipGetLastError());
   return true;
 }
@@ -2483,6 +2545,7 @@ struct MvBatchArgs {
   uint32_t stage_n, stage_stride;
 };
 
+template <bool NT_LOAD>
 __global__ __launch_bounds__(kDenseThreads) void matvec_batch_kernel(MvBatchArgs a,
                                                                     const float* __restrict__ x) {
   const int tid = threadIdx.x;
@@ -2497,8 +2560,9 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_batch_kernel(MvBatchArgs
     while (g >= a.row_end[j]) ++j;
     const uint32_t row = g - (j ? a.row_end[j - 1] : 0u);
     const float total = a.quant[j] == AFF_FP8_E4M3
-        ? fp8_row_dot((const uint8_t*)a.data[j], a.scales[j], x, row, a.cols, a.sc_cols, lane)
-        : bf16_row_dot((const uint16_t*)a.data[j], x, row, a.cols, lane);
+        ? fp8_row_dot<NT_LOAD>(as_global((const uint8_t*)a.data[j]), as_global(a.scales[j]), x, row,
+                               a.cols, a.sc_cols, lane)
+        : bf16_row_dot<NT_LOAD>(as_global((const uint16_t*)a.data[j]), x, row, a.cols, lane);
     if (lane == 0) a.out[j][row] = total * a.scale[j];
   }
 
@@ -2518,19 +2582,19 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_batch_kernel(MvBatchArgs
 // a few-token GEMM computes a full-width tile and throws most of the arithmetic away.
 //
 // The cost is registers — 4T partials plus the unpacked weights — which is what sets the T cap.
-template <uint32_t T>
-__device__ __forceinline__ void bf16_row_dot_multix(const uint16_t* __restrict__ W,
+template <uint32_t T, bool NT_LOAD, class WPtr>
+__device__ __forceinline__ void bf16_row_dot_multix(WPtr W,
                                                     const float* __restrict__ x, uint32_t xs,
                                                     uint32_t row, uint32_t cols, int lane,
                                                     float* __restrict__ out) {
   const uint32_t stride = kWave * 8u;
   const uint32_t full = (cols / stride) * stride;
-  const uint16_t* w = W + (size_t)row * cols;
+  auto w = W + (size_t)row * cols;
   float a0[T], a1[T], a2[T], a3[T];
 #pragma unroll
   for (uint32_t t = 0; t < T; ++t) { a0[t] = 0.0f; a1[t] = 0.0f; a2[t] = 0.0f; a3[t] = 0.0f; }
   for (uint32_t c = (uint32_t)lane * 8u; c < full; c += stride) {
-    const uint4 packed = *(const uint4*)(w + c);
+    const uint4 packed = aff::load_uint4_nt<NT_LOAD>(w + c);
     const uint32_t* pw = (const uint32_t*)&packed;
     const float w0 = __uint_as_float((pw[0] & 0xFFFFu) << 16);
     const float w1 = __uint_as_float(pw[0] & 0xFFFF0000u);
@@ -2564,7 +2628,7 @@ __device__ __forceinline__ void bf16_row_dot_multix(const uint16_t* __restrict__
     }
   }
   for (uint32_t c = full + (uint32_t)lane; c < cols; c += kWave) {
-    const float wv = __uint_as_float((uint32_t)w[c] << 16);
+    const float wv = __uint_as_float((uint32_t)aff::load_nt<NT_LOAD>(&w[c]) << 16);
 #pragma unroll
     for (uint32_t t = 0; t < T; ++t) a0[t] = fmaf(wv, x[(size_t)t * xs + c], a0[t]);
   }
@@ -2572,7 +2636,7 @@ __device__ __forceinline__ void bf16_row_dot_multix(const uint16_t* __restrict__
   for (uint32_t t = 0; t < T; ++t) out[t] = wave_reduce_add((a0[t] + a1[t]) + (a2[t] + a3[t]));
 }
 
-template <uint32_t T>
+template <uint32_t T, bool NT_LOAD>
 __global__ __launch_bounds__(kDenseThreads) void matvec_multix_kernel(MvBatchArgs a,
                                                                      const float* __restrict__ x,
                                                                      uint32_t xs) {
@@ -2586,7 +2650,8 @@ __global__ __launch_bounds__(kDenseThreads) void matvec_multix_kernel(MvBatchArg
     const uint32_t base = j ? a.row_end[j - 1] : 0u;
     const uint32_t row = g - base, rows_j = a.row_end[j] - base;
     float acc[T];
-    bf16_row_dot_multix<T>((const uint16_t*)a.data[j], x, xs, row, a.cols, lane, acc);
+    bf16_row_dot_multix<T, NT_LOAD>(as_global((const uint16_t*)a.data[j]), x, xs, row, a.cols,
+                                    lane, acc);
     if (lane == 0) {
       // Token-major, so the pool reads token t's whole projection as one contiguous row and needs
       // no transpose behind this at all.
@@ -2619,16 +2684,20 @@ bool matvec_multix_hip(const MvJob* jobs, uint32_t n_jobs, const float* x, uint3
   a.total_rows = acc;
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (acc + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
-#define AFF_MULTIX(T)                                                                             \
+  const bool nt_load = aff::dense_nt_load_enabled();
+#define AFF_MULTIX(T, NT)                                                                         \
   case T:                                                                                         \
-    hipLaunchKernelGGL((matvec_multix_kernel<T>), dim3(blocks), dim3(kDenseThreads), 0,            \
-                       (hipStream_t)stream, a, x, x_stride); AFF_HIP_CHECK(hipGetLastError());                                      \
+    hipLaunchKernelGGL((matvec_multix_kernel<T, NT>), dim3(blocks), dim3(kDenseThreads), 0,       \
+                       (hipStream_t)stream, a, x, x_stride); AFF_HIP_CHECK(hipGetLastError());    \
     break
-  switch (nt) {
-    AFF_MULTIX(1); AFF_MULTIX(2); AFF_MULTIX(3); AFF_MULTIX(4);
-    AFF_MULTIX(5); AFF_MULTIX(6); AFF_MULTIX(7); AFF_MULTIX(8);
-    default: return false;
+#define AFF_MULTIX_ALL(NT)                                                                        \
+  switch (nt) {                                                                                   \
+    AFF_MULTIX(1, NT); AFF_MULTIX(2, NT); AFF_MULTIX(3, NT); AFF_MULTIX(4, NT);                   \
+    AFF_MULTIX(5, NT); AFF_MULTIX(6, NT); AFF_MULTIX(7, NT); AFF_MULTIX(8, NT);                   \
+    default: return false;                                                                        \
   }
+  if (nt_load) { AFF_MULTIX_ALL(true); } else { AFF_MULTIX_ALL(false); }
+#undef AFF_MULTIX_ALL
 #undef AFF_MULTIX
   AFF_HIP_CHECK(hipGetLastError());
   return true;
@@ -2640,6 +2709,7 @@ bool matvec_multix_hip(const MvJob* jobs, uint32_t n_jobs, const float* x, uint3
 //
 // The two row dots cost twice the registers of one, which is fine here: the wave still owns one row
 // and nothing crosses lanes until the reductions at the end.
+template <bool NT_LOAD>
 __global__ __launch_bounds__(kDenseThreads) void mv_gate_up_swiglu_kernel(
     MvGuArgs a, const float* __restrict__ x) {
   const int tid = threadIdx.x;
@@ -2648,11 +2718,13 @@ __global__ __launch_bounds__(kDenseThreads) void mv_gate_up_swiglu_kernel(
   for (uint32_t row = blockIdx.x * kDenseWaves + wave; row < a.rows;
        row += gridDim.x * kDenseWaves) {
     const float g = a.quant_g == AFF_FP8_E4M3
-        ? fp8_row_dot((const uint8_t*)a.wg, a.sg, x, row, a.cols, a.sc_cols, lane)
-        : bf16_row_dot((const uint16_t*)a.wg, x, row, a.cols, lane);
+        ? fp8_row_dot<NT_LOAD>(as_global((const uint8_t*)a.wg), as_global(a.sg), x, row, a.cols,
+                               a.sc_cols, lane)
+        : bf16_row_dot<NT_LOAD>(as_global((const uint16_t*)a.wg), x, row, a.cols, lane);
     const float u = a.quant_u == AFF_FP8_E4M3
-        ? fp8_row_dot((const uint8_t*)a.wu, a.su, x, row, a.cols, a.sc_cols, lane)
-        : bf16_row_dot((const uint16_t*)a.wu, x, row, a.cols, lane);
+        ? fp8_row_dot<NT_LOAD>(as_global((const uint8_t*)a.wu), as_global(a.su), x, row, a.cols,
+                               a.sc_cols, lane)
+        : bf16_row_dot<NT_LOAD>(as_global((const uint16_t*)a.wu), x, row, a.cols, lane);
     if (lane == 0) {
       float gv = g, uv = u;
       // Identical to the standalone SwiGLU above, deliberately: this is the same arithmetic moved,
@@ -2674,8 +2746,13 @@ void mv_gate_up_swiglu_hip(const void* wg, const uint8_t* sg, uint32_t quant_g, 
   a.limit = limit;
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
-  hipLaunchKernelGGL(mv_gate_up_swiglu_kernel, dim3(blocks), dim3(kDenseThreads), 0,
-                     (hipStream_t)stream, a, x);
+  if (aff::dense_nt_load_enabled()) {
+    hipLaunchKernelGGL((mv_gate_up_swiglu_kernel<true>), dim3(blocks), dim3(kDenseThreads), 0,
+                       (hipStream_t)stream, a, x);
+  } else {
+    hipLaunchKernelGGL((mv_gate_up_swiglu_kernel<false>), dim3(blocks), dim3(kDenseThreads), 0,
+                       (hipStream_t)stream, a, x);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -2706,8 +2783,13 @@ void matvec_batch_hip(const MvJob* jobs, uint32_t n_jobs, const float* x, uint32
   a.total_rows = acc;
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (acc + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
-  hipLaunchKernelGGL(matvec_batch_kernel, dim3(blocks), dim3(kDenseThreads), 0,
-                     (hipStream_t)stream, a, x);
+  if (aff::dense_nt_load_enabled()) {
+    hipLaunchKernelGGL((matvec_batch_kernel<true>), dim3(blocks), dim3(kDenseThreads), 0,
+                       (hipStream_t)stream, a, x);
+  } else {
+    hipLaunchKernelGGL((matvec_batch_kernel<false>), dim3(blocks), dim3(kDenseThreads), 0,
+                       (hipStream_t)stream, a, x);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -2718,24 +2800,39 @@ void matvec_fp8_hip(const uint8_t* W, const uint8_t* S, const float* x, uint32_t
   // lanes land on the same LDS bank and the conflicts cost more than the staging saves. `x` is small
   // enough that every wave in the block keeps it in L1 regardless.
   const uint32_t rb = mv_rb(rows, cols);
+  const bool nt_load = aff::dense_nt_load_enabled();
   if (rb > 1u) {
     const uint32_t per = kDenseWaves * rb;
     const uint32_t blocks = aff::safe_grid_blocks(
         std::min<uint32_t>(2048u, (rows + per - 1) / per), kDenseWaves);
     const uint32_t sc = (cols + 127) / 128;
-#define AFF_MVRB(N)                                                                          \
-  hipLaunchKernelGGL((matvec_fp8_rb_kernel<N>), dim3(blocks), dim3(kDenseThreads), 0,         \
+#define AFF_MVRB(N, NT)                                                                        \
+  hipLaunchKernelGGL((matvec_fp8_rb_kernel<N, NT>), dim3(blocks), dim3(kDenseThreads), 0,      \
                      (hipStream_t)stream, W, S, x, out, rows, cols, sc)
-    if (rb == 2u) { AFF_MVRB(2); } else if (rb == 4u) { AFF_MVRB(4); } else { AFF_MVRB(8); }
+    if (nt_load) {
+      if (rb == 2u) { AFF_MVRB(2, true); }
+      else if (rb == 4u) { AFF_MVRB(4, true); }
+      else { AFF_MVRB(8, true); }
+    } else {
+      if (rb == 2u) { AFF_MVRB(2, false); }
+      else if (rb == 4u) { AFF_MVRB(4, false); }
+      else { AFF_MVRB(8, false); }
+    }
 #undef AFF_MVRB
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (rows + kDenseWaves - 1) / kDenseWaves), kDenseWaves);
-  hipLaunchKernelGGL(matvec_fp8_kernel, dim3(blocks), dim3(kDenseThreads),
-                     0, (hipStream_t)stream, W, S, x, out, rows, cols,
-                     (cols + 127) / 128, 0);
+  if (nt_load) {
+    hipLaunchKernelGGL((matvec_fp8_kernel<true>), dim3(blocks), dim3(kDenseThreads),
+                       0, (hipStream_t)stream, W, S, x, out, rows, cols,
+                       (cols + 127) / 128, 0);
+  } else {
+    hipLaunchKernelGGL((matvec_fp8_kernel<false>), dim3(blocks), dim3(kDenseThreads),
+                       0, (hipStream_t)stream, W, S, x, out, rows, cols,
+                       (cols + 127) / 128, 0);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -2752,13 +2849,20 @@ void matvec_fp8_rmsnorm_hip(const uint8_t* W, const uint8_t* S, const float* x, 
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (rows + per - 1) / per), kDenseWaves);
   const uint32_t sc = (cols + 127) / 128;
-#define AFF_MVRN(N)                                                                          \
-  hipLaunchKernelGGL((matvec_fp8_rn_kernel<N>), dim3(blocks), dim3(kDenseThreads), 0,         \
+#define AFF_MVRN(N, NT)                                                                        \
+  hipLaunchKernelGGL((matvec_fp8_rn_kernel<N, NT>), dim3(blocks), dim3(kDenseThreads), 0,      \
                      (hipStream_t)stream, W, S, x, nw, out, xn, rows, cols, sc, eps); AFF_HIP_CHECK(hipGetLastError())
-  if (rb == 1u) { AFF_MVRN(1); }
-  else if (rb == 2u) { AFF_MVRN(2); }
-  else if (rb == 4u) { AFF_MVRN(4); }
-  else { AFF_MVRN(8); }
+  if (aff::dense_nt_load_enabled()) {
+    if (rb == 1u) { AFF_MVRN(1, true); }
+    else if (rb == 2u) { AFF_MVRN(2, true); }
+    else if (rb == 4u) { AFF_MVRN(4, true); }
+    else { AFF_MVRN(8, true); }
+  } else {
+    if (rb == 1u) { AFF_MVRN(1, false); }
+    else if (rb == 2u) { AFF_MVRN(2, false); }
+    else if (rb == 4u) { AFF_MVRN(4, false); }
+    else { AFF_MVRN(8, false); }
+  }
 #undef AFF_MVRN
   AFF_HIP_CHECK(hipGetLastError());
 }
@@ -2826,6 +2930,7 @@ void expert_gemv_multix_hip(const DeviceMatrix* mats, const float* const* xs, co
   const bool use6 = tr && (ng % (uint32_t)kWavesPerBlock != 0u) && (ng % 6u == 0u);
   const uint32_t tr_blocks = aff::safe_grid_blocks(blocks, use6 ? 6u : (uint32_t)kWavesPerBlock);
   const uint32_t v8_blocks = aff::safe_grid_blocks(blocks, (uint32_t)kWavesPerBlock);
+  const bool nt_load = aff::dense_nt_load_enabled();
   for (uint32_t off = 0; off < n_mats; off += kMaxBatch) {
     const uint32_t n = std::min<uint32_t>(kMaxBatch, n_mats - off);
     BatchPtrs p{};
@@ -2838,26 +2943,36 @@ void expert_gemv_multix_hip(const DeviceMatrix* mats, const float* const* xs, co
     if (tr) {
       // Same wire-format switch as expert_gemv_batch_hip; see the comment there.
       const uint32_t fmt = expert_wire_format();
-#define AFF_GTRX(FV)                                                                              \
+#define AFF_GTRX(FV, NT)                                                                          \
   do {                                                                                             \
     if (use6) {                                                                                    \
-      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV, 6u>), dim3(tr_blocks), dim3(6u * kWave), 0,   \
-                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);             \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV, 6u, NT>), dim3(tr_blocks), dim3(6u * kWave),  \
+                         0, (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);          \
     } else {                                                                                       \
-      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV>), dim3(tr_blocks), dim3(kThreads), 0,          \
-                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);             \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV, (uint32_t)kWavesPerBlock, NT>),                \
+                         dim3(tr_blocks), dim3(kThreads), 0, (hipStream_t)stream, p,               \
+                         weights + off, n, cb, y, rows, cols);                                     \
     }                                                                                              \
     AFF_HIP_CHECK(hipGetLastError());                                                              \
   } while (0)
-      if (fmt == kFmtQuad2S) { AFF_GTRX(kFmtQuad2S); }
-      else if (fmt == kFmtQuad4S) { AFF_GTRX(kFmtQuad4S); }
-      else if (fmt == kFmtQuad4) { AFF_GTRX(kFmtQuad4); }
-      else if (fmt == kFmtQuad8) { AFF_GTRX(kFmtQuad8); }
-      else { AFF_GTRX(kFmtPair16); }
+#define AFF_GTRX_FMT(NT)                                                                           \
+  do {                                                                                             \
+    if (fmt == kFmtQuad2S) { AFF_GTRX(kFmtQuad2S, NT); }                                           \
+    else if (fmt == kFmtQuad4S) { AFF_GTRX(kFmtQuad4S, NT); }                                      \
+    else if (fmt == kFmtQuad4) { AFF_GTRX(kFmtQuad4, NT); }                                        \
+    else if (fmt == kFmtQuad8) { AFF_GTRX(kFmtQuad8, NT); }                                        \
+    else { AFF_GTRX(kFmtPair16, NT); }                                                             \
+  } while (0)
+      if (nt_load) { AFF_GTRX_FMT(true); } else { AFF_GTRX_FMT(false); }
+#undef AFF_GTRX_FMT
 #undef AFF_GTRX
-    } else
-      hipLaunchKernelGGL(expert_gemv_multix_kernel, dim3(v8_blocks), dim3(kThreads), 0,
+    } else if (nt_load) {
+      hipLaunchKernelGGL((expert_gemv_multix_kernel<true>), dim3(v8_blocks), dim3(kThreads), 0,
                          (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);
+    } else {
+      hipLaunchKernelGGL((expert_gemv_multix_kernel<false>), dim3(v8_blocks), dim3(kThreads), 0,
+                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);
+    }
     AFF_HIP_CHECK(hipGetLastError());
   }
 }
@@ -2881,6 +2996,7 @@ bool expert_gemv_split_hip(const DeviceMatrix* mats, const float* const* xs, flo
   // the ragged lanes re-read row0 and a STORE (unlike the accumulate) would then write it twice.
   const uint32_t use_rb = (rows % (rb * kWave) == 0) ? rb : 1u;
   const uint32_t nb = rows / (use_rb * kWave);
+  const bool nt_load = aff::dense_nt_load_enabled();
   for (uint32_t off = 0; off < n_mats; off += kMaxBatch) {
     const uint32_t n = std::min<uint32_t>(kMaxBatch, n_mats - off);
     BatchPtrs p{};
@@ -2900,28 +3016,33 @@ bool expert_gemv_split_hip(const DeviceMatrix* mats, const float* const* xs, flo
     const uint32_t launch_blocks =
         aff::safe_grid_blocks(blocks, use6 ? 6u : (uint32_t)kWavesPerBlock);
     const uint32_t fmt = expert_wire_format();
-#define AFF_GSPL(FV, RV)                                                                          \
+#define AFF_GSPL(FV, RV, NT)                                                                      \
   do {                                                                                             \
     if (use6) {                                                                                    \
-      hipLaunchKernelGGL((expert_gemv_kernel_tr_split<FV, RV, 6u>), dim3(launch_blocks),           \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr_split<FV, RV, 6u, NT>), dim3(launch_blocks),       \
                          dim3(6u * kWave), 0, (hipStream_t)stream, p, weights + off, n, cb, rows,  \
                          cols);                                                                    \
     } else {                                                                                       \
-      hipLaunchKernelGGL((expert_gemv_kernel_tr_split<FV, RV>), dim3(launch_blocks),               \
-                         dim3(kThreads), 0, (hipStream_t)stream, p, weights + off, n, cb, rows,    \
-                         cols);                                                                    \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr_split<FV, RV, (uint32_t)kWavesPerBlock, NT>),      \
+                         dim3(launch_blocks), dim3(kThreads), 0, (hipStream_t)stream, p,           \
+                         weights + off, n, cb, rows, cols);                                        \
     }                                                                                              \
     AFF_HIP_CHECK(hipGetLastError());                                                              \
   } while (0)
-#define AFF_GSPR(FV)                                                                              \
-  do { if (use_rb == 4u) { AFF_GSPL(FV, 4); }                                                     \
-       else if (use_rb == 2u) { AFF_GSPL(FV, 2); }                                                \
-       else { AFF_GSPL(FV, 1); } } while (0)
-    if (fmt == kFmtQuad2S) { AFF_GSPR(kFmtQuad2S); }
-    else if (fmt == kFmtQuad4S) { AFF_GSPR(kFmtQuad4S); }
-    else if (fmt == kFmtQuad4) { AFF_GSPR(kFmtQuad4); }
-    else if (fmt == kFmtQuad8) { AFF_GSPR(kFmtQuad8); }
-    else { AFF_GSPR(kFmtPair16); }
+#define AFF_GSPR(FV, NT)                                                                           \
+  do { if (use_rb == 4u) { AFF_GSPL(FV, 4, NT); }                                                  \
+       else if (use_rb == 2u) { AFF_GSPL(FV, 2, NT); }                                             \
+       else { AFF_GSPL(FV, 1, NT); } } while (0)
+#define AFF_GSPR_FMT(NT)                                                                           \
+  do {                                                                                             \
+    if (fmt == kFmtQuad2S) { AFF_GSPR(kFmtQuad2S, NT); }                                           \
+    else if (fmt == kFmtQuad4S) { AFF_GSPR(kFmtQuad4S, NT); }                                      \
+    else if (fmt == kFmtQuad4) { AFF_GSPR(kFmtQuad4, NT); }                                        \
+    else if (fmt == kFmtQuad8) { AFF_GSPR(kFmtQuad8, NT); }                                        \
+    else { AFF_GSPR(kFmtPair16, NT); }                                                             \
+  } while (0)
+    if (nt_load) { AFF_GSPR_FMT(true); } else { AFF_GSPR_FMT(false); }
+#undef AFF_GSPR_FMT
 #undef AFF_GSPR
 #undef AFF_GSPL
     AFF_HIP_CHECK(hipGetLastError());
@@ -2967,6 +3088,7 @@ void expert_gemv_batch_hip(const DeviceMatrix* mats, const float* weights, uint3
   const uint32_t tr_blocks = aff::safe_grid_blocks(blocks, use6 ? 6u : (uint32_t)kWavesPerBlock);
   const uint32_t v8_blocks = aff::safe_grid_blocks(blocks, (uint32_t)kWavesPerBlock);
 
+  const bool nt_load = aff::dense_nt_load_enabled();
   for (uint32_t off = 0; off < n_mats; off += kMaxBatch) {
     const uint32_t n = std::min<uint32_t>(kMaxBatch, n_mats - off);
     BatchPtrs p{};
@@ -2985,29 +3107,40 @@ void expert_gemv_batch_hip(const DeviceMatrix* mats, const float* weights, uint3
       // very same planes through this kernel, so a container the GEMM understands and this does
       // not is silently wrong output rather than a failure.
       const uint32_t fmt = expert_wire_format();
-#define AFF_GTR(FV)                                                                               \
+#define AFF_GTR(FV, NT)                                                                           \
   do {                                                                                             \
     if (use6) {                                                                                    \
-      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV, 6u>), dim3(tr_blocks), dim3(6u * kWave), 0,   \
-                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);             \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV, 6u, NT>), dim3(tr_blocks), dim3(6u * kWave),  \
+                         0, (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);          \
     } else {                                                                                       \
-      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV>), dim3(tr_blocks), dim3(kThreads), 0,          \
-                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);             \
+      hipLaunchKernelGGL((expert_gemv_kernel_tr<FV, (uint32_t)kWavesPerBlock, NT>),                \
+                         dim3(tr_blocks), dim3(kThreads), 0, (hipStream_t)stream, p,               \
+                         weights + off, n, cb, y, rows, cols);                                     \
     }                                                                                              \
     AFF_HIP_CHECK(hipGetLastError());                                                              \
   } while (0)
-      if (fmt == kFmtQuad2S) { AFF_GTR(kFmtQuad2S); }
-      else if (fmt == kFmtQuad4S) { AFF_GTR(kFmtQuad4S); }
-      else if (fmt == kFmtQuad4) { AFF_GTR(kFmtQuad4); }
-      else if (fmt == kFmtQuad8) { AFF_GTR(kFmtQuad8); }
-      else { AFF_GTR(kFmtPair16); }
+#define AFF_GTR_FMT(NT)                                                                            \
+  do {                                                                                             \
+    if (fmt == kFmtQuad2S) { AFF_GTR(kFmtQuad2S, NT); }                                            \
+    else if (fmt == kFmtQuad4S) { AFF_GTR(kFmtQuad4S, NT); }                                       \
+    else if (fmt == kFmtQuad4) { AFF_GTR(kFmtQuad4, NT); }                                         \
+    else if (fmt == kFmtQuad8) { AFF_GTR(kFmtQuad8, NT); }                                         \
+    else { AFF_GTR(kFmtPair16, NT); }                                                              \
+  } while (0)
+      if (nt_load) { AFF_GTR_FMT(true); } else { AFF_GTR_FMT(false); }
+#undef AFF_GTR_FMT
 #undef AFF_GTR
       AFF_HIP_CHECK(hipGetLastError());
       continue;
     }
     // Row-major, which only a test or a bench that builds its own planes ever asks for.
-    hipLaunchKernelGGL(expert_gemv_kernel_v8, dim3(v8_blocks), dim3(kThreads), 0,
-                       (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);
+    if (nt_load) {
+      hipLaunchKernelGGL((expert_gemv_kernel_v8<true>), dim3(v8_blocks), dim3(kThreads), 0,
+                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);
+    } else {
+      hipLaunchKernelGGL((expert_gemv_kernel_v8<false>), dim3(v8_blocks), dim3(kThreads), 0,
+                         (hipStream_t)stream, p, weights + off, n, cb, y, rows, cols);
+    }
     AFF_HIP_CHECK(hipGetLastError());
   }
   // No synchronise here. Work is ordered on the stream, and the caller's download (or explicit

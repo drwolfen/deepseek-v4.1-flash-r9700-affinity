@@ -142,25 +142,27 @@ struct QSrcSwiGLU {
   }
 };
 
-template <class Src, bool Hadamard32 = false>
-__global__ __launch_bounds__(kQThreads) void batch_quant_fp8_kernel(
+template <class Src, bool Hadamard32 = false, uint32_t QTok = 32u>
+__global__ __launch_bounds__(QTok * 8u) void batch_quant_fp8_kernel(
     Src src, uint8_t* __restrict__ out,
     float* __restrict__ scales, uint32_t dim, uint32_t nb, uint32_t x_off) {
-  __shared__ float tile[128][kQTok + 1];
-  __shared__ float part[8][kQTok];
-  __shared__ float smax[kQTok];
+  static_assert(QTok == 8u || QTok == 16u || QTok == 32u, "QTok must be 8, 16, or 32");
+  __shared__ float tile[128][QTok + 1];
+  __shared__ float part[8][QTok];
+  __shared__ float smax[QTok];
 
-  const uint32_t tid = threadIdx.x, tt = tid & 31u, kk = tid >> 5;
-  const uint32_t t0 = blockIdx.x * kQTok;
+  const uint32_t tid = threadIdx.x, tt = tid & (QTok - 1u), kk = tid / QTok;
+  const uint32_t t0 = blockIdx.x * QTok;
+  if (t0 >= nb) return;
   const uint32_t tok = t0 + tt;
   const uint32_t nkb = dim >> 7;
 
-  // gridDim.y IS the 128-dim block index, not a loop. As a loop the grid is only nb/kQTok blocks,
+  // gridDim.y IS the 128-dim block index, not a loop. As a loop the grid is only nb/QTok blocks,
   // which does not fill the card. Every (token, kb) pair is independent — the scale is per pair, and
   // `tile`/`part`/`smax` are re-derived each iteration — so the iteration space is the grid. Same
   // arithmetic in the same order per pair, so the output is bit-identical; only the schedule moved.
   for (uint32_t kb = blockIdx.y; kb < nkb; kb += gridDim.y) {
-    aff::lds_barrier();
+    if (kb != blockIdx.y) aff::lds_barrier();
     float m = 0.0f;
 #pragma unroll
     for (uint32_t i = 0; i < 16; ++i) {
@@ -177,23 +179,27 @@ __global__ __launch_bounds__(kQThreads) void batch_quant_fp8_kernel(
     if constexpr (Hadamard32) {
       aff::lds_barrier();
       for (uint32_t stride = 1; stride < 32u; stride <<= 1) {
+        if (tok < nb) {
 #pragma unroll
-        for (uint32_t b32 = 0; b32 < 4u; ++b32) {
-          for (uint32_t pair_idx = kk; pair_idx < 16u; pair_idx += 8u) {
-            const uint32_t base = b32 * 32u + (pair_idx / stride) * (2u * stride) + (pair_idx % stride);
-            const float a = tile[base][tt], b = tile[base + stride][tt];
-            tile[base][tt] = a + b;
-            tile[base + stride][tt] = a - b;
+          for (uint32_t b32 = 0; b32 < 4u; ++b32) {
+            for (uint32_t pair_idx = kk; pair_idx < 16u; pair_idx += 8u) {
+              const uint32_t base = b32 * 32u + (pair_idx / stride) * (2u * stride) + (pair_idx % stride);
+              const float a = tile[base][tt], b = tile[base + stride][tt];
+              tile[base][tt] = a + b;
+              tile[base + stride][tt] = a - b;
+            }
           }
         }
         aff::lds_barrier();
       }
+      if (tok < nb) {
 #pragma unroll
-      for (uint32_t i = 0; i < 16; ++i) {
-        const uint32_t k = kk + i * 8;
-        const float v = tile[k][tt] * 0.17677669529663689f;
-        tile[k][tt] = v;
-        m = fmaxf(m, fabsf(v));
+        for (uint32_t i = 0; i < 16; ++i) {
+          const uint32_t k = kk + i * 8;
+          const float v = tile[k][tt] * 0.17677669529663689f;
+          tile[k][tt] = v;
+          m = fmaxf(m, fabsf(v));
+        }
       }
     }
     part[kk][tt] = m;
@@ -416,9 +422,10 @@ constexpr uint32_t kFMTiles = 1, kFNTiles = 8;
 //
 // The layout is the remaining lever, not the schedule: pipelining depth, split-K and occupancy have
 // all been tried here and none of them moves this kernel much.
+template <bool NT_LOAD = false>
 __device__ __forceinline__ wmma::i2v load_frag8_ps(const uint8_t* __restrict__ W, uint32_t rt,
                                                    uint32_t kt, uint32_t ktiles, uint32_t lane) {
-  const uint2 v = *(const uint2*)(W + (((size_t)rt * ktiles + kt) * 32 + lane) * 8);
+  const uint2 v = aff::load_uint2_nt<NT_LOAD>(W + (((size_t)rt * ktiles + kt) * 32 + lane) * 8);
   wmma::i2v f;
   f[0] = (int)v.x;
   f[1] = (int)v.y;
@@ -461,11 +468,19 @@ __device__ __forceinline__ wmma::i2v load_frag8(const uint8_t* __restrict__ lds,
 typedef unsigned int aff_u32x4 __attribute__((ext_vector_type(4)));
 struct Stage8Reg { aff_u32x4 v, w; };
 
+template <bool NT_LOAD = false>
 __device__ __forceinline__ Stage8Reg stage8_load(const uint8_t* __restrict__ src, bool live) {
   Stage8Reg r;
   r.v = {0u, 0u, 0u, 0u};
   r.w = {0u, 0u, 0u, 0u};
   if (live) {
+#ifdef __HIP_DEVICE_COMPILE__
+    if constexpr (NT_LOAD) {
+      r.v = __builtin_nontemporal_load((const aff_u32x4*)src);
+      r.w = __builtin_nontemporal_load((const aff_u32x4*)(src + 16));
+      return r;
+    }
+#endif
     r.v = *(const aff_u32x4*)src;
     r.w = *(const aff_u32x4*)(src + 16);
   }
@@ -539,7 +554,8 @@ struct GemmJobsArgs {
 // The body, with `m0` and the K range handed in — same split the WMMA kernel took, and for the
 // same reason: a grouped wrapper maps blockIdx.x through a job table so several weight matrices
 // sharing an activation are one launch, and this is far too much staging code to keep two of.
-template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u>
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u,
+          bool NT_LOAD = false>
 __device__ __forceinline__ void gemm_fp8_body(
     const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Sw, const uint8_t* __restrict__ Xp,
     const float* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
@@ -548,6 +564,7 @@ __device__ __forceinline__ void gemm_fp8_body(
     uint32_t by, uint32_t kbeg, uint32_t kend, uint32_t ws_rows, uint32_t tile_id) {
   static_assert(MTW == 1u || (NT == 8u && MW == 8u && FK == 64u),
                 "4x2 prefill wave layout applies only to 8x8x64");
+  constexpr bool kNtLoad = NT_LOAD && (NT == 1u);
   constexpr uint32_t kMWaves = (MTW == 2u) ? 4u : MW;
   constexpr uint32_t kNWaves = (MTW == 2u) ? 2u : 1u;
   constexpr uint32_t kMWTiles = MTW;
@@ -613,13 +630,13 @@ __device__ __forceinline__ void gemm_fp8_body(
   for (uint32_t g = 0; g < kNG; ++g) {
     const uint32_t o = kbeg + g * 64;
     pb[g] = stage8_load(bsrc + o, b_row && (Full || o + sk + 32 <= cols));
-    pa[g] = stage8_load(asrc + o, a_row && (Full || o + sk + 32 <= cols));
+    pa[g] = stage8_load<kNtLoad>(asrc + o, a_row && (Full || o + sk + 32 <= cols));
   }
   uint32_t pws = 0u;
   float psx = 0.0f;
   if (tid < kFolds) {
     const uint32_t kb0 = (kbeg >> 7) + tid;
-    if (Full || kb0 < sc_cols) pws = Sw[(size_t)srow * sc_cols + kb0];
+    if (Full || kb0 < sc_cols) pws = aff::load_nt<kNtLoad>(&Sw[(size_t)srow * sc_cols + kb0]);
   }
   if (tid < kFolds * FN) {
     const uint32_t kb0 = (kbeg >> 7) + sf;
@@ -662,11 +679,12 @@ __device__ __forceinline__ void gemm_fp8_body(
           const uint32_t o = c1 + g * 64;
           const bool live = Full || (o + sk + 32 <= cols);
           if (sn < FN) pb[g] = stage8_load(bsrc + o, b_row && live);
-          if (!PS) pa[g] = stage8_load(asrc + o, a_row && live);
+          if (!PS) pa[g] = stage8_load<kNtLoad>(asrc + o, a_row && live);
         }
         if (tid < kFolds) {
           const uint32_t kb1 = (c1 >> 7) + tid;
-          pws = (Full || kb1 < sc_cols) ? Sw[(size_t)srow * sc_cols + kb1] : 0u;
+          pws = (Full || kb1 < sc_cols) ? aff::load_nt<kNtLoad>(&Sw[(size_t)srow * sc_cols + kb1])
+                                        : 0u;
         }
         if (tid < kFolds * FN) {
           const uint32_t kb1 = (c1 >> 7) + sf;
@@ -689,7 +707,7 @@ __device__ __forceinline__ void gemm_fp8_body(
 #pragma unroll
         for (uint32_t i = 0; i < kMWTiles; ++i) {
           if (Full || (m0 + wm + i * 16u) < rows) {
-            apf[i][t] = load_frag8_ps(Wp, rt0 + i, (c0 + t * wmma::kK) >> 4, ktiles, lane);
+            apf[i][t] = load_frag8_ps<kNtLoad>(Wp, rt0 + i, (c0 + t * wmma::kK) >> 4, ktiles, lane);
           } else {
             apf[i][t][0] = 0;
             apf[i][t][1] = 0;
@@ -812,7 +830,8 @@ __device__ __forceinline__ void gemm_fp8_body(
   }
 }
 
-template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u>
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u,
+          bool NT_LOAD = false>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((NT == 8u && MW == 8u && FK == 64u) ? 8 : 1,
                                    (NT == 8u && MW == 8u && FK == 64u) ? 8 : 16)))
@@ -841,13 +860,13 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_kernel(
   const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
   const uint32_t ws_rows = ck ? rows : 0u;
   const uint32_t tile_id = by * gridDim.x + bx;
-  gemm_fp8_body<Full, PS, NT, MW, FK, MTW>(Wp, Sw, Xp, Sx, Y, FinalY, Ctr, rows, cols, nb, sc_cols,
-                                           x_off, w_row_off, x_ld, sx_ld, accum, bx, by, kbeg,
-                                           kend, ws_rows, tile_id);
+  gemm_fp8_body<Full, PS, NT, MW, FK, MTW, NT_LOAD>(Wp, Sw, Xp, Sx, Y, FinalY, Ctr, rows, cols, nb,
+                                                    sc_cols, x_off, w_row_off, x_ld, sx_ld, accum,
+                                                    bx, by, kbeg, kend, ws_rows, tile_id);
 }
 
 // Several fp8 weight matrices against one activation, one launch. See batch_gemm_multi_kernel.
-template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK>
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, bool NT_LOAD = false>
 __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_multi_kernel(
     GemmJobsArgs J, const uint8_t* __restrict__ Xp, const float* __restrict__ Sx,
     float* __restrict__ FinalY0, unsigned int* __restrict__ Ctr, uint32_t cols, uint32_t nb,
@@ -861,7 +880,7 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_multi_kernel(
   const size_t band_off = (size_t)(y_job - (const float*)J.y[0]);
   float* const final_job = (ck && FinalY0) ? (FinalY0 + band_off) : nullptr;
   const uint32_t tile_id = blockIdx.y * gridDim.x + blockIdx.x;
-  gemm_fp8_body<Full, PS, NT, MW, FK, 1u>(
+  gemm_fp8_body<Full, PS, NT, MW, FK, 1u, NT_LOAD>(
       (const uint8_t*)J.w[j], J.s[j], Xp, Sx, y_job, final_job, Ctr, J.rows[j], cols, nb, sc_cols,
       J.xoff[j], J.woff[j], x_ld, sx_ld, 0, blockIdx.x - tbeg, blockIdx.y, kbeg, kend,
       ck ? total : 0u, tile_id);
@@ -869,7 +888,8 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_multi_kernel(
 
 // Grouped W8A8 FP8 WMMA with per-32 UE8M0 activation scales (`Sx`: [ng][nb][group_dim >> 5])
 // folded every 2 K=16 WMMA steps (`b32 = 0 .. FK/32 - 1`) and 128x128 UE8M0 weight scales (`Ws`).
-template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u>
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u,
+          bool NT_LOAD = false>
 __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
     const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Ws, const uint8_t* __restrict__ Xp,
     const uint8_t* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
@@ -878,6 +898,7 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
     uint32_t ws_rows, uint32_t tile_id) {
   static_assert(MTW == 1u || (NT == 8u && MW == 8u && FK == 64u),
                 "4x2 prefill wave layout applies only to 8x8x64");
+  constexpr bool kNtLoad = NT_LOAD && (NT == 1u);
   constexpr uint32_t kMWaves = (MTW == 2u) ? 4u : MW;
   constexpr uint32_t kNWaves = (MTW == 2u) ? 2u : 1u;
   constexpr uint32_t kMWTiles = MTW;
@@ -960,14 +981,15 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
   for (uint32_t g = 0; g < kNG; ++g) {
     const uint32_t o = kbeg + g * 64u;
     pb[g] = stage8_load(bsrc + o, b_row && (Full || o + sk + 32u <= cols));
-    if constexpr (!PS) pa[g] = stage8_load(asrc + o, a_row && (Full || o + sk + 32u <= cols));
+    if constexpr (!PS) pa[g] = stage8_load<kNtLoad>(asrc + o, a_row && (Full || o + sk + 32u <= cols));
   }
   uint32_t pws0 = 0u, pws1 = 0u;
   if (tid < kFolds128) {
     const uint32_t kb0 = (kbeg >> 7) + tid;
     if (Full || kb0 < sc_cols) {
-      pws0 = Ws[(size_t)srow0 * sc_cols + kb0];
-      if constexpr (!Full) pws1 = (srow1 != srow0) ? Ws[(size_t)srow1 * sc_cols + kb0] : pws0;
+      pws0 = aff::load_nt<kNtLoad>(&Ws[(size_t)srow0 * sc_cols + kb0]);
+      if constexpr (!Full)
+        pws1 = (srow1 != srow0) ? aff::load_nt<kNtLoad>(&Ws[(size_t)srow1 * sc_cols + kb0]) : pws0;
     }
   }
   sx_word_t psx = load_sx_tile(kbeg);
@@ -1007,13 +1029,15 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
           const uint32_t o = c1 + g * 64u;
           const bool live = Full || (o + sk + 32u <= cols);
           if (sn < FN) pb[g] = stage8_load(bsrc + o, b_row && live);
-          if constexpr (!PS) pa[g] = stage8_load(asrc + o, a_row && live);
+          if constexpr (!PS) pa[g] = stage8_load<kNtLoad>(asrc + o, a_row && live);
         }
         if (tid < kFolds128) {
           const uint32_t kb1 = (c1 >> 7) + tid;
           if (Full || kb1 < sc_cols) {
-            pws0 = Ws[(size_t)srow0 * sc_cols + kb1];
-            if constexpr (!Full) pws1 = (srow1 != srow0) ? Ws[(size_t)srow1 * sc_cols + kb1] : pws0;
+            pws0 = aff::load_nt<kNtLoad>(&Ws[(size_t)srow0 * sc_cols + kb1]);
+            if constexpr (!Full)
+              pws1 =
+                  (srow1 != srow0) ? aff::load_nt<kNtLoad>(&Ws[(size_t)srow1 * sc_cols + kb1]) : pws0;
           } else {
             pws0 = 0u;
             pws1 = 0u;
@@ -1031,7 +1055,7 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
 #pragma unroll
         for (uint32_t i = 0; i < kMWTiles; ++i) {
           if (Full || ((m0 + wm + i * 16u) < rank && (c0 + t * wmma::kK) < kend)) {
-            apf[i][t] = load_frag8_ps(Wp, rt0 + i, (c0 + t * wmma::kK) >> 4, ktiles, lane);
+            apf[i][t] = load_frag8_ps<kNtLoad>(Wp, rt0 + i, (c0 + t * wmma::kK) >> 4, ktiles, lane);
           } else {
             apf[i][t][0] = 0;
             apf[i][t][1] = 0;
@@ -1182,7 +1206,8 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
   }
 }
 
-template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u>
+template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u,
+          bool NT_LOAD = false>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((NT == 8u && MW == 8u && FK == 64u) ? 8 : 1,
                                    (NT == 8u && MW == 8u && FK == 64u) ? 8 : 16)))
@@ -1213,7 +1238,7 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_grouped_b32_kernel(
   const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
   const uint32_t ws_rows = ck ? (ng * rank) : 0u;
   const uint32_t tile_id = by * gridDim.x + lin_bx;
-  gemm_fp8_grouped_b32_body<Full, PS, NT, MW, FK, MTW>(
+  gemm_fp8_grouped_b32_body<Full, PS, NT, MW, FK, MTW, NT_LOAD>(
       Wp, Ws, Xp + (size_t)g * nb * cols, Sx + (size_t)g * nb * sx_cols,
       Y + (size_t)g * rank * nb, FinalY ? (FinalY + (size_t)g * rank * nb) : nullptr, Ctr, rank,
       cols, nb, sc_cols, sx_cols, w_row_off, bx_g, by, kbeg, kend, ws_rows, tile_id);
@@ -1244,11 +1269,13 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_grouped_b32_kernel(
 // sharing an activation are one launch instead of several. Extracted rather than copied — the fusion
 // is worth well over a third, and this is 120 lines of WMMA staging that must not drift between two
 // versions of itself.
-template <int Q, bool Full, bool XB, uint32_t MT, uint32_t NT, uint32_t NW>
+template <int Q, bool Full, bool XB, uint32_t MT, uint32_t NT, uint32_t NW,
+          bool NT_LOAD = false>
 __device__ __forceinline__ void gemm_wmma_body(
     const void* __restrict__ Wp, const uint8_t* __restrict__ S, const void* __restrict__ Xp,
     float* __restrict__ Y, uint32_t rows, uint32_t cols, uint32_t nb, uint32_t sc_cols,
     uint32_t x_off, uint32_t w_row_off, uint32_t m0, uint32_t kbeg, uint32_t kend) {
+  constexpr bool kNtLoad = NT_LOAD && (NT == 1u);
   constexpr uint32_t kMW = kWWaves / NW;                   // waves along M
   constexpr uint32_t kMExt = kMW * MT * 16;                // == kWM in both instantiations
   constexpr uint32_t kNExt = NW * NT * 16;
@@ -1294,7 +1321,7 @@ __device__ __forceinline__ void gemm_wmma_body(
     // block, so the branch is uniform and the barrier inside it is legal.
     if (Q != AFF_BF16 && (c0 >> 7) != lut_tile) {
       lut_tile = c0 >> 7;
-      const uint32_t e = S[(size_t)srow * sc_cols + lut_tile];
+      const uint32_t e = aff::load_nt<kNtLoad>(&S[(size_t)srow * sc_cols + lut_tile]);
       s_lut[tid] = e4m3_bf16_bits(tid, __uint_as_float(e ? (e << 23) : 0u));
       aff::lds_barrier();
     }
@@ -1315,13 +1342,13 @@ __device__ __forceinline__ void gemm_wmma_body(
 #pragma unroll
         for (uint32_t gi = 0; gi < 4; ++gi) {                    // one uint4 IS one granule
           const uint32_t k = sh + gi * 8;
-          *(uint4*)(dst + ((((k >> 3) ^ (sm & 7u))) << 3)) = src[gi];
+          *(uint4*)(dst + ((((k >> 3) ^ (sm & 7u))) << 3)) = aff::load_uint4_nt<kNtLoad>(src + gi);
         }
       } else if (live) {
         const uint4* src = (const uint4*)((const uint8_t*)Wp + (size_t)grow * cols + c0 + sh);
 #pragma unroll
         for (uint32_t h = 0; h < 2; ++h) {                       // 16 source bytes = 2 granules
-          const uint4 v = src[h];
+          const uint4 v = aff::load_uint4_nt<kNtLoad>(src + h);
           const uint32_t w[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
           for (uint32_t gi = 0; gi < 2; ++gi) {
@@ -1350,8 +1377,9 @@ __device__ __forceinline__ void gemm_wmma_body(
               const uint32_t k = sh + gi * 8 + q * 2 + e;
               if ((m0 + sm) >= rows || c0 + k >= cols) continue;
               const size_t idx = (size_t)grow * cols + c0 + k;
-              h2[e] = Q == AFF_BF16 ? ((const uint16_t*)Wp)[idx]
-                                    : s_lut[((const uint8_t*)Wp)[idx]];
+              h2[e] = Q == AFF_BF16
+                          ? aff::load_nt<kNtLoad>(&((const uint16_t*)Wp)[idx])
+                          : s_lut[aff::load_nt<kNtLoad>(&((const uint8_t*)Wp)[idx])];
             }
             d[q] = h2[0] | (h2[1] << 16);
           }
@@ -1458,7 +1486,7 @@ __device__ __forceinline__ void gemm_wmma_body(
 }
 
 template <int Q, bool Full, bool XB, uint32_t MT = kWMTiles, uint32_t NT = kWNTiles,
-          uint32_t NW = 2>
+          uint32_t NW = 2, bool NT_LOAD = false>
 __global__ __launch_bounds__(kWThreads) void batch_gemm_wmma_kernel(
     const void* __restrict__ Wp, const uint8_t* __restrict__ S, const void* __restrict__ Xp,
     float* __restrict__ Y, uint32_t rows, uint32_t cols, uint32_t nb, uint32_t sc_cols,
@@ -1470,16 +1498,17 @@ __global__ __launch_bounds__(kWThreads) void batch_gemm_wmma_kernel(
   // empty — they returned without writing, and splitk_reduce summed their uninitialised partials.
   const uint32_t kbeg = ck ? blockIdx.z * ck : 0u;
   const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
-  gemm_wmma_body<Q, Full, XB, MT, NT, NW>(Wp, S, Xp, Y + (size_t)blockIdx.z * rows * nb, rows, cols,
-                                          nb, sc_cols, x_off, w_row_off,
-                                          blockIdx.x * (kWWaves / NW * MT * 16), kbeg, kend);
+  gemm_wmma_body<Q, Full, XB, MT, NT, NW, NT_LOAD>(
+      Wp, S, Xp, Y + (size_t)blockIdx.z * rows * nb, rows, cols, nb, sc_cols, x_off, w_row_off,
+      blockIdx.x * (kWWaves / NW * MT * 16), kbeg, kend);
 }
 
 // Several weight matrices against one activation, in one launch. blockIdx.x is a GLOBAL M-tile
 // index; `tile_end` maps it to a job in at most kGemmJobsMax scalar compares, all uniform.
 //
 // No split-K here: the whole point is that the union of the jobs' row tiles already fills the grid.
-template <int Q, bool Full, bool XB, uint32_t MT = 1, uint32_t NT = 1, uint32_t NW = 1>
+template <int Q, bool Full, bool XB, uint32_t MT = 1, uint32_t NT = 1, uint32_t NW = 1,
+          bool NT_LOAD = false>
 __global__ __launch_bounds__(kWThreads) void batch_gemm_multi_kernel(GemmJobsArgs J,
                                                                     const void* __restrict__ Xp,
                                                                     uint32_t cols, uint32_t nb,
@@ -1494,11 +1523,9 @@ __global__ __launch_bounds__(kWThreads) void batch_gemm_multi_kernel(GemmJobsArg
   // job's band of it and z strides by the whole thing.
   const uint32_t kbeg = ck ? blockIdx.z * ck : 0u;
   const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
-  gemm_wmma_body<Q, Full, XB, MT, NT, NW>(J.w[j], J.s[j], Xp,
-                                          J.y[j] + (size_t)blockIdx.z * total * nb, J.rows[j], cols,
-                                          nb, sc_cols, J.xoff[j], J.woff[j],
-                                          (blockIdx.x - tbeg) * (kWWaves / NW * MT * 16), kbeg,
-                                          kend);
+  gemm_wmma_body<Q, Full, XB, MT, NT, NW, NT_LOAD>(
+      J.w[j], J.s[j], Xp, J.y[j] + (size_t)blockIdx.z * total * nb, J.rows[j], cols, nb, sc_cols,
+      J.xoff[j], J.woff[j], (blockIdx.x - tbeg) * (kWWaves / NW * MT * 16), kbeg, kend);
 }
 
 // ---- lossless 12.25-bit bf16x12 packing & bit-identical decode kernels -------------------------
@@ -1599,7 +1626,7 @@ __global__ __launch_bounds__(kB12PackThreads) void pack_bf16x12_kernel(
 constexpr uint32_t kB12MvWaves = 8;
 constexpr uint32_t kB12MvThreads = kB12MvWaves * kWave;
 
-template <uint32_t T>
+template <uint32_t T, bool NT_LOAD = true>
 __global__ __launch_bounds__(kB12MvThreads) void matvec_bf16x12_multix_kernel(
     const uint8_t* __restrict__ b12_sm, const uint8_t* __restrict__ b12_exp4,
     const uint8_t* __restrict__ b12_mexp, const uint32_t* __restrict__ esc_off,
@@ -1619,9 +1646,9 @@ __global__ __launch_bounds__(kB12MvThreads) void matvec_bf16x12_multix_kernel(
 #pragma unroll
     for (uint32_t t = 0; t < T; ++t) { a0[t] = 0.0f; a1[t] = 0.0f; a2[t] = 0.0f; a3[t] = 0.0f; }
     for (uint32_t c = lane * 8u; c < cols; c += 256u) {
-      const uint2 sm8 = *(const uint2*)(smrow + c);
-      const uint32_t e4 = *(const uint32_t*)(e4row + (c >> 1));
-      const uint32_t mexp = (uint32_t)mrow[c >> 5];
+      const uint2 sm8 = aff::load_uint2_nt<NT_LOAD>(smrow + c);
+      const uint32_t e4 = aff::load_nt<NT_LOAD>((const uint32_t*)(e4row + (c >> 1)));
+      const uint32_t mexp = (uint32_t)aff::load_nt<NT_LOAD>(&mrow[c >> 5]);
       uint16_t wu[8];
       bf16x12_decode8_u16(sm8, e4, mexp, row, c, esc_off, esc_col, esc_val, wu);
       const float w0 = __uint_as_float((uint32_t)wu[0] << 16);
@@ -1660,13 +1687,14 @@ __global__ __launch_bounds__(kB12MvThreads) void matvec_bf16x12_multix_kernel(
   }
 }
 
-template <bool Full, uint32_t MT, uint32_t NT, uint32_t NW>
+template <bool Full, uint32_t MT, uint32_t NT, uint32_t NW, bool NT_LOAD = false>
 __device__ __forceinline__ void gemm_bf16x12_body(
     const uint8_t* __restrict__ b12_sm, const uint8_t* __restrict__ b12_exp4,
     const uint8_t* __restrict__ b12_mexp, const uint32_t* __restrict__ esc_off,
     const uint16_t* __restrict__ esc_col, const uint16_t* __restrict__ esc_val,
     const float* __restrict__ X, float* __restrict__ Y, uint32_t rows, uint32_t cols,
     uint32_t nb, uint32_t w_row_off, uint32_t m0, uint32_t kbeg, uint32_t kend) {
+  constexpr bool kNtLoad = NT_LOAD && (NT == 1u);
   constexpr uint32_t kMW = kWWaves / NW;
   constexpr uint32_t kMExt = kMW * MT * 16;
   constexpr uint32_t kNExt = NW * NT * 16;
@@ -1697,15 +1725,15 @@ __device__ __forceinline__ void gemm_bf16x12_body(
       const bool live = Full || ((m0 + sm) < rows && (c0 + sh + 32u) <= cols);
       uint16_t* dst = s_a + sm * kWLdsRow;
       if (live) {
-        const uint32_t mexp =
-            (uint32_t)b12_mexp[(size_t)grow * (cols >> 5) + ((c0 + sh) >> 5)];
-        const uint4 e4 =
-            *(const uint4*)(b12_exp4 + (size_t)grow * (cols >> 1) + ((c0 + sh) >> 1));
+        const uint32_t mexp = (uint32_t)aff::load_nt<kNtLoad>(
+            &b12_mexp[(size_t)grow * (cols >> 5) + ((c0 + sh) >> 5)]);
+        const uint4 e4 = aff::load_uint4_nt<kNtLoad>(
+            b12_exp4 + (size_t)grow * (cols >> 1) + ((c0 + sh) >> 1));
         const uint32_t e4w[4] = {e4.x, e4.y, e4.z, e4.w};
         const uint2* sm_src = (const uint2*)(b12_sm + (size_t)grow * cols + c0 + sh);
 #pragma unroll
         for (uint32_t gi = 0; gi < 4u; ++gi) {
-          const uint2 sm8 = sm_src[gi];
+          const uint2 sm8 = aff::load_uint2_nt<kNtLoad>(sm_src + gi);
           uint16_t wu[8];
           bf16x12_decode8_u16(sm8, e4w[gi], mexp, grow, c0 + sh + gi * 8u, esc_off, esc_col,
                               esc_val, wu);
@@ -1795,7 +1823,8 @@ __device__ __forceinline__ void gemm_bf16x12_body(
     }
 }
 
-template <bool Full, uint32_t MT = kWMTiles, uint32_t NT = kWNTiles, uint32_t NW = 2>
+template <bool Full, uint32_t MT = kWMTiles, uint32_t NT = kWNTiles, uint32_t NW = 2,
+          bool NT_LOAD = false>
 __global__ __launch_bounds__(kWThreads) void batch_gemm_bf16x12_kernel(
     const uint8_t* __restrict__ b12_sm, const uint8_t* __restrict__ b12_exp4,
     const uint8_t* __restrict__ b12_mexp, const uint32_t* __restrict__ esc_off,
@@ -1804,9 +1833,10 @@ __global__ __launch_bounds__(kWThreads) void batch_gemm_bf16x12_kernel(
     uint32_t nb, uint32_t w_row_off, uint32_t ck) {
   const uint32_t kbeg = ck ? blockIdx.z * ck : 0u;
   const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
-  gemm_bf16x12_body<Full, MT, NT, NW>(b12_sm, b12_exp4, b12_mexp, esc_off, esc_col, esc_val, X,
-                                      Y + (size_t)blockIdx.z * rows * nb, rows, cols, nb,
-                                      w_row_off, blockIdx.x * (kWWaves / NW * MT * 16), kbeg, kend);
+  gemm_bf16x12_body<Full, MT, NT, NW, NT_LOAD>(
+      b12_sm, b12_exp4, b12_mexp, esc_off, esc_col, esc_val, X,
+      Y + (size_t)blockIdx.z * rows * nb, rows, cols, nb, w_row_off,
+      blockIdx.x * (kWWaves / NW * MT * 16), kbeg, kend);
 }
 
 // ---- the f32 GEMM, as three bf16 WMMA passes ---------------------------------------------------
@@ -3778,6 +3808,7 @@ __device__ __forceinline__ uint64_t markov_key(float v, uint32_t row) {
   return ((uint64_t)u << 32) | (uint64_t)(~row);       // ~row: bigger key = smaller row
 }
 
+template <bool NT_LOAD = true>
 __global__ __launch_bounds__(kMarkovThr) void markov_step_kernel(
     const uint16_t* __restrict__ w1, const uint16_t* __restrict__ w2,
     const uint32_t* __restrict__ ids, const float* __restrict__ logits,
@@ -3810,7 +3841,7 @@ __global__ __launch_bounds__(kMarkovThr) void markov_step_kernel(
     const uint16_t* row = w2 + (size_t)(w2_row0 + r) * rank;
     float acc = 0.0f;
     for (uint32_t i = lane * 8; i < rank; i += kWave * 8) {
-      const uint4 v = *(const uint4*)(row + i);
+      const uint4 v = aff::load_uint4_nt<NT_LOAD>(row + i);
       const uint32_t w[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
@@ -3855,6 +3886,7 @@ __global__ void markov_combine_kernel(const unsigned long long* __restrict__ a,
   ids[col + 1] = ~(uint32_t)(k & 0xffffffffu);
 }
 
+template <bool NT_LOAD = true>
 __global__ __launch_bounds__(kMarkovThr) void markov_step_fp8_g128_kernel(
     const uint16_t* __restrict__ w1, const uint8_t* __restrict__ w2_fp8,
     const uint16_t* __restrict__ w2_scales, const uint32_t* __restrict__ ids,
@@ -3876,9 +3908,9 @@ __global__ __launch_bounds__(kMarkovThr) void markov_step_fp8_g128_kernel(
     const uint16_t* srow = w2_scales + (size_t)r * sc_cols;
     float acc = 0.0f;
     for (uint32_t g = 0u; g < sc_cols; ++g) {
-      const float sc = wmma::bf16_to_f32(srow[g]);
+      const float sc = wmma::bf16_to_f32(aff::load_nt<NT_LOAD>(&srow[g]));
       const uint32_t c = g * 128u + lane * 4u;
-      const uint32_t pk = *(const uint32_t*)(wrow + c);
+      const uint32_t pk = aff::load_nt<NT_LOAD>((const uint32_t*)(wrow + c));
       const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(pk);
       const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(pk);
       const float dot = (d01.x * s_e[c] + d01.y * s_e[c + 1u]) +
@@ -4110,13 +4142,19 @@ void gemm_launch(uint32_t quant, const void* W, const uint8_t* S, const void* X,
   const dim3 grid(gx, gy, ksplit);
   const bool full = (rows % kWM == 0) && (nb % wn_eff == 0) && (cols % kWK == 0);
   const bool narrow = wn_eff == kNarrowN;
+  const bool nt_load = narrow && aff::dense_nt_load_enabled();
   float* const dst = ksplit > 1 ? ws : Y;
-#define AFF_GEMM_G(q, f, xb, mt, nt, nw)                                                         \
-  AFF_BLAUNCH((batch_gemm_wmma_kernel<q, f, xb, mt, nt, nw>), grid, dim3(kWThreads), 0, st, W, S, \
-              X, dst, rows, cols, nb, sc_cols, x_off, w_row_off, ck)
+#define AFF_GEMM_G(q, f, xb, mt, nt, nw, ntl)                                                    \
+  AFF_BLAUNCH((batch_gemm_wmma_kernel<q, f, xb, mt, nt, nw, ntl>), grid, dim3(kWThreads), 0, st, \
+              W, S, X, dst, rows, cols, nb, sc_cols, x_off, w_row_off, ck)
 #define AFF_GEMM_W(q, f, xb)                                                                     \
   do {                                                                                           \
-    if (narrow) AFF_GEMM_G(q, f, xb, 1, 1, 1); else AFF_GEMM_G(q, f, xb, kWMTiles, kWNTiles, 2); \
+    if (narrow) {                                                                                \
+      if (nt_load) AFF_GEMM_G(q, f, xb, 1, 1, 1, true);                                          \
+      else         AFF_GEMM_G(q, f, xb, 1, 1, 1, false);                                         \
+    } else {                                                                                     \
+      AFF_GEMM_G(q, f, xb, kWMTiles, kWNTiles, 2, false);                                        \
+    }                                                                                            \
   } while (0)
 #define AFF_GEMM_X(q)                                                                            \
   do {                                                                                           \
@@ -4126,6 +4164,7 @@ void gemm_launch(uint32_t quant, const void* W, const uint8_t* S, const void* X,
   if (quant == AFF_BF16) AFF_GEMM_X(AFF_BF16); else AFF_GEMM_X(AFF_FP8_E4M3);
 #undef AFF_GEMM_X
 #undef AFF_GEMM_W
+#undef AFF_GEMM_G
   if (ksplit > 1) {
     const size_t n = (size_t)rows * nb;
     AFF_BLAUNCH(splitk_reduce_kernel, dim3((uint32_t)((n + 255) / 256)), dim3(256), 0, st, ws, Y,
@@ -4188,9 +4227,15 @@ bool batch_gemm_multi_hip(uint32_t quant, const BatchGemmJob* jobs, uint32_t n, 
   const dim3 grid(tiles, gy, ksplit);
   const uint32_t sc_cols = (uint32_t)((cols + 127) / 128);
   const hipStream_t st = (hipStream_t)stream;
-#define AFF_GEMM_M(q, f, xb) \
-  AFF_BLAUNCH((batch_gemm_multi_kernel<q, f, xb>), grid, dim3(kWThreads), 0, st, J, X, cols, nb, \
-              sc_cols, ck, total)
+  const bool nt_load = aff::dense_nt_load_enabled();
+#define AFF_GEMM_M_NTL(q, f, xb, ntl)                                                              \
+  AFF_BLAUNCH((batch_gemm_multi_kernel<q, f, xb, 1, 1, 1, ntl>), grid, dim3(kWThreads), 0, st, J,  \
+              X, cols, nb, sc_cols, ck, total)
+#define AFF_GEMM_M(q, f, xb)                                                                       \
+  do {                                                                                             \
+    if (nt_load) AFF_GEMM_M_NTL(q, f, xb, true);                                                   \
+    else         AFF_GEMM_M_NTL(q, f, xb, false);                                                  \
+  } while (0)
   if (quant == AFF_BF16) {
     if (x_bf16) { if (full) AFF_GEMM_M(AFF_BF16, true, true);  else AFF_GEMM_M(AFF_BF16, false, true); }
     else        { if (full) AFF_GEMM_M(AFF_BF16, true, false); else AFF_GEMM_M(AFF_BF16, false, false); }
@@ -4199,6 +4244,7 @@ bool batch_gemm_multi_hip(uint32_t quant, const BatchGemmJob* jobs, uint32_t n, 
     else        { if (full) AFF_GEMM_M(AFF_FP8_E4M3, true, false); else AFF_GEMM_M(AFF_FP8_E4M3, false, false); }
   }
 #undef AFF_GEMM_M
+#undef AFF_GEMM_M_NTL
   if (ksplit > 1) {
     const size_t nn = (size_t)total * nb;
     AFF_BLAUNCH(splitk_reduce_kernel, dim3((uint32_t)((nn + 255) / 256)), dim3(256), 0, st, ws,
@@ -4230,39 +4276,63 @@ bool batch_gemm_bf16x_hip(uint32_t quant, const void* W, const uint8_t* S, const
 // is tens of blocks and the dim axis multiplies that by the block count. `tile` is ~18 KiB of LDS so
 // only about three blocks are resident a CU regardless — the point is having enough of them that
 // every CU has one at all.
+template <uint32_t QTok = kQTok>
 static inline dim3 quant_grid(uint32_t dim, uint32_t nb) {
   const uint32_t nkb = dim >> 7;
-  return dim3((nb + kQTok - 1) / kQTok, nkb ? nkb : 1u);
+  return dim3((nb + QTok - 1u) / QTok, nkb ? nkb : 1u);
+}
+
+inline bool quant_hadamard_enabled() {
+  static const bool had = [] {
+    const char* s = std::getenv("AFF_HADAMARD_ROT");
+    return s && *s && *s != '0';
+  }();
+  return had;
+}
+
+inline bool quant_fast_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_QUANT_FAST");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
+template <class Src, bool Had, uint32_t QTok>
+static inline void launch_batch_quant_fp8_qtok(Src src, uint8_t* out, float* scales, uint32_t dim,
+                                               uint32_t nb, uint32_t x_off, hipStream_t stream) {
+  AFF_BLAUNCH((batch_quant_fp8_kernel<Src, Had, QTok>), quant_grid<QTok>(dim, nb),
+              dim3(QTok * 8u), 0, stream, src, out, scales, dim, nb, x_off);
+}
+
+template <class Src>
+static inline void launch_batch_quant_fp8(Src src, uint8_t* out, float* scales, uint32_t dim,
+                                          uint32_t nb, uint32_t x_off, hipStream_t stream) {
+  if (!out || !scales || !nb || (dim >> 7) == 0u) return;
+  const bool had = quant_hadamard_enabled();
+  const uint32_t qtok = quant_fast_enabled() ? (nb <= 8u ? 8u : (nb <= 16u ? 16u : kQTok)) : kQTok;
+  if (qtok == 8u) {
+    if (had) launch_batch_quant_fp8_qtok<Src, true, 8u>(src, out, scales, dim, nb, x_off, stream);
+    else     launch_batch_quant_fp8_qtok<Src, false, 8u>(src, out, scales, dim, nb, x_off, stream);
+  } else if (qtok == 16u) {
+    if (had) launch_batch_quant_fp8_qtok<Src, true, 16u>(src, out, scales, dim, nb, x_off, stream);
+    else     launch_batch_quant_fp8_qtok<Src, false, 16u>(src, out, scales, dim, nb, x_off, stream);
+  } else {
+    if (had) launch_batch_quant_fp8_qtok<Src, true, kQTok>(src, out, scales, dim, nb, x_off, stream);
+    else     launch_batch_quant_fp8_qtok<Src, false, kQTok>(src, out, scales, dim, nb, x_off, stream);
+  }
 }
 
 void batch_quant_fp8_hip(const float* x, uint8_t* out, float* scales, uint32_t dim, uint32_t nb,
                          uint32_t x_off, void* stream) {
-  static const bool had = [] {
-    const char* s = std::getenv("AFF_HADAMARD_ROT");
-    return s && *s && *s != '0';
-  }();
-  if (had) {
-    AFF_BLAUNCH((batch_quant_fp8_kernel<QSrcF32, true>), quant_grid(dim, nb), dim3(kQThreads), 0,
-                (hipStream_t)stream, QSrcF32{x}, out, scales, dim, nb, x_off);
-  } else {
-    AFF_BLAUNCH((batch_quant_fp8_kernel<QSrcF32, false>), quant_grid(dim, nb), dim3(kQThreads), 0,
-                (hipStream_t)stream, QSrcF32{x}, out, scales, dim, nb, x_off);
-  }
+  if (!x) return;
+  launch_batch_quant_fp8(QSrcF32{x}, out, scales, dim, nb, x_off, (hipStream_t)stream);
 }
 
 void batch_swiglu_quant_fp8_hip(const float* g, const float* u, uint8_t* out, float* scales,
                                 uint32_t dim, uint32_t nb, float limit, void* stream) {
-  static const bool had = [] {
-    const char* s = std::getenv("AFF_HADAMARD_ROT");
-    return s && *s && *s != '0';
-  }();
-  if (had) {
-    AFF_BLAUNCH((batch_quant_fp8_kernel<QSrcSwiGLU, true>), quant_grid(dim, nb), dim3(kQThreads), 0,
-                (hipStream_t)stream, QSrcSwiGLU{g, u, limit}, out, scales, dim, nb, 0u);
-  } else {
-    AFF_BLAUNCH((batch_quant_fp8_kernel<QSrcSwiGLU, false>), quant_grid(dim, nb), dim3(kQThreads), 0,
-                (hipStream_t)stream, QSrcSwiGLU{g, u, limit}, out, scales, dim, nb, 0u);
-  }
+  if (!g || !u) return;
+  launch_batch_quant_fp8(QSrcSwiGLU{g, u, limit}, out, scales, dim, nb, 0u, (hipStream_t)stream);
 }
 
 void batch_quant_tm_fp8_hip(const float* src, uint8_t* out, float* scales, uint32_t dim,
@@ -4374,9 +4444,15 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
   const dim3 grid(tiles, gy, ksplit);
   const hipStream_t st = (hipStream_t)stream;
   float* const final_y0 = ksplit > 1 ? jobs[0].y : nullptr;
-#define AFF_F8M(f, ps, mw_, fk_)                                                                  \
-  AFF_BLAUNCH((batch_gemm_fp8_multi_kernel<f, ps, 1u, mw_, fk_>), grid, dim3(mw_ * kWave),        \
+  const bool nt_load = aff::dense_nt_load_enabled();
+#define AFF_F8M_NTL(f, ps, mw_, fk_, ntl)                                                         \
+  AFF_BLAUNCH((batch_gemm_fp8_multi_kernel<f, ps, 1u, mw_, fk_, ntl>), grid, dim3(mw_ * kWave),   \
               0, st, J, X, Sx, final_y0, ctr_buf, cols, nb, sc_cols, x_ld, sx_ld, ck, total)
+#define AFF_F8M(f, ps, mw_, fk_)                                                                  \
+  do {                                                                                            \
+    if (nt_load) AFF_F8M_NTL(f, ps, mw_, fk_, true);                                              \
+    else         AFF_F8M_NTL(f, ps, mw_, fk_, false);                                             \
+  } while (0)
 #define AFF_F8M_FK(f, ps, mw_)                                                                    \
   do {                                                                                            \
     if (use128) AFF_F8M(f, ps, mw_, kFKNarrow);                                                   \
@@ -4394,6 +4470,7 @@ bool batch_gemm_fp8_multi_hip(const BatchGemmJob* jobs, uint32_t n, const uint8_
 #undef AFF_F8M_MW
 #undef AFF_F8M_FK
 #undef AFF_F8M
+#undef AFF_F8M_NTL
   if (ksplit > 1 && !ctr_buf) {
     const size_t nn = (size_t)total * nb;
     AFF_BLAUNCH(splitk_reduce_kernel, dim3((uint32_t)((nn + 255) / 256)), dim3(256), 0, st, ws,
@@ -4468,13 +4545,18 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
   const bool full = (rows % fm == 0) && (nb % fn == 0) && (cols % 128 == 0);
   if (narrow && (cols % kFKNarrow) != 0) { aff::ui::fatal("batch_gemm_fp8: cols=%u is not a multiple of %u\n", cols, kFKNarrow); std::abort(); }
   const bool prefill_4x2 = !narrow && fp8_prefill_4x2_enabled();
+  const bool nt_load = narrow && aff::dense_nt_load_enabled();
 // FK: a whole 256-byte cacheline a row when cols % 256 == 0, 128 for odd multiples of 128, and 64
 // for the wide prefill instantiation.
-#define AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, mtw_)                                               \
-  AFF_BLAUNCH((batch_gemm_fp8_kernel<f, ps, nt_, mw_, fk_, mtw_>), grid, dim3(mw_ * kWave), 0,    \
-              (hipStream_t)stream, W, Sw, X, Sx, dst, final_y, ctr_buf, rows, cols, nb, sc_cols,  \
-              x_off, w_row_off, x_ld, sx_ld, accum ? 1 : 0, ck)
-#define AFF_GEMM_F8(f, ps, nt_, mw_, fk_) AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, 1u)
+#define AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, mtw_, ntl_)                                          \
+  AFF_BLAUNCH((batch_gemm_fp8_kernel<f, ps, nt_, mw_, fk_, mtw_, ntl_>), grid, dim3(mw_ * kWave),  \
+              0, (hipStream_t)stream, W, Sw, X, Sx, dst, final_y, ctr_buf, rows, cols, nb,         \
+              sc_cols, x_off, w_row_off, x_ld, sx_ld, accum ? 1 : 0, ck)
+#define AFF_GEMM_F8(f, ps, nt_, mw_, fk_)                                                          \
+  do {                                                                                             \
+    if (nt_load) AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, 1u, true);                                  \
+    else         AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, 1u, false);                                 \
+  } while (0)
 #define AFF_GEMM_F8_FK(f, ps, nt_, mw_)                                                           \
   do {                                                                                            \
     if (use128) AFF_GEMM_F8(f, ps, nt_, mw_, kFKNarrow);                                          \
@@ -4483,8 +4565,8 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
 #define AFF_GEMM_F8_MW(f, ps)                                                                     \
   do {                                                                                            \
     if (!narrow) {                                                                                \
-      if (prefill_4x2) AFF_GEMM_F8_MTW(f, ps, kFNTiles, kFWaves, kFK, 2u);                        \
-      else             AFF_GEMM_F8_MTW(f, ps, kFNTiles, kFWaves, kFK, 1u);                        \
+      if (prefill_4x2) AFF_GEMM_F8_MTW(f, ps, kFNTiles, kFWaves, kFK, 2u, false);                 \
+      else             AFF_GEMM_F8_MTW(f, ps, kFNTiles, kFWaves, kFK, 1u, false);                 \
     }                                                                                             \
     else if (mw == 1u)  AFF_GEMM_F8_FK(f, ps, 1u, 1u);                                            \
     else if (mw == 2u)  AFF_GEMM_F8_FK(f, ps, 1u, 2u);                                            \
@@ -4610,11 +4692,16 @@ void batch_gemm_fp8_grouped_b32_hip(const uint8_t* W, const uint8_t* Ws, const u
                     (group_dim % 128u == 0u) && (group_dim % fk_sel == 0u) &&
                     (((uintptr_t)Sx & 7u) == 0u);
   const bool prefill_4x2 = !narrow && fp8_prefill_4x2_enabled();
-#define AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, mtw_)                                             \
-  AFF_BLAUNCH((batch_gemm_fp8_grouped_b32_kernel<f, ps, nt_, mw_, fk_, mtw_>), grid,              \
+  const bool nt_load = narrow && aff::dense_nt_load_enabled();
+#define AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, mtw_, ntl_)                                       \
+  AFF_BLAUNCH((batch_gemm_fp8_grouped_b32_kernel<f, ps, nt_, mw_, fk_, mtw_, ntl_>), grid,        \
               dim3(mw_ * kWave), 0, st, W, Ws, Xp, Sx, dst, final_y, ctr_buf, ng, rank,           \
               group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck)
-#define AFF_GEMM_GB32(f, ps, nt_, mw_, fk_) AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, 1u)
+#define AFF_GEMM_GB32(f, ps, nt_, mw_, fk_)                                                        \
+  do {                                                                                             \
+    if (nt_load) AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, 1u, true);                                \
+    else         AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, 1u, false);                               \
+  } while (0)
 #define AFF_GEMM_GB32_FK(f, ps, nt_, mw_)                                                         \
   do {                                                                                            \
     if (fk_sel == kFKNarrowWide)      AFF_GEMM_GB32(f, ps, nt_, mw_, kFKNarrowWide);              \
@@ -4624,8 +4711,8 @@ void batch_gemm_fp8_grouped_b32_hip(const uint8_t* W, const uint8_t* Ws, const u
 #define AFF_GEMM_GB32_MW(f, ps)                                                                   \
   do {                                                                                            \
     if (!narrow) {                                                                                \
-      if (prefill_4x2) AFF_GEMM_GB32_MTW(f, ps, kFNTiles, kFWaves, kFK, 2u);                      \
-      else             AFF_GEMM_GB32_MTW(f, ps, kFNTiles, kFWaves, kFK, 1u);                      \
+      if (prefill_4x2) AFF_GEMM_GB32_MTW(f, ps, kFNTiles, kFWaves, kFK, 2u, false);               \
+      else             AFF_GEMM_GB32_MTW(f, ps, kFNTiles, kFWaves, kFK, 1u, false);               \
     }                                                                                             \
     else if (mw == 1u) AFF_GEMM_GB32_FK(f, ps, 1u, 1u);                                           \
     else if (mw == 2u) AFF_GEMM_GB32_FK(f, ps, 1u, 2u);                                           \
@@ -5468,10 +5555,14 @@ void markov_step_hip(const uint16_t* w1, const uint16_t* w2, const uint32_t* ids
   if (reset_best) {
     AFF_HIP_CHECK(hipMemsetAsync(b64, 0, sizeof(unsigned long long), (hipStream_t)stream));
   }
-  AFF_BLAUNCH(markov_step_kernel,
-              dim3((rows + (kMarkovThr / kWave) - 1) / (kMarkovThr / kWave)), dim3(kMarkovThr), 0,
-              (hipStream_t)stream, w1, w2, ids, logits, b64, rows, row0, w2_row0, rank, nb, col,
-              l_rs, l_cs);
+  const dim3 m_grid((rows + (kMarkovThr / kWave) - 1) / (kMarkovThr / kWave));
+  if (aff::dense_nt_load_enabled()) {
+    AFF_BLAUNCH(markov_step_kernel<true>, m_grid, dim3(kMarkovThr), 0, (hipStream_t)stream, w1, w2,
+                ids, logits, b64, rows, row0, w2_row0, rank, nb, col, l_rs, l_cs);
+  } else {
+    AFF_BLAUNCH(markov_step_kernel<false>, m_grid, dim3(kMarkovThr), 0, (hipStream_t)stream, w1,
+                w2, ids, logits, b64, rows, row0, w2_row0, rank, nb, col, l_rs, l_cs);
+  }
 }
 
 void markov_step_fp8_g128_hip(const uint16_t* w1, const uint8_t* w2_fp8,
@@ -5488,10 +5579,16 @@ void markov_step_fp8_g128_hip(const uint16_t* w1, const uint8_t* w2_fp8,
   if (reset_best) {
     AFF_HIP_CHECK(hipMemsetAsync(b64, 0, sizeof(unsigned long long), (hipStream_t)stream));
   }
-  AFF_BLAUNCH(markov_step_fp8_g128_kernel,
-              dim3((rows + (kMarkovThr / kWave) - 1) / (kMarkovThr / kWave)), dim3(kMarkovThr), 0,
-              (hipStream_t)stream, w1, w2_fp8, w2_scales, ids, logits, b64, rows, row0, rank, col,
-              l_rs, l_cs);
+  const dim3 m_grid((rows + (kMarkovThr / kWave) - 1) / (kMarkovThr / kWave));
+  if (aff::dense_nt_load_enabled()) {
+    AFF_BLAUNCH(markov_step_fp8_g128_kernel<true>, m_grid, dim3(kMarkovThr), 0,
+                (hipStream_t)stream, w1, w2_fp8, w2_scales, ids, logits, b64, rows, row0, rank,
+                col, l_rs, l_cs);
+  } else {
+    AFF_BLAUNCH(markov_step_fp8_g128_kernel<false>, m_grid, dim3(kMarkovThr), 0,
+                (hipStream_t)stream, w1, w2_fp8, w2_scales, ids, logits, b64, rows, row0, rank,
+                col, l_rs, l_cs);
+  }
 }
 
 void markov_combine_p2p_hip(const uint64_t* own, const MarkovP2PTargets& targets,
@@ -5614,7 +5711,7 @@ void quantize_bf16_to_w4_g128_hip(const uint16_t* src, uint8_t* w4, uint16_t* sc
 constexpr uint32_t kW4Waves = 8;
 constexpr uint32_t kW4Threads = kW4Waves * kWave;
 
-template <uint32_t T>
+template <uint32_t T, bool NT_LOAD = true>
 __global__ __launch_bounds__(kW4Threads) void matvec_w4_multix_kernel(
     const uint8_t* __restrict__ w4, const uint16_t* __restrict__ scales,
     const float* __restrict__ x, float* __restrict__ out, uint32_t rows, uint32_t cols,
@@ -5630,8 +5727,8 @@ __global__ __launch_bounds__(kW4Threads) void matvec_w4_multix_kernel(
     #pragma unroll
     for (uint32_t t = 0; t < T; ++t) acc[t] = 0.0f;
     for (uint32_t c = lane * 8u; c < cols; c += 256u) {
-      const uint32_t p = *(const uint32_t*)(wrow + (c >> 1));
-      const float s = wmma::bf16_to_f32(srow[c >> 7]);
+      const uint32_t p = aff::load_nt<NT_LOAD>((const uint32_t*)(wrow + (c >> 1)));
+      const float s = wmma::bf16_to_f32(aff::load_nt<NT_LOAD>(&srow[c >> 7]));
       const float w0 = (float)(int)((p >>  0) & 0xFu) - 8.0f;
       const float w1 = (float)(int)((p >>  4) & 0xFu) - 8.0f;
       const float w2 = (float)(int)((p >>  8) & 0xFu) - 8.0f;
@@ -5670,18 +5767,34 @@ bool matvec_w4_multix_hip(const uint8_t* w4, const uint16_t* scales, const float
     return false;
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (rows + kW4Waves - 1) / kW4Waves), kW4Waves);
-#define AFF_W4_MX(T)                                                                               \
+#define AFF_W4_MX_NTL(T, NTL)                                                                      \
   case T:                                                                                          \
-    AFF_BLAUNCH((matvec_w4_multix_kernel<T>), dim3(blocks), dim3(kW4Threads), 0,                   \
+    AFF_BLAUNCH((matvec_w4_multix_kernel<T, NTL>), dim3(blocks), dim3(kW4Threads), 0,              \
                 (hipStream_t)stream, w4, scales, x_tm, out, rows, cols, out_col_stride,            \
                 out_token_major);                                                                  \
     break
-  switch (nt) {
-    AFF_W4_MX(1); AFF_W4_MX(2); AFF_W4_MX(3); AFF_W4_MX(4);
-    AFF_W4_MX(5); AFF_W4_MX(6); AFF_W4_MX(7); AFF_W4_MX(8);
-    default: return false;
-  }
+#define AFF_W4_MX(T)                                                                               \
+  do {                                                                                             \
+    if (nt_load) {                                                                                 \
+      switch (T) {                                                                                 \
+        AFF_W4_MX_NTL(1, true); AFF_W4_MX_NTL(2, true); AFF_W4_MX_NTL(3, true);                    \
+        AFF_W4_MX_NTL(4, true); AFF_W4_MX_NTL(5, true); AFF_W4_MX_NTL(6, true);                    \
+        AFF_W4_MX_NTL(7, true); AFF_W4_MX_NTL(8, true);                                            \
+        default: return false;                                                                     \
+      }                                                                                            \
+    } else {                                                                                       \
+      switch (T) {                                                                                 \
+        AFF_W4_MX_NTL(1, false); AFF_W4_MX_NTL(2, false); AFF_W4_MX_NTL(3, false);                 \
+        AFF_W4_MX_NTL(4, false); AFF_W4_MX_NTL(5, false); AFF_W4_MX_NTL(6, false);                 \
+        AFF_W4_MX_NTL(7, false); AFF_W4_MX_NTL(8, false);                                          \
+        default: return false;                                                                     \
+      }                                                                                            \
+    }                                                                                              \
+  } while (0)
+  const bool nt_load = aff::dense_nt_load_enabled();
+  AFF_W4_MX(nt);
 #undef AFF_W4_MX
+#undef AFF_W4_MX_NTL
   return true;
 }
 
@@ -5744,7 +5857,7 @@ struct Fp8G128XPtrs {
 constexpr uint32_t kFp8G128Waves = 8;
 constexpr uint32_t kFp8G128Threads = kFp8G128Waves * kWave;
 
-template <uint32_t T>
+template <uint32_t T, bool NT_LOAD = true>
 __global__ __launch_bounds__(kFp8G128Threads) void matvec_fp8_g128_multix_kernel(
     const uint8_t* __restrict__ fp8_data, const uint16_t* __restrict__ fp8_scales_bf16,
     Fp8G128XPtrs xp, float* __restrict__ y, uint32_t rows, uint32_t cols, uint32_t y_stride,
@@ -5760,8 +5873,8 @@ __global__ __launch_bounds__(kFp8G128Threads) void matvec_fp8_g128_multix_kernel
 #pragma unroll
     for (uint32_t t = 0; t < T; ++t) acc[t] = 0.0f;
     for (uint32_t c = lane * 8u; c < cols; c += 256u) {
-      const uint2 p = *(const uint2*)(wrow + c);
-      const float s = wmma::bf16_to_f32(srow[c >> 7]);
+      const uint2 p = aff::load_uint2_nt<NT_LOAD>(wrow + c);
+      const float s = wmma::bf16_to_f32(aff::load_nt<NT_LOAD>(&srow[c >> 7]));
       const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(p.x);
       const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(p.x);
       const aff::aff_f32x2 d45 = aff::e4m3_decode_pk<false>(p.y);
@@ -5803,17 +5916,33 @@ bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_sca
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (rows + kFp8G128Waves - 1u) / kFp8G128Waves), kFp8G128Waves);
   const int tm = out_token_major ? 1 : 0;
-#define AFF_FP8_G128_MX(NT_)                                                                       \
+  const bool nt_load = aff::dense_nt_load_enabled();
+#define AFF_FP8_G128_MX(NT_, NTL_)                                                                 \
   case NT_:                                                                                        \
-    AFF_BLAUNCH((matvec_fp8_g128_multix_kernel<NT_>), dim3(blocks), dim3(kFp8G128Threads), 0,      \
-                (hipStream_t)stream, fp8_data, fp8_scales_bf16, xp, y, rows, cols, y_stride, tm);  \
+    AFF_BLAUNCH((matvec_fp8_g128_multix_kernel<NT_, NTL_>), dim3(blocks), dim3(kFp8G128Threads),   \
+                0, (hipStream_t)stream, fp8_data, fp8_scales_bf16, xp, y, rows, cols, y_stride,    \
+                tm);                                                                               \
     break
-  switch (T) {
-    AFF_FP8_G128_MX(1);  AFF_FP8_G128_MX(2);  AFF_FP8_G128_MX(3);  AFF_FP8_G128_MX(4);
-    AFF_FP8_G128_MX(5);  AFF_FP8_G128_MX(6);  AFF_FP8_G128_MX(7);  AFF_FP8_G128_MX(8);
-    AFF_FP8_G128_MX(9);  AFF_FP8_G128_MX(10); AFF_FP8_G128_MX(11); AFF_FP8_G128_MX(12);
-    AFF_FP8_G128_MX(13); AFF_FP8_G128_MX(14); AFF_FP8_G128_MX(15); AFF_FP8_G128_MX(16);
-    default: return false;
+  if (nt_load) {
+    switch (T) {
+      AFF_FP8_G128_MX(1, true);  AFF_FP8_G128_MX(2, true);  AFF_FP8_G128_MX(3, true);
+      AFF_FP8_G128_MX(4, true);  AFF_FP8_G128_MX(5, true);  AFF_FP8_G128_MX(6, true);
+      AFF_FP8_G128_MX(7, true);  AFF_FP8_G128_MX(8, true);  AFF_FP8_G128_MX(9, true);
+      AFF_FP8_G128_MX(10, true); AFF_FP8_G128_MX(11, true); AFF_FP8_G128_MX(12, true);
+      AFF_FP8_G128_MX(13, true); AFF_FP8_G128_MX(14, true); AFF_FP8_G128_MX(15, true);
+      AFF_FP8_G128_MX(16, true);
+      default: return false;
+    }
+  } else {
+    switch (T) {
+      AFF_FP8_G128_MX(1, false);  AFF_FP8_G128_MX(2, false);  AFF_FP8_G128_MX(3, false);
+      AFF_FP8_G128_MX(4, false);  AFF_FP8_G128_MX(5, false);  AFF_FP8_G128_MX(6, false);
+      AFF_FP8_G128_MX(7, false);  AFF_FP8_G128_MX(8, false);  AFF_FP8_G128_MX(9, false);
+      AFF_FP8_G128_MX(10, false); AFF_FP8_G128_MX(11, false); AFF_FP8_G128_MX(12, false);
+      AFF_FP8_G128_MX(13, false); AFF_FP8_G128_MX(14, false); AFF_FP8_G128_MX(15, false);
+      AFF_FP8_G128_MX(16, false);
+      default: return false;
+    }
   }
 #undef AFF_FP8_G128_MX
   return true;
@@ -5894,16 +6023,25 @@ bool matvec_bf16x12_multix_hip(const uint8_t* b12_sm, const uint8_t* b12_exp4,
     return false;
   const uint32_t blocks = aff::safe_grid_blocks(
       std::min<uint32_t>(2048u, (rows + kB12MvWaves - 1u) / kB12MvWaves), kB12MvWaves);
-#define AFF_B12_MX(T)                                                                              \
+  const bool nt_load = aff::dense_nt_load_enabled();
+#define AFF_B12_MX(T, NTL)                                                                         \
   case T:                                                                                          \
-    AFF_BLAUNCH((matvec_bf16x12_multix_kernel<T>), dim3(blocks), dim3(kB12MvThreads), 0,           \
+    AFF_BLAUNCH((matvec_bf16x12_multix_kernel<T, NTL>), dim3(blocks), dim3(kB12MvThreads), 0,     \
                 (hipStream_t)stream, b12_sm, b12_exp4, b12_mexp, esc_off, esc_col, esc_val, x_tm,  \
                 out, rows, cols, out_col_stride, out_token_major);                                 \
     break
-  switch (nt) {
-    AFF_B12_MX(1); AFF_B12_MX(2); AFF_B12_MX(3); AFF_B12_MX(4);
-    AFF_B12_MX(5); AFF_B12_MX(6); AFF_B12_MX(7); AFF_B12_MX(8);
-    default: return false;
+  if (nt_load) {
+    switch (nt) {
+      AFF_B12_MX(1, true); AFF_B12_MX(2, true); AFF_B12_MX(3, true); AFF_B12_MX(4, true);
+      AFF_B12_MX(5, true); AFF_B12_MX(6, true); AFF_B12_MX(7, true); AFF_B12_MX(8, true);
+      default: return false;
+    }
+  } else {
+    switch (nt) {
+      AFF_B12_MX(1, false); AFF_B12_MX(2, false); AFF_B12_MX(3, false); AFF_B12_MX(4, false);
+      AFF_B12_MX(5, false); AFF_B12_MX(6, false); AFF_B12_MX(7, false); AFF_B12_MX(8, false);
+      default: return false;
+    }
   }
 #undef AFF_B12_MX
   return true;
@@ -5942,13 +6080,20 @@ void batch_gemm_bf16x12_hip(const uint8_t* b12_sm, const uint8_t* b12_exp4,
   const dim3 grid(gx, gy, ksplit);
   const bool full = (rows % kWM == 0u) && (nb % wn_eff == 0u) && (cols % kWK == 0u);
   const bool narrow = wn_eff == kNarrowN;
+  const bool nt_load = narrow && aff::dense_nt_load_enabled();
   float* const dst = ksplit > 1u ? ws : Y;
-#define AFF_B12_GEMM_G(f, mt, nt, nw)                                                              \
-  AFF_BLAUNCH((batch_gemm_bf16x12_kernel<f, mt, nt, nw>), grid, dim3(kWThreads), 0, st, b12_sm,    \
-              b12_exp4, b12_mexp, esc_off, esc_col, esc_val, X, dst, rows, cols, nb, w_row_off, ck)
+#define AFF_B12_GEMM_G(f, mt, nt, nw, ntl)                                                         \
+  AFF_BLAUNCH((batch_gemm_bf16x12_kernel<f, mt, nt, nw, ntl>), grid, dim3(kWThreads), 0, st,       \
+              b12_sm, b12_exp4, b12_mexp, esc_off, esc_col, esc_val, X, dst, rows, cols, nb,       \
+              w_row_off, ck)
 #define AFF_B12_GEMM_W(f)                                                                          \
   do {                                                                                             \
-    if (narrow) AFF_B12_GEMM_G(f, 1, 1, 1); else AFF_B12_GEMM_G(f, kWMTiles, kWNTiles, 2);         \
+    if (narrow) {                                                                                  \
+      if (nt_load) AFF_B12_GEMM_G(f, 1, 1, 1, true);                                               \
+      else         AFF_B12_GEMM_G(f, 1, 1, 1, false);                                              \
+    } else {                                                                                       \
+      AFF_B12_GEMM_G(f, kWMTiles, kWNTiles, 2, false);                                             \
+    }                                                                                              \
   } while (0)
   if (full) AFF_B12_GEMM_W(true); else AFF_B12_GEMM_W(false);
 #undef AFF_B12_GEMM_W

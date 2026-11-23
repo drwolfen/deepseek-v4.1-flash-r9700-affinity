@@ -256,7 +256,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       }
     }
     s_amax[tid] = a;
-    __syncthreads();
+    lds_barrier();
     if (tid < 16u) {
       float m = 0.0f;
       for (uint32_t i = 0; i < kQTh; ++i) m = fmaxf(m, s_amax[tid * kQTh + i]);
@@ -267,7 +267,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       // the numerator at zero.
       s_l[hd] = sink0 ? 1.0f : 0.0f;
     }
-    __syncthreads();
+    lds_barrier();
     const float inv = 1.0f / s_qs[hh];
     uint8_t* dst = s_q + hh * kQLd + seg;
 #pragma unroll
@@ -275,7 +275,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       *(uint32_t*)(dst + i * 4) = pack4(v[i].x * inv, v[i].y * inv, v[i].z * inv, v[i].w * inv);
   }
   if (tid == 0) s_sprev = 1.0f;
-  __syncthreads();
+  lds_barrier();
 
   wmma::f8v o[NT][kOT];
 #pragma unroll
@@ -326,7 +326,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       mx = wave_reduce_max_dpp(mx);
       if (lane == 0) s_scur = (mx > 0.0f) ? mx : s_sprev;
     }
-    __syncthreads();
+    lds_barrier();
 
     // ---- S^T = K . Q^T over all 512 dims. A is K (dim contiguous, plain load), B is Q from LDS.
     // D[m][n] is S^T[key m][head n], so a lane owns ONE head and eight keys — which is what makes
@@ -380,7 +380,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       mt = fmaxf(mt, dpp_xor_lane<16u>(mt));
       if (lane < 16) s_red[wave * NH + nt * 16u + c] = mt;
     }
-    __syncthreads();
+    lds_barrier();
 #pragma unroll
     for (uint32_t nt = 0; nt < NT; ++nt) {
       const uint32_t hd = nt * 16u + c;
@@ -400,7 +400,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       const float ps = psum + dpp_xor_lane<16u>(psum);
       if (lane < 16) s_ps[wave * NH + hd] = ps;
     }
-    __syncthreads();
+    lds_barrier();
 
     // ---- P -> E4M3, with the key's row scale folded in.
     //
@@ -438,7 +438,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
                 acc[nt][6] * (rw[6] * inv_scur), acc[nt][7] * (rw[7] * inv_scur)));
     }
     if (wave == 0 && lane == 0) s_skip = skip;
-    __syncthreads();
+    lds_barrier();
 
     // ---- rescale O, then O += P . V. The accumulator row is the HEAD here, not the key, so the
     // factor is indexed by 8h+j and the eight values are contiguous in s_af.
@@ -470,7 +470,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       }
     }
     if (tid == 0) s_sprev = s_scur;
-    __syncthreads();
+    lds_barrier();
   }
 
   // ---- out = O * S_last / denominator. O's row is the head, its column the dim.
@@ -553,7 +553,7 @@ __global__ __launch_bounds__(kCT) void flash_combine_kernel(
     l = wave_reduce_add_dpp(l);
     if (threadIdx.x == 0) s_inv = (l > 0.0f) ? 1.0f / l : 0.0f;
   }
-  __syncthreads();
+  lds_barrier();
 
   const uint32_t d = threadIdx.x * 4u;
   float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);

@@ -171,12 +171,12 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
   for (uint32_t e = threadIdx.x; e < NE; e += kPlanThreads) {
     L.counts[e] = 0u; L.fill[e] = 0u; L.gm[e] = 0ull; L.rank[e] = kNone;
   }
-  __syncthreads();
+  aff::lds_barrier();
   for (uint32_t i = threadIdx.x; i < TOTAL; i += kPlanThreads) {
     const uint32_t e = a.sel[i];
     if (e < NE) atomicAdd(&L.counts[e], 1u);
   }
-  __syncthreads();
+  aff::lds_barrier();
 
   // ---- B. uniq, and the prefix that fixes start[e] ----------------------------------------------
   //
@@ -198,13 +198,13 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
     // rather than handing it an arena column and a null base pointer.
     if (live && !pv) { atomicAdd(&a.status->bad, 1u); L.counts[e] = 0u; }
   }
-  __syncthreads();
+  aff::lds_barrier();
   wg_excl_scan(L.tc, L.tmp, NE, 2u);
   // The scan is exclusive, so the totals have to be recovered from the last entry plus its own flag,
   // and that flag is gone. Recompute both counts directly; NE is 256 and this is one pass.
   __shared__ uint32_t s_nres, s_npool, s_taken, s_ntile[2];
   if (!threadIdx.x) { s_nres = 0u; s_npool = 0u; s_taken = 0u; s_ntile[0] = 0u; s_ntile[1] = 0u; }
-  __syncthreads();
+  aff::lds_barrier();
   for (uint32_t e = threadIdx.x; e < NE; e += kPlanThreads) {
     const uint64_t pv = plc[e];
     if (!L.counts[e]) continue;
@@ -212,7 +212,7 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
     if (pv & 1ull) atomicAdd(&s_nres, 1u);
     else if (pv) atomicAdd(&s_npool, 1u);
   }
-  __syncthreads();
+  aff::lds_barrier();
   const uint32_t n_res = s_nres, n_uniq = s_nres + s_npool;
   for (uint32_t e = threadIdx.x; e < NE; e += kPlanThreads) {
     const uint64_t pv = plc[e];
@@ -221,17 +221,17 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
     L.rank[e] = j;
     L.uniq[j] = e;
   }
-  __syncthreads();
+  aff::lds_barrier();
   // start[e] = prefix of counts in uniq order. Permute into `tmp`, scan, permute back.
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) L.start[j] = L.counts[L.uniq[j]];
   for (uint32_t j = n_uniq + threadIdx.x; j < NE; j += kPlanThreads) L.start[j] = 0u;
-  __syncthreads();
+  aff::lds_barrier();
   wg_excl_scan(L.start, L.tmp, NE, 1u);
   // `start` is indexed by uniq position at this point; fold it back onto the expert id.
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) L.tmp[L.uniq[j]] = L.start[j];
-  __syncthreads();
+  aff::lds_barrier();
   for (uint32_t e = threadIdx.x; e < NE; e += kPlanThreads) L.start[e] = L.tmp[e];
-  __syncthreads();
+  aff::lds_barrier();
 
   // ---- C. the arena column of every slot --------------------------------------------------------
   //
@@ -246,7 +246,7 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
       const uint32_t e = a.sel[(size_t)(g0 + i / K) * K + i % K];
       if (e < NE && L.counts[e]) atomicOr(&L.gm[e], 1ull << (i / K));
     }
-    __syncthreads();
+    aff::lds_barrier();
     for (uint32_t i = threadIdx.x; i < gn * K; i += kPlanThreads) {
       const uint32_t b = i / K, t = g0 + b;
       const size_t s = (size_t)t * K + i % K;
@@ -258,12 +258,13 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
       a.tok[col] = t;
       a.wt_out[col] = a.wt[s];
     }
+    // Global stores to a.slot_col/a.tok/a.wt_out must be visible across waves before Phase D/E reads a.slot_col.
     __syncthreads();
     for (uint32_t e = threadIdx.x; e < NE; e += kPlanThreads) {
       L.fill[e] += (uint32_t)__popcll(L.gm[e]);
       L.gm[e] = 0ull;
     }
-    __syncthreads();
+    aff::lds_barrier();
   }
   const uint32_t taken = s_taken;
   // The down tiles read the SwiGLU arena, which is indexed by slot rather than by token, so their
@@ -276,13 +277,14 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
   // run[t] = sum of counts below t directly, and run[NB] = taken, which is what run[] means:
   // token t owns ord[run[t] .. run[t+1]).
   for (uint32_t t = threadIdx.x; t <= NB; t += kPlanThreads) L.run[t] = 0u;
-  __syncthreads();
+  aff::lds_barrier();
   for (uint32_t t = threadIdx.x; t < NB; t += kPlanThreads) {
     uint32_t n = 0;
     for (uint32_t j = 0; j < K; ++j)
       if (a.slot_col[(size_t)t * K + j] != kNone) ++n;
     L.run[t] = n;
   }
+  // Keep full barrier after global reads/a.tok global stores before Phase D scan & Phase E global writes.
   __syncthreads();
   wg_excl_scan(L.run, L.tmp, NB + 1u, 1u);
   for (uint32_t t = threadIdx.x; t <= NB; t += kPlanThreads) a.run[t] = L.run[t];
@@ -310,9 +312,9 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
   // tile of width r in bucket(r). `tc[cls*4 + b][j]` is what uniq entry j contributes to each, and
   // the scan over j turns that into the offset of j's first tile in that group — which reproduces
   // the host's stable sort, whose order within a group is exactly (uniq index, then offset).
-  __syncthreads();
+  aff::lds_barrier();
   for (uint32_t i = threadIdx.x; i < 8u * NE; i += kPlanThreads) L.tc[i] = 0u;
-  __syncthreads();
+  aff::lds_barrier();
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) {
     const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
     const bool hyb128 = (cls == 1u && a.hybrid_tile128);
@@ -324,23 +326,25 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
     L.tc[(cls * 4u + full_b) * NE + j] += q;
     if (r) L.tc[(cls * 4u + plan_bucket(r)) * NE + j] += 1u;
   }
-  __syncthreads();
+  aff::lds_barrier();
   // The per-group totals, needed both for `bbeg` and for the pad. Recomputed rather than recovered
   // from the scan, for the same reason as in phase B.
   __shared__ uint32_t s_gtot[8];
   for (uint32_t b = threadIdx.x; b < 8u; b += kPlanThreads) s_gtot[b] = 0u;
-  __syncthreads();
+  aff::lds_barrier();
   for (uint32_t i = threadIdx.x; i < 8u * NE; i += kPlanThreads)
     if (L.tc[i]) atomicAdd(&s_gtot[i / NE], L.tc[i]);
-  __syncthreads();
+  aff::lds_barrier();
   wg_excl_scan(L.tc, L.tmp, NE, 8u);
   if (!threadIdx.x)
     for (uint32_t cls = 0; cls < 2; ++cls)
       s_ntile[cls] = s_gtot[cls * 4] + s_gtot[cls * 4 + 1] + s_gtot[cls * 4 + 2] +
                      s_gtot[cls * 4 + 3];
-  __syncthreads();
+  aff::lds_barrier();
 
   const uint32_t cap = a.tile_cap;
+  const bool custom_caps = a.plane_stride > 0u;
+  const uint32_t pstride = custom_caps ? a.plane_stride : 8u * cap;
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) {
     const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
     const bool hyb128 = (cls == 1u && a.hybrid_tile128);
@@ -360,9 +364,12 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
     // region per class forces one `max_nt` on every tile in it, which puts a 6-wide decode tile on
     // the arm a 64-wide one wants and changes the summation.
     auto emit = [&](uint32_t grp, uint32_t slot, uint32_t off, uint32_t nt) {
-      const uint32_t at = grp * cap + slot;
+      const uint32_t gcap = custom_caps ? a.group_cap[grp] : cap;
+      if (slot >= gcap) return;
+      const uint32_t goff = custom_caps ? a.group_off[grp] : grp * cap;
+      const uint32_t at = goff + slot;
       for (uint32_t pl = 0; pl < 3; ++pl) {
-        ExpertTile& T = a.tiles[(size_t)pl * 8u * cap + at];
+        ExpertTile& T = a.tiles[(size_t)pl * pstride + at];
         T.data = base + a.shard.data_off[pl];
         T.fields = base + a.shard.scale_off[pl];
         T.rscales = (const uint16_t*)(base + a.shard.rscale_off[pl]);
@@ -388,7 +395,7 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
       emit(cls * 4u + b, at, L.start[e] + q * wmax, r);
     }
   }
-  __syncthreads();
+  aff::lds_barrier();
 
   // ---- G. the pad, and the status ----------------------------------------------------------------
   //
@@ -397,9 +404,11 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
   for (uint32_t g = 0; g < 8u; ++g) {
     const uint32_t lg = (g < 4u) ? last_group_res : last_group_hyb;
     if ((g & 3u) > lg) continue;
-    for (uint32_t i = s_gtot[g] + threadIdx.x; i < cap; i += kPlanThreads)
+    const uint32_t gcap = custom_caps ? a.group_cap[g] : cap;
+    const uint32_t goff = custom_caps ? a.group_off[g] : g * cap;
+    for (uint32_t i = s_gtot[g] + threadIdx.x; i < gcap; i += kPlanThreads)
       for (uint32_t pl = 0; pl < 3u; ++pl)
-        a.tiles[(size_t)pl * 8u * cap + g * cap + i].nt = 0u;
+        a.tiles[(size_t)pl * pstride + goff + i].nt = 0u;
   }
   // ---- the activation record ---------------------------------------------------------------------
   //
@@ -422,7 +431,7 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
       const uint32_t cnt = (threadIdx.x < n_act) ? L.counts[threadIdx.x] : 0u;
       const uint64_t mask = (uint64_t)__ballot(cnt > 0u) & 0xFFFFFFFFull;
       if (wave < nw && lane == 0u) s_wpop[wave] = (uint32_t)__popcll(mask);
-      __syncthreads();
+      aff::lds_barrier();
       const unsigned long long h = s_head;
       ActRecord* const rec = &a.act->slot[h % kActSlots];
       if (!threadIdx.x) {
@@ -436,23 +445,25 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
         rec->count = run;
         rec->pad = 0u;
       }
-      __syncthreads();
+      aff::lds_barrier();
       if (cnt > 0u) {
         const uint32_t pos = s_woff[wave] + (uint32_t)__popcll(mask & ((1ull << lane) - 1ull));
         rec->entries[pos].exp = (uint16_t)threadIdx.x;
         rec->entries[pos].cnt = (uint16_t)(cnt > 65535u ? 65535u : cnt);
       }
+      // Global/system stores to rec->entries must drain before thread 0 issues __threadfence_system().
       __syncthreads();
       if (!threadIdx.x) {
         __threadfence_system();
         a.act->head = h + 1ull;
       }
     } else {
-      __syncthreads();
+      aff::lds_barrier();
       const unsigned long long h = s_head;
       ActRecord* const rec = &a.act->slot[h % kActSlots];
       for (uint32_t e = threadIdx.x; e < kActExperts; e += kPlanThreads)
         rec->counts[e] = e < NE ? L.counts[e] : 0u;
+      // Global/system stores to rec->counts must drain before thread 0 issues __threadfence_system().
       __syncthreads();
       if (!threadIdx.x) {
         rec->layer = a.layer;
@@ -475,7 +486,10 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
     // An overflowing class is a bug in the host's bound, and it has already silently dropped tiles
     // by the time anyone can read this — so it is recorded beside `bad` rather than clamped, and
     // the host treats a non-zero value as fatal.
-    for (uint32_t g = 0; g < 8u; ++g) if (s_gtot[g] > cap) a.status->over = 1u;
+    for (uint32_t g = 0; g < 8u; ++g) {
+      const uint32_t gcap = custom_caps ? a.group_cap[g] : cap;
+      if (s_gtot[g] > gcap) a.status->over = 1u;
+    }
   }
 }
 
@@ -511,6 +525,11 @@ bool moe_plan_hip(const MoePlanArgs& a, void* stream) {
   // presents as an engine that has stopped promoting rather than as a refusal.
   if (a.act && a.n_expert > kActExperts) return false;
   if (!a.shard.stride) return false;      // the tile records are built from the shard layout
+  if (a.plane_stride > 0u) {
+    for (uint32_t g = 0; g < 8u; ++g) {
+      if ((uint64_t)a.group_off[g] + a.group_cap[g] > a.plane_stride) return false;
+    }
+  }
   // Against what the card will actually give a workgroup, not a literal. Queried once a device:
   // this is on the dispatch path and hipGetDeviceProperties is a driver call.
   const size_t lds = moe_plan_lds_bytes(a.n_expert, a.nb_tok);

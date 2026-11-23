@@ -1500,17 +1500,41 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
 // allocation below is guarded rather than assumed non-empty.
 static inline size_t tp_npeer(const TpContext* ctx) { return ctx->ranks ? ctx->ranks - 1 : 0; }
 
+static inline bool tp_scratch_fp8_enabled() {
+  const char* v = std::getenv("AFF_TP_SCRATCH_FP8");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
 // Floats one double-buffer slot spans on one rank: every peer's message, back to back.
 static inline size_t tp_slot_floats(const TpContext* ctx) {
-  return tp_npeer(ctx) * ctx->max_floats;
+  return tp_npeer(ctx) * (ctx->scratch_peer_bytes / sizeof(float));
 }
 
 bool tp_grow(TpContext* ctx, size_t max_floats, std::string* err) {
   if (!ctx->ready) return false;
   const size_t want = (max_floats + 3) / 4 * 4;
-  if (want <= ctx->max_floats) return true;
+  size_t want_bytes = want * sizeof(float);
+  if (tp_scratch_fp8_enabled() && want_bytes >= kTpFp8MinBytes) {
+    // Compact prefill scratch to FP8 code space + 128-elem block scales (16-byte aligned).
+    // Exact/BF16 small-batch paths (decode/verify) check scratch_peer_bytes directly, and
+    // oversized Exact/Coded fallbacks slice along scratch_peer_bytes.
+    const size_t code_bytes = (want + 15u) & ~size_t(15u);
+    const size_t n_groups = (want + kTpFp8Group - 1u) / kTpFp8Group;
+    const size_t fp8_bytes = (code_bytes + n_groups * sizeof(float) + 15u) & ~size_t(15u);
+    want_bytes = std::min(want_bytes, fp8_bytes);
+  }
+  want_bytes = std::max(ctx->scratch_peer_bytes, want_bytes);
+  if (want <= ctx->max_floats && want_bytes <= ctx->scratch_peer_bytes) return true;
   const size_t np = tp_npeer(ctx);
-  if (!np) { ctx->max_floats = want; return true; }
+  if (!np) {
+    ctx->max_floats = std::max(ctx->max_floats, want);
+    ctx->scratch_peer_bytes = want_bytes;
+    return true;
+  }
+  if (want_bytes <= ctx->scratch_peer_bytes) {
+    ctx->max_floats = std::max(ctx->max_floats, want);
+    return true;
+  }
   for (size_t r = 0; r < ctx->ranks; ++r) {
     if (!hip_try(hipSetDevice(ctx->dev[r]), "hipSetDevice", err)) return false;
     if (!hip_try(hipStreamSynchronize((hipStream_t)ctx->stream[r]), "drain before grow", err))
@@ -1518,13 +1542,14 @@ bool tp_grow(TpContext* ctx, size_t max_floats, std::string* err) {
     (void)hipFree(ctx->scratch[r]);
     ctx->scratch[r] = nullptr;
     void* sc = nullptr;
-    if (!hip_try(hipExtMallocWithFlags(&sc, TpContext::kTpSlots * np * want * sizeof(float),
+    if (!hip_try(hipExtMallocWithFlags(&sc, TpContext::kTpSlots * np * want_bytes,
                                        hipDeviceMallocFinegrained),
                  "scratch regrow", err))
       return false;
     ctx->scratch[r] = (float*)sc;
   }
-  ctx->max_floats = want;
+  ctx->max_floats = std::max(ctx->max_floats, want);
+  ctx->scratch_peer_bytes = want_bytes;
   ctx->last_scratch_nb = 0;
   return true;
 }
@@ -1593,6 +1618,7 @@ bool tp_init(TpContext* ctx, size_t max_floats, std::string* err, ihipStream_t* 
   ctx->ranks = n_ranks;
   for (size_t r = 0; r < n_ranks; ++r) ctx->dev[r] = devs_in[r];
   ctx->max_floats = (max_floats + 3) / 4 * 4;          // float4 alignment
+  ctx->scratch_peer_bytes = ctx->max_floats * sizeof(float);
   ctx->own_stream = (ext == nullptr);
   const size_t np = tp_npeer(ctx);
 
@@ -1729,6 +1755,9 @@ void tp_free(TpContext* ctx) {
   (void)hipHostFree(ctx->timeout);
   ctx->timeout = nullptr;
   ctx->timeout_dev = nullptr;
+  ctx->max_floats = 0;
+  ctx->scratch_peer_bytes = 0;
+  ctx->fold_floats = 0;
   ctx->last_scratch_nb = 0;
   ctx->ready = false;
 }
@@ -1840,7 +1869,7 @@ void tp_launch_exact(TpContext& ctx, float* const* in, float* const* out, int n4
     for (size_t q = 0, j = 0; q < ctx.ranks; ++q) {
       if (q == r) continue;
       const size_t mine = tp_peer_slot(r, q);      // where rank r sits in rank q's tables
-      push.scratch[j] = (float4*)(ctx.scratch[q] + mine * ctx.max_floats);
+      push.scratch[j] = (float4*)((unsigned char*)ctx.scratch[q] + mine * ctx.scratch_peer_bytes);
       push.flags[j] = ctx.flags[q] + mine * kTpFlagStride;
       push.wake[j] = ctx.flags[q] + np * kTpFlagStride;
       ++j;
@@ -1911,7 +1940,7 @@ void tp_launch_fp8(TpContext& ctx, float* const* in, float* const* out, int n, i
     for (size_t q = 0, j = 0; q < ctx.ranks; ++q) {
       if (q == r) continue;
       const size_t mine = tp_peer_slot(r, q);
-      push.base[j] = (unsigned char*)(ctx.scratch[q] + mine * ctx.max_floats);
+      push.base[j] = (unsigned char*)ctx.scratch[q] + mine * ctx.scratch_peer_bytes;
       push.flags[j] = ctx.flags[q] + mine * kTpFlagStride;
       push.wake[j] = ctx.flags[q] + np * kTpFlagStride;
       ++j;
@@ -2044,7 +2073,7 @@ void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n
     const size_t n_groups = (n + kTpCodedGroup - 1u) / kTpCodedGroup;
     const size_t base_off = n_groups * 128u;
     const size_t need_bytes = base_off + n_groups;
-    const size_t slot_bytes = ctx.max_floats * sizeof(float);
+    const size_t slot_bytes = ctx.scratch_peer_bytes;
     if (need_bytes <= slot_bytes) {
       const int nn = (int)n;
       int nb = (int)((n_groups + 31u) / 32u);
@@ -2053,51 +2082,116 @@ void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n
       tp_launch_coded(ctx, in, out, nn, nb, slot_bytes, base_off);
       return;
     }
+    const size_t chunk_groups = slot_bytes / 129u;
+    if (chunk_groups > 0u) {
+      const size_t chunk_elems = chunk_groups * kTpCodedGroup;
+      float* in_c[kTpMaxRanks];
+      float* out_c[kTpMaxRanks];
+      for (size_t off = 0; off < n; off += chunk_elems) {
+        const size_t cur = std::min(chunk_elems, n - off);
+        const size_t cur_groups = (cur + kTpCodedGroup - 1u) / kTpCodedGroup;
+        const size_t cur_base_off = cur_groups * 128u;
+        for (size_t r = 0; r < ctx.ranks; ++r) {
+          in_c[r] = in[r] + off;
+          out_c[r] = out[r] + off;
+        }
+        int nb = (int)((cur_groups + 31u) / 32u);
+        nb = std::max(1, std::min(nb, kTpMaxBlocks));
+        tp_sync_on_grid_change(ctx, nb);
+        tp_launch_coded(ctx, in_c, out_c, (int)cur, nb, slot_bytes, cur_base_off);
+      }
+      return;
+    }
     mode = TpReduce::Exact;
   }
 
   if (mode == TpReduce::Fp8) {
-    const int nn = (int)n;
-    int nb = (int)(((n + kTpFp8Group - 1) / kTpFp8Group + 63) / 64);
-    nb = std::max(1, std::min(nb, kTpMaxBlocks));
-    tp_sync_on_grid_change(ctx, nb);
-    const int peer_bytes = (int)(ctx.max_floats * sizeof(float));
-    const int slot_bytes = (int)(np * ctx.max_floats * sizeof(float));
-    const int scale_off = (int)ctx.max_floats;      // codes occupy [0,n); scales start past them
-    switch (np) {
-      case 1: tp_launch_fp8<1>(ctx, in, out, nn, nb, slot_bytes, peer_bytes, scale_off); break;
-      case 2: tp_launch_fp8<2>(ctx, in, out, nn, nb, slot_bytes, peer_bytes, scale_off); break;
-      case 3: tp_launch_fp8<3>(ctx, in, out, nn, nb, slot_bytes, peer_bytes, scale_off); break;
-      case 4: tp_launch_fp8<4>(ctx, in, out, nn, nb, slot_bytes, peer_bytes, scale_off); break;
-      case 5: tp_launch_fp8<5>(ctx, in, out, nn, nb, slot_bytes, peer_bytes, scale_off); break;
-      case 6: tp_launch_fp8<6>(ctx, in, out, nn, nb, slot_bytes, peer_bytes, scale_off); break;
-      default: tp_launch_fp8<7>(ctx, in, out, nn, nb, slot_bytes, peer_bytes, scale_off); break;
+    const size_t peer_bytes = ctx.scratch_peer_bytes;
+    const size_t slot_bytes = np * peer_bytes;
+    const size_t n_groups_total = (n + kTpFp8Group - 1u) / kTpFp8Group;
+    const size_t scale_off_total = (n + 15u) & ~size_t(15u);
+    const size_t need_bytes = scale_off_total + n_groups_total * sizeof(float);
+    auto launch_fp8_chunk = [&](float* const* in_p, float* const* out_p, size_t cur,
+                                int scale_off) {
+      const int nn = (int)cur;
+      int nb = (int)(((cur + kTpFp8Group - 1u) / kTpFp8Group + 63u) / 64u);
+      nb = std::max(1, std::min(nb, kTpMaxBlocks));
+      tp_sync_on_grid_change(ctx, nb);
+      switch (np) {
+        case 1: tp_launch_fp8<1>(ctx, in_p, out_p, nn, nb, (int)slot_bytes, (int)peer_bytes, scale_off); break;
+        case 2: tp_launch_fp8<2>(ctx, in_p, out_p, nn, nb, (int)slot_bytes, (int)peer_bytes, scale_off); break;
+        case 3: tp_launch_fp8<3>(ctx, in_p, out_p, nn, nb, (int)slot_bytes, (int)peer_bytes, scale_off); break;
+        case 4: tp_launch_fp8<4>(ctx, in_p, out_p, nn, nb, (int)slot_bytes, (int)peer_bytes, scale_off); break;
+        case 5: tp_launch_fp8<5>(ctx, in_p, out_p, nn, nb, (int)slot_bytes, (int)peer_bytes, scale_off); break;
+        case 6: tp_launch_fp8<6>(ctx, in_p, out_p, nn, nb, (int)slot_bytes, (int)peer_bytes, scale_off); break;
+        default: tp_launch_fp8<7>(ctx, in_p, out_p, nn, nb, (int)slot_bytes, (int)peer_bytes, scale_off); break;
+      }
+    };
+    if (need_bytes <= peer_bytes) {
+      launch_fp8_chunk(in, out, n, (int)scale_off_total);
+      return;
     }
-    return;
+    const size_t max_chunk =
+        (peer_bytes >= kTpFp8Group + sizeof(float))
+            ? (peer_bytes / (kTpFp8Group + sizeof(float))) * kTpFp8Group
+            : ((peer_bytes >= 20u) ? ((peer_bytes - sizeof(float)) & ~size_t(15u)) : 0u);
+    if (max_chunk > 0u) {
+      float* in_c[kTpMaxRanks];
+      float* out_c[kTpMaxRanks];
+      for (size_t off = 0; off < n; off += max_chunk) {
+        const size_t cur = std::min(max_chunk, n - off);
+        const int cur_scale_off = (int)((cur + 15u) & ~size_t(15u));
+        for (size_t r = 0; r < ctx.ranks; ++r) {
+          in_c[r] = in[r] + off;
+          out_c[r] = out[r] + off;
+        }
+        launch_fp8_chunk(in_c, out_c, cur, cur_scale_off);
+      }
+      return;
+    }
   }
 
-  const int n4 = (int)((n + 3) / 4);
-  const int peer4 = (int)(ctx.max_floats / 4);
-  const int slot4 = (int)(np * ctx.max_floats / 4);
-
-  // Block count from the payload. Small messages want ONE block: their cost is the handshake, and
-  // extra blocks add flag traffic without adding transfer.
-  int nb = (int)((n4 + kTpWordsPerBlock - 1) / kTpWordsPerBlock);
-  nb = std::max(1, std::min(nb, kTpMaxBlocks));
-  tp_sync_on_grid_change(ctx, nb);
+  const size_t peer_bytes = ctx.scratch_peer_bytes;
+  const size_t peer_floats4 = peer_bytes / sizeof(float4);
+  if (!peer_floats4) return;
+  const int peer4 = (int)peer_floats4;
+  const int slot4 = (int)(np * peer_floats4);
   const int nt = 256;
+  const size_t chunk_floats = peer_floats4 * 4u;
+  auto launch_exact_chunk = [&](float* const* in_p, float* const* out_p, size_t cur) {
+    const int n4 = (int)((cur + 3u) / 4u);
+    // Block count from the payload. Small messages want ONE block: their cost is the handshake,
+    // and extra blocks add flag traffic without adding transfer.
+    int nb = (int)((n4 + kTpWordsPerBlock - 1) / kTpWordsPerBlock);
+    nb = std::max(1, std::min(nb, kTpMaxBlocks));
+    tp_sync_on_grid_change(ctx, nb);
+    switch (np) {
+      case 1: tp_launch_exact<1>(ctx, in_p, out_p, n4, nb, nt, slot4, peer4); break;
+      case 2: tp_launch_exact<2>(ctx, in_p, out_p, n4, nb, nt, slot4, peer4); break;
+      case 3: tp_launch_exact<3>(ctx, in_p, out_p, n4, nb, nt, slot4, peer4); break;
+      case 4: tp_launch_exact<4>(ctx, in_p, out_p, n4, nb, nt, slot4, peer4); break;
+      case 5: tp_launch_exact<5>(ctx, in_p, out_p, n4, nb, nt, slot4, peer4); break;
+      case 6: tp_launch_exact<6>(ctx, in_p, out_p, n4, nb, nt, slot4, peer4); break;
+      default: tp_launch_exact<7>(ctx, in_p, out_p, n4, nb, nt, slot4, peer4); break;
+    }
+  };
 
   // Every rank's kernel must be IN FLIGHT together — each spins on the others' flags. Launching them
   // back to back on separate devices and streams achieves that; synchronising between the launches
   // would deadlock, and a blocking synchronise per all-reduce costs many times the crossing itself.
-  switch (np) {
-    case 1: tp_launch_exact<1>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
-    case 2: tp_launch_exact<2>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
-    case 3: tp_launch_exact<3>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
-    case 4: tp_launch_exact<4>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
-    case 5: tp_launch_exact<5>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
-    case 6: tp_launch_exact<6>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
-    default: tp_launch_exact<7>(ctx, in, out, n4, nb, nt, slot4, peer4); break;
+  if (n <= chunk_floats) {
+    launch_exact_chunk(in, out, n);
+  } else {
+    float* in_c[kTpMaxRanks];
+    float* out_c[kTpMaxRanks];
+    for (size_t off = 0; off < n; off += chunk_floats) {
+      const size_t cur = std::min(chunk_floats, n - off);
+      for (size_t r = 0; r < ctx.ranks; ++r) {
+        in_c[r] = in[r] + off;
+        out_c[r] = out[r] + off;
+      }
+      launch_exact_chunk(in_c, out_c, cur);
+    }
   }
 }
 
@@ -2121,8 +2215,11 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
                            uint32_t pf_blocks) {
   if (!ctx.ready || ctx.ranks != 2 || !n_embd || !nb || !live || live > nb) return false;
   if (has_control && n_hc != 1u && n_hc != 2u && n_hc != 4u && n_hc != 8u) return false;
+  const bool use_bf16_wire = tp_ar_hc_bf16_enabled() && (!has_control || n_hc == 4u);
   const size_t live_elems = (size_t)n_embd * live;
-  if (live_elems > ctx.max_floats) return false;
+  const size_t wire_elem_bytes = use_bf16_wire ? sizeof(uint16_t) : sizeof(float);
+  const size_t slot_floats = ctx.scratch_peer_bytes / sizeof(float);
+  if (live_elems * wire_elem_bytes > ctx.scratch_peer_bytes || !slot_floats) return false;
 
   const bool has_pre_collapse =
       pre_in && pre_in[0] && pre_in[1] &&
@@ -2170,8 +2267,6 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
     out_n16 = (cap - mis) >> 4;
   };
 
-  const bool use_bf16_wire = tp_ar_hc_bf16_enabled() && (!has_control || n_hc == 4u);
-
   for (size_t r = 0; r < 2; ++r) {
     const size_t q = 1u - r;
     float* const ps = ctx.scratch[q];
@@ -2203,7 +2298,7 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
                      dim3(launch_blk), dim3(nt), 0, st, out_hc[r], block[r],                      \
                      hc ? hc[r] : nullptr, post ? post[r] : nullptr, comb ? comb[r] : nullptr,    \
                      n_embd, nb, live, zb, tap_r, b_lo, n_keep, row0, rows_cap, row_stride,       \
-                     slot_off, ps, ms, pf, mf, pw, ctx.seq[r], ctx.timeout_dev, ctx.max_floats,   \
+                     slot_off, ps, ms, pf, mf, pw, ctx.seq[r], ctx.timeout_dev, slot_floats,      \
                      (uint32_t)ar_blk, ar_flags, pre_r, cur_r, part_r, pf_p0_r, pf_n16_0_r,       \
                      pf_p1_r, pf_n16_1_r, pf_blk_r)
 #define AFF_TP_BHC_REG(NH_, TAP_, CTL_, ONE_, PRE_, BF16_)                                        \

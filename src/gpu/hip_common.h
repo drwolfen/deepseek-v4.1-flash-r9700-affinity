@@ -346,7 +346,85 @@ __device__ __forceinline__ float wave_reduce_max_dpp(float v) {
   v = fmaxf(v, dpp_xor_lane<1u>(v));
   return v;
 }
+
+using aff_u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+using aff_u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+using aff_u16_ua = uint16_t __attribute__((aligned(1)));
+
+// Read-once global weight/scale load helpers (`TH_LOAD_NT` on gfx1201) to avoid evicting
+// hot KV cache and activations from the 8 MiB L2 and 64 MiB MALL during narrow decode.
+template <bool NT_LOAD, typename T>
+__device__ __forceinline__ T load_nt(const T* p) {
+#ifdef __HIP_DEVICE_COMPILE__
+  if constexpr (NT_LOAD) return __builtin_nontemporal_load(p);
 #endif
+  return *p;
+}
+
+template <bool NT_LOAD>
+__device__ __forceinline__ uint4 load_uint4_nt(const void* p) {
+#ifdef __HIP_DEVICE_COMPILE__
+  if constexpr (NT_LOAD) {
+    const aff_u32x4 v = __builtin_nontemporal_load((const aff_u32x4*)p);
+    return make_uint4(v[0], v[1], v[2], v[3]);
+  }
+#endif
+  return *(const uint4*)p;
+}
+
+template <bool NT_LOAD>
+__device__ __forceinline__ uint2 load_uint2_nt(const void* p) {
+#ifdef __HIP_DEVICE_COMPILE__
+  if constexpr (NT_LOAD) {
+    const aff_u32x2 v = __builtin_nontemporal_load((const aff_u32x2*)p);
+    return make_uint2(v[0], v[1]);
+  }
+#endif
+  return *(const uint2*)p;
+}
+
+#ifdef __HIP_DEVICE_COMPILE__
+template <bool NT_LOAD, typename T>
+__device__ __forceinline__ T load_nt(const __attribute__((address_space(1))) T* p) {
+  if constexpr (NT_LOAD) return __builtin_nontemporal_load(p);
+  return *p;
+}
+
+template <bool NT_LOAD>
+__device__ __forceinline__ uint4 load_uint4_nt(
+    const __attribute__((address_space(1))) void* p) {
+  if constexpr (NT_LOAD) {
+    const aff_u32x4 v = __builtin_nontemporal_load(
+        (const __attribute__((address_space(1))) aff_u32x4*)p);
+    return make_uint4(v[0], v[1], v[2], v[3]);
+  }
+  const aff_u32x4 v = *(const __attribute__((address_space(1))) aff_u32x4*)p;
+  return make_uint4(v[0], v[1], v[2], v[3]);
+}
+
+template <bool NT_LOAD>
+__device__ __forceinline__ uint2 load_uint2_nt(
+    const __attribute__((address_space(1))) void* p) {
+  if constexpr (NT_LOAD) {
+    const aff_u32x2 v = __builtin_nontemporal_load(
+        (const __attribute__((address_space(1))) aff_u32x2*)p);
+    return make_uint2(v[0], v[1]);
+  }
+  const aff_u32x2 v = *(const __attribute__((address_space(1))) aff_u32x2*)p;
+  return make_uint2(v[0], v[1]);
+}
+#endif
+#endif
+
+// Host-cached gate for non-temporal loads on read-once decode weight/scale streams (default ON
+// unless `AFF_DENSE_NT_LOAD=0`).
+inline bool dense_nt_load_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_DENSE_NT_LOAD");
+    return !s || !*s || (s[0] != '0' || s[1] != '\0');
+  }();
+  return on;
+}
 
 // Guards persistent / block-bounded launches against the gfx1201 full-card wave-slot cliff:
 // wavefront counts in `[2016..2047] mod 2048` (and exact non-zero multiples of 2048) incur heavy

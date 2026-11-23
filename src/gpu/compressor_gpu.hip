@@ -54,7 +54,7 @@ __device__ __forceinline__ void idx_key_store(float v, float* s, float* s_sc, ui
                                               uint32_t row) {
   if (HADAMARD) {
     s[j] = v;
-    __syncthreads();
+    lds_barrier();
     for (uint32_t stride = 1; stride < hd; stride <<= 1) {
       float a = 0.0f, b = 0.0f;
       uint32_t ia = 0, ib = 0;
@@ -63,14 +63,14 @@ __device__ __forceinline__ void idx_key_store(float v, float* s, float* s_sc, ui
         ia = base + off; ib = base + stride + off;
         a = s[ia]; b = s[ib];
       }
-      __syncthreads();
+      lds_barrier();
       if (j < hd / 2u) { s[ia] = a + b; s[ib] = a - b; }
-      __syncthreads();
+      lds_barrier();
     }
     // 1/sqrt(hd) as a literal, because hd is 128 here and no runtime rsqrt reproduces these bits.
     // The callers refuse any other width rather than letting the factor go quietly wrong.
     v = s[j] * 0.08838834764831845f;
-    __syncthreads();
+    lds_barrier();
   }
   // ---- an E2M1 round trip per 32, with an E8M0 scale ---------------------------------------------
   {
@@ -182,14 +182,14 @@ __global__ void compress_kernel(Window win, const float* __restrict__ ape,
 
   // ---- rope_tail over the trailing n_rot, at the group's FIRST position ------------------------
   s[j] = v;
-  __syncthreads();
+  lds_barrier();
   const uint32_t n_nope = hd - n_rot;
   if (j >= n_nope && ((j - n_nope) & 1u) == 0u)
     rope_pair(s + n_nope, (j - n_nope) >> 1, (uint32_t)(pe + 1 - (int64_t)ratio), freq_scale,
               theta_scale, ext_factor, lo, hi, 1.0f);
-  __syncthreads();
+  lds_barrier();
   v = s[j];
-  __syncthreads();
+  lds_barrier();
 
   if (MODE == 0) {
     // ---- fp8_kv_qat: E4M3 round trip over the NOPE part, one power-of-two scale per 64 ----------
@@ -265,14 +265,14 @@ __global__ void idx_key_kernel(const float* __restrict__ src, const float* __res
 
   // ---- rope_tail over the trailing n_rot, at the group's own position --------------------------
   s[j] = v;
-  __syncthreads();
+  lds_barrier();
   const uint32_t n_nope = hd - n_rot;
   if (j >= n_nope && ((j - n_nope) & 1u) == 0u)
     rope_pair(s + n_nope, (j - n_nope) >> 1, row * ratio, freq_scale, theta_scale, ext_factor, lo,
               hi, 1.0f);
-  __syncthreads();
+  lds_barrier();
   v = s[j];
-  __syncthreads();
+  lds_barrier();
 
   idx_key_store<false>(v, s, s_sc, j, hd, out, out_scale, out_stride, row);
 }

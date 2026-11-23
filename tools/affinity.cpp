@@ -443,7 +443,7 @@ int main(int argc, char** argv) {
   // Taken from the free VRAM left after the slabs rather than from residency, so turning the engine
   // on costs no hit rate. It also bounds how many transfers can be in flight, which is why it is not
   // larger.
-  uint32_t placement_shadow = 32;
+  uint32_t placement_shadow = 12;
   std::string route_trace_path;
   // Fitted by `aff-profile` from --route-trace records; overrides the container's imatrix-derived
   // profile for BOTH consumers. See AffReader::profile().
@@ -754,7 +754,7 @@ int main(int argc, char** argv) {
         "                              is on the compute stream — so an unbounded lead means the\n"
         "                              mover runs out of slots to move into and issues a quarter of\n"
         "                              what it should. Worth 2.6-28.6%% of decode. Decode only.\n"
-        "      --placement-shadow N    spare slab slots for in-flight promotions (default 32),\n"
+        "      --placement-shadow N    spare slab slots for in-flight promotions (default 12),\n"
         "                              taken from free VRAM rather than from residency\n"
         "      --keepalive-us U        per-card heartbeat interval; 0 = off (default). See\n"
         "                              src/gpu/keepalive.h\n"

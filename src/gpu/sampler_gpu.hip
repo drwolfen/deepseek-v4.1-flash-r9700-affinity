@@ -2,10 +2,20 @@
 #include "gpu/hip_common.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace aff {
 
 namespace {
+
+inline bool sampler_fast_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_SAMPLER_FAST");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
 
 constexpr uint32_t kThr = 1024;
 constexpr uint32_t kCandCap = 2048;
@@ -106,6 +116,34 @@ __device__ __forceinline__ void wave_argmax_reduce(float& bv, uint32_t& bi) {
   wave_argmax_step(bv, bi, 1u);
 }
 
+template <class Lg>
+__device__ __forceinline__ void greedy_argmax_emit(
+    Shared& sh, Lg lg, uint32_t vocab, uint32_t tid, uint32_t lane, uint32_t wave,
+    uint32_t pos, uint32_t q, SpecDraw* __restrict__ out) {
+  float bv = -INFINITY;
+  uint32_t bi = 0xFFFFFFFFu;
+  for (uint32_t v = tid; v < vocab; v += kThr) {
+    const float x = lg(v);
+    if (x > bv || (x == bv && v < bi)) { bv = x; bi = v; }
+  }
+  wave_argmax_reduce(bv, bi);
+  if (lane == 0u) {
+    sh.red[wave] = bv;
+    sh.red_i[wave] = bi;
+  }
+  lds_barrier();
+  if (wave == 0u) {
+    bv = sh.red[lane];
+    bi = sh.red_i[lane];
+    wave_argmax_reduce(bv, bi);
+    if (lane == 0u) {
+      out[pos].tok = bi;
+      out[pos].tok_excl = bi;
+      out[pos].p_query = (q == bi) ? 1.0f : 0.0f;
+    }
+  }
+}
+
 // ---- the kernel ---------------------------------------------------------------------------------
 //
 // One block owns one position and walks the vocabulary several times. Every pass reads the same
@@ -113,6 +151,7 @@ __device__ __forceinline__ void wave_argmax_reduce(float& bv, uint32_t& bi) {
 //
 // The order is vLLM's — temperature, softmax, top_k, top_p, min_p, renormalise, sample — and it is
 // not a detail: reordering changes which tokens survive.
+template <bool Fast>
 __global__ __launch_bounds__(kThr) void sample_kernel(
     const float* __restrict__ logits, uint32_t vocab, uint32_t row_stride, uint32_t col_stride,
     const uint32_t* __restrict__ query, const float* __restrict__ u, float temperature,
@@ -126,41 +165,30 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
 
   auto lg = [&](uint32_t v) { return col[(size_t)v * row_stride]; };
 
+  // ---- temperature 0 is greedy, and stays a real path ------------------------------------------
+  //
+  // Kept here rather than special-cased by the caller so that a request asking for determinism gets
+  // it from the same code, with the SAME tie-break the argmax kernel uses (lowest id wins) — the two
+  // must agree or a temperature-0 request stops matching a greedy run. Under Fast=true, exit
+  // BEFORE reduce_max so greedy computes argmax in a single full-vocab pass instead of two.
+  if constexpr (Fast) {
+    if (!(temperature > 0.0f)) {
+      greedy_argmax_emit(sh, lg, vocab, tid, lane, wave, pos, q, out);
+      return;
+    }
+  }
+
   const float m = reduce_max(sh, [&] {
     float best = -INFINITY;
     for (uint32_t v = tid; v < vocab; v += kThr) best = fmaxf(best, lg(v));
     return best;
   }());
 
-  // ---- temperature 0 is greedy, and stays a real path ------------------------------------------
-  //
-  // Kept here rather than special-cased by the caller so that a request asking for determinism gets
-  // it from the same code, with the SAME tie-break the argmax kernel uses (lowest id wins) — the two
-  // must agree or a temperature-0 request stops matching a greedy run.
-  if (!(temperature > 0.0f)) {
-    float bv = -INFINITY;
-    uint32_t bi = 0xFFFFFFFFu;
-    for (uint32_t v = tid; v < vocab; v += kThr) {
-      const float x = lg(v);
-      if (x > bv || (x == bv && v < bi)) { bv = x; bi = v; }
+  if constexpr (!Fast) {
+    if (!(temperature > 0.0f)) {
+      greedy_argmax_emit(sh, lg, vocab, tid, lane, wave, pos, q, out);
+      return;
     }
-    wave_argmax_reduce(bv, bi);
-    if (lane == 0u) {
-      sh.red[wave] = bv;
-      sh.red_i[wave] = bi;
-    }
-    lds_barrier();
-    if (wave == 0u) {
-      bv = sh.red[lane];
-      bi = sh.red_i[lane];
-      wave_argmax_reduce(bv, bi);
-      if (lane == 0u) {
-        out[pos].tok = bi;
-        out[pos].tok_excl = bi;
-        out[pos].p_query = (q == bi) ? 1.0f : 0.0f;
-      }
-    }
-    return;
   }
 
   const float inv_t = 1.0f / temperature;
@@ -177,11 +205,11 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
   uint32_t k_key = 0u;
   if (top_k > 0 && top_k < vocab) {
     if (tid == 0) sh.prefix = 0u;
-    __syncthreads();
+    lds_barrier();
     uint32_t remaining = top_k;
     for (int shift = 24; shift >= 0; shift -= 8) {
       if (tid < 256) sh.cnt[tid] = 0u;
-      __syncthreads();
+      lds_barrier();
       const uint32_t mask = (shift == 24) ? 0u : (0xFFFFFFFFu << (shift + 8));
       for (uint32_t v0 = 0; v0 < vocab; v0 += kThr) {
         const uint32_t v = v0 + tid;
@@ -190,7 +218,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
         const bool match = in_r && ((key & mask) == (sh.prefix & mask));
         cnt_wave_accum(match, (key >> shift) & 0xFFu, lane, sh.cnt);
       }
-      __syncthreads();
+      lds_barrier();
       if (tid == 0) {
         uint32_t acc = 0u, b = 0u;
         for (int i = 255; i >= 0; --i) {
@@ -200,7 +228,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
         remaining -= acc;
         sh.prefix |= b << shift;
       }
-      __syncthreads();
+      lds_barrier();
     }
     k_key = sh.prefix;
   }
@@ -222,7 +250,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
   if (top_p < 1.0f) {
     if (tid == 0) { sh.prefix = 0u; sh.n_cand = 0u; }
     if (tid < 256) sh.mass[tid] = 0.0f;
-    __syncthreads();
+    lds_barrier();
     float target = top_p;
     for (uint32_t v0 = 0; v0 < vocab; v0 += kThr) {
       const uint32_t v = v0 + tid;
@@ -232,7 +260,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       const bool match = in_r && (k_key == 0u || key >= k_key);
       mass_wave_accum(match, (key >> 24) & 0xFFu, p, lane, sh.mass);
     }
-    __syncthreads();
+    lds_barrier();
     if (tid == 0) {
       float acc = 0.0f;
       uint32_t b = 0u;
@@ -243,7 +271,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       target -= acc;
       sh.prefix = b << 24;
     }
-    __syncthreads();
+    lds_barrier();
     const uint32_t b24 = sh.prefix >> 24;
     for (uint32_t v0 = 0; v0 < vocab; v0 += kThr) {
       const uint32_t v = v0 + tid;
@@ -266,12 +294,12 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
         }
       }
     }
-    __syncthreads();
+    lds_barrier();
     compacted = (sh.n_cand <= kCandCap);
     const uint32_t nc = sh.n_cand;
     for (int shift = 16; shift >= 0; shift -= 8) {
       if (tid < 256) sh.mass[tid] = 0.0f;
-      __syncthreads();
+      lds_barrier();
       const uint32_t mask = 0xFFFFFFFFu << (shift + 8);
       if (compacted) {
         for (uint32_t i0 = 0; i0 < nc; i0 += kThr) {
@@ -293,7 +321,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
           mass_wave_accum(match, (key >> shift) & 0xFFu, p, lane, sh.mass);
         }
       }
-      __syncthreads();
+      lds_barrier();
       if (tid == 0) {
         float acc = 0.0f;
         uint32_t b = 0u;
@@ -304,7 +332,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
         target -= acc;
         sh.prefix |= b << shift;
       }
-      __syncthreads();
+      lds_barrier();
     }
     p_key = sh.prefix;
   }
@@ -346,7 +374,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
     sh.excl_total = excl_total;
     sh.p_query = p_query;
   }
-  __syncthreads();
+  lds_barrier();
 
   if (compacted) {
     // Sort compacted survivors by ascending token id so inverse-CDF draw order is identical to the
@@ -416,7 +444,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       my_last = (int32_t)v;
     }
     sh.red[tid] = mine;
-    __syncthreads();
+    lds_barrier();
     if (tid == 0) {
       float acc = 0.0f;
       uint32_t who = kThr - 1;
@@ -428,7 +456,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       sh.slice_base = acc;
       sh.pick = 0xFFFFFFFFu;
     }
-    __syncthreads();
+    lds_barrier();
     if (tid == sh.slice) {
       float acc = sh.slice_base;
       uint32_t last = 0xFFFFFFFFu;
@@ -443,7 +471,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       // token in this range is the right answer there, not token 0.
       if (sh.pick == 0xFFFFFFFFu) sh.pick = last;
     }
-    __syncthreads();
+    lds_barrier();
     // amdnas-fixes 2026-09-21 (BUG): `keep_total` is a STRIDED sum and the slices are CONTIGUOUS sums, so with a flat
     // distribution `want` can exceed the sum of every slice. The walk above then falls to slice kThr-1 — the top of the
     // vocabulary, the special-token region that top_p filters out — which holds no kept token, `last` stays 0xFFFFFFFF
@@ -461,7 +489,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       lds_barrier();
     }
     const uint32_t r = sh.pick;
-    __syncthreads();
+    lds_barrier();
     return r;
   };
 
@@ -537,14 +565,125 @@ bool apply_dry_penalty_hip(float* logits, uint32_t vocab, uint32_t n, uint32_t r
   return hipGetLastError() == hipSuccess;
 }
 
+// Fused repeat + DRY penalties in one kernel pass: exact sequential equivalence
+// (repeat_penalty divide/multiply applied first, then dry_delta subtraction) with zero
+// cross-thread races even when repeat_ids and dry_ids overlap or contain duplicates.
+__global__ void penalties_kernel(
+    float* __restrict__ plane, uint32_t vocab, uint32_t row_stride, uint32_t col_stride,
+    uint32_t n, const uint32_t* __restrict__ repeat_ids, uint32_t n_repeat, float repeat_penalty,
+    const uint32_t* __restrict__ dry_ids, uint32_t n_dry, float dry_delta) {
+  const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool do_rep = (repeat_penalty > 0.0f) && (repeat_penalty != 1.0f);
+  const bool do_dry = (dry_delta > 0.0f);
+  if (tid < n_repeat) {
+    if (!do_rep) return;
+    const uint32_t id = repeat_ids[tid];
+    if (id >= vocab) return;
+    for (uint32_t k = 0u; k < tid; ++k) {
+      if (repeat_ids[k] == id) return;
+    }
+    uint32_t cnt_rep = 1u;
+    for (uint32_t k = tid + 1u; k < n_repeat; ++k) {
+      if (repeat_ids[k] == id) ++cnt_rep;
+    }
+    uint32_t cnt_dry = 0u;
+    if (do_dry && dry_ids) {
+      for (uint32_t k = 0u; k < n_dry; ++k) {
+        if (dry_ids[k] == id) ++cnt_dry;
+      }
+    }
+    float* const row = plane + (size_t)id * row_stride;
+    for (uint32_t c = 0u; c < n; ++c) {
+      float x = row[(size_t)c * col_stride];
+      for (uint32_t r = 0u; r < cnt_rep; ++r) {
+        x = (x > 0.0f) ? x / repeat_penalty : x * repeat_penalty;
+      }
+      for (uint32_t d = 0u; d < cnt_dry; ++d) {
+        x -= dry_delta;
+      }
+      row[(size_t)c * col_stride] = x;
+    }
+    return;
+  }
+  const uint32_t j = tid - n_repeat;
+  if (j >= n_dry || !do_dry) return;
+  const uint32_t id = dry_ids[j];
+  if (id >= vocab) return;
+  if (do_rep && repeat_ids) {
+    for (uint32_t k = 0u; k < n_repeat; ++k) {
+      if (repeat_ids[k] == id) return;
+    }
+  }
+  for (uint32_t k = 0u; k < j; ++k) {
+    if (dry_ids[k] == id) return;
+  }
+  uint32_t cnt_dry = 1u;
+  for (uint32_t k = j + 1u; k < n_dry; ++k) {
+    if (dry_ids[k] == id) ++cnt_dry;
+  }
+  float* const row = plane + (size_t)id * row_stride;
+  for (uint32_t c = 0u; c < n; ++c) {
+    float x = row[(size_t)c * col_stride];
+    for (uint32_t d = 0u; d < cnt_dry; ++d) {
+      x -= dry_delta;
+    }
+    row[(size_t)c * col_stride] = x;
+  }
+}
+
+bool apply_penalties_hip(float* logits, uint32_t vocab, uint32_t n, uint32_t row_stride,
+                       uint32_t col_stride, const uint32_t* d_repeat_ids, uint32_t n_repeat,
+                       float repeat_penalty, const uint32_t* d_dry_ids, uint32_t n_dry,
+                       float dry_delta, void* stream) {
+  if (!logits || !vocab || !n) return true;
+  const bool do_rep = d_repeat_ids && n_repeat && (repeat_penalty > 0.0f) &&
+                      (repeat_penalty != 1.0f);
+  const bool do_dry = d_dry_ids && n_dry && (dry_delta > 0.0f);
+  if (!do_rep && !do_dry) return true;
+  if (sampler_fast_enabled() && (!do_rep || n_repeat <= 1024u) && (!do_dry || n_dry <= 1024u)) {
+    if (do_rep && do_dry) {
+      const uint32_t total = n_repeat + n_dry;
+      const uint32_t threads = 128u;
+      const uint32_t blocks = (total + threads - 1u) / threads;
+      hipLaunchKernelGGL(penalties_kernel, dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                         logits, vocab, row_stride, col_stride, n, d_repeat_ids, n_repeat,
+                         repeat_penalty, d_dry_ids, n_dry, dry_delta);
+      return hipGetLastError() == hipSuccess;
+    }
+    if (do_rep) {
+      return apply_repeat_penalty_hip(logits, vocab, n, row_stride, col_stride, d_repeat_ids,
+                                      n_repeat, repeat_penalty, stream);
+    }
+    return apply_dry_penalty_hip(logits, vocab, n, row_stride, col_stride, d_dry_ids, n_dry,
+                                 dry_delta, stream);
+  }
+  if (do_rep &&
+      !apply_repeat_penalty_hip(logits, vocab, n, row_stride, col_stride, d_repeat_ids, n_repeat,
+                                repeat_penalty, stream)) {
+    return false;
+  }
+  if (do_dry &&
+      !apply_dry_penalty_hip(logits, vocab, n, row_stride, col_stride, d_dry_ids, n_dry, dry_delta,
+                             stream)) {
+    return false;
+  }
+  return true;
+}
+
 bool batch_sample_hip(const float* logits, uint32_t vocab, uint32_t n,
                       uint32_t row_stride, uint32_t col_stride,
                       const uint32_t* d_query, const float* d_u, SampleParams p,
                       SpecDraw* d_out, void* stream) {
   if (!logits || !d_out || !d_u || !n || !vocab) return false;
-  hipLaunchKernelGGL(sample_kernel, dim3(n), dim3(kThr), 0, (hipStream_t)stream, logits, vocab,
-                     row_stride, col_stride, d_query, d_u, p.temperature, p.top_p, p.top_k,
-                     p.min_p, d_out);
+  if (sampler_fast_enabled()) {
+    hipLaunchKernelGGL((sample_kernel<true>), dim3(n), dim3(kThr), 0, (hipStream_t)stream, logits,
+                       vocab, row_stride, col_stride, d_query, d_u, p.temperature, p.top_p,
+                       p.top_k, p.min_p, d_out);
+  } else {
+    hipLaunchKernelGGL((sample_kernel<false>), dim3(n), dim3(kThr), 0, (hipStream_t)stream, logits,
+                       vocab, row_stride, col_stride, d_query, d_u, p.temperature, p.top_p,
+                       p.top_k, p.min_p, d_out);
+  }
   return hipGetLastError() == hipSuccess;
 }
 

@@ -538,6 +538,8 @@ private:
   void* bg_[8] = {};  void* bu_[8] = {};
   void* ba8_[8] = {}; void* bas_[8] = {};
   void* bydn_[8] = {};
+  size_t barena_bytes_[8] = {};
+  bool   barena_aliased_[8] = {};
   void* btiles_[8] = {};
   // Slices of `bpack_`, not allocations: one buffer laid out like the pinned slot so the layer's
   // five uploads are a single copy. See the note on bpin_ for what that is worth.
@@ -598,7 +600,9 @@ private:
   // Grows the arenas above to hold one layer's slots. Returns false if any allocation fails, in
   // which case the caller must not launch — the tiles point into buffers that do not exist.
   bool grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uint32_t nb_tok, uint32_t hidden,
-                 uint32_t inter, uint32_t nb_stride, bool exact_cap = false);
+                 uint32_t inter, uint32_t nb_stride, bool exact_cap = false,
+                 bool need_bpin = false);
+  void free_batch_arenas();
 
   struct Impl;
   Impl* impl_ = nullptr;                                  // HIP handles, kept out of this header

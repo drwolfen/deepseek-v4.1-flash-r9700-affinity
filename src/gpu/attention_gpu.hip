@@ -507,13 +507,13 @@ __global__ __launch_bounds__(kAttnThreads) void mqa_attend_batch_kernel(
 __device__ __forceinline__ void row_scale(float* s_abs, float* s_scale, uint32_t i, uint32_t width,
                                           uint8_t* slot) {
   const uint32_t n_grp = width / 64u;
-  __syncthreads();
+  lds_barrier();
   if (i < n_grp) {
     float a = 0.0f;
     for (uint32_t j = 0; j < 64u; ++j) a = fmaxf(a, s_abs[i * 64u + j]);
     s_scale[i] = a;
   }
-  __syncthreads();
+  lds_barrier();
   if (i == 0) {
     float a = 0.0f;
     for (uint32_t g = 0; g < n_grp; ++g) a = fmaxf(a, s_scale[g]);
@@ -521,7 +521,7 @@ __device__ __forceinline__ void row_scale(float* s_abs, float* s_scale, uint32_t
     s_scale[n_grp] = sc;
     *(float*)(slot + width) = sc;
   }
-  __syncthreads();
+  lds_barrier();
 }
 
 // One block, `width` threads, one cache row out.
@@ -557,14 +557,14 @@ __global__ void kv_store_kernel(const float* __restrict__ kv, uint8_t* __restric
   float* g_scale = (float*)(slot + ((DT == 3) ? nope + (size_t)(width - nope) * 2 : width));
 
   if (i < n_e4m3) s_abs[i] = fabsf(v);
-  __syncthreads();
+  lds_barrier();
   if (i < n_grp) {
     float amax = 0.0f;
     for (uint32_t j = 0; j < 64u; ++j) amax = fmaxf(amax, s_abs[i * 64u + j]);
     s_scale[i] = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
     g_scale[i] = s_scale[i];
   }
-  __syncthreads();
+  lds_barrier();
 
   if (i < n_e4m3) slot[i] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / s_scale[i >> 6])));
   else if (DT == 3 && i < width) ((__half*)(slot + nope))[i - nope] = __float2half(v);
@@ -617,16 +617,16 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
       for (int o = 16; o; o >>= 1) acc += __shfl_down(acc, o);
       if ((i & 31u) == 0u) red[i >> 5] = acc;
     }
-    __syncthreads();
+    lds_barrier();
     if (i == 0) {
       float s = 0.0f;
       for (uint32_t k = 0; k < kNT / 32u; ++k) s += red[k];
       red[0] = rsqrtf(s / (float)width + nrm.eps);
     }
-    __syncthreads();
+    lds_barrier();
     const float inv = red[0];
     if (i < width) s_abs[i] = kv[i] * inv * (nrm.w ? nrm.w[i] : 1.0f);
-    __syncthreads();
+    lds_barrier();
     if (i < nope) {
       v = s_abs[i];
     } else if (i < width) {
@@ -640,7 +640,7 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
     } else {
       v = 0.0f;
     }
-    __syncthreads();                                // s_abs is the QAT's scratch from here on
+    lds_barrier();                                // s_abs is the QAT's scratch from here on
   } else {
     v = (i < width) ? kv[(size_t)i * nb + b0 + t] : 0.0f;
   }
@@ -648,18 +648,18 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
   // ---- fp8_kv_qat, in place, NOPE part only ----
   const uint32_t n_qat = (nope / 64u) * 64u;
   s_abs[i] = (i < n_qat) ? fabsf(v) : 0.0f;
-  __syncthreads();
+  lds_barrier();
   if (i < n_qat / 64u) {
     float amax = 0.0f;
     for (uint32_t j = 0; j < 64u; ++j) amax = fmaxf(amax, s_abs[i * 64u + j]);
     s_scale[i] = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
   }
-  __syncthreads();
+  lds_barrier();
   if (i < n_qat) {
     const float sc = s_scale[i >> 6];
     v = e4m3_decode(e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / sc)))) * sc;
   }
-  __syncthreads();
+  lds_barrier();
 
   // ---- kv_store: f16-round first, then encode ----
   v = __half2float(__float2half(v));
@@ -678,14 +678,14 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
   float* g_scale = (float*)(slot + ((DT == 3) ? nope + (size_t)(width - nope) * 2 : width));
 
   s_abs[i] = (i < n_e4m3) ? fabsf(v) : 0.0f;
-  __syncthreads();
+  lds_barrier();
   if (i < n_grp) {
     float amax = 0.0f;
     for (uint32_t j = 0; j < 64u; ++j) amax = fmaxf(amax, s_abs[i * 64u + j]);
     s_scale[i] = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
     g_scale[i] = s_scale[i];
   }
-  __syncthreads();
+  lds_barrier();
 
   if (i < n_e4m3) slot[i] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / s_scale[i >> 6])));
   else if (DT == 3 && i < width) ((__half*)(slot + nope))[i - nope] = __float2half(v);
