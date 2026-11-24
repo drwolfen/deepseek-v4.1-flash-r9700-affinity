@@ -2118,8 +2118,10 @@ __device__ __forceinline__ float stripe_sum_n(float* red, uint32_t s, uint32_t b
 
 __global__ __launch_bounds__(32) void batch_quant_tm_fp8_kernel(
     const float* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ scales,
-    uint32_t nkb, uint32_t dim, uint32_t n_live) {
+    uint32_t nkb, uint32_t dim, uint32_t n_live, uint32_t src_col0, uint32_t src_ld) {
   const uint32_t kb = blockIdx.x, tok = blockIdx.y, lane = threadIdx.x;
+  const uint32_t ld = src_ld ? src_ld : dim;
+  const size_t src_base = ((size_t)tok * ld) + src_col0 + (size_t)kb * 128u;
   const size_t base = ((size_t)tok * dim) + (size_t)kb * 128u;
   if (n_live > 0u && tok >= n_live) {
     if (lane == 0u) scales[(size_t)tok * nkb + kb] = 1.0f;
@@ -2132,11 +2134,11 @@ __global__ __launch_bounds__(32) void batch_quant_tm_fp8_kernel(
     return;
   }
   float v0, v1, v2, v3;
-  if ((reinterpret_cast<uintptr_t>(src + base) & 15u) == 0u) {
-    const float4 v = reinterpret_cast<const float4*>(src + base)[lane];
+  if ((reinterpret_cast<uintptr_t>(src + src_base) & 15u) == 0u) {
+    const float4 v = reinterpret_cast<const float4*>(src + src_base)[lane];
     v0 = v.x; v1 = v.y; v2 = v.z; v3 = v.w;
   } else {
-    const float* p = src + base + lane * 4u;
+    const float* p = src + src_base + lane * 4u;
     v0 = p[0]; v1 = p[1]; v2 = p[2]; v3 = p[3];
   }
   float m = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
@@ -2938,6 +2940,7 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
   }
 
   float sq = 0.0f;
+  float* const cur_out = cur ? cur : norm;
   if (live)
     for (uint32_t d = s; d < n_embd; d += kBlkStripe) {
       float acc = 0.0f;
@@ -2946,13 +2949,13 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
           acc += wmma::bf16_to_f32(hc[((size_t)h * n_embd + d) * nb + b]) * s_pre[bl * 8 + h];
       else
         acc = wmma::bf16_to_f32(hc[(size_t)d * nb + b]);
-      cur[(size_t)d * nb + b] = acc;
+      cur_out[(size_t)d * nb + b] = acc;
       sq += acc * acc;
     }
   const float inv = rsqrtf(stripe_sum(red, s, bl, sq) / (float)n_embd + rms_eps);
   if (!live) return;
   for (uint32_t d = s; d < n_embd; d += kBlkStripe)
-    norm[(size_t)d * nb + b] = cur[(size_t)d * nb + b] * inv * (nw ? nw[d] : 1.0f);
+    norm[(size_t)d * nb + b] = cur_out[(size_t)d * nb + b] * inv * (nw ? nw[d] : 1.0f);
 }
 
 // ---- the same thing for a speculative block ----------------------------------------------------
@@ -3647,9 +3650,9 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_v41_kernel(
 // a single store, so an instantiation would buy nothing and the comma in a two-parameter template
 // argument list does not survive the launch macro.
 template <uint32_t NH>
-__global__ void batch_hc_expand_reg_kernel(uint16_t* __restrict__ out_hc,
+__global__ void batch_hc_expand_reg_kernel(uint16_t* out_hc,
                                            float* __restrict__ block,
-                                           const uint16_t* __restrict__ hc,
+                                           const uint16_t* hc,
                                            const float* __restrict__ post,
                                            const float* __restrict__ comb, uint32_t n_embd,
                                            uint32_t nb, int zb, float* __restrict__ tap,
@@ -3684,7 +3687,7 @@ __global__ void batch_hc_expand_reg_kernel(uint16_t* __restrict__ out_hc,
 
 template <uint32_t NH>
 __global__ void batch_hc_expand_reg_vec4_kernel(
-    uint16_t* __restrict__ out_hc, float* __restrict__ block, const uint16_t* __restrict__ hc,
+    uint16_t* out_hc, float* __restrict__ block, const uint16_t* hc,
     const float* __restrict__ post, const float* __restrict__ comb, uint32_t n_embd, uint32_t nb,
     int zb, float* __restrict__ tap, uint32_t b_lo, uint32_t n_keep, uint32_t row0,
     uint32_t rows_cap, uint32_t row_stride, uint32_t slot_off) {
@@ -4437,11 +4440,12 @@ void batch_swiglu_quant_fp8_hip(const float* g, const float* u, uint8_t* out, fl
 }
 
 void batch_quant_tm_fp8_hip(const float* src, uint8_t* out, float* scales, uint32_t dim,
-                            uint32_t nb, void* stream, uint32_t n_live) {
+                            uint32_t nb, void* stream, uint32_t n_live, uint32_t src_col0,
+                            uint32_t src_ld) {
   if (!nb || !dim || (dim % 128u) != 0u) return;
   const uint32_t nkb = dim >> 7;
   AFF_BLAUNCH(batch_quant_tm_fp8_kernel, dim3(nkb, nb), dim3(32), 0, (hipStream_t)stream, src, out,
-              scales, nkb, dim, n_live);
+              scales, nkb, dim, n_live, src_col0, src_ld);
 }
 
 // Waves a block for the narrow (nb <= 16) instantiation, i.e. the M tile in units of 16 rows. Take

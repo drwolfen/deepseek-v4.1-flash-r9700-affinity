@@ -63,6 +63,7 @@ inline bool env_default_on(const char* name) {
   return !s || !*s || std::strcmp(s, "0") != 0;
 }
 inline bool batch_arena_alias_enabled() { return env_default_on("AFF_BATCH_ARENA_ALIAS"); }
+inline bool moe_cross_alias_enabled() { return env_default_on("AFF_MOE_CROSS_ALIAS"); }
 inline bool skip_bounce_pin_enabled() { return env_default_on("AFF_SKIP_BOUNCE_PIN"); }
 inline bool mover_ev_wait_enabled() {
   const char* s = std::getenv("AFF_MOVER_EV_WAIT");
@@ -222,17 +223,23 @@ void StaticPlacement::free_batch_arenas() {
   const bool have_prev = hipGetDevice(&prev) == hipSuccess;
   for (size_t i = 0; i < devs_.size() && i < 8; ++i) {
     (void)hipSetDevice(devs_[i]);
-    // Interior pointers aliased into bydn_[i] must NEVER be passed to hipFree().
+    // Interior/external pointers aliased into dense/bydn arenas must NEVER be passed to hipFree().
     if (!barena_aliased_[i]) {
       for (void* p : {bg_[i], bu_[i], bq8_[i], bqs_[i]})
         if (p) (void)hipFree(p);
     }
-    for (void* p : {ba8_[i], bas_[i], bydn_[i], bpack_[i]})
-      if (p) (void)hipFree(p);
+    if (!ba8_ext_[i]) {
+      for (void* p : {ba8_[i], bas_[i]})
+        if (p) (void)hipFree(p);
+    }
+    if (!bydn_ext_[i] && bydn_[i]) (void)hipFree(bydn_[i]);
+    if (bpack_[i]) (void)hipFree(bpack_[i]);
     bg_[i] = bu_[i] = bq8_[i] = bqs_[i] = nullptr;
     ba8_[i] = bas_[i] = bydn_[i] = bpack_[i] = nullptr;
     btok_[i] = bwt_[i] = bord_[i] = brun_[i] = btiles_[i] = nullptr;
     barena_aliased_[i] = false;
+    bydn_ext_[i] = false;
+    ba8_ext_[i] = false;
     barena_bytes_[i] = 0;
     bpack_n_[i] = 0;
     bcap_slot_[i] = bcap_tile_[i] = bcap_nb_[i] = bcap_tok_[i] = 0;
@@ -1664,6 +1671,26 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
     *p = nullptr;
     return hipMalloc(p, bytes) == hipSuccess;
   };
+  auto free_bydn = [&] {
+    if (bydn_[dv]) {
+      sync_all_devs();
+      if (!bydn_ext_[dv]) AFF_HIP_CHECK(hipFree(bydn_[dv]));
+      bydn_[dv] = nullptr;
+    }
+    bydn_ext_[dv] = false;
+  };
+  auto free_ba8 = [&] {
+    if (ba8_[dv] || bas_[dv]) {
+      sync_all_devs();
+      if (!ba8_ext_[dv]) {
+        if (ba8_[dv]) AFF_HIP_CHECK(hipFree(ba8_[dv]));
+        if (bas_[dv]) AFF_HIP_CHECK(hipFree(bas_[dv]));
+      }
+      ba8_[dv] = nullptr;
+      bas_[dv] = nullptr;
+    }
+    ba8_ext_[dv] = false;
+  };
   // Slack on every growth: layers differ in how many slots land on a card, and a realloc a layer
   // would serialise the stream on the free.
   //
@@ -1674,8 +1701,9 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
   //   Phase 3:   Down GEMMs read (ba8_, bas_) and write (bydn_), then scatter reads (bydn_).
   // Thus (bg_, bu_, bq8_, bqs_) and (bydn_) are strictly disjoint in lifetime and can share one
   // backing allocation at `bydn_[dv]` (saving ~19.6-78.4 MiB/card). `ba8_`/`bas_` overlap both
-  // phases and stay separate allocations.
+  // phases and stay separate allocations (or alias unused dense tail under AFF_MOE_CROSS_ALIAS=1).
   const bool want_alias = batch_arena_alias_enabled() && !imat_on_;
+  const bool cross_alias = want_alias && moe_cross_alias_enabled();
   if (want_alias) {
     if (!barena_aliased_[dv]) {
       for (void** p : {&bg_[dv], &bu_[dv], &bq8_[dv], &bqs_[dv]}) {
@@ -1692,13 +1720,26 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
       const uint32_t slot_cap =
           need_slot_grow ? (exact_cap ? taken : (taken + (taken >> 1) + 64u)) : bcap_slot_[dv];
       const uint32_t nb_cap = need_nb_grow ? nb_stride : bcap_nb_[dv];
+      auto align256 = [](size_t n) { return (n + 255u) & ~(size_t)255u; };
 
       if (need_slot_grow) {
-        if (!grow(&ba8_[dv], (size_t)slot_cap * inter)) return false;
-        if (!grow(&bas_[dv], (size_t)slot_cap * (inter / 128u) * sizeof(float))) return false;
+        const size_t ba8_bytes = (size_t)slot_cap * inter;
+        const size_t bas_bytes = (size_t)slot_cap * (inter / 128u) * sizeof(float);
+        const size_t off_bas = align256(ba8_bytes);
+        const size_t ba8_need = off_bas + bas_bytes;
+        if (cross_alias && ext_ba8_[dv] && ba8_need <= ext_ba8_bytes_[dv]) {
+          if (ba8_ext_[dv]) sync_all_devs();
+          else free_ba8();
+          ba8_[dv] = ext_ba8_[dv];
+          bas_[dv] = reinterpret_cast<uint8_t*>(ext_ba8_[dv]) + off_bas;
+          ba8_ext_[dv] = true;
+        } else {
+          if (ba8_ext_[dv]) free_ba8();
+          if (!grow(&ba8_[dv], ba8_bytes)) return false;
+          if (!grow(&bas_[dv], bas_bytes)) return false;
+        }
       }
 
-      auto align256 = [](size_t n) { return (n + 255u) & ~(size_t)255u; };
       const size_t dn_bytes  = (size_t)hidden * slot_cap * sizeof(uint16_t);
       const size_t bg_bytes  = (size_t)inter * slot_cap * sizeof(uint16_t);
       const size_t bu_bytes  = (size_t)inter * slot_cap * sizeof(uint16_t);
@@ -1711,18 +1752,27 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
       const size_t need_arena = std::max(dn_bytes, off_bqs + bqs_bytes);
 
       if (!bydn_[dv] || need_arena > barena_bytes_[dv]) {
-        // Clear interior aliases before grow() frees bydn_[dv] so OOM never leaves dangling aliases.
+        // Clear interior aliases before freeing/repointing bydn_[dv] so OOM never leaves dangling aliases.
         if (barena_aliased_[dv]) {
           bg_[dv] = bu_[dv] = bq8_[dv] = bqs_[dv] = nullptr;
           barena_aliased_[dv] = false;
         }
-        if (!grow(&bydn_[dv], need_arena)) {
-          barena_bytes_[dv] = 0;
-          bcap_slot_[dv] = 0;
-          bcap_nb_[dv] = 0;
-          return false;
+        if (cross_alias && ext_bydn_[dv] && need_arena <= ext_bydn_bytes_[dv]) {
+          if (bydn_ext_[dv]) sync_all_devs();
+          else free_bydn();
+          bydn_[dv] = ext_bydn_[dv];
+          bydn_ext_[dv] = true;
+          barena_bytes_[dv] = need_arena;
+        } else {
+          if (bydn_ext_[dv]) free_bydn();
+          if (!grow(&bydn_[dv], need_arena)) {
+            barena_bytes_[dv] = 0;
+            bcap_slot_[dv] = 0;
+            bcap_nb_[dv] = 0;
+            return false;
+          }
+          barena_bytes_[dv] = need_arena;
         }
-        barena_bytes_[dv] = need_arena;
       } else if (barena_aliased_[dv]) {
         sync_all_devs();
       }
@@ -1745,6 +1795,8 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
       bcap_slot_[dv] = 0;
       bcap_nb_[dv] = 0;
     }
+    if (ba8_ext_[dv]) { free_ba8(); bcap_slot_[dv] = 0; }
+    if (bydn_ext_[dv]) { free_bydn(); bcap_slot_[dv] = 0; }
     if (bcap_slot_[dv] < taken) {
       const uint32_t cap = exact_cap ? taken : (taken + (taken >> 1) + 64);
       // bf16: gate/up are read once by the SwiGLU, which requantises to E4M3 immediately, and `down`

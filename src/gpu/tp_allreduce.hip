@@ -1106,7 +1106,7 @@ __global__ __launch_bounds__(256) void tp_ar_coded_staged_kernel(
 template <uint32_t NH, bool HasTap, bool HasControl, bool LiveOne, bool HasPreCollapse,
           bool RegForm, bool Bf16Wire = false, bool HcDpp = false>
 __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
-    uint16_t* __restrict__ out_hc, float* __restrict__ block, const uint16_t* __restrict__ hc,
+    uint16_t* out_hc, float* __restrict__ block, const uint16_t* hc,
     const float* __restrict__ post, const float* __restrict__ comb, uint32_t n_embd, uint32_t nb,
     uint32_t live, int zb, float* __restrict__ tap, uint32_t b_lo, uint32_t n_keep,
     uint32_t row0, uint32_t rows_cap, uint32_t row_stride, uint32_t slot_off,

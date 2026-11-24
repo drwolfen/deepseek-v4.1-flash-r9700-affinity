@@ -270,6 +270,13 @@ public:
   // standalone caller, and wrong the moment the two enumerations can differ, which they do under
   // AFF_LOGICAL_RANKS and whenever the dense path was capped below the card count.
   void set_rank_plan(const int* devs, size_t n) { devs_.assign(devs, devs + n); }
+  void set_ext_batch_arenas(size_t dv, void* bydn, size_t bydn_bytes, void* ba8, size_t ba8_bytes) {
+    if (dv >= 8) return;
+    ext_bydn_[dv] = bydn;
+    ext_bydn_bytes_[dv] = bydn_bytes;
+    ext_ba8_[dv] = ba8;
+    ext_ba8_bytes_[dv] = ba8_bytes;
+  }
 
   // PREFILL AND DSPARK VERIFY: a whole chunk's routed experts for one layer, grouped by expert so
   // each one's 8.64 MiB is read once for every token that chose it rather than once per token.
@@ -545,6 +552,12 @@ private:
   void* bydn_[8] = {};
   size_t barena_bytes_[8] = {};
   bool   barena_aliased_[8] = {};
+  void*  ext_bydn_[8] = {};
+  size_t ext_bydn_bytes_[8] = {};
+  void*  ext_ba8_[8] = {};
+  size_t ext_ba8_bytes_[8] = {};
+  bool   bydn_ext_[8] = {};
+  bool   ba8_ext_[8] = {};
   void* btiles_[8] = {};
   // Slices of `bpack_`, not allocations: one buffer laid out like the pinned slot so the layer's
   // five uploads are a single copy. See the note on bpin_ for what that is worth.

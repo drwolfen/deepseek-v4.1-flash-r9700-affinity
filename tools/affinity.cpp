@@ -1499,6 +1499,12 @@ int main(int argc, char** argv) {
   // The chunk has to reach placement: the routed arena scales with it, placement allocates that
   // arena before it sizes its slabs, and a chunk it never heard about aborts the run mid-prefill.
   placement.set_rank_plan(rank_plan.data(), rank_plan.size());
+  for (size_t d = 0; d < dense_gpu.ranks(); ++d) {
+    void *bydn = nullptr, *ba8 = nullptr;
+    size_t bydn_b = 0, ba8_b = 0;
+    dense_gpu.moe_ext_arenas(d, &bydn, &bydn_b, &ba8, &ba8_b);
+    placement.set_ext_batch_arenas(d, bydn, bydn_b, ba8, ba8_b);
+  }
   if (placement.init(&model.reader(), model.codebook(), gpu_budget_mib / 1024.0, c.n_layer,
                      c.n_expert,
                      dense_gpu.batch_cap(), c.n_expert_used, &cerr)) {

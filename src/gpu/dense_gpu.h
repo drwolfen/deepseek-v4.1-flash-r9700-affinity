@@ -316,6 +316,8 @@ public:
                   std::string* err);
   Model::BatchOps batch_ops();
   uint32_t batch_cap() const { return b_cap_; }
+  void moe_ext_arenas(size_t rank, void** bydn_ptr, size_t* bydn_bytes, void** ba8_ptr,
+                      size_t* ba8_bytes) const;
 
   // Everything the DSpark draft allocates, after batch_init and before static placement. `tap_in`
   // is n_embd * the tap count — main_proj's input width. Until this runs every draft entry point
@@ -441,6 +443,7 @@ private:
   uint64_t tp_calls_ = 0;    // collectives issued, for the periodic tp_check
 
   struct Impl;
+  static bool ensure_single_arena(Impl& I, size_t d);
   Impl* impl_ = nullptr;
   std::vector<Entry> ent_;
   void upload_sink(uint32_t layer);

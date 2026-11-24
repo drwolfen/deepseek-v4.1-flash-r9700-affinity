@@ -136,7 +136,8 @@ void batch_swiglu_quant_fp8_hip(const float* g, const float* u, uint8_t* out, fl
 // 128-column) scale without a transpose pass. Requires dim % 128 == 0. When n_live > 0, tokens
 // tok >= n_live emit zeroed E4M3 0x00 bytes and scale 1.0f.
 void batch_quant_tm_fp8_hip(const float* src, uint8_t* out, float* scales, uint32_t dim,
-                            uint32_t nb, void* stream = nullptr, uint32_t n_live = 0);
+                            uint32_t nb, void* stream = nullptr, uint32_t n_live = 0,
+                            uint32_t src_col0 = 0, uint32_t src_ld = 0);
 
 // Permute an E4M3 weight into the order the WMMA fragment wants, once at load. This is
 // vllm-radiance's shuffle_weight(w, (16,16)) and it is what `batch_gemm_fp8_hip` expects `W` to be

@@ -323,6 +323,8 @@ struct DenseGpu::Impl {
     // as far as the sequence has actually reached. `a_comp[l]` is the span's base and never moves,
     // so every kernel keeps its linear addressing. See gpu/vmem.h for why this and not paging.
     std::vector<std::vector<VirtualSpan>> a_comp_span_s;
+    std::vector<std::vector<VirtualSpan>> a_idx8_span_s;
+    std::vector<std::vector<VirtualSpan>> a_idxs_span_s;
     hipStream_t a_kv_zero = nullptr;   // shared by every span on this card; see attn_init
     std::vector<float*>   a_sink;
     // The indexer's compressed keys as the scoring kernel wants them: E4M3 rows with one f32 scale
@@ -468,6 +470,7 @@ struct DenseGpu::Impl {
     // for, and borrowing it would tie one lane's capacity to another's.
     float* e_in = nullptr; float* e_out = nullptr; float* e_stage = nullptr;
     uint32_t e_tile = 0;
+    hipEvent_t ev_eng = nullptr, ev_eng_done = nullptr;
     // ---- THE FOUR STAGING RINGS -----------------------------------------------------------------
     //
     // Every H2D on the hot path whose source the host rewrites. See StageRing for why each is a ring
@@ -547,9 +550,11 @@ struct DenseGpu::Impl {
     void* ev_route[kRouteSlots] = {};            // rank 0: one per slot
     size_t route_woff_slot[kRouteSlots] = {};    // per-slot byte offset to wt inside m_ring[slot]
     size_t b_q_floats = 0;                       // float capacity of b_q (nq * b_cap_)
+    size_t b_qtm_bytes = 0;                      // byte capacity of b_qtm
     size_t b_q_c_end = 0;                        // byte end of c_* alias band in b_q
     size_t b_q_i_tail_off = 0;                   // byte start of i_q8/i_qs/i_w tail in b_q
     bool route_wt_packed = false;                // b_rwt aliases D.b_rsel + live_nk
+    bool single_ready = false;
     bool is_bq_alias(const void* p) const {
       if (!b_q || !b_q_floats || !p) return false;
       const uintptr_t base = reinterpret_cast<uintptr_t>(b_q);
@@ -576,6 +581,8 @@ struct DenseGpu::Impl {
   };
   std::vector<Dev> dev;
   TpContext tp;
+  uint64_t single_max_rows = 0;
+  uint64_t single_max_cols = 0;
   uint16_t* h_embed_pinned = nullptr;
   uint16_t* d_embed_uva = nullptr;
   size_t embed_bytes = 0;
@@ -654,6 +661,62 @@ inline bool flash_q_e4m3_enabled() {
 inline bool dense_arena_alias_enabled() {
   const char* v = std::getenv("AFF_DENSE_ARENA_ALIAS");
   return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+inline bool hc_inplace_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_HC_INPLACE");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool dense_arena_alias_v2_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_DENSE_ARENA_ALIAS_V2");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool skip_single_arena_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_SKIP_SINGLE_ARENA");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool moe_cross_alias_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_MOE_CROSS_ALIAS");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool idx_vmem_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_IDX_VMEM");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool engram_tp_shard_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_ENGRAM_TP_SHARD");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool mtp_proj_tp_shard_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_MTP_PROJ_TP_SHARD");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
 }
 
 inline bool route_wt_alias_enabled() {
@@ -853,13 +916,21 @@ DenseGpu::~DenseGpu() {
     (void)hipSetDevice(D.id);
     for (Entry& e : ent_) free_shard_bufs(e.sh[d]);
     // Non-owning aliases: b_conf==b_ids, b_htm==b_q, b_heads==b_qtm, and under
-    // AFF_DENSE_ARENA_ALIAS b_emb==b_y and b_head==b_u, plus {e_*, c_*, c_py, i_*} inside b_q.
+    // AFF_DENSE_ARENA_ALIAS[_V2] b_emb==b_y, b_head==b_u, b_u==b_qtm, b_qr in b_g,
+    // fsplit.o==b_y, i_bsc==b_y, plus {e_*, c_*, c_py, i_*} inside b_q.
     D.b_conf = nullptr;
     D.h_conf = nullptr;
     D.b_htm = nullptr;
     D.b_heads = nullptr;
     if (D.b_emb == D.b_y) D.b_emb = nullptr;
     if (D.b_head == D.b_u) D.b_head = nullptr;
+    if (D.b_u == reinterpret_cast<float*>(D.b_qtm)) D.b_u = nullptr;
+    if (D.b_head == reinterpret_cast<float*>(D.b_qtm)) D.b_head = nullptr;
+    if (D.b_g && D.b_qr && D.b_qr >= D.b_g &&
+        D.b_qr < D.b_g + (size_t)b_g_cap_ * (b_cap_ ? b_cap_ : b_nb_))
+      D.b_qr = nullptr;
+    if (D.fsplit.o == D.b_y) D.fsplit.o = nullptr;
+    if (D.i_bsc == D.b_y) D.i_bsc = nullptr;
     for (float** p : {&D.e_in, &D.e_out, &D.e_stage,
                       &D.c_kv, &D.c_sc, &D.ci_kv, &D.ci_sc, &D.c_lat, &D.ci_ky, &D.c_py,
                       &D.i_q, &D.i_qs, &D.i_w, &D.i_sc}) {
@@ -885,6 +956,22 @@ DenseGpu::~DenseGpu() {
     for (float* p : D.b_tap_s) if (p) (void)hipFree(p);
     for (auto& v : D.a_raw_s)  for (uint8_t* p : v) if (p) (void)hipFree(p);
     for (auto& v : D.a_comp_s) for (uint8_t* p : v) if (p) (void)hipFree(p);
+    for (size_t sl = 0; sl < D.a_idx8_s.size(); ++sl) {
+      for (size_t l = 0; l < D.a_idx8_s[sl].size(); ++l) {
+        const bool is_vmem = sl < D.a_idx8_span_s.size() && l < D.a_idx8_span_s[sl].size() &&
+                             D.a_idx8_span_s[sl][l].reserved();
+        if (is_vmem) D.a_idx8_span_s[sl][l].release();
+        else if (D.a_idx8_s[sl][l]) (void)hipFree(D.a_idx8_s[sl][l]);
+      }
+    }
+    for (size_t sl = 0; sl < D.a_idxs_s.size(); ++sl) {
+      for (size_t l = 0; l < D.a_idxs_s[sl].size(); ++l) {
+        const bool is_vmem = sl < D.a_idxs_span_s.size() && l < D.a_idxs_span_s[sl].size() &&
+                             D.a_idxs_span_s[sl][l].reserved();
+        if (is_vmem) D.a_idxs_span_s[sl][l].release();
+        else if (D.a_idxs_s[sl][l]) (void)hipFree(D.a_idxs_s[sl][l]);
+      }
+    }
     for (float* p : D.c_pend) if (p) (void)hipFree(p);
     for (float* p : D.a_sink) if (p) (void)hipFree(p);
     if (D.a_allow) (void)hipFree(D.a_allow);
@@ -926,6 +1013,8 @@ DenseGpu::~DenseGpu() {
     }
     if (D.ev_sx) (void)hipEventDestroy(D.ev_sx);
     if (D.ev_sd) (void)hipEventDestroy(D.ev_sd);
+    if (D.ev_eng) (void)hipEventDestroy(D.ev_eng);
+    if (D.ev_eng_done) (void)hipEventDestroy(D.ev_eng_done);
     batch_splitk_release_hip(D.sstream);
     batch_splitk_release_hip(D.stream);
     if (D.sstream) (void)hipStreamDestroy(D.sstream);
@@ -971,6 +1060,26 @@ static size_t rank_plan(const std::vector<int>& devs, size_t want, std::vector<i
   return use;
 }
 
+bool DenseGpu::ensure_single_arena(Impl& I, size_t d) {
+  Impl::Dev& D = I.dev[d];
+  if (D.single_ready) return true;
+  AFF_HIP_CHECK(hipSetDevice(D.id));
+  if (hipMalloc(&D.d_x, I.single_max_cols * sizeof(float)) != hipSuccess) return false;
+  if (hipMalloc(&D.d_y, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
+  if (hipMalloc(&D.d_g, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
+  if (hipMalloc(&D.d_u, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
+  if (hipMalloc(&D.d_a, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
+  if (hipMalloc(&D.d_p, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
+  if (hipHostMalloc(&D.h_y, I.single_max_rows * sizeof(float), hipHostMallocDefault) != hipSuccess)
+    return false;
+  for (auto& s : D.stg) {
+    if (hipHostMalloc(&s.h, I.single_max_cols * sizeof(float), hipHostMallocDefault) != hipSuccess)
+      return false;
+  }
+  D.single_ready = true;
+  return true;
+}
+
 bool DenseGpu::init(uint64_t max_rows, uint64_t max_cols, std::string* err, size_t want_ranks) {
   static_assert(kMaxRanks == (size_t)kMaxGpuDevices, "per-rank and per-device tables must agree");
   const std::vector<int> devs = gfx12_devices();
@@ -991,6 +1100,8 @@ bool DenseGpu::init(uint64_t max_rows, uint64_t max_cols, std::string* err, size
 
   impl_ = new Impl();
   impl_->dev.resize(use);
+  impl_->single_max_rows = max_rows;
+  impl_->single_max_cols = max_cols;
   // Every per-sequence vector is slot-major; give each its outer dimension before anything
   // indexes [slot_]. n_slots_ is 1 unless --slots raised it.
   init_slot_keys();
@@ -998,16 +1109,16 @@ bool DenseGpu::init(uint64_t max_rows, uint64_t max_cols, std::string* err, size
     D.a_raw_s.resize(n_slots_);   D.a_comp_s.resize(n_slots_);
     D.a_comp_span_s.resize(n_slots_);
     D.a_idx8_s.resize(n_slots_);  D.a_idxs_s.resize(n_slots_);
+    D.a_idx8_span_s.resize(n_slots_); D.a_idxs_span_s.resize(n_slots_);
     D.c_hkv_s.resize(n_slots_);   D.c_hsc_s.resize(n_slots_);
     D.ci_hkv_s.resize(n_slots_);  D.ci_hsc_s.resize(n_slots_);
   }
+  const bool defer_single = skip_single_arena_enabled();
   for (size_t d = 0; d < use; ++d) {
     impl_->dev[d].id = plan[d];
     AFF_HIP_CHECK(hipSetDevice(plan[d]));
     // Each rank only ever writes its own row slice, but sizing to the full width keeps the
     // arithmetic obvious and costs half a megabyte.
-    AFF_HIP_CHECK(hipMalloc(&impl_->dev[d].d_x, max_cols * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&impl_->dev[d].d_y, max_rows * sizeof(float)));
     AFF_HIP_CHECK(hipStreamCreate(&impl_->dev[d].stream));
     // The trace watches ONE card's stream. Its events are created here, not lazily: an event
     // belongs to the device current at creation and may only be recorded on that device's stream.
@@ -1017,15 +1128,14 @@ bool DenseGpu::init(uint64_t max_rows, uint64_t max_cols, std::string* err, size
     // Intermediates are bounded by the widest thing a fused chain carries: n_head*qk_width for the
     // query path, moe_inter for the shared expert. max_rows covers both.
     impl_->dev[d].cap_mid = max_rows;
-    AFF_HIP_CHECK(hipMalloc(&impl_->dev[d].d_g, max_rows * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&impl_->dev[d].d_u, max_rows * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&impl_->dev[d].d_a, max_rows * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&impl_->dev[d].d_p, max_rows * sizeof(float)));
-    AFF_HIP_CHECK(hipHostMalloc(&impl_->dev[d].h_y, max_rows * sizeof(float),
-                                hipHostMallocDefault));
     for (auto& s : impl_->dev[d].stg) {
-      AFF_HIP_CHECK(hipHostMalloc(&s.h, max_cols * sizeof(float), hipHostMallocDefault));
       AFF_HIP_CHECK(hipEventCreateWithFlags(&s.ev, hipEventDisableTiming));
+    }
+    if (!defer_single) {
+      if (!ensure_single_arena(*impl_, d)) {
+        if (err) *err = "hipMalloc single-token arena";
+        return false;
+      }
     }
     // hipEventDisableTiming: nothing asks these for elapsed time, and the timing variant costs a
     // host-visible timestamp write on every record, twice a layer a rank.
@@ -1234,13 +1344,13 @@ DenseGpu::Split DenseGpu::split_for(const char* name) {
   // consumes them reads the hidden state, which is replicated — so a row split would hand each card
   // half a key and an exchange per engram layer per token to put them back together. 150 MiB a
   // layer a card, for two layers, against that.
-  if (!std::strcmp(s, "engram_wkv")) return Split::Rep;
+  if (!std::strcmp(s, "engram_wkv")) return engram_tp_shard_enabled() ? Split::Row : Split::Rep;
   // 64 rows. The indexer weights every head by it and every card scores every head-group.
   if (!std::strcmp(s, "idx_proj")) return Split::Rep;
   // ---- DSpark ---------------------------------------------------------------------------------
   // main_proj is the one activation the whole draft is conditioned on and every stage reads all of
-  // it, so a Row split needs a gather before stage one. 50 MB read twice beats 25 MB exchanged.
-  if (!std::strcmp(s, "mtp_main_proj")) return Split::Rep;
+  // it; Col-sharding halves the VRAM footprint and reads, followed by one 320 KiB reduce.
+  if (!std::strcmp(s, "mtp_main_proj")) return mtp_proj_tp_shard_enabled() ? Split::Col : Split::Rep;
   // The Markov correction. w1 is an embedding — one row chosen at run time — so Row-split only one
   // card would hold it. w2 is a [vocab][rank] head whose band must match the vocabulary head's, and
   // those are different tensors with no reason to agree on a boundary; replicated, each card slices
@@ -1783,6 +1893,7 @@ bool DenseGpu::mv_multi(const int32_t* h, const uint64_t* rows, uint64_t cols, u
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     if (!total[d]) continue;
+    if (!ensure_single_arena(*impl_, d)) return false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
     const float* xin = x ? D.d_x : D.d_norm;
     if (x) AFF_STAGE_UP(D, kStgMv, D.d_x, x, cols, D.stream);
@@ -1866,6 +1977,9 @@ bool DenseGpu::attn_pre(int32_t qa, int32_t kv, uint64_t qr, uint32_t width, con
   if (qa < 0 || kv < 0 || (size_t)qa >= ent_.size() || (size_t)kv >= ent_.size()) return false;
   if (n + 2 > kMvBatchMax) return false;
   const size_t R = impl_->dev.size();
+  for (size_t d = 0; d < R; ++d) {
+    if (!ensure_single_arena(*impl_, d)) return false;
+  }
 
   // Every check attn_q and attn_kv make about their FIRST matvec, made here. If one of them would
   // have refused, the caller must be left on a path where it still owns the whole chain. Both are
@@ -2033,6 +2147,7 @@ bool DenseGpu::router(int32_t h, const float* x, uint32_t n_expert, uint64_t n_e
     uint64_t r0 = 0, nr = 0;
     router_band(d, R, n_expert, r0_only, &r0, &nr);
     if (!D.router[h] || !D.d_rlog || !nr) continue;
+    if (!ensure_single_arena(*impl_, d)) return false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
     // x == null: the norm is already in VRAM from hc_pre, so nothing crosses the bus on the way in
     // and only 512 B of logits comes back from each card.
@@ -2729,16 +2844,19 @@ __global__ __launch_bounds__(256) void head_unpack_tm_bf16_kernel(const uint16_t
 __global__ __launch_bounds__(256) void draft_transpose_pad_kernel(const float* __restrict__ src,
                                                                   float* __restrict__ dst,
                                                                   uint32_t n_live,
-                                                                  uint32_t nb_out, uint32_t cols) {
+                                                                  uint32_t nb_out, uint32_t cols,
+                                                                  uint32_t src_col0 = 0u,
+                                                                  uint32_t src_ld = 0u) {
   __shared__ float tile[32][33];
   const uint32_t tid = threadIdx.x;
   const uint32_t tx = tid & 31u, ty = tid >> 5;
   const uint32_t c0 = blockIdx.x * 32u, r0 = blockIdx.y * 32u;
   const uint32_t c = c0 + tx;
+  const uint32_t sld = src_ld ? src_ld : cols;
 #pragma unroll
   for (uint32_t k = 0u; k < 32u; k += 8u) {
     const uint32_t r = r0 + ty + k;
-    tile[ty + k][tx] = (r < n_live && c < cols) ? src[(size_t)r * cols + c] : 0.0f;
+    tile[ty + k][tx] = (r < n_live && c < cols) ? src[(size_t)r * sld + src_col0 + c] : 0.0f;
   }
   lds_barrier();
   const uint32_t r_out = r0 + tx;
@@ -2794,6 +2912,7 @@ bool DenseGpu::attn_q(int32_t qa, int32_t qb, int32_t qn, const float* x, uint64
   }
 
   for (size_t d = 0; d < R; ++d) {
+    if (!ensure_single_arena(*impl_, d)) return false;
     Impl::Dev& D = impl_->dev[d];
     const uint64_t nq = B.sh[d].nrows;                // this card's heads, in floats
     const uint32_t nh = (uint32_t)(nq / width);
@@ -2938,6 +3057,7 @@ bool DenseGpu::kv_commit(uint32_t layer, uint32_t pos, uint32_t width, uint32_t 
   // overlaps execution rather than dispatch, so the event round trip would cost what the overlap
   // saved.
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    if (!ensure_single_arena(*impl_, d)) { kvn_pending_ = false; return false; }
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     hipStream_t kst = D.stream;
@@ -3005,6 +3125,7 @@ bool DenseGpu::shexp(int32_t hg, int32_t hu, int32_t hd, const float* x, uint64_
 
   float* in[kMaxRanks]; float* outp[kMaxRanks];
   for (size_t d = 0; d < R; ++d) {
+    if (!ensure_single_arena(*impl_, d)) return false;
     Impl::Dev& D = impl_->dev[d];
     const uint32_t li = (uint32_t)G.sh[d].nrows;      // this card's share of the intermediate
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -3354,6 +3475,7 @@ bool DenseGpu::norm_collect(float* norm_host, uint32_t n_embd) {
 // count it twice.
 bool DenseGpu::block_add_host(const float* src, uint32_t n_embd) {
   if (!hc_ok_) return false;
+  if (!ensure_single_arena(*impl_, 0)) return false;
   Impl::Dev& D = impl_->dev[0];
   AFF_HIP_CHECK(hipSetDevice(D.id));
   AFF_STAGE_UP(D, kStgShexp, D.d_x, src, n_embd, D.stream);
@@ -3571,12 +3693,29 @@ bool DenseGpu::kv_commit_positions(uint64_t positions, std::string* err) {
   for (Impl::Dev& D : impl_->dev) {
     AFF_HIP_CHECK(hipSetDevice(D.id));
     for (size_t l = 0; l < D.a_comp_span_s[slot_].size(); ++l) {
-      if (!D.a_comp_span_s[slot_][l].reserved()) continue;
-      const size_t was = D.a_comp_span_s[slot_][l].committed();
-      if (!D.a_comp_span_s[slot_][l].commit_to((uint64_t)comp_rows_for((uint32_t)l, positions) * rb,
-                                      D.a_kv_zero, err))
-        return false;
-      st_.kv_bytes += D.a_comp_span_s[slot_][l].committed() - was;
+      if (D.a_comp_span_s[slot_][l].reserved()) {
+        const size_t was = D.a_comp_span_s[slot_][l].committed();
+        if (!D.a_comp_span_s[slot_][l].commit_to((uint64_t)comp_rows_for((uint32_t)l, positions) * rb,
+                                                 D.a_kv_zero, err))
+          return false;
+        st_.kv_bytes += D.a_comp_span_s[slot_][l].committed() - was;
+      }
+      if (l < a_comp_rows_.size()) {
+        const uint64_t idx_rows =
+            std::min<uint64_t>(comp_rows_for((uint32_t)l, positions), a_comp_rows_[l]);
+        if (l < D.a_idx8_span_s[slot_].size() && D.a_idx8_span_s[slot_][l].reserved()) {
+          const size_t was8 = D.a_idx8_span_s[slot_][l].committed();
+          if (!D.a_idx8_span_s[slot_][l].commit_to(idx_rows * kIdxDim, D.a_kv_zero, err))
+            return false;
+          st_.kv_bytes += D.a_idx8_span_s[slot_][l].committed() - was8;
+        }
+        if (l < D.a_idxs_span_s[slot_].size() && D.a_idxs_span_s[slot_][l].reserved()) {
+          const size_t wass = D.a_idxs_span_s[slot_][l].committed();
+          if (!D.a_idxs_span_s[slot_][l].commit_to(idx_rows * sizeof(float), D.a_kv_zero, err))
+            return false;
+          st_.kv_bytes += D.a_idxs_span_s[slot_][l].committed() - wass;
+        }
+      }
     }
   }
   return true;
@@ -3716,6 +3855,7 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
     D.a_raw_s.resize(n_slots_);   D.a_comp_s.resize(n_slots_);
     D.a_comp_span_s.resize(n_slots_);
     D.a_idx8_s.resize(n_slots_);  D.a_idxs_s.resize(n_slots_);
+    D.a_idx8_span_s.resize(n_slots_); D.a_idxs_span_s.resize(n_slots_);
     D.c_hkv_s.resize(n_slots_);   D.c_hsc_s.resize(n_slots_);
     D.ci_hkv_s.resize(n_slots_);  D.ci_hsc_s.resize(n_slots_);
     for (uint32_t sl = 0; sl < n_slots_; ++sl) {
@@ -3723,6 +3863,10 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
       D.a_comp_s[sl].assign(n_layer, nullptr);
       D.a_comp_span_s[sl].clear();
       D.a_comp_span_s[sl].resize(n_layer);
+      D.a_idx8_span_s[sl].clear();
+      D.a_idx8_span_s[sl].resize(n_layer);
+      D.a_idxs_span_s[sl].clear();
+      D.a_idxs_span_s[sl].resize(n_layer);
     }
     // ONE zeroing stream a card, shared by every layer's span. Per-span streams cost 640 MiB of
     // host RAM across 86 of them, which comes out of the expert pool and strands experts on the
@@ -4092,6 +4236,7 @@ bool DenseGpu::attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_t widt
 
   float* in[kMaxRanks]; float* outp[kMaxRanks];
   for (size_t d = 0; d < R; ++d) {
+    if (!ensure_single_arena(*impl_, d)) return false;
     Impl::Dev& D = impl_->dev[d];
     const uint32_t ng = (uint32_t)(A.sh[d].nrows / rank);   // groups on this card
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -4170,6 +4315,7 @@ void DenseGpu::mv(int32_t h, const float* x, uint64_t rows, uint64_t cols, float
     const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
     const bool lmhead_int4 = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
     for (size_t d = 0; d < I.dev.size(); ++d) {
+      if (!ensure_single_arena(I, d)) return;
       const Shard& s = e.sh[d];
       AFF_HIP_CHECK(hipSetDevice(I.dev[d].id));
       AFF_STAGE_UP(I.dev[d], kStgMv, I.dev[d].d_x, x + s.col0, s.ncols, I.dev[d].stream);
@@ -4208,6 +4354,7 @@ void DenseGpu::mv(int32_t h, const float* x, uint64_t rows, uint64_t cols, float
   for (size_t d = 0; d < I.dev.size(); ++d) {
     const Shard& s = e.sh[d];
     if (!s.nrows || s.row0 >= rows) continue;
+    if (!ensure_single_arena(I, d)) return;
     const uint64_t n = std::min(s.nrows, rows - s.row0);
     AFF_HIP_CHECK(hipSetDevice(I.dev[d].id));
     AFF_STAGE_UP(I.dev[d], kStgMv, I.dev[d].d_x, x, cols, I.dev[d].stream);
@@ -4269,6 +4416,7 @@ void DenseGpu::mvg(int32_t h, const float* x, uint32_t n_groups, uint64_t group_
       }
       return;
     }
+    if (!ensure_single_arena(I, d)) return;
     AFF_HIP_CHECK(hipSetDevice(I.dev[d].id));
     const uint32_t g0 = (uint32_t)(s.row0 / rank), gn = (uint32_t)(s.nrows / rank);
     // The WHOLE input, staged once. Per-group staging would race: the host memcpy for group g+1 is
@@ -4375,9 +4523,14 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
   const uint32_t mid_tp =
       (uint32_t)std::min<uint64_t>(max_mid, std::max<uint64_t>(n_embd, (max_mid + R - 1u) / R));
   const bool alias_on = dense_arena_alias_enabled();
+  const bool v2_alias = alias_on && dense_arena_alias_v2_enabled();
+  const bool hc_inplace = hc_inplace_enabled();
   const bool emb_aliases_y = alias_on && (mid_tp >= n_embd);
+  const bool cur_narrow = v2_alias;
   b_qr_cap_ = mid_tp;
   b_g_cap_ = mid_tp;
+  const bool qr_in_g = v2_alias && b_g_cap_ >= 2048u + 1536u;
+  if (qr_in_g) b_qr_cap_ = b_g_cap_ - 2048u;
   b_u_cap_ =
       std::min<uint32_t>(mid_tp, (uint32_t)std::max<uint64_t>(width, (uint64_t)(n_embd / R) + 512u));
   b_y_cap_ = mid_tp;
@@ -4391,6 +4544,8 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       alias_on ? (std::max<size_t>((size_t)b_u_cap_ * nb, (size_t)vocab * kNarrowTok) *
                   sizeof(float))
                : ((size_t)b_u_cap_ * nb * sizeof(float));
+  const size_t qtm_bytes = (size_t)nq * nb * sizeof(uint16_t);
+  const bool u_in_qtm = v2_alias && qtm_bytes >= u_bytes;
   b_kv_width_ = (uint32_t)width;
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
@@ -4402,7 +4557,9 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       {&D.b_pre_prev, (size_t)n_hc * nb * sizeof(float), n_hc, "pre prev"},
       {&D.b_post, (size_t)n_hc * nb * sizeof(float), n_hc, "post"},
       {&D.b_comb, (size_t)n_hc * n_hc * nb * sizeof(float), (uint64_t)n_hc * n_hc, "comb"},
-      {&D.b_cur, (size_t)n_embd * nb * sizeof(float), n_embd, "cur"},
+      {&D.b_cur, cur_narrow ? ((size_t)n_embd * kNarrowTok * sizeof(float))
+                            : ((size_t)n_embd * nb * sizeof(float)),
+       cur_narrow ? 0ull : n_embd, "cur"},
       {&D.b_norm, (size_t)n_embd * nb * sizeof(float), n_embd, "norm"},
       {&D.b_block, (size_t)n_embd * nb * sizeof(float), n_embd, "block"},
       // Rows, not tokens: TWO [kHcnChunks][nb] planes and the loop below multiplies by nb. Two,
@@ -4416,10 +4573,11 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       // One float a head a token: the per-head RMS scale; omitted when no_qrms_ (V4.1).
       {&D.b_hinv, no_qrms_ ? 0u : ((size_t)(nq / width) * nb * sizeof(float)),
        no_qrms_ ? 0ull : (nq / width), "hinv"},
-      {&D.b_qr, (size_t)b_qr_cap_ * nb * sizeof(float), b_qr_cap_, "qr"},
+      {&D.b_qr, qr_in_g ? 0u : ((size_t)b_qr_cap_ * nb * sizeof(float)),
+       qr_in_g ? 0ull : b_qr_cap_, "qr"},
       {&D.b_g, (size_t)b_g_cap_ * nb * sizeof(float), b_g_cap_, "g"},
-      // Under AFF_DENSE_ARENA_ALIAS b_u also backs b_head (disjoint layer vs head lifetimes).
-      {&D.b_u, u_bytes, b_u_cap_, "u"},
+      // Under AFF_DENSE_ARENA_ALIAS[_V2] b_u backs b_head and aliases b_qtm.
+      {&D.b_u, u_in_qtm ? 0u : u_bytes, u_in_qtm ? 0ull : b_u_cap_, "u"},
       {&D.b_y, (size_t)b_y_cap_ * nb * sizeof(float), b_y_cap_, "y"},
       {&D.b_tm, b_tm_cap_ ? ((size_t)b_tm_cap_ * nb * sizeof(float)) : 0u, b_tm_cap_, "tm"},
     };
@@ -4434,21 +4592,24 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       arena_f32_bytes += a.bytes;
     }
     if (emb_aliases_y) D.b_emb = D.b_y;
+    if (qr_in_g) D.b_qr = D.b_g + (size_t)2048u * nb;
     D.b_q_floats = (size_t)nq * nb;
     D.b_q_c_end = 0u;
     D.b_q_i_tail_off = 0u;
     // The hyper-connection lanes, in bf16 and therefore not in the f32 list above. Two of them,
-    // hcd = n_embd * n_hc rows each. Holding them in bf16 rather than f32 takes a quarter off the
-    // arena, for a buffer whose only GEMM consumer already reads it as bf16.
+    // hcd = n_embd * n_hc rows each (1 in-place under AFF_HC_INPLACE).
     struct BAlloc { uint16_t** p; uint64_t rows; };
-    const BAlloc bs[] = {{&D.b_hc, hcd}, {&D.b_hc_next, hcd}, {&D.b_qtm, nq}};
+    const BAlloc bs[] = {{&D.b_hc, hcd}, {&D.b_hc_next, hc_inplace ? 0ull : hcd}, {&D.b_qtm, nq}};
     uint64_t brows = 0;
     for (const BAlloc& a : bs) {
+      if (!a.rows) continue;
       if (!hip_try(hipMalloc(a.p, a.rows * nb * sizeof(uint16_t)), "hipMalloc batch bf16", err))
         return false;
       AFF_HIP_CHECK(hipMemset(*a.p, 0, a.rows * nb * sizeof(uint16_t)));
       brows += a.rows;
     }
+    D.b_qtm_bytes = qtm_bytes;
+    if (u_in_qtm) D.b_u = reinterpret_cast<float*>(D.b_qtm);
     const uint64_t arena_bytes = arena_f32_bytes + brows * nb * sizeof(uint16_t);
     // ---- two aliases, and why they are safe ----------------------------------------------------
     //
@@ -4557,6 +4718,28 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
   return true;
 }
 
+void DenseGpu::moe_ext_arenas(size_t rank, void** bydn_ptr, size_t* bydn_bytes, void** ba8_ptr,
+                              size_t* ba8_bytes) const {
+  if (bydn_ptr) *bydn_ptr = nullptr;
+  if (bydn_bytes) *bydn_bytes = 0;
+  if (ba8_ptr) *ba8_ptr = nullptr;
+  if (ba8_bytes) *ba8_bytes = 0;
+  if (!moe_cross_alias_enabled() || !impl_ || rank >= impl_->dev.size() || !b_cap_) return;
+  const Impl::Dev& D = impl_->dev[rank];
+  const size_t bq_bytes = D.b_q_floats * sizeof(float);
+  constexpr size_t kShexpKeep = 4u << 20;
+  if (D.b_q && bq_bytes > kShexpKeep) {
+    if (bydn_ptr) *bydn_ptr = reinterpret_cast<uint8_t*>(D.b_q) + kShexpKeep;
+    if (bydn_bytes) *bydn_bytes = bq_bytes - kShexpKeep;
+  }
+  const size_t u_res = align256(std::max<size_t>((size_t)b_u_cap_ * b_cap_ * sizeof(float),
+                                                 (size_t)b_vocab_ * kNarrowTok * sizeof(float)));
+  if (D.b_qtm && D.b_qtm_bytes > u_res) {
+    if (ba8_ptr) *ba8_ptr = reinterpret_cast<uint8_t*>(D.b_qtm) + u_res;
+    if (ba8_bytes) *ba8_bytes = D.b_qtm_bytes - u_res;
+  }
+}
+
 // Everything the DSpark draft allocates, in one place and once, after batch_init and before static
 // placement — the same rule every other dense allocation here follows, because placement decides
 // how many expert shards fit by asking the driver what is free.
@@ -4646,9 +4829,17 @@ bool DenseGpu::ensure_by(uint32_t need_rows, std::string* err) {
     if (!hip_try(hipMalloc(&p, (size_t)need_rows * nb * sizeof(float)), "hipMalloc batch y", err))
       return false;
     const bool emb_was_y = (D.b_emb && D.b_emb == D.b_y);
+    const bool fsplit_was_y = (D.fsplit.o && D.fsplit.o == D.b_y);
+    const bool ibsc_was_y = (D.i_bsc && D.i_bsc == D.b_y);
     if (D.b_y) (void)hipFree(D.b_y);
     D.b_y = p;
     if (emb_was_y) D.b_emb = p;
+    if (fsplit_was_y) D.fsplit.o = p;
+    if (ibsc_was_y) {
+      D.i_bsc = p;
+      const size_t bc = cand_blocks_cap_ ? cand_blocks_cap_ : 1u;
+      D.i_bsc_rows = (uint32_t)std::min<size_t>(nb, ((size_t)need_rows * nb) / bc);
+    }
   }
   b_y_cap_ = need_rows;
   return true;
@@ -4774,6 +4965,8 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
     // cache CAPACITY, and anything allocated after StaticPlacement is invisible to the decision it
     // makes about how many expert shards fit. One byte a block a token — at the shipped block of 8
     // that is an eighth of what the admission mask beside it costs.
+    const bool v2_alias = dense_arena_alias_enabled() && dense_arena_alias_v2_enabled();
+    const size_t by_bytes = (b_cap_ && D.b_y) ? ((size_t)b_y_cap_ * b_cap_ * sizeof(float)) : 0u;
     if (cand_block) {
       cand_block_ = cand_block;
       cand_blocks_cap_ = (a_maxcomp_ + cand_block - 1u) / cand_block;
@@ -4782,9 +4975,15 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
                                    idx_cand_blocks_fit_u16(cand_blocks_cap_) &&
                                    (uint64_t)cand_topk_blocks * cand_block <= a_maxcomp_;
       cand_topk_cap_ = use_gather_cand ? cand_topk_blocks : 0u;
-      if (!hip_try(hipMalloc(&D.i_bsc, (size_t)i_tile_ * bc * sizeof(float)), "block scores", err))
-        return false;
-      D.i_bsc_rows = i_tile_;
+      const size_t bsc_min_bytes = (size_t)i_tile_ * bc * sizeof(float);
+      if (v2_alias && D.b_y && by_bytes >= bsc_min_bytes) {
+        D.i_bsc = D.b_y;
+        D.i_bsc_rows = (uint32_t)std::min<size_t>(b_cap_, by_bytes / (bc * sizeof(float)));
+      } else {
+        if (!hip_try(hipMalloc(&D.i_bsc, bsc_min_bytes), "block scores", err))
+          return false;
+        D.i_bsc_rows = i_tile_;
+      }
       if (use_gather_cand) {
         if (!hip_try(hipMalloc(&D.a_cand_ids, (size_t)cand_topk_cap_ * sizeof(uint16_t)),
                      "candidate block ids (decode)", err) ||
@@ -4811,8 +5010,12 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
       constexpr uint32_t kSplitTok = 8, kSplitSlots = 32;
       uint64_t mlb = 0;
       const uint64_t ob = flash_split_bytes(kSplitTok, a_hpr_, kSplitSlots, &mlb);
-      if (!hip_try(hipMalloc(&D.fsplit.o, ob), "flash split numerators", err) ||
-          !hip_try(hipMalloc(&D.fsplit.ml, mlb), "flash split softmax state", err))
+      if (v2_alias && D.b_y && by_bytes >= ob) {
+        D.fsplit.o = D.b_y;
+      } else if (!hip_try(hipMalloc(&D.fsplit.o, ob), "flash split numerators", err)) {
+        return false;
+      }
+      if (!hip_try(hipMalloc(&D.fsplit.ml, mlb), "flash split softmax state", err))
         return false;
       D.fsplit.tok_cap = kSplitTok;
       D.fsplit.slots = kSplitSlots;
@@ -5151,8 +5354,10 @@ bool DenseGpu::batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint
         norm_q8_invalidate(D.id, D.b_norm);
       }
     } else {
+      const bool v2_alias = dense_arena_alias_enabled() && dense_arena_alias_v2_enabled();
+      float* const cur_dst = v2_alias ? nullptr : D.b_cur;
       batch_hc_fused_hip(D.b_hc, D.b_mix, ctl ? D.vec[sv] : nullptr, ctl ? D.vec[bv] : nullptr,
-                         nwp, D.b_pre, D.b_post, D.b_comb, D.b_cur, D.b_norm, n_embd, n_hc, b_nb_,
+                         nwp, D.b_pre, D.b_post, D.b_comb, cur_dst, D.b_norm, n_embd, n_hc, b_nb_,
                          iters, hc_eps, rms_eps, ctl ? 1 : 0, D.stream,
                          shift_pre_ ? D.b_pre_prev : nullptr);
       D.b_ar_precollapsed = false;
@@ -5233,8 +5438,12 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
         // One layout flag for the group. Both are fp8 with the same K, so the load-time preshuffle
         // took both or neither; a mixed group would silently read one in the wrong order, so it
         // refuses the fusion and each goes on its own.
+        const uint64_t g_lim =
+            (D.b_g && D.b_qr > D.b_g && D.b_qr < D.b_g + (size_t)b_g_cap_ * b_cap_)
+                ? 2048ull
+                : (uint64_t)b_g_cap_;
         if (A.sh[d].ps == K.sh[d].ps &&
-            (uint64_t)qr + width <= b_g_cap_ &&
+            (uint64_t)qr + width <= g_lim &&
             batch_gemm_fp8_multi_hip(bj, 2, D.q8, D.qs, (uint32_t)hidden, b_nb_, D.q_dim,
                                      D.q_dim / 128u, D.stream, A.sh[d].ps)) {
           ykv = D.b_g + (size_t)qr * b_nb_;
@@ -5270,6 +5479,15 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
     }
     {
       AFF_TRACE(41);
+      // If ykv sits inside D.b_u == D.b_qtm (unfused fallback), normalize+rope it into D.b_kv
+      // BEFORE batch_head_*_tr_hip overwrites D.b_qtm.
+      const bool ykv_in_qtm =
+          (ykv == D.b_u && D.b_u == reinterpret_cast<float*>(D.b_qtm));
+      if (ykv_in_qtm) {
+        if (!ensure_b_kv(width)) { b_kvn_pending_ = false; return false; }
+        batch_rms_norm_rope_hip(ykv, D.vec[kvnorm], D.b_kv, width, n_rot, b_pos0_, rope, eps, b_nb_,
+                                D.stream);
+      }
       // Per-head RMS, the rope tail and the dim-major -> token-major transpose attention needs, in
       // two passes over b_q rather than five. b_q is left unscaled: this transpose was its only
       // reader, and b_q is b_htm, which mqa_attend overwrites next.
@@ -5286,9 +5504,9 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
         return false;
       }
       if (defer_bkvn) {
-        b_kvn_src_[d] = ykv;
+        b_kvn_src_[d] = ykv_in_qtm ? nullptr : ykv;
         b_kvn_w_[d] = D.vec[kvnorm];
-      } else {
+      } else if (!ykv_in_qtm) {
         batch_rms_norm_rope_hip(ykv, D.vec[kvnorm], D.b_kv, width, n_rot, b_pos0_, rope, eps, b_nb_,
                                 D.stream);
       }
@@ -5590,8 +5808,39 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
   }
   if (idx_keys || idx_width) {
     const uint32_t irows = idx_compact_alloc_enabled() ? a_comp_rows_[layer] : a_maxcomp_;
-    if (hipMalloc(&D.a_idx8_s[slot_][layer], (size_t)irows * kIdxDim) != hipSuccess) return false;
-    if (hipMalloc(&D.a_idxs_s[slot_][layer], (size_t)irows * sizeof(float)) != hipSuccess) return false;
+    const size_t b8 = (size_t)irows * kIdxDim;
+    const size_t bs = (size_t)irows * sizeof(float);
+    size_t gran = 0u;
+    const bool use_vmem = idx_vmem_enabled() && D.a_kv_zero &&
+                          VirtualSpan::granularity_for(D.id, &gran, nullptr) && gran > 0u;
+    const uint32_t init_rows =
+        std::max<uint32_t>(1u, std::min<uint32_t>(irows, comp_rows_for(layer, a_init_pos_ ? a_init_pos_ : 1u)));
+    bool synced_zero = false;
+    if (use_vmem && b8 > gran && slot_ < D.a_idx8_span_s.size() &&
+        layer < D.a_idx8_span_s[slot_].size()) {
+      std::string verr;
+      if (!D.a_idx8_span_s[slot_][layer].reserve(D.id, b8, &verr) ||
+          !D.a_idx8_span_s[slot_][layer].commit_to((size_t)init_rows * kIdxDim, D.a_kv_zero, &verr))
+        return false;
+      D.a_idx8_s[slot_][layer] = static_cast<uint8_t*>(D.a_idx8_span_s[slot_][layer].ptr());
+      st_.kv_bytes += D.a_idx8_span_s[slot_][layer].committed();
+      synced_zero = true;
+    } else {
+      if (hipMalloc(&D.a_idx8_s[slot_][layer], b8) != hipSuccess) return false;
+    }
+    if (use_vmem && bs > gran && slot_ < D.a_idxs_span_s.size() &&
+        layer < D.a_idxs_span_s[slot_].size()) {
+      std::string verr;
+      if (!D.a_idxs_span_s[slot_][layer].reserve(D.id, bs, &verr) ||
+          !D.a_idxs_span_s[slot_][layer].commit_to((size_t)init_rows * sizeof(float), D.a_kv_zero, &verr))
+        return false;
+      D.a_idxs_s[slot_][layer] = static_cast<float*>(D.a_idxs_span_s[slot_][layer].ptr());
+      st_.kv_bytes += D.a_idxs_span_s[slot_][layer].committed();
+      synced_zero = true;
+    } else {
+      if (hipMalloc(&D.a_idxs_s[slot_][layer], bs) != hipSuccess) return false;
+    }
+    if (synced_zero) AFF_HIP_CHECK(hipStreamSynchronize(D.a_kv_zero));
   }
   D.c_ratio[layer] = ratio;
   return true;
@@ -5837,6 +6086,8 @@ static constexpr uint32_t kEngramTileMax = 512u;
 
 bool DenseGpu::engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t out_dim) {
   Impl::Dev& D = *(Impl::Dev*)devp;
+  if (!D.ev_eng) AFF_HIP_CHECK(hipEventCreateWithFlags(&D.ev_eng, hipEventDisableTiming));
+  if (!D.ev_eng_done) AFF_HIP_CHECK(hipEventCreateWithFlags(&D.ev_eng_done, hipEventDisableTiming));
   if (D.e_tile >= tile && D.e_in) return true;
   for (void** p : {(void**)&D.e_in, (void**)&D.e_out, (void**)&D.e_stage}) {
     if (*p && !D.is_bq_alias(*p)) (void)hipFree(*p);
@@ -5884,9 +6135,8 @@ bool DenseGpu::engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool
   AFF_TRACE(33);
   const Entry& e = ent_[h_wkv];
   const uint64_t out_dim = (uint64_t)(n_hc + 1u) * n_embd;
-  // Replicated, like every other matrix whose result both cards need whole: the gate reads the
-  // hidden state, which is replicated, so a row split would be half a key per card.
-  if (e.split != Split::Rep || e.cols != in_dim || e.rows < out_dim) return false;
+  if ((e.split != Split::Rep && e.split != Split::Row) || e.cols != in_dim || e.rows < out_dim)
+    return false;
   if (raw_mxfp8 && (!engram_fp8_enabled() || !engram_raw_h2d_enabled() ||
                     e.quant != AFF_FP8_E4M3 || (in_dim % 128u) != 0u))
     return false;
@@ -5894,20 +6144,43 @@ bool DenseGpu::engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool
   const uint32_t hc_stride = batched ? b_nb_ : n;
   const size_t token_bytes = raw_mxfp8 ? ((size_t)in_dim + (size_t)(in_dim / 32u))
                                        : (size_t)in_dim * sizeof(float);
-  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+  const size_t R = impl_->dev.size();
+  const bool row_sharded = (e.split == Split::Row) && (R > 1u);
+  uint64_t r0[kMaxRanks] = {}, nr[kMaxRanks] = {};
+  for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    hipStream_t st = D.stream;
     if (!engram_grow(&D, tile, in_dim, (uint32_t)out_dim)) return false;
     if (!(batched ? (void*)D.b_hc : (void*)D.d_hc)) return false;
     if (batched) {
       D.b_ar_precollapsed = false;
       D.b_ar_npart = 0;
     }
-    for (uint32_t off = 0; off < n; off += tile) {
-      const uint32_t nt = std::min(tile, n - off);
-      const void* const slice_rows = static_cast<const uint8_t*>(rows) + (size_t)off * token_bytes;
-      const size_t row_bytes = token_bytes * nt;
+    if (e.split == Split::Row) {
+      row_band(e.sh[d], out_dim, &r0[d], &nr[d]);
+    } else {
+      r0[d] = 0u;
+      nr[d] = out_dim;
+    }
+  }
+  for (uint32_t off = 0; off < n; off += tile) {
+    const uint32_t nt = std::min(tile, n - off);
+    const void* const slice_rows = static_cast<const uint8_t*>(rows) + (size_t)off * token_bytes;
+    const size_t row_bytes = token_bytes * nt;
+    if (row_sharded && off > 0u) {
+      for (size_t d = 0; d < R; ++d) {
+        if (!nr[d]) continue;
+        Impl::Dev& D = impl_->dev[d];
+        AFF_HIP_CHECK(hipSetDevice(D.id));
+        for (size_t p = 0; p < R; ++p) {
+          if (p != d) AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, impl_->dev[p].ev_eng_done, 0));
+        }
+      }
+    }
+    for (size_t d = 0; d < R; ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      AFF_HIP_CHECK(hipSetDevice(D.id));
+      hipStream_t st = D.stream;
       if (D.eng.fit(row_bytes, kEngRingBudget)) {
         uint32_t es = 0;
         uint8_t* const pin = D.eng.claim(&es);
@@ -5918,38 +6191,63 @@ bool DenseGpu::engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool
       } else {
         AFF_HIP_CHECK(hipMemcpyAsync(D.e_stage, slice_rows, row_bytes, hipMemcpyHostToDevice, st));
       }
-      if (raw_mxfp8) {
-        uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.e_in);
-        const size_t qs_off = ((size_t)nt * in_dim + 15u) & ~size_t(15);
-        float* const eqs = reinterpret_cast<float*>(eq8 + qs_off);
-        if (!engram_mxfp8_requant_fp8_hip(reinterpret_cast<const uint8_t*>(D.e_stage), eq8, eqs,
-                                          nt, in_dim, st))
-          return false;
-        batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, D.e_out,
-                           (uint32_t)out_dim, in_dim, nt, 0u, 0u, st, e.sh[d].ps);
-      } else if (engram_fp8_enabled() && e.quant == AFF_FP8_E4M3 && (in_dim % 128u) == 0u) {
-        // D.e_stage is already token-major [nt][in_dim]: quantize directly into D.e_in (holding
-        // [nt][in_dim] E4M3 + scales) and run W8A8 batch_gemm_fp8_hip without any transpose.
-        uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.e_in);
-        const size_t qs_off = ((size_t)nt * in_dim + 15u) & ~size_t(15);
-        float* const eqs = reinterpret_cast<float*>(eq8 + qs_off);
-        batch_quant_tm_fp8_hip(D.e_stage, eq8, eqs, in_dim, nt, st);
-        batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, D.e_out,
-                           (uint32_t)out_dim, in_dim, nt, 0u, 0u, st, e.sh[d].ps);
-      } else {
-        const float* x = D.e_stage;
-        if (nt > 1u) {                       // token-major -> dim-major; the identity at one token
-          batch_transpose_hip(D.e_stage, D.e_in, nt, in_dim, 1, st);
-          x = D.e_in;
+      if (nr[d]) {
+        float* const e_out_d = D.e_out + (size_t)r0[d] * nt;
+        const uint64_t rel_r = (e.split == Split::Row) ? (r0[d] - e.sh[d].row0) : 0ull;
+        if (raw_mxfp8) {
+          uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.e_in);
+          const size_t qs_off = ((size_t)nt * in_dim + 15u) & ~size_t(15);
+          float* const eqs = reinterpret_cast<float*>(eq8 + qs_off);
+          if (!engram_mxfp8_requant_fp8_hip(reinterpret_cast<const uint8_t*>(D.e_stage), eq8, eqs,
+                                            nt, in_dim, st))
+            return false;
+          batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, e_out_d,
+                             (uint32_t)nr[d], in_dim, nt, 0u, (uint32_t)rel_r, st, e.sh[d].ps);
+        } else if (engram_fp8_enabled() && e.quant == AFF_FP8_E4M3 && (in_dim % 128u) == 0u) {
+          // D.e_stage is already token-major [nt][in_dim]: quantize directly into D.e_in (holding
+          // [nt][in_dim] E4M3 + scales) and run W8A8 batch_gemm_fp8_hip without any transpose.
+          uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.e_in);
+          const size_t qs_off = ((size_t)nt * in_dim + 15u) & ~size_t(15);
+          float* const eqs = reinterpret_cast<float*>(eq8 + qs_off);
+          batch_quant_tm_fp8_hip(D.e_stage, eq8, eqs, in_dim, nt, st);
+          batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, e_out_d,
+                             (uint32_t)nr[d], in_dim, nt, 0u, (uint32_t)rel_r, st, e.sh[d].ps);
+        } else {
+          const float* x = D.e_stage;
+          if (nt > 1u) {                     // token-major -> dim-major; the identity at one token
+            batch_transpose_hip(D.e_stage, D.e_in, nt, in_dim, 1, st);
+            x = D.e_in;
+          }
+          batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, rel_r), shard_scales(e.sh[d], rel_r),
+                         x, e_out_d, (uint32_t)nr[d], in_dim, nt, st);
         }
-        batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), x,
-                       D.e_out, (uint32_t)out_dim, in_dim, nt, st);
       }
+      if (row_sharded && nr[d]) AFF_HIP_CHECK(hipEventRecord(D.ev_eng, st));
+    }
+    if (row_sharded) {
+      for (size_t d = 0; d < R; ++d) {
+        Impl::Dev& D = impl_->dev[d];
+        AFF_HIP_CHECK(hipSetDevice(D.id));
+        for (size_t p = 0; p < R; ++p) {
+          if (p == d || !nr[p]) continue;
+          Impl::Dev& P = impl_->dev[p];
+          AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, P.ev_eng, 0));
+          AFF_HIP_CHECK(hipMemcpyPeerAsync(D.e_out + (size_t)r0[p] * nt, D.id,
+                                           P.e_out + (size_t)r0[p] * nt, P.id,
+                                           (size_t)nr[p] * nt * sizeof(float), D.stream));
+        }
+        if (off + tile < n) AFF_HIP_CHECK(hipEventRecord(D.ev_eng_done, D.stream));
+      }
+    }
+    for (size_t d = 0; d < R; ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      AFF_HIP_CHECK(hipSetDevice(D.id));
       void* const hc = batched ? (void*)((uint16_t*)D.b_hc + off)
                                : (void*)((float*)D.d_hc + off);
       // `e_out` is [out_dim][nt]; the state is [n_hc*n_embd][hc_stride], so shifting by `off`
       // selects slice tokens [off, off+nt) without changing the column stride.
-      engram_gate_hip(hc, batched, D.e_out, D.vec[qk_vec], n_embd, n_hc, nt, hc_stride, eps, st);
+      engram_gate_hip(hc, batched, D.e_out, D.vec[qk_vec], n_embd, n_hc, nt, hc_stride, eps,
+                      D.stream);
     }
   }
   ++st_.calls;
@@ -6747,7 +7045,7 @@ bool DenseGpu::batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
     for (size_t d = 0; d < 2; ++d) {
       Impl::Dev& D = impl_->dev[d];
       keepalive_notify_active(D.id);
-      out_p[d] = has_control ? D.b_hc_next : D.b_hc;
+      out_p[d] = has_control ? (D.b_hc_next ? D.b_hc_next : D.b_hc) : D.b_hc;
       blk_p[d] = D.b_block;
       hc_p[d] = D.b_hc;
       post_p[d] = D.b_post;
@@ -6775,7 +7073,7 @@ bool DenseGpu::batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
       return false;
     for (size_t d = 0; d < 2; ++d) {
       Impl::Dev& D = impl_->dev[d];
-      if (has_control) std::swap(D.b_hc, D.b_hc_next);
+      if (has_control && D.b_hc_next) std::swap(D.b_hc, D.b_hc_next);
       D.b_ar_precollapsed = (fuse_pre && npart > 0u);
       D.b_ar_npart = D.b_ar_precollapsed ? npart : 0u;
     }
@@ -6790,9 +7088,10 @@ bool DenseGpu::batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
     if (has_control) {
       // `zb`: this pass visits every element of the sublayer accumulator, so it leaves it zeroed
       // and the next sublayer needs no memset. See batch_hc_expand_reg_kernel.
-      batch_hc_expand_hip(D.b_hc_next, D.b_block, D.b_hc, D.b_post, D.b_comb, n_embd, n_hc, b_nb_,
+      uint16_t* const out_hc = D.b_hc_next ? D.b_hc_next : D.b_hc;
+      batch_hc_expand_hip(out_hc, D.b_block, D.b_hc, D.b_post, D.b_comb, n_embd, n_hc, b_nb_,
                           /*zb=*/1, D.stream);
-      std::swap(D.b_hc, D.b_hc_next);
+      if (D.b_hc_next) std::swap(D.b_hc, D.b_hc_next);
     } else {
       // Lane 0 only, exactly as the host and single-token paths do it for a layer with no control.
       batch_hc_add_bf16_hip(D.b_hc, D.b_block, (uint64_t)n_embd * b_nb_, /*zb=*/1, D.stream);
@@ -7261,7 +7560,11 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
         const size_t q8_bytes = (size_t)b_nb_ * li;
         const size_t qs_off = (q8_bytes + 15u) & ~size_t(15);
         const size_t need_bytes = qs_off + (size_t)b_nb_ * (li / 128u) * sizeof(float);
-        if (D.b_q_floats * sizeof(float) >= need_bytes) {
+        const size_t max_sw_bytes =
+            moe_cross_alias_enabled()
+                ? std::min<size_t>(D.b_q_floats * sizeof(float), 4u << 20)
+                : (D.b_q_floats * sizeof(float));
+        if (max_sw_bytes >= need_bytes) {
           sw_q8 = reinterpret_cast<uint8_t*>(D.b_q);
           sw_qs = reinterpret_cast<float*>(sw_q8 + qs_off);
           can_async = true;
@@ -7345,9 +7648,11 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
       batch_gemm_ent_q8(d, hd, D.b_block, hidden, li, 0, 0, /*accum=*/true);
     } else {
       if (!ensure_by(li)) return false;
+      float* const tmp = (hidden <= b_qr_cap_) ? D.b_qr :
+                         ((hidden <= b_g_cap_) ? D.b_g : D.b_q);
       batch_swiglu_hip(D.b_g, yu, D.b_y, li, b_nb_, limit, D.stream);
-      batch_gemm_ent(d, hd, D.b_y, D.b_qr, hidden, li);
-      batch_hc_add_hip(D.b_block, D.b_qr, hidden * b_nb_, D.stream);
+      batch_gemm_ent(d, hd, D.b_y, tmp, hidden, li);
+      batch_hc_add_hip(D.b_block, tmp, hidden * b_nb_, D.stream);
     }
   }
   ++st_.calls;
@@ -7357,15 +7662,19 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
 // The host tier's contribution, added to rank 0 only. See block_add_host: it is already whole
 // rather than a partial, so adding it on both cards would have block_reduce double it.
 bool DenseGpu::batch_block_add(const float* src, uint32_t n_embd) {
-  if (!b_nb_ || n_embd > b_qr_cap_) return false;
-  batch_shexp_join(0);
+  if (!b_nb_) return false;
   Impl::Dev& D = impl_->dev[0];
+  float* const tmp = (n_embd <= b_qr_cap_) ? D.b_qr :
+                     ((n_embd <= b_g_cap_) ? D.b_g : D.b_q);
+  if (!tmp) return false;
+  if (tmp == D.b_q && (size_t)n_embd * b_nb_ > D.b_q_floats) return false;
+  batch_shexp_join(0);
   AFF_HIP_CHECK(hipSetDevice(D.id));
   AFF_HIP_CHECK(hipMemsetAsync(D.b_emb, 0, (size_t)b_nb_ * n_embd * sizeof(float), D.stream));
   AFF_HIP_CHECK(hipMemcpyAsync(D.b_emb, src, (size_t)b_live_ * n_embd * sizeof(float),
                                hipMemcpyHostToDevice, D.stream));
-  batch_transpose_hip(D.b_emb, D.b_qr, n_embd, b_nb_, 0, D.stream);
-  batch_hc_add_hip(D.b_block, D.b_qr, (uint64_t)n_embd * b_nb_, D.stream);
+  batch_transpose_hip(D.b_emb, tmp, n_embd, b_nb_, 0, D.stream);
+  batch_hc_add_hip(D.b_block, tmp, (uint64_t)n_embd * b_nb_, D.stream);
   AFF_DRAIN_AT(D, aff::BlockSite::BlockAdd);                                       // `src` is a caller local
   return true;
 }
@@ -7415,6 +7724,7 @@ bool DenseGpu::batch_block_reduce(uint32_t n_embd) {
 
 bool DenseGpu::batch_hc_read(uint32_t b, float* dst, uint32_t n_embd, uint32_t n_hc) {
   if (!b_nb_) return false;
+  if (!ensure_single_arena(*impl_, 0)) return false;
   Impl::Dev& D = impl_->dev[0];                       // replicated
   AFF_HIP_CHECK(hipSetDevice(D.id));
   const uint32_t n = n_embd * n_hc;
@@ -7428,6 +7738,7 @@ bool DenseGpu::batch_hc_read(uint32_t b, float* dst, uint32_t n_embd, uint32_t n
 
 bool DenseGpu::batch_hc_read_pre(uint32_t b, float* dst, uint32_t n_hc) {
   if (!b_nb_ || !dst || !n_hc || b >= b_nb_) return false;
+  if (!ensure_single_arena(*impl_, 0)) return false;
   Impl::Dev& D = impl_->dev[0];
   const float* const pre_last = shift_pre_ ? D.b_pre_prev : D.b_pre;
   if (!pre_last) return false;
@@ -7551,7 +7862,7 @@ bool DenseGpu::batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_tap
     for (size_t d = 0; d < 2; ++d) {
       Impl::Dev& D = impl_->dev[d];
       keepalive_notify_active(D.id);
-      out_p[d] = D.b_hc_next;
+      out_p[d] = D.b_hc_next ? D.b_hc_next : D.b_hc;
       blk_p[d] = D.b_block;
       hc_p[d] = D.b_hc;
       post_p[d] = D.b_post;
@@ -7580,7 +7891,7 @@ bool DenseGpu::batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_tap
       return false;
     for (size_t d = 0; d < 2; ++d) {
       Impl::Dev& D = impl_->dev[d];
-      std::swap(D.b_hc, D.b_hc_next);
+      if (D.b_hc_next) std::swap(D.b_hc, D.b_hc_next);
       D.b_ar_precollapsed = (fuse_pre && npart > 0u);
       D.b_ar_npart = D.b_ar_precollapsed ? npart : 0u;
     }
@@ -7592,10 +7903,11 @@ bool DenseGpu::batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_tap
     D.b_ar_precollapsed = false;
     D.b_ar_npart = 0;
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    batch_hc_expand_hip(D.b_hc_next, D.b_block, D.b_hc, D.b_post, D.b_comb, n_embd, n_hc, b_nb_,
+    uint16_t* const out_hc = D.b_hc_next ? D.b_hc_next : D.b_hc;
+    batch_hc_expand_hip(out_hc, D.b_block, D.b_hc, D.b_post, D.b_comb, n_embd, n_hc, b_nb_,
                         /*zb=*/1, D.stream, D.b_tap_s[slot_], b_lo, n_keep, row0, rows_cap,
                         (uint32_t)stride, slot * n_embd);
-    std::swap(D.b_hc, D.b_hc_next);
+    if (D.b_hc_next) std::swap(D.b_hc, D.b_hc_next);
   }
   return true;
 }
@@ -8070,33 +8382,54 @@ bool DenseGpu::draft_proj(int32_t h, int32_t norm_w, uint64_t rows, uint64_t col
   if (!n || n > kNarrowTok || h < 0 || (size_t)h >= ent_.size() || norm_w < 0) return false;
   if (cols > b_tapin_) return false;
   const Entry& e = ent_[h];
-  // Rep, so both cards produce the whole vector and no exchange stands between the tap and the
-  // first stage. split_for says so; this is where it would be noticed if it stopped.
-  if (e.split != Split::Rep || e.rows != rows || e.cols != cols) return false;
-  b_nb_ = kNarrowTok; b_live_ = n;
-  for (size_t d = 0; d < impl_->dev.size(); ++d) {
-    Impl::Dev& D = impl_->dev[d];
-    if (!D.b_dx || !D.b_dm || !D.b_tap_s[slot_]) return false;
+  const size_t R = impl_->dev.size();
+  // `Rep` keeps every rank independent; `Col` shards the wide tap GEMM across ranks and
+  // all-reduces `b_dm` before normalizing so both cards keep identical draft projections while
+  // halving per-card weight VRAM (`mtp_proj_tp_shard_enabled()`).
+  if ((e.split != Split::Rep && e.split != Split::Col) || e.rows != rows || e.cols != cols) {
+    return false;
+  }
+  if (e.split == Split::Col && R > 1 && !impl_->tp.ready) return false;
+  for (size_t d = 0; d < R; ++d) {
+    const Impl::Dev& D = impl_->dev[d];
+    if (!D.b_dx || !D.b_dm || !D.b_tap_s[slot_] || !D.vec[norm_w]) return false;
     if ((size_t)(tap_row0 + n) * cols * sizeof(float) > D.tap_bytes_s[slot_]) return false;
+    if (e.split == Split::Col && (size_t)e.sh[d].col0 + e.sh[d].ncols > cols) return false;
+  }
+  b_nb_ = kNarrowTok; b_live_ = n;
+  for (size_t d = 0; d < R; ++d) {
+    Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     const float* const tap_src = D.b_tap_s[slot_] + (size_t)tap_row0 * cols;
+    const uint32_t scols = (e.split == Split::Col) ? (uint32_t)e.sh[d].ncols : (uint32_t)cols;
+    const uint32_t col0 = (e.split == Split::Col) ? (uint32_t)e.sh[d].col0 : 0u;
     if ((e.sh[d].ps || mtp_proj_fp8_enabled()) && e.quant == AFF_FP8_E4M3 &&
-        e.sh[d].scales != nullptr && (cols % 128u) == 0u) {
+        e.sh[d].scales != nullptr && (scols % 128u) == 0u) {
       uint8_t* const eq8 = reinterpret_cast<uint8_t*>(D.b_dx);
-      const size_t qs_off = ((size_t)kNarrowTok * cols + 15u) & ~size_t(15);
+      const size_t qs_off = ((size_t)kNarrowTok * scols + 15u) & ~size_t(15);
       float* const eqs = reinterpret_cast<float*>(eq8 + qs_off);
-      batch_quant_tm_fp8_hip(tap_src, eq8, eqs, (uint32_t)cols, kNarrowTok, D.stream, n);
+      batch_quant_tm_fp8_hip(tap_src, eq8, eqs, scols, kNarrowTok, D.stream, n, col0,
+                             (uint32_t)cols);
       batch_gemm_fp8_hip((const uint8_t*)e.sh[d].data, e.sh[d].scales, eq8, eqs, D.b_dm,
-                         (uint32_t)rows, (uint32_t)cols, kNarrowTok, 0u, 0u, D.stream,
+                         (uint32_t)rows, scols, kNarrowTok, 0u, 0u, D.stream,
                          e.sh[d].ps);
     } else {
       hipLaunchKernelGGL(draft_transpose_pad_kernel,
-                         dim3(((uint32_t)cols + 31u) / 32u, (kNarrowTok + 31u) / 32u), dim3(256),
-                         0, D.stream, tap_src, D.b_dx, n, kNarrowTok, (uint32_t)cols);
+                         dim3((scols + 31u) / 32u, (kNarrowTok + 31u) / 32u), dim3(256),
+                         0, D.stream, tap_src, D.b_dx, n, kNarrowTok, scols, col0,
+                         (uint32_t)cols);
       AFF_HIP_CHECK(hipGetLastError());
-      batch_gemm_ent(d, h, D.b_dx, D.b_dm, rows, cols);
+      batch_gemm_ent(d, h, D.b_dx, D.b_dm, rows, scols);
     }
-    if (!D.vec[norm_w]) return false;
+  }
+  if (e.split == Split::Col && R > 1) {
+    float* dm_p[kMaxRanks]{};
+    for (size_t d = 0; d < R; ++d) dm_p[d] = impl_->dev[d].b_dm;
+    tp_all_reduce(impl_->tp, dm_p, dm_p, (size_t)rows * kNarrowTok, TpReduce::Exact);
+  }
+  for (size_t d = 0; d < R; ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    AFF_HIP_CHECK(hipSetDevice(D.id));
     batch_rms_norm_hip(D.b_dm, D.vec[norm_w], nullptr, D.b_dm, (uint32_t)rows, kNarrowTok, eps,
                        D.stream);
   }
