@@ -190,9 +190,83 @@ __global__ __launch_bounds__(32) void engram_mxfp8_requant_fp8_kernel(
 
 }  // namespace
 
+// Coalesced nb<=16 kernel: lanes map `t = tid & 15`, `d = (tid >> 4) + 16*k` so `hc`, `kv`,
+// and `w` loads hit single 64B sectors and share `w` across all tokens via scalar cache.
+template <bool BF16>
+__global__ __launch_bounds__(kEngThreads) void engram_gate_tok_v2_kernel(
+    void* __restrict__ hc, const float* __restrict__ kv, const float* __restrict__ w,
+    uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t hs, float eps) {
+  const uint32_t c = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t lane = tid & 31u;
+  const uint32_t wave = tid >> 5;
+  const uint32_t t = tid & 15u;
+  if (c >= n_hc || nb > 16u) return;
+
+  __shared__ float s_red[3][16][kEngWaves];
+  __shared__ float s_gate[16];
+
+  const size_t band = (size_t)c * n_embd;
+  const size_t vband = (size_t)n_hc * n_embd;
+  const bool tok_live = (t < nb);
+  float sh = 0.0f, sk = 0.0f, dot = 0.0f;
+  for (uint32_t d = tid >> 4; d < n_embd; d += 16u) {
+    if (tok_live) {
+      const float h = ld_hc(hc, (band + d) * hs + t, BF16);
+      const float k = kv[(band + d) * nb + t];
+      sh = fmaf(h, h, sh);
+      sk = fmaf(k, k, sk);
+      dot = fmaf(h * w[band + d], k, dot);
+    }
+  }
+  sh += aff::dpp_xor_lane<16u>(sh);
+  sk += aff::dpp_xor_lane<16u>(sk);
+  dot += aff::dpp_xor_lane<16u>(dot);
+  if (lane < nb) {
+    s_red[0][lane][wave] = sh;
+    s_red[1][lane][wave] = sk;
+    s_red[2][lane][wave] = dot;
+  }
+  aff::lds_barrier();
+
+  if (tid < nb) {
+    float fsh = 0.0f, fsk = 0.0f, fdot = 0.0f;
+#pragma unroll
+    for (uint32_t wp = 0; wp < kEngWaves; ++wp) {
+      fsh += s_red[0][tid][wp];
+      fsk += s_red[1][tid][wp];
+      fdot += s_red[2][tid][wp];
+    }
+    const float rstd = rsqrtf(fsh / (float)n_embd + eps) * rsqrtf(fsk / (float)n_embd + eps);
+    const float d = fdot * rstd * rsqrtf((float)n_embd);
+    const float s = copysignf(sqrtf(fmaxf(fabsf(d), 1e-6f)), d);
+    s_gate[tid] = 1.0f / (1.0f + __expf(-s));
+  }
+  aff::lds_barrier();
+
+  const float gate = tok_live ? s_gate[t] : 0.0f;
+  for (uint32_t d = tid >> 4; d < n_embd; d += 16u) {
+    if (tok_live) {
+      const size_t off = (band + d) * hs + t;
+      st_hc(hc, off, ld_hc(hc, off, BF16) + gate * kv[(vband + d) * nb + t], BF16);
+    }
+  }
+}
+
 void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, uint32_t n_embd,
                      uint32_t n_hc, uint32_t nb, uint32_t hc_stride, float eps, void* stream) {
   if (!hc || !kv || !w || !n_embd || !n_hc || !nb || hc_stride < nb) return;
+  if (nb >= 2u && nb <= 16u) {
+    const dim3 g(n_hc), b(kEngThreads);
+    if (hc_bf16)
+      hipLaunchKernelGGL(engram_gate_tok_v2_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv, w,
+                         n_embd, n_hc, nb, hc_stride, eps);
+    else
+      hipLaunchKernelGGL(engram_gate_tok_v2_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv,
+                         w, n_embd, n_hc, nb, hc_stride, eps);
+    AFF_HIP_CHECK(hipGetLastError());
+    return;
+  }
   if (nb <= 64u && n_hc <= kEngMaxHc) {
     const dim3 g(nb), b(kEngThreads);
     if (hc_bf16)

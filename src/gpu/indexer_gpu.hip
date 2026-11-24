@@ -423,19 +423,58 @@ __device__ __forceinline__ void hist_add(uint32_t* h, uint32_t bin, bool active)
 // and would have to read it coherently.
 //
 // `b` comes back as that bucket and `acc` as the count strictly above it.
+constexpr uint32_t kTieCap = 1024;
+constexpr uint32_t kTopkWaves = kTopkThr / 32u;
+
+// `b` comes back as that bucket and `acc` as the count strictly above it.
+// Wave32 reverse inclusive scan + 8-wave suffix scan + ballot match (4 barriers vs 19).
 __device__ __forceinline__ void hist_scan(uint32_t* h, uint32_t* s_b, uint32_t* s_any,
                                           uint32_t need, uint32_t tid,
                                           uint32_t* b, uint32_t* acc) {
-  for (uint32_t off = 1; off < 256u; off <<= 1) {
-    uint32_t add = 0;
-    if (tid + off < 256u) add = h[tid + off];
-    lds_barrier();
-    if (tid < 256u) h[tid] += add;
-    lds_barrier();
+  __shared__ uint32_t s_wsum[8];
+  __shared__ uint32_t s_bm[8];
+  const uint32_t lane = tid & 31u, wave = tid >> 5;
+  uint32_t val = (tid < 256u) ? h[tid] : 0u;
+  if (tid < 256u) {
+#pragma unroll
+    for (uint32_t off = 1u; off < 32u; off <<= 1) {
+      const uint32_t nbr = (uint32_t)__shfl_down((int)val, (int)off, 32);
+      if (lane + off < 32u) val += nbr;
+    }
+    if (lane == 0u) s_wsum[wave] = val;
   }
-  if (tid == 0) { *s_b = 0; *s_any = 0; }
   lds_barrier();
-  if (tid < 256u && h[tid] >= need) { atomicMax(s_b, tid); atomicExch(s_any, 1u); }
+  if (wave == 0u) {
+    const uint32_t wv = (lane < 8u) ? s_wsum[lane] : 0u;
+    uint32_t incl = wv;
+#pragma unroll
+    for (uint32_t off = 1u; off <= 4u; off <<= 1) {
+      const uint32_t nbr = (uint32_t)__shfl_down((int)incl, (int)off, 32);
+      if (lane + off < 8u) incl += nbr;
+    }
+    if (lane < 8u) s_wsum[lane] = incl - wv;
+  }
+  lds_barrier();
+  if (tid < 256u) {
+    val += s_wsum[wave];
+    h[tid] = val;
+    const uint32_t bm = (uint32_t)__ballot(val >= need);
+    if (lane == 0u) s_bm[wave] = bm;
+  }
+  lds_barrier();
+  if (tid == 0u) {
+    uint32_t any = 0u, bb = 0u;
+#pragma unroll
+    for (uint32_t w = 8u; w-- > 0u;) {
+      if (s_bm[w]) {
+        bb = (w << 5) | (31u - (uint32_t)__clz((int)s_bm[w]));
+        any = 1u;
+        break;
+      }
+    }
+    *s_b = bb;
+    *s_any = any;
+  }
   lds_barrier();
   const uint32_t bb = *s_b;
   *b = bb;
@@ -443,21 +482,6 @@ __device__ __forceinline__ void hist_scan(uint32_t* h, uint32_t* s_b, uint32_t* 
   // least `need` at every later one — but the serial walk fell out with the whole sum, so match it.
   *acc = *s_any ? (bb + 1u < 256u ? h[bb + 1u] : 0u) : h[0];
 }
-
-// Admitting the ties at T, in INDEX order, `need` of them — the rule the CPU's top_k_select uses
-// and the one the golden fixture depends on.
-//
-// The obvious implementation walks the row from index 0 and stops once the quota is filled: ONE
-// WAVE, on a serial dependent chain, over however far into the row the k-th largest happens to sit.
-// Exact float equality is rare, so `need` is normally 1 and the expected walk is HALF THE ROW, which
-// at long context dominates the whole select once the histogram passes are spread across the card
-// and stop hiding it.
-//
-// The marking pass reads every score against T anyway, so it collects the ties as it goes and this
-// only has to rank them. `nt` above `kTieCap` cannot happen without that many bit-identical scores;
-// it is still handled, by the old walk, rather than silently admitting the wrong rows.
-constexpr uint32_t kTieCap = 1024;
-constexpr uint32_t kTopkWaves = kTopkThr / 32u;
 
 // ---- the mask, compacted into the ascending LIST of rows it admits ------------------------------
 //
@@ -470,34 +494,34 @@ constexpr uint32_t kTopkWaves = kTopkThr / 32u;
 // ballot ranks the admissions inside each wave, and the wave counts prefix across the block. That
 // makes the list a deterministic function of the mask, which an atomic append would not.
 //
-// One block a token, which is what both callers already are — so this costs no extra launch.
+// Double-buffered `s_wc[2 * kTopkWaves]` + register `base` cuts 3 barriers per tile to 1.
 template <typename OutIdx>
 __device__ __forceinline__ void compact_row_t(const uint8_t* __restrict__ row, uint32_t n,
                                               uint32_t tid, OutIdx* __restrict__ adm, uint32_t cap,
                                               uint32_t* s_wc, uint32_t* s_base) {
   const uint32_t lane = tid & 31u, wave = tid >> 5;
-  if (tid == 0) *s_base = 0;
-  lds_barrier();
+  uint32_t base = 0u, parity = 0u;
   for (uint32_t i0 = 0; i0 < n; i0 += kTopkThr) {
     const uint32_t i = i0 + tid;
     const bool a = (i < n) && row[i] != 0;
     const uint32_t bm = (uint32_t)__ballot(a);
     const uint32_t mask_lt = (lane == 0) ? 0u : ((1u << lane) - 1u);
     const uint32_t wr = (uint32_t)__popc(bm & mask_lt);
-    if (lane == 0) s_wc[wave] = (uint32_t)__popc(bm);
+    uint32_t* const wc = s_wc + parity * kTopkWaves;
+    if (lane == 0) wc[wave] = (uint32_t)__popc(bm);
     lds_barrier();
-    uint32_t off = 0;
-    for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
-    const uint32_t p = *s_base + off + wr;
-    if (a && p < cap) adm[p] = static_cast<OutIdx>(i);
-    lds_barrier();
-    if (tid == 0) {
-      uint32_t s = 0;
-      for (uint32_t w = 0; w < kTopkWaves; ++w) s += s_wc[w];
-      *s_base += s;
+    uint32_t off = 0u, tot = 0u;
+    for (uint32_t w = 0u; w < kTopkWaves; ++w) {
+      const uint32_t c = wc[w];
+      if (w < wave) off += c;
+      tot += c;
     }
-    lds_barrier();
+    const uint32_t p = base + off + wr;
+    if (a && p < cap) adm[p] = static_cast<OutIdx>(i);
+    base += tot;
+    parity ^= 1u;
   }
+  if (tid == 0) *s_base = base;
 }
 
 template <typename OutIdx>
@@ -507,8 +531,7 @@ __device__ __forceinline__ void compact_admitted_t(const float* __restrict__ sc,
                                                    uint32_t cap, uint32_t* s_wc,
                                                    uint32_t* s_base) {
   const uint32_t lane = tid & 31u, wave = tid >> 5;
-  if (tid == 0) *s_base = 0;
-  lds_barrier();
+  uint32_t base = 0u, parity = 0u;
   for (uint32_t i0 = 0; i0 < n; i0 += kTopkThr) {
     const uint32_t i = i0 + tid;
     bool a = false;
@@ -519,20 +542,21 @@ __device__ __forceinline__ void compact_admitted_t(const float* __restrict__ sc,
     const uint32_t bm = (uint32_t)__ballot(a);
     const uint32_t mask_lt = (lane == 0) ? 0u : ((1u << lane) - 1u);
     const uint32_t wr = (uint32_t)__popc(bm & mask_lt);
-    if (lane == 0) s_wc[wave] = (uint32_t)__popc(bm);
+    uint32_t* const wc = s_wc + parity * kTopkWaves;
+    if (lane == 0) wc[wave] = (uint32_t)__popc(bm);
     lds_barrier();
-    uint32_t off = 0;
-    for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
-    const uint32_t p = *s_base + off + wr;
-    if (a && p < cap) adm[p] = static_cast<OutIdx>(i);
-    lds_barrier();
-    if (tid == 0) {
-      uint32_t s = 0;
-      for (uint32_t w = 0; w < kTopkWaves; ++w) s += s_wc[w];
-      *s_base += s;
+    uint32_t off = 0u, tot = 0u;
+    for (uint32_t w = 0u; w < kTopkWaves; ++w) {
+      const uint32_t c = wc[w];
+      if (w < wave) off += c;
+      tot += c;
     }
-    lds_barrier();
+    const uint32_t p = base + off + wr;
+    if (a && p < cap) adm[p] = static_cast<OutIdx>(i);
+    base += tot;
+    parity ^= 1u;
   }
+  if (tid == 0) *s_base = base;
 }
 
 template <uint32_t FixedBlock>
@@ -552,8 +576,7 @@ __device__ __forceinline__ void compact_admitted_cand(const float* __restrict__ 
                                                       uint32_t* __restrict__ adm, uint32_t cap,
                                                       uint32_t* s_wc, uint32_t* s_base) {
   const uint32_t lane = tid & 31u, wave = tid >> 5;
-  if (tid == 0) *s_base = 0;
-  lds_barrier();
+  uint32_t base = 0u, parity = 0u;
   for (uint32_t i0 = 0; i0 < n; i0 += kTopkThr) {
     const uint32_t i = i0 + tid;
     bool a = false;
@@ -566,20 +589,21 @@ __device__ __forceinline__ void compact_admitted_cand(const float* __restrict__ 
     const uint32_t bm = (uint32_t)__ballot(a);
     const uint32_t mask_lt = (lane == 0) ? 0u : ((1u << lane) - 1u);
     const uint32_t wr = (uint32_t)__popc(bm & mask_lt);
-    if (lane == 0) s_wc[wave] = (uint32_t)__popc(bm);
+    uint32_t* const wc = s_wc + parity * kTopkWaves;
+    if (lane == 0) wc[wave] = (uint32_t)__popc(bm);
     lds_barrier();
-    uint32_t off = 0;
-    for (uint32_t w = 0; w < wave; ++w) off += s_wc[w];
-    const uint32_t p = *s_base + off + wr;
-    if (a && p < cap) adm[p] = g;
-    lds_barrier();
-    if (tid == 0) {
-      uint32_t s = 0;
-      for (uint32_t w = 0; w < kTopkWaves; ++w) s += s_wc[w];
-      *s_base += s;
+    uint32_t off = 0u, tot = 0u;
+    for (uint32_t w = 0u; w < kTopkWaves; ++w) {
+      const uint32_t c = wc[w];
+      if (w < wave) off += c;
+      tot += c;
     }
-    lds_barrier();
+    const uint32_t p = base + off + wr;
+    if (a && p < cap) adm[p] = g;
+    base += tot;
+    parity ^= 1u;
   }
+  if (tid == 0) *s_base = base;
 }
 
 __device__ __forceinline__ void tie_cutoff_excl(const uint32_t* tie, uint32_t nt, uint32_t need,
@@ -716,7 +740,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
     uint32_t cand_stride) {
   __shared__ uint32_t s_hist[256];
   __shared__ uint32_t s_tie[kTieCap];
-  __shared__ uint32_t s_wc[kTopkWaves];
+  __shared__ uint32_t s_wc[2u * kTopkWaves];
   __shared__ uint32_t s_prefix, s_need, s_gt, s_b, s_any, s_nt, s_base, s_tie_end;
   const uint32_t t = blockIdx.x, tid = threadIdx.x;
   const float* sc = scores + (size_t)t * stride;
@@ -1034,7 +1058,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
     uint32_t* __restrict__ adm, uint32_t* __restrict__ admn, uint32_t adm_stride,
     uint16_t* __restrict__ cand_ids_out, uint32_t* __restrict__ cand_n_out, uint32_t cand_stride) {
   __shared__ uint32_t s_tie[kTieCap];
-  __shared__ uint32_t s_wc[kTopkWaves];
+  __shared__ uint32_t s_wc[2u * kTopkWaves];
   __shared__ uint32_t s_base, s_tie_end;
   const uint32_t t = blockIdx.x, tid = threadIdx.x;
   const float* sc = scores + (size_t)t * stride;
@@ -1387,7 +1411,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_mask_kernel(
     uint32_t adm_stride) {
   __shared__ uint32_t s_hist[256];
   __shared__ uint32_t s_tie[kTieCap];
-  __shared__ uint32_t s_wc[kTopkWaves];
+  __shared__ uint32_t s_wc[2u * kTopkWaves];
   __shared__ uint32_t s_prefix, s_need, s_gt, s_b, s_any, s_nt, s_base, s_tie_end;
   const uint32_t t = blockIdx.x, tid = threadIdx.x;
   const float* sc = cand_scores + (size_t)t * sstride;
@@ -1623,7 +1647,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_tie_kernel(
     uint32_t mlen, uint32_t k, const uint32_t* __restrict__ state, uint32_t* __restrict__ tie,
     uint32_t* __restrict__ adm, uint32_t* __restrict__ admn, uint32_t adm_stride) {
   __shared__ uint32_t s_tie[kTieCap];
-  __shared__ uint32_t s_wc[kTopkWaves];
+  __shared__ uint32_t s_wc[2u * kTopkWaves];
   __shared__ uint32_t s_base, s_tie_end;
   const uint32_t t = blockIdx.x, tid = threadIdx.x;
   const float* sc = cand_scores + (size_t)t * sstride;

@@ -374,7 +374,7 @@ constexpr int expert_gemm_max_waves() {
   return 16;
 }
 
-template <uint32_t NT, uint32_t MT, uint32_t FMT = kFmtPair16, bool TR = false>
+template <uint32_t NT, uint32_t MT, uint32_t FMT = kFmtPair16, bool TR = false, bool BUF_V2 = false>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((expert_gemm_min_waves<NT, MT, FMT, TR>()),
                                    (expert_gemm_max_waves<NT, MT, FMT, TR>()))))
@@ -520,6 +520,8 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   // Non-temporal on the CODE and FIELD planes only, and not on `x8`/`xs`/`cb`. Caching is not
   // arithmetic, so the output hash must not move across this change.
   auto ld_nt = [](const auto* p) { return __builtin_nontemporal_load(p); };
+  const aff::gfx12_rsrc_t rsrc_d = aff::make_gfx12_rsrc(data);
+  const aff::gfx12_rsrc_t rsrc_f = aff::make_gfx12_rsrc(fields);
   // NAMED SCALARS, NOT AN ARRAY. `uint32_t cw[5]` indexed by an unrolled `bb` looks like it
   // must fold and does not — it lands in scratch and costs a double-digit percentage of the
   // kernel. Check ScratchSize in `-Rpass-analysis=kernel-resource-usage` before changing this.
@@ -534,31 +536,65 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
     const uint32_t row = m0 + sm;
     if (row < rows) {
       if constexpr (kWide) {
-        const AFF_GLOBAL uint8_t* cp0;
-        const AFF_GLOBAL uint8_t* fp0;
+        uint32_t coff = 0u, foff = 0u;
+        const AFF_GLOBAL uint8_t* cp0 = nullptr;
+        const AFF_GLOBAL uint8_t* fp0 = nullptr;
         if constexpr (TR) {
           const size_t g = (size_t)(c0 / kEK) * rows + row;
-          cp0 = as_global(data + g * (kEK / 16 * 5) + (size_t)sblk * 5);
-          fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
+          if constexpr (BUF_V2) {
+            coff = (uint32_t)(g * (kEK / 16u * 5u) + (size_t)sblk * 5u);
+            foff = (uint32_t)(g * (kEK / 16u * 6u / 8u));
+          } else {
+            cp0 = as_global(data + g * (kEK / 16 * 5) + (size_t)sblk * 5);
+            fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
+          }
         } else {
           const uint32_t b0 = (c0 >> 4) + sblk;
-          cp0 = as_global(data + (size_t)row * code_bytes_row) + (size_t)b0 * 5;
-          fp0 = as_global(fields + (size_t)row * field_bytes_row) + (size_t)b0 * 6 / 8;
+          if constexpr (BUF_V2) {
+            coff = (uint32_t)((size_t)row * code_bytes_row + (size_t)b0 * 5u);
+            foff = (uint32_t)((size_t)row * field_bytes_row + (size_t)b0 * 6u / 8u);
+          } else {
+            cp0 = as_global(data + (size_t)row * code_bytes_row) + (size_t)b0 * 5;
+            fp0 = as_global(fields + (size_t)row * field_bytes_row) + (size_t)b0 * 6 / 8;
+          }
         }
-        const auto* cp32 = (const AFF_GLOBAL uint32_t*)cp0;
-        p.w0 = ld_nt(&cp32[0]); p.w1 = ld_nt(&cp32[1]); p.w2 = ld_nt(&cp32[2]);
-        p.w3 = ld_nt(&cp32[3]); p.w4 = ld_nt(&cp32[4]);
-        p.f01 = (uint32_t)ld_nt((const AFF_GLOBAL u16_ua*)fp0);
-        p.f2  = (uint32_t)ld_nt(&fp0[2]);
-      } else if constexpr (kHalfTR) {
-        const size_t g = (size_t)(c0 / kEK) * rows + row;
-        const auto* g32 = (const AFF_GLOBAL uint32_t*)as_global(data + g * (kEK / 16 * 5));
-        const auto* gp = g32 + (sblk ? 2u : 0u);
-        p.w0 = ld_nt(&gp[0]); p.w1 = ld_nt(&gp[1]); p.w2 = ld_nt(&gp[2]);
-        if (sblk == 0u) {
-          const AFF_GLOBAL uint8_t* fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
+        if constexpr (BUF_V2) {
+          const aff::aff_u32x4 v4 = aff::buf_load_u32x4<aff::kGfx12ThNt>(rsrc_d, coff);
+          p.w0 = v4[0]; p.w1 = v4[1]; p.w2 = v4[2]; p.w3 = v4[3];
+          p.w4 = aff::buf_load_u32<aff::kGfx12ThNt>(rsrc_d, coff + 16u);
+          const uint32_t f0 = aff::buf_load_u8<aff::kGfx12ThNtHt>(rsrc_f, foff);
+          const uint32_t f1 = aff::buf_load_u8<aff::kGfx12ThNtHt>(rsrc_f, foff + 1u);
+          p.f01 = f0 | (f1 << 8);
+          p.f2  = aff::buf_load_u8<aff::kGfx12ThNtHt>(rsrc_f, foff + 2u);
+        } else {
+          const auto* cp32 = (const AFF_GLOBAL uint32_t*)cp0;
+          p.w0 = ld_nt(&cp32[0]); p.w1 = ld_nt(&cp32[1]); p.w2 = ld_nt(&cp32[2]);
+          p.w3 = ld_nt(&cp32[3]); p.w4 = ld_nt(&cp32[4]);
           p.f01 = (uint32_t)ld_nt((const AFF_GLOBAL u16_ua*)fp0);
           p.f2  = (uint32_t)ld_nt(&fp0[2]);
+        }
+      } else if constexpr (kHalfTR) {
+        const size_t g = (size_t)(c0 / kEK) * rows + row;
+        if constexpr (BUF_V2) {
+          const uint32_t goff = (uint32_t)(g * (kEK / 16u * 5u) + (sblk ? 8u : 0u));
+          const uint3 w3 = aff::buf_load_u32x3<aff::kGfx12ThNt>(rsrc_d, goff);
+          p.w0 = w3.x; p.w1 = w3.y; p.w2 = w3.z;
+          if (sblk == 0u) {
+            const uint32_t foff = (uint32_t)(g * (kEK / 16u * 6u / 8u));
+            const uint32_t f0 = aff::buf_load_u8<aff::kGfx12ThNtHt>(rsrc_f, foff);
+            const uint32_t f1 = aff::buf_load_u8<aff::kGfx12ThNtHt>(rsrc_f, foff + 1u);
+            p.f01 = f0 | (f1 << 8);
+            p.f2  = aff::buf_load_u8<aff::kGfx12ThNtHt>(rsrc_f, foff + 2u);
+          }
+        } else {
+          const auto* g32 = (const AFF_GLOBAL uint32_t*)as_global(data + g * (kEK / 16 * 5));
+          const auto* gp = g32 + (sblk ? 2u : 0u);
+          p.w0 = ld_nt(&gp[0]); p.w1 = ld_nt(&gp[1]); p.w2 = ld_nt(&gp[2]);
+          if (sblk == 0u) {
+            const AFF_GLOBAL uint8_t* fp0 = as_global(fields + g * (kEK / 16 * 6 / 8));
+            p.f01 = (uint32_t)ld_nt((const AFF_GLOBAL u16_ua*)fp0);
+            p.f2  = (uint32_t)ld_nt(&fp0[2]);
+          }
         }
       }
     }
@@ -3550,6 +3586,14 @@ uint32_t expert_recon_tiles() {
   return (uint32_t)g_recon_tiles;
 }
 
+inline bool expert_decode_v2_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_EXPERT_DECODE_V2");
+    return !s || !*s || !(s[0] == '0' && s[1] == '\0');
+  }();
+  return on;
+}
+
 void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t max_nt,
                           const uint8_t* x8, const float* xs, const float* cb, uint32_t rows,
                           uint32_t cols, float wscale, void* stream, bool y_bf16,
@@ -3569,28 +3613,35 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
   // expert_wire_format_for_quant.
   const uint32_t fmt = expert_wire_format();
   const bool tr = expert_planes_are_colgroup_major();
+  const bool buf_v2 = expert_decode_v2_enabled() && aff::gfx12_cache_hints_enabled() &&
+                      ((uint64_t)rows * cols <= 0xffffff00ull);
   for (uint32_t t0 = 0; t0 < n_tiles; t0 += step) {
     const uint32_t chunk_tiles = std::min<uint32_t>(step, n_tiles - t0);
     const ExpertTile* cur_tiles = tiles + t0;
     const ExpertTile* cur_tiles2 = tiles2 ? (tiles2 + t0) : nullptr;
-#define AFF_EW1(NTV, MTV, FV, TRV)                                                                \
+#define AFF_EW1(NTV, MTV, FV, TRV, V2V)                                                           \
   do {                                                                                             \
-  hipLaunchKernelGGL((expert_gemm_wmma_kernel<NTV, MTV, FV, TRV>),                                 \
+  hipLaunchKernelGGL((expert_gemm_wmma_kernel<NTV, MTV, FV, TRV, V2V>),                            \
                      dim3((rows + kEWaves * MTV * 16 - 1) / (kEWaves * MTV * 16), chunk_tiles,     \
                           cur_tiles2 ? 2u : 1u),                                                   \
                      dim3(kEThreads), 0, (hipStream_t)stream, cur_tiles, x8, xs, cb, wscale, rows, \
                      cols, y_bf16 ? 1 : 0, cur_tiles2); AFF_HIP_CHECK(hipGetLastError());          \
+  } while (0)
+#define AFF_EW2(NTV, MTV, FV, TRV)                                                                \
+  do {                                                                                             \
+    if (buf_v2 && ((MTV) == 2 || (TRV))) AFF_EW1(NTV, MTV, FV, TRV, true);                         \
+    else                                 AFF_EW1(NTV, MTV, FV, TRV, false);                        \
   } while (0)
 // The plane layout and the wire format are INDEPENDENT, and both `tr` branches carry every format
 // on purpose: dispatching `tr` first and falling through to kFmtPair16 would read the shipped
 // layout with the wrong decode — right size, in-bounds addresses, wrong weights.
 #define AFF_EWF(NTV, MTV, TRV)                                                                    \
   do {                                                                                             \
-    if (fmt == kFmtQuad8) AFF_EW1(NTV, MTV, kFmtQuad8, TRV);                                       \
-    else if (fmt == kFmtQuad2S) AFF_EW1(NTV, MTV, kFmtQuad2S, TRV);                                \
-    else if (fmt == kFmtQuad4S) AFF_EW1(NTV, MTV, kFmtQuad4S, TRV);                                \
-    else if (fmt == kFmtQuad4) AFF_EW1(NTV, MTV, kFmtQuad4, TRV);                                  \
-    else AFF_EW1(NTV, MTV, kFmtPair16, TRV);                                                       \
+    if (fmt == kFmtQuad8) AFF_EW2(NTV, MTV, kFmtQuad8, TRV);                                       \
+    else if (fmt == kFmtQuad2S) AFF_EW2(NTV, MTV, kFmtQuad2S, TRV);                                \
+    else if (fmt == kFmtQuad4S) AFF_EW2(NTV, MTV, kFmtQuad4S, TRV);                                \
+    else if (fmt == kFmtQuad4) AFF_EW2(NTV, MTV, kFmtQuad4, TRV);                                  \
+    else AFF_EW2(NTV, MTV, kFmtPair16, TRV);                                                       \
   } while (0)
 #define AFF_EW(NTV, MTV)                                                                          \
   do {                                                                                             \
@@ -3608,6 +3659,7 @@ void expert_gemm_wmma_hip(const ExpertTile* tiles, uint32_t n_tiles, uint32_t ma
     else AFF_EW(8, 1);
 #undef AFF_EW
 #undef AFF_EWF
+#undef AFF_EW2
 #undef AFF_EW1
   }
 }

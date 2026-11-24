@@ -349,7 +349,108 @@ __device__ __forceinline__ float wave_reduce_max_dpp(float v) {
 
 using aff_u32x4 = uint32_t __attribute__((ext_vector_type(4)));
 using aff_u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+using aff_i32x4 = int __attribute__((ext_vector_type(4)));
+using aff_i32x3 = int __attribute__((ext_vector_type(3)));
+using aff_i32x2 = int __attribute__((ext_vector_type(2)));
 using aff_u16_ua = uint16_t __attribute__((aligned(1)));
+
+// gfx1201 (RDNA 4) buffer descriptor word 3 and temporal-hint fields (`CPol` / `TH`).
+inline constexpr uint32_t kGfx12BufRsrc3 = 0x31004000u;
+inline constexpr int kGfx12ThRt   = 0x00;
+inline constexpr int kGfx12ThNt   = 0x01;
+inline constexpr int kGfx12ThHt   = 0x02;
+inline constexpr int kGfx12ThLu   = 0x03;
+inline constexpr int kGfx12ThNtRt = 0x04;
+inline constexpr int kGfx12ThRtNt = 0x05;
+inline constexpr int kGfx12ThNtHt = 0x06;
+
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+using gfx12_rsrc_t = __amdgpu_buffer_rsrc_t;
+
+__device__ __forceinline__ gfx12_rsrc_t make_gfx12_rsrc(const void* base,
+                                                        uint32_t bytes = 0xffffffffu) {
+  return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(base), 0, bytes, kGfx12BufRsrc3);
+}
+
+template <int TH>
+__device__ __forceinline__ aff_u32x4 buf_load_u32x4(gfx12_rsrc_t r, uint32_t off) {
+  const aff_i32x4 v = __builtin_amdgcn_raw_buffer_load_b128(r, (int)off, 0, TH);
+  return aff_u32x4{(uint32_t)v[0], (uint32_t)v[1], (uint32_t)v[2], (uint32_t)v[3]};
+}
+
+template <int TH>
+__device__ __forceinline__ uint3 buf_load_u32x3(gfx12_rsrc_t r, uint32_t off) {
+  const aff_i32x3 v = __builtin_amdgcn_raw_buffer_load_b96(r, (int)off, 0, TH);
+  return make_uint3((uint32_t)v[0], (uint32_t)v[1], (uint32_t)v[2]);
+}
+
+template <int TH>
+__device__ __forceinline__ uint2 buf_load_u32x2(gfx12_rsrc_t r, uint32_t off) {
+  const aff_i32x2 v = __builtin_amdgcn_raw_buffer_load_b64(r, (int)off, 0, TH);
+  return make_uint2((uint32_t)v[0], (uint32_t)v[1]);
+}
+
+template <int TH>
+__device__ __forceinline__ uint32_t buf_load_u32(gfx12_rsrc_t r, uint32_t off) {
+  return (uint32_t)__builtin_amdgcn_raw_buffer_load_b32(r, (int)off, 0, TH);
+}
+
+template <int TH>
+__device__ __forceinline__ uint16_t buf_load_u16(gfx12_rsrc_t r, uint32_t off) {
+  return static_cast<uint16_t>(__builtin_amdgcn_raw_buffer_load_b16(r, (int)off, 0, TH));
+}
+
+template <int TH>
+__device__ __forceinline__ uint8_t buf_load_u8(gfx12_rsrc_t r, uint32_t off) {
+  return static_cast<uint8_t>(__builtin_amdgcn_raw_buffer_load_b8(r, (int)off, 0, TH));
+}
+
+__device__ __forceinline__ void prefetch_l2_uniform(const void* p, int lines = 1) {
+  __builtin_amdgcn_s_prefetch_data(p, lines);
+}
+#else
+struct gfx12_rsrc_t {
+  const uint8_t* ptr;
+};
+
+__host__ __device__ __forceinline__ gfx12_rsrc_t make_gfx12_rsrc(const void* base,
+                                                                 uint32_t = 0xffffffffu) {
+  return gfx12_rsrc_t{static_cast<const uint8_t*>(base)};
+}
+
+template <int TH>
+__device__ __forceinline__ aff_u32x4 buf_load_u32x4(gfx12_rsrc_t r, uint32_t off) {
+  return *reinterpret_cast<const aff_u32x4*>(r.ptr + off);
+}
+
+template <int TH>
+__device__ __forceinline__ uint3 buf_load_u32x3(gfx12_rsrc_t r, uint32_t off) {
+  const uint32_t* p = reinterpret_cast<const uint32_t*>(r.ptr + off);
+  return make_uint3(p[0], p[1], p[2]);
+}
+
+template <int TH>
+__device__ __forceinline__ uint2 buf_load_u32x2(gfx12_rsrc_t r, uint32_t off) {
+  return *reinterpret_cast<const uint2*>(r.ptr + off);
+}
+
+template <int TH>
+__device__ __forceinline__ uint32_t buf_load_u32(gfx12_rsrc_t r, uint32_t off) {
+  return *reinterpret_cast<const uint32_t*>(r.ptr + off);
+}
+
+template <int TH>
+__device__ __forceinline__ uint16_t buf_load_u16(gfx12_rsrc_t r, uint32_t off) {
+  return *reinterpret_cast<const uint16_t*>(r.ptr + off);
+}
+
+template <int TH>
+__device__ __forceinline__ uint8_t buf_load_u8(gfx12_rsrc_t r, uint32_t off) {
+  return *(r.ptr + off);
+}
+
+__device__ __forceinline__ void prefetch_l2_uniform(const void*, int = 1) {}
+#endif
 
 // Read-once global weight/scale load helpers (`TH_LOAD_NT` on gfx1201) to avoid evicting
 // hot KV cache and activations from the 8 MiB L2 and 64 MiB MALL during narrow decode.
@@ -422,6 +523,15 @@ inline bool dense_nt_load_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("AFF_DENSE_NT_LOAD");
     return s && *s && !(s[0] == '0' && s[1] == '\0');
+  }();
+  return on;
+}
+
+// Host-cached gate for gfx1201 two-level V# buffer cache hints (`TH_LOAD_NT_RT`/`TH_LOAD_NT_HT`).
+inline bool gfx12_cache_hints_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_GFX12_CACHE_HINTS");
+    return !s || !*s || !(s[0] == '0' && s[1] == '\0');
   }();
   return on;
 }

@@ -7996,6 +7996,7 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
       else pack_tm = false;
     }
   }
+  bool r0_tm_direct = false;
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     if (!D.b_head) return false;
@@ -8020,20 +8021,28 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     const uint64_t r0 = r0_band[d], nr = nr_band[d];
     covered += nr;
     if (!nr) continue;
-    // Into the band's own place in the full plane, so the gather below is a copy and not a shuffle.
+    // When pack_tm is active, fp8/w4 matvec kernels can write token-major directly:
+    // rank 0 lands straight in D0.b_q at stride `vocab` (skipping head_unpack_tm_kernel), and
+    // peers when !hs_bf16 land straight in `peer_src[d]` (skipping head_pack_tm_kernel).
+    const bool tm_direct = pack_tm && (use_fp8 || use_w4) && (!hs_bf16 || d == 0u);
+    if (d == 0u) r0_tm_direct = tm_direct;
+    float* const band_dst =
+        tm_direct ? (d == 0u ? (D0.b_q + r0) : peer_src[d]) : (D.b_head + (size_t)r0 * b_nb_);
+    const uint32_t band_ld = tm_direct ? (d == 0u ? (uint32_t)vocab : (uint32_t)nr) : b_nb_;
+    const int band_tm = tm_direct ? 1 : 0;
     if (use_w4) {
       const uint64_t off = r0 - e.sh[d].row0;
       if (!launch_w4_head(e.sh[d].w4_data + off * (n_embd / 2),
                           e.sh[d].w4_scales + off * (n_embd / 128), D.b_emb,
-                          D.b_head + (size_t)r0 * b_nb_, (uint32_t)nr, (uint32_t)n_embd, n,
-                          b_nb_, /*out_token_major=*/0, D.stream))
+                          band_dst, (uint32_t)nr, (uint32_t)n_embd, n,
+                          band_ld, band_tm, D.stream))
         return no("int4 head kernel failed");
     } else if (use_fp8) {
       const uint64_t off = r0 - e.sh[d].row0;
       if (!launch_fp8_g128_head(static_cast<const uint8_t*>(e.sh[d].fp8_data) + off * n_embd,
                                 e.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb,
-                                D.b_head + (size_t)r0 * b_nb_, (uint32_t)nr, (uint32_t)n_embd, n,
-                                b_nb_, /*out_token_major=*/0, D.stream))
+                                band_dst, (uint32_t)nr, (uint32_t)n_embd, n,
+                                band_ld, band_tm, D.stream))
         return no("fp8 g128 head kernel failed");
     } else if (use_b12) {
       const uint64_t off = r0 - e.sh[d].row0;
@@ -8047,7 +8056,7 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
                      D.b_head + (size_t)r0 * b_nb_, (uint32_t)nr, (uint32_t)n_embd, b_nb_,
                      D.stream);
     }
-    if (pack_tm && d > 0) {
+    if (pack_tm && !tm_direct && d > 0) {
       if (hs_bf16) {
         hipLaunchKernelGGL(head_pack_tm_bf16_kernel,
                            dim3(((uint32_t)nr + 255u) / 256u, n), dim3(256), 0, D.stream,
@@ -8067,7 +8076,7 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
 
   // Gather every other card's band onto card 0 asynchronously, ordered by each peer's ev_amx.
   AFF_HIP_CHECK(hipSetDevice(D0.id));
-  if (pack_tm && nr_band[0]) {
+  if (pack_tm && !r0_tm_direct && nr_band[0]) {
     hipLaunchKernelGGL(head_unpack_tm_kernel,
                        dim3(((uint32_t)nr_band[0] + 255u) / 256u, n), dim3(256), 0, D0.stream,
                        D0.b_head + (size_t)r0_band[0] * b_nb_, D0.b_q, (uint32_t)nr_band[0], b_nb_,
