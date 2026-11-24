@@ -23,12 +23,38 @@ static inline float gelu(float x) {
   return 0.5f * x * (1.0f + std::erff(x * 0.7071067811865475f));
 }
 
+#if defined(__AVX2__)
+
+static inline float hsum256_ps(__m256 v) {
+  __m128 lo = _mm256_castps256_ps128(v);
+  __m128 hi = _mm256_extractf128_ps(v, 1);
+  lo = _mm_add_ps(lo, hi);
+  __m128 shuf = _mm_movehdup_ps(lo);
+  __m128 sums = _mm_add_ps(lo, shuf);
+  shuf = _mm_movehl_ps(shuf, sums);
+  sums = _mm_add_ss(sums, shuf);
+  return _mm_cvtss_f32(sums);
+}
+
+#endif
+
 static inline float dot_f32(const float* a, const float* b, uint32_t n) {
+#if defined(__AVX512F__)
   __m512 acc = _mm512_setzero_ps();
   uint32_t i = 0;
   for (; i + 16 <= n; i += 16)
     acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
   float s = _mm512_reduce_add_ps(acc);
+#elif defined(__AVX2__) && defined(__FMA__)
+  __m256 acc = _mm256_setzero_ps();
+  uint32_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+  float s = hsum256_ps(acc);
+#else
+  float s = 0.0f;
+  uint32_t i = 0;
+#endif
   for (; i < n; ++i) s += a[i] * b[i];
   return s;
 }
@@ -46,6 +72,7 @@ static void gemm_nt(const uint16_t* W, const float* X, uint32_t N, uint32_t R, u
     for (uint64_t rb = rb0; rb < rb1; ++rb) {
       const uint32_t r0 = (uint32_t)rb * RB;
       const uint32_t nr = std::min<uint32_t>(RB, R - r0);
+#if defined(__AVX512F__)
       __m512 acc[RB];
       for (uint32_t k = 0; k < N; ++k) {
         const float* xk = X + (size_t)k * C;
@@ -67,6 +94,39 @@ static void gemm_nt(const uint16_t* W, const float* X, uint32_t N, uint32_t R, u
           for (uint32_t cc = c; cc < C; ++cc) s += bf16_val(wr[cc]) * xk[cc];
           ok[r] = s;
         }
+#elif defined(__AVX2__)
+      __m256 acc[RB];
+      for (uint32_t k = 0; k < N; ++k) {
+        const float* xk = X + (size_t)k * C;
+        for (uint32_t r = 0; r < nr; ++r) acc[r] = _mm256_setzero_ps();
+        uint32_t c = 0;
+        for (; c + 8 <= C; c += 8) {
+          const __m256 xv = _mm256_loadu_ps(xk + c);
+          for (uint32_t r = 0; r < nr; ++r) {
+            const uint16_t* wr = W + (size_t)(r0 + r) * C + c;
+            const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(wr));
+            const __m256 wv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+            acc[r] = _mm256_fmadd_ps(wv, xv, acc[r]);
+          }
+        }
+        float* ok = out + (size_t)k * R + r0;
+        for (uint32_t r = 0; r < nr; ++r) {
+          float s = hsum256_ps(acc[r]);
+          const uint16_t* wr = W + (size_t)(r0 + r) * C;
+          for (uint32_t cc = c; cc < C; ++cc) s += bf16_val(wr[cc]) * xk[cc];
+          ok[r] = s;
+        }
+#else
+      for (uint32_t k = 0; k < N; ++k) {
+        const float* xk = X + (size_t)k * C;
+        float* ok = out + (size_t)k * R + r0;
+        for (uint32_t r = 0; r < nr; ++r) {
+          const uint16_t* wr = W + (size_t)(r0 + r) * C;
+          float s = 0.0f;
+          for (uint32_t cc = 0; cc < C; ++cc) s += bf16_val(wr[cc]) * xk[cc];
+          ok[r] = s;
+        }
+#endif
       }
     }
   });
@@ -313,6 +373,7 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
           float* ao = acc.data() + (size_t)r * HD;
           std::memset(ao, 0, (size_t)HD * sizeof(float));
           for (uint32_t j = 0; j < N; ++j) {
+#if defined(__AVX512F__)
             const __m512 pv = _mm512_set1_ps(row[j] * inv_sum);
             const float* vj = V.data() + (size_t)j * D + hoff;
             for (uint32_t c = 0; c < HD; c += 16) {
@@ -320,6 +381,21 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
               a = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + c), a);
               _mm512_storeu_ps(ao + c, a);
             }
+#elif defined(__AVX2__) && defined(__FMA__)
+            const __m256 pv = _mm256_set1_ps(row[j] * inv_sum);
+            const float* vj = V.data() + (size_t)j * D + hoff;
+            for (uint32_t c = 0; c < HD; c += 8) {
+              __m256 a = _mm256_loadu_ps(ao + c);
+              a = _mm256_fmadd_ps(pv, _mm256_loadu_ps(vj + c), a);
+              _mm256_storeu_ps(ao + c, a);
+            }
+#else
+            const float pv = row[j] * inv_sum;
+            const float* vj = V.data() + (size_t)j * D + hoff;
+            for (uint32_t c = 0; c < HD; ++c) {
+              ao[c] += pv * vj[c];
+            }
+#endif
           }
           std::memcpy(Attn_out.data() + (size_t)(qb + r) * D + hoff, ao,
                       (size_t)HD * sizeof(float));
