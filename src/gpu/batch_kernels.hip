@@ -2985,10 +2985,12 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
     const float* __restrict__ base, const float* __restrict__ nw, float* __restrict__ pre_out,
     float* __restrict__ post_out, float* __restrict__ comb_out, float* __restrict__ cur,
     float* __restrict__ norm, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t iters,
-    float hc_eps, float rms_eps, int has_control, const float* __restrict__ pre_in) {
+    float hc_eps, float rms_eps, int has_control, const float* __restrict__ pre_in,
+    uint8_t* __restrict__ q8, float* __restrict__ qs) {
   __shared__ float red[kBlkStripe * kBlkTok];
   __shared__ float s_pre[kBlkTok * 8], s_post[kBlkTok * 8], s_comb[kBlkTok * 64];
   __shared__ float s_scale[kBlkTok];
+  __shared__ __align__(16) uint8_t s_q8[kBlkTok][128];
   const uint32_t bl = threadIdx.x & (kBlkTok - 1), s = threadIdx.x / kBlkTok;
   const uint32_t b = blockIdx.x * kBlkTok + bl;
   const bool live = b < nb;
@@ -3039,6 +3041,53 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
       sq += acc * acc;
     }
   const float inv = rsqrtf(stripe_sum(red, s, bl, sq) / (float)n_embd + rms_eps);
+  if (q8 && qs && (n_embd & 127u) == 0u) {
+    const uint32_t nkb = n_embd >> 7;
+    for (uint32_t kb = 0u; kb < nkb; ++kb) {
+      const uint32_t d0 = kb << 7;
+      const uint32_t da = d0 + s;
+      const uint32_t db = d0 + 64u + s;
+      const float va =
+          live ? (cur_out[(size_t)da * nb + b] * inv * (nw ? nw[da] : 1.0f)) : 0.0f;
+      const float vb =
+          live ? (cur_out[(size_t)db * nb + b] * inv * (nw ? nw[db] : 1.0f)) : 0.0f;
+      if (live) {
+        norm[(size_t)da * nb + b] = va;
+        norm[(size_t)db * nb + b] = vb;
+      }
+      red[s * kBlkTok + bl] = fmaxf(fabsf(va), fabsf(vb));
+      aff::lds_barrier();
+      if (s < 4u) {
+        float m = 0.0f;
+#pragma unroll
+        for (uint32_t k = s; k < kBlkStripe; k += 4u) m = fmaxf(m, red[k * kBlkTok + bl]);
+        m = fmaxf(m, aff::dpp_xor_lane<16u>(m));
+        m = fmaxf(m, aff::dpp_xor_lane<8u>(m));
+        if (s == 0u) {
+          const float sc = (m > 0.0f) ? m * (1.0f / 448.0f) : 1.0f;
+          s_scale[bl] = 1.0f / sc;
+          if (live) qs[(size_t)b * nkb + kb] = sc;
+        }
+      }
+      aff::lds_barrier();
+      const float inv_s = s_scale[bl];
+      const float ca = fminf(fmaxf(va * inv_s, -448.0f), 448.0f);
+      const float cb = fminf(fmaxf(vb * inv_s, -448.0f), 448.0f);
+      const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(ca, cb, 0, false);
+      s_q8[bl][s]       = (uint8_t)((uint32_t)pk & 0xffu);
+      s_q8[bl][64u + s] = (uint8_t)(((uint32_t)pk >> 8) & 0xffu);
+      aff::lds_barrier();
+      if (threadIdx.x < 64u) {
+        const uint32_t wt = threadIdx.x >> 3;
+        const uint32_t wk = (threadIdx.x & 7u) << 4;
+        const uint32_t bt = blockIdx.x * kBlkTok + wt;
+        if (bt < nb)
+          *(uint4*)(q8 + (size_t)bt * n_embd + d0 + wk) = *(const uint4*)(&s_q8[wt][wk]);
+      }
+      aff::lds_barrier();
+    }
+    return;
+  }
   if (!live) return;
   for (uint32_t d = s; d < n_embd; d += kBlkStripe)
     norm[(size_t)d * nb + b] = cur_out[(size_t)d * nb + b] * inv * (nw ? nw[d] : 1.0f);
@@ -5336,10 +5385,14 @@ void batch_scale_transpose_hip(const float* src, float* dst, uint32_t n, uint32_
 void batch_hc_fused_hip(const uint16_t* hc, const float* mix, const float* scale, const float* base,
                         const float* nw, float* pre, float* post, float* comb, float* cur,
                         float* norm, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t iters,
-                        float hc_eps, float rms_eps, int has_control, void* stream, const float* pre_in) {
+                        float hc_eps, float rms_eps, int has_control, void* stream,
+                        const float* pre_in, uint8_t* q8, float* qs) {
+  const bool emit_q8 =
+      q8 && qs && (n_embd & 127u) == 0u && (((uintptr_t)q8 & 15u) == 0u);
   AFF_BLAUNCH(batch_hc_fused_kernel, dim3((nb + kBlkTok - 1) / kBlkTok), dim3(kBlkThreads),
                      0, (hipStream_t)stream, hc, mix, scale, base, nw, pre, post, comb, cur, norm,
-                     n_embd, n_hc, nb, iters, hc_eps, rms_eps, has_control, pre_in);
+                     n_embd, n_hc, nb, iters, hc_eps, rms_eps, has_control, pre_in,
+                     emit_q8 ? q8 : nullptr, emit_q8 ? qs : nullptr);
 }
 
 void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float* scale,

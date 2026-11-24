@@ -150,7 +150,7 @@ __device__ __forceinline__ uint32_t pack4(float a, float b, float c, float d) {
 // faster. NT=2 also lets one K fragment feed two head tiles and one V fragment feed two
 // accumulators, so the operand-load count per mma falls from 1.0 to 0.75 (QK) and 1.125 to 0.625
 // (PV) as a side effect.
-template <uint32_t NT, bool HAS_SINK, bool HAS_MASK>
+template <uint32_t NT, bool HAS_SINK, bool HAS_MASK, bool RESOLVE_4W = true>
 __global__ __launch_bounds__(kThreads) void flash_kernel(
     const void* __restrict__ qp, const uint8_t* __restrict__ raw, const uint8_t* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const uint32_t* __restrict__ n_comp_v, uint32_t n_comp1,
@@ -178,6 +178,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
   float* const s_ps = s_amax;
   __shared__ float s_scur, s_sprev;
   __shared__ int s_skip;
+  __shared__ float s_wmx[kWaves];
 
   const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
   const uint32_t c = lane & 15u, hlf = lane >> 4;    // fragment column, lane half
@@ -286,9 +287,35 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
   const uint32_t kr = tr_row(lane), co = tr_col(lane);
 
   for (uint32_t kt0 = kt_lo; kt0 < kt_hi; kt0 += kKT) {
-    // ---- resolve the tile's rows on wave 0 alone, two keys a lane, so the tile scale reduction
-    // needs no second barrier.
-    if (wave == 0) {
+    // ---- resolve the tile's rows: 4 waves x 16 keys (RESOLVE_4W) or wave 0 alone.
+    if constexpr (RESOLVE_4W) {
+      float r = 0.0f;
+      if (lane < 16u) {
+        const uint32_t i = wave * 16u + lane;
+        const uint32_t k = kt0 + i;
+        const uint8_t* p = raw;                      // valid fallback: absent keys get weight 0
+        if (k < kt_hi) {
+          if (k < n_raw) {
+            uint32_t sl = raw0 + k;
+            if (sl >= ring) sl -= ring;
+            p = raw + (size_t)sl * kRowB;
+          } else {
+            const uint32_t cr = adm ? adm[(size_t)tk * adm_stride + (k - n_raw)] : (k - n_raw);
+            p = comp + (size_t)cr * kRowB;
+          }
+          r = *(const AFF_GLOBAL float*)(p + kW);
+          if (HAS_MASK && k >= n_raw && !allowed[(size_t)tk * max_comp + (k - n_raw)]) r = 0.0f;
+        }
+        s_ptr[i] = p;
+        s_rs[i] = r;
+      }
+      float wmx = (lane < 16u) ? r : 0.0f;
+      wmx = fmaxf(wmx, dpp_xor_lane<8u>(wmx));
+      wmx = fmaxf(wmx, dpp_xor_lane<4u>(wmx));
+      wmx = fmaxf(wmx, dpp_xor_lane<2u>(wmx));
+      wmx = fmaxf(wmx, dpp_xor_lane<1u>(wmx));
+      if (lane == 0u) s_wmx[wave] = wmx;
+    } else if (wave == 0) {
       float rs[kKT / 32u];
 #pragma unroll
       for (uint32_t u = 0; u < kKT / 32u; ++u) {
@@ -327,6 +354,12 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       if (lane == 0) s_scur = (mx > 0.0f) ? mx : s_sprev;
     }
     lds_barrier();
+    if constexpr (RESOLVE_4W) {
+      if (tid == 0u) {
+        const float tile_mx = fmaxf(fmaxf(s_wmx[0], s_wmx[1]), fmaxf(s_wmx[2], s_wmx[3]));
+        s_scur = (tile_mx > 0.0f) ? tile_mx : s_sprev;
+      }
+    }
 
     // ---- S^T = K . Q^T over all 512 dims. A is K (dim contiguous, plain load), B is Q from LDS.
     // D[m][n] is S^T[key m][head n], so a lane owns ONE head and eight keys — which is what makes
@@ -700,20 +733,29 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
   float* po = nsp > 1u ? split->o : nullptr;
   float* pm = nsp > 1u ? split->ml : nullptr;
   const uint32_t ptok = nsp > 1u ? split->tok_cap : 0u;
+  static const bool resolve_4w = []() -> bool {
+    const char* v = std::getenv("AFF_FLASH_4WAVE_RESOLVE");
+    return !v || !*v || !(v[0] == '0' && v[1] == '\0');
+  }();
   const dim3 g(n, ntiles, nsp), b(kThreads);
-#define AFF_LAUNCH(T, S, M)                                                                      \
-  hipLaunchKernelGGL((flash_kernel<T, S, M>), g, b, 0, st, q, r8, c8, allowed, n_comp_v, n_comp1,  \
-                     sinks, out, b0, pos0, sliding, ring, max_comp, n_head, scale, q_bf16 ? 1 : 0, \
-                     po, pm, ptok, adm, adm_stride, raw_floor, q_scales)
-#define AFF_PICK(T)                                                    \
+#define AFF_LAUNCH(T, S, M, R4)                                                                  \
+  hipLaunchKernelGGL((flash_kernel<T, S, M, R4>), g, b, 0, st, q, r8, c8, allowed, n_comp_v,     \
+                     n_comp1, sinks, out, b0, pos0, sliding, ring, max_comp, n_head, scale,      \
+                     q_bf16 ? 1 : 0, po, pm, ptok, adm, adm_stride, raw_floor, q_scales)
+#define AFF_PICK(T, R4)                                                \
   do {                                                                 \
-    if (sinks && allowed)  AFF_LAUNCH(T, true, true);                  \
-    else if (sinks)        AFF_LAUNCH(T, true, false);                 \
-    else if (allowed)      AFF_LAUNCH(T, false, true);                 \
-    else                   AFF_LAUNCH(T, false, false);                \
+    if (sinks && allowed)  AFF_LAUNCH(T, true, true, R4);              \
+    else if (sinks)        AFF_LAUNCH(T, true, false, R4);             \
+    else if (allowed)      AFF_LAUNCH(T, false, true, R4);             \
+    else                   AFF_LAUNCH(T, false, false, R4);            \
   } while (0)
-  if (nt == 2u) AFF_PICK(2u);
-  else          AFF_PICK(1u);
+  if (resolve_4w) {
+    if (nt == 2u) AFF_PICK(2u, true);
+    else          AFF_PICK(1u, true);
+  } else {
+    if (nt == 2u) AFF_PICK(2u, false);
+    else          AFF_PICK(1u, false);
+  }
 #undef AFF_PICK
 #undef AFF_LAUNCH
   if (nsp > 1u)

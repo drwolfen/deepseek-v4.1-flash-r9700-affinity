@@ -724,6 +724,205 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_staged_kernel(const float* __re
   fold_stage(stages - 1);
 }
 
+// Staged 2-rank FP8-wire all-reduce fused with prefill HC post/expand over [n_embd][nb].
+template <uint32_t NH, bool HasControl, bool CacheStage>
+__global__ __launch_bounds__(256) void tp_ar_fp8_hc_expand_kernel(
+    uint16_t* out_hc, float* __restrict__ block, const uint16_t* hc,
+    const float* __restrict__ post, const float* __restrict__ comb, TpPush8<1> push,
+    const unsigned char* my_base, unsigned int* my_flags, unsigned int* seq_ctrs,
+    unsigned int* timeout, uint32_t n_embd, uint32_t nb, int n, int slot_stride_bytes,
+    int scale_off_bytes, int stages, int zb, uint32_t ar_flags) {
+  const int b = blockIdx.x, grid_nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], 1u);
+  __shared__ unsigned int s_seq;
+  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
+  aff::lds_barrier();
+  const unsigned int s = s_seq;
+  const int slot = (int)(s % TpContext::kTpSlots);
+
+  if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
+
+  unsigned char* const pb0 = push.base[0] + (size_t)slot * slot_stride_bytes;
+  float* const p_scale0 = (float*)(pb0 + scale_off_bytes);
+  const unsigned char* const mb0 = my_base + (size_t)slot * slot_stride_bytes;
+  const float* const m_scale0 = (const float*)(mb0 + scale_off_bytes);
+
+  const int n_groups = (n + kTpFp8Group - 1) / kTpFp8Group;
+  const int waves = nt / kWave;
+  const int lane = tid & (kWave - 1);
+  const int wave = tid / kWave;
+  const int gw = (n_groups + grid_nb - 1) / grid_nb;
+  const int g0 = b * gw;
+  const int g1 = (g0 + gw < n_groups) ? (g0 + gw) : n_groups;
+  const int gw_blk = (g1 > g0) ? (g1 - g0) : 0;
+  constexpr int kPerLane = kTpFp8Group / kWave;  // 4
+  constexpr int kStageCacheGroups = 30;
+  __shared__ uint32_t s_pk[CacheStage ? 2 : 1][CacheStage ? kStageCacheGroups : 1]
+                          [CacheStage ? kWave : 1];
+  __shared__ float s_sc[CacheStage ? 2 : 1][CacheStage ? kStageCacheGroups : 1];
+  const uint32_t nb4 = nb >> 2;
+
+  auto quant_group = [&](int g, float& mine_scale, uint32_t& pk, bool write_peer) {
+    const int lo = g * kTpFp8Group;
+    const int base_idx = lo + lane * kPerLane;
+    float v[kPerLane];
+    if (base_idx + (kPerLane - 1) < n) {
+      const float4 bv = *(const float4*)(block + base_idx);
+      v[0] = bv.x; v[1] = bv.y; v[2] = bv.z; v[3] = bv.w;
+    } else {
+#pragma unroll
+      for (int i = 0; i < kPerLane; ++i) {
+        const int idx = base_idx + i;
+        v[i] = (idx < n) ? block[idx] : 0.0f;
+      }
+    }
+    const float amax = aff::wave_reduce_max_dpp(
+        fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))));
+    mine_scale = (amax > 0.0f) ? amax * (1.0f / 448.0f) : 1.0f;
+    const float inv = 1.0f / mine_scale;
+    if (write_peer && lane == 0) p_scale0[g] = mine_scale;
+    pk = pack4_e4m3(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv);
+    if (write_peer) {
+      if (base_idx + (kPerLane - 1) < n) {
+        *(uint32_t*)(pb0 + base_idx) = pk;
+      } else {
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+          const int idx = base_idx + i;
+          if (idx < n) pb0[idx] = (unsigned char)(pk >> (8 * i));
+        }
+      }
+    }
+  };
+
+  auto push_stage = [&](int st) {
+    const int sg0 = g0 + (gw_blk * st) / stages;
+    const int sg1 = g0 + (gw_blk * (st + 1)) / stages;
+    const int bank = st & 1;
+    for (int g = sg0 + wave; g < sg1; g += waves) {
+      float sc_tmp;
+      uint32_t pk_tmp;
+      quant_group(g, sc_tmp, pk_tmp, true);
+      if constexpr (CacheStage) {
+        const int lg = g - sg0;
+        if (lg < kStageCacheGroups) {
+          s_pk[bank][lg][lane] = pk_tmp;
+          if (lane == 0) s_sc[bank][lg] = sc_tmp;
+        }
+      }
+    }
+  };
+
+  const bool fast_rel = (ar_flags & kTpArFlagFastRel) != 0u;
+  auto publish_stage = [&](int st) {
+    asm volatile("s_wait_storecnt 0x0" ::: "memory");
+    aff::lds_barrier();
+    if (tid == 0) publish_flag(&push.flags[0][(size_t)(1 + st) * kTpMaxBlocks + b], s, fast_rel);
+  };
+
+  auto fold_stage = [&](int st) {
+    if (tid == 0) {
+      const unsigned int* const f = &my_flags[(size_t)(1 + st) * kTpMaxBlocks + b];
+      unsigned long long z = 0;
+      unsigned int fv = load_sys_relaxed(f);
+      if ((int)(fv - s) < 0) {
+        do {
+          __builtin_amdgcn_s_sleep(1);
+          fv = load_sys_relaxed(f);
+        } while ((int)(fv - s) < 0 && ++z <= kTpSpinMax);
+        if ((int)(fv - s) < 0) note_timeout(timeout, s);
+      }
+    }
+    aff::lds_barrier();
+    fence_sys_acq();
+
+    const int sg0 = g0 + (gw_blk * st) / stages;
+    const int sg1 = g0 + (gw_blk * (st + 1)) / stages;
+    const int bank = st & 1;
+    for (int g = sg0 + wave; g < sg1; g += waves) {
+      const int lo = g * kTpFp8Group;
+      const int base_idx = lo + lane * kPerLane;
+      if (base_idx >= n) continue;
+      const float peer_scale = m_scale0[g];
+      float mine_scale;
+      uint32_t pk;
+      if constexpr (CacheStage) {
+        const int lg = g - sg0;
+        if (lg < kStageCacheGroups) {
+          pk = s_pk[bank][lg][lane];
+          mine_scale = s_sc[bank][lg];
+        } else {
+          quant_group(g, mine_scale, pk, false);
+        }
+      } else {
+        quant_group(g, mine_scale, pk, false);
+      }
+      const uint32_t peer_pk = *(const uint32_t*)(mb0 + base_idx);
+      const aff::aff_f32x2 m0 = aff::e4m3_decode_pk<false>(pk);
+      const aff::aff_f32x2 m1 = aff::e4m3_decode_pk<true>(pk);
+      const aff::aff_f32x2 p0 = aff::e4m3_decode_pk<false>(peer_pk);
+      const aff::aff_f32x2 p1 = aff::e4m3_decode_pk<true>(peer_pk);
+      const float bv[4] = {
+          m0.x * mine_scale + p0.x * peer_scale,
+          m0.y * mine_scale + p0.y * peer_scale,
+          m1.x * mine_scale + p1.x * peer_scale,
+          m1.y * mine_scale + p1.y * peer_scale,
+      };
+      if (zb) *(float4*)(block + base_idx) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      if constexpr (HasControl) {
+        const uint32_t idx4 = (uint32_t)base_idx >> 2;
+        const uint32_t d = idx4 / nb4;
+        const uint32_t b0 = (idx4 - d * nb4) << 2;
+        float v[NH][4];
+#pragma unroll
+        for (uint32_t src = 0; src < NH; ++src) {
+          const uint2 h4 = *(const uint2*)(hc + ((size_t)src * n_embd + d) * nb + b0);
+          v[src][0] = wmma::bf16_to_f32((uint16_t)(h4.x & 0xFFFFu));
+          v[src][1] = wmma::bf16_to_f32((uint16_t)(h4.x >> 16));
+          v[src][2] = wmma::bf16_to_f32((uint16_t)(h4.y & 0xFFFFu));
+          v[src][3] = wmma::bf16_to_f32((uint16_t)(h4.y >> 16));
+        }
+#pragma unroll
+        for (uint32_t dst = 0; dst < NH; ++dst) {
+          const float4 pv4 = *(const float4*)(post + (size_t)dst * nb + b0);
+          float acc[4] = {bv[0] * pv4.x, bv[1] * pv4.y, bv[2] * pv4.z, bv[3] * pv4.w};
+#pragma unroll
+          for (uint32_t src = 0; src < NH; ++src) {
+            const float4 cv4 = *(const float4*)(comb + (size_t)(dst + src * NH) * nb + b0);
+            acc[0] += cv4.x * v[src][0];
+            acc[1] += cv4.y * v[src][1];
+            acc[2] += cv4.z * v[src][2];
+            acc[3] += cv4.w * v[src][3];
+          }
+          const uint16_t h0 = wmma::f32_to_bf16(acc[0]);
+          const uint16_t h1 = wmma::f32_to_bf16(acc[1]);
+          const uint16_t h2 = wmma::f32_to_bf16(acc[2]);
+          const uint16_t h3 = wmma::f32_to_bf16(acc[3]);
+          *(uint2*)(out_hc + ((size_t)dst * n_embd + d) * nb + b0) =
+              make_uint2((uint32_t)h0 | ((uint32_t)h1 << 16), (uint32_t)h2 | ((uint32_t)h3 << 16));
+        }
+      } else {
+        const uint2 h4 = *(const uint2*)(out_hc + base_idx);
+        const uint16_t h0 = wmma::f32_to_bf16(wmma::bf16_to_f32((uint16_t)(h4.x & 0xFFFFu)) + bv[0]);
+        const uint16_t h1 = wmma::f32_to_bf16(wmma::bf16_to_f32((uint16_t)(h4.x >> 16)) + bv[1]);
+        const uint16_t h2 = wmma::f32_to_bf16(wmma::bf16_to_f32((uint16_t)(h4.y & 0xFFFFu)) + bv[2]);
+        const uint16_t h3 = wmma::f32_to_bf16(wmma::bf16_to_f32((uint16_t)(h4.y >> 16)) + bv[3]);
+        *(uint2*)(out_hc + base_idx) =
+            make_uint2((uint32_t)h0 | ((uint32_t)h1 << 16), (uint32_t)h2 | ((uint32_t)h3 << 16));
+      }
+    }
+  };
+
+  push_stage(0);
+  publish_stage(0);
+  for (int st = 1; st < stages; ++st) {
+    push_stage(st);
+    fold_stage(st - 1);
+    publish_stage(st);
+  }
+  fold_stage(stages - 1);
+}
+
 // Lossless 12.125-bit exponent-delta BF16 codec (R2) for 64-element groups across 8 adjacent
 // Wave32 lanes. Encodes normals within span <= 14 exponents + exact +-0.0 into 96 B/group + 1 B
 // base_exp, with 128 B raw BF16 fallback (base_exp == 0xFF) for subnormals, Inf/NaN, or wide
@@ -2545,6 +2744,100 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
 #undef AFF_TP_BHC_PRE
 #undef AFF_TP_BHC_REG
 #undef AFF_TP_BHC_EXP
+    AFF_HIP_CHECK(hipGetLastError());
+  }
+  return true;
+}
+
+inline bool prefill_fuse_ar_hc_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_PREFILL_FUSE_AR_HC");
+    return !v || !*v || !(v[0] == '0' && v[1] == '\0');
+  }();
+  return on;
+}
+
+bool tp_ar_fp8_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
+                               float* const block[kTpMaxRanks],
+                               const uint16_t* const hc[kTpMaxRanks],
+                               const float* const post[kTpMaxRanks],
+                               const float* const comb[kTpMaxRanks], uint32_t n_embd,
+                               uint32_t n_hc, uint32_t nb, bool has_control, int zb) {
+  if (!prefill_fuse_ar_hc_enabled()) return false;
+  if (!ctx.ready || ctx.ranks != 2 || !n_embd || !nb || (nb & 3u) != 0u) return false;
+  if (has_control && n_hc != 1u && n_hc != 2u && n_hc != 4u && n_hc != 8u) return false;
+
+  const char* env_mode = std::getenv("AFF_TP_AR_MODE");
+  if (env_mode && *env_mode && std::strcmp(env_mode, "fp8") != 0) return false;
+  if ((!env_mode || !*env_mode) && tp_ar_coded_enabled()) return false;
+
+  const size_t n_total = (size_t)n_embd * nb;
+  if (n_total > (size_t)INT32_MAX || n_total * sizeof(float) < kTpFp8MinBytes) return false;
+
+  if (!block || !block[0] || !block[1] || !out_hc || !out_hc[0] || !out_hc[1]) return false;
+  if ((((uintptr_t)block[0] | (uintptr_t)block[1]) & 15u) != 0u) return false;
+  if ((((uintptr_t)out_hc[0] | (uintptr_t)out_hc[1]) & 7u) != 0u) return false;
+  if (has_control) {
+    if (!hc || !hc[0] || !hc[1] || !post || !post[0] || !post[1] || !comb || !comb[0] || !comb[1])
+      return false;
+    if ((((uintptr_t)hc[0] | (uintptr_t)hc[1]) & 7u) != 0u) return false;
+    if ((((uintptr_t)post[0] | (uintptr_t)post[1]) & 15u) != 0u) return false;
+    if ((((uintptr_t)comb[0] | (uintptr_t)comb[1]) & 15u) != 0u) return false;
+  }
+
+  const size_t n_groups_total = (n_total + kTpFp8Group - 1u) / kTpFp8Group;
+  const size_t scale_off_total = (n_total + 15u) & ~size_t(15u);
+  const size_t need_bytes = scale_off_total + n_groups_total * sizeof(float);
+  if (need_bytes > ctx.scratch_peer_bytes) return false;
+
+  const int n = (int)n_total;
+  const int n_groups = (int)n_groups_total;
+  const int grid_nb = std::max(1, std::min((n_groups + 63) / 64, kTpMaxBlocks));
+  const int gw = (n_groups + grid_nb - 1) / grid_nb;
+  const int stages = (tp_ar_staged_enabled() && n_total * sizeof(float) >= kTpStagedMinBytes)
+                         ? std::min(tp_ar_fp8_stages_cfg(), gw)
+                         : 1;
+  const bool cache_stage = tp_ar_staged_cache_enabled();
+  const int slot_bytes = (int)ctx.scratch_peer_bytes;
+  const int scale_off = (int)scale_off_total;
+  const uint32_t ar_flags = tp_ar_flags_cfg();
+
+  tp_sync_on_grid_change(ctx, grid_nb);
+
+  for (size_t r = 0; r < 2; ++r) {
+    TpPush8<1> push{};
+    const size_t q = 1u - r;
+    push.base[0] = (unsigned char*)ctx.scratch[q];
+    push.flags[0] = ctx.flags[q];
+    push.wake[0] = ctx.flags[q] + kTpFlagStride;
+    set_device(ctx.dev[r]);
+    const hipStream_t st = (hipStream_t)ctx.stream[r];
+    const uint16_t* const hc_r = has_control ? hc[r] : nullptr;
+    const float* const post_r = has_control ? post[r] : nullptr;
+    const float* const comb_r = has_control ? comb[r] : nullptr;
+#define AFF_TP_FP8_HC_LAUNCH(NH_, CTL_, CS_)                                                       \
+  hipLaunchKernelGGL((tp_ar_fp8_hc_expand_kernel<NH_, CTL_, CS_>), dim3(grid_nb), dim3(256), 0,   \
+                     st, out_hc[r], block[r], hc_r, post_r, comb_r, push,                          \
+                     (const unsigned char*)ctx.scratch[r], ctx.flags[r], ctx.seq[r],               \
+                     ctx.timeout_dev, n_embd, nb, n, slot_bytes, scale_off, stages, zb, ar_flags)
+#define AFF_TP_FP8_HC_CS(NH_, CTL_)                                                                \
+  do {                                                                                             \
+    if (cache_stage) AFF_TP_FP8_HC_LAUNCH(NH_, CTL_, true);                                        \
+    else             AFF_TP_FP8_HC_LAUNCH(NH_, CTL_, false);                                       \
+  } while (0)
+    if (!has_control) {
+      AFF_TP_FP8_HC_CS(1u, false);
+    } else if (n_hc == 4u) {
+      AFF_TP_FP8_HC_CS(4u, true);
+    } else if (n_hc == 8u) {
+      AFF_TP_FP8_HC_CS(8u, true);
+    } else if (n_hc == 2u) {
+      AFF_TP_FP8_HC_CS(2u, true);
+    } else {
+      AFF_TP_FP8_HC_CS(1u, true);
+    }
+#undef AFF_TP_FP8_HC_CS
+#undef AFF_TP_FP8_HC_LAUNCH
     AFF_HIP_CHECK(hipGetLastError());
   }
   return true;

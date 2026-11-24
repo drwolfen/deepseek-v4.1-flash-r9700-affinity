@@ -843,6 +843,22 @@ inline bool idx_compact_alloc_enabled() {
   return on;
 }
 
+inline bool kv_fuse_batch_norm_prefill_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_FUSE_BATCH_KV_NORM_PREFILL");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool prefill_fuse_hc_q8_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_PREFILL_FUSE_HC_Q8");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
 inline uint32_t lmhead_fp8_max_t_cfg() {
   const char* v = std::getenv("AFF_LMHEAD_FP8_MAX_T");
   if (!v || !*v) return 16u;
@@ -5356,14 +5372,22 @@ bool DenseGpu::batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint
     } else {
       const bool v2_alias = dense_arena_alias_enabled() && dense_arena_alias_v2_enabled();
       float* const cur_dst = v2_alias ? nullptr : D.b_cur;
+      const bool fold = prefill_fuse_hc_q8_enabled() && ((n_embd & 127u) == 0u) &&
+                        q_slot(d, (uint32_t)n_embd);
       batch_hc_fused_hip(D.b_hc, D.b_mix, ctl ? D.vec[sv] : nullptr, ctl ? D.vec[bv] : nullptr,
                          nwp, D.b_pre, D.b_post, D.b_comb, cur_dst, D.b_norm, n_embd, n_hc, b_nb_,
                          iters, hc_eps, rms_eps, ctl ? 1 : 0, D.stream,
-                         shift_pre_ ? D.b_pre_prev : nullptr);
+                         shift_pre_ ? D.b_pre_prev : nullptr, fold ? D.q8 : nullptr,
+                         fold ? D.qs : nullptr);
       D.b_ar_precollapsed = false;
       D.b_ar_npart = 0;
-      D.q8_src = nullptr;
-      norm_q8_invalidate(D.id, D.b_norm);
+      D.q8_src = fold ? D.b_norm : nullptr;
+      if (fold) {
+        D.q8_act = D.q8; D.qs_act = D.qs; D.q_active_dim = n_embd;
+        norm_q8_publish(D.id, D.b_norm, D.q8, D.qs, n_embd, b_nb_);
+      } else {
+        norm_q8_invalidate(D.id, D.b_norm);
+      }
     }
     // Ping-pong b_pre and b_pre_prev on host instead of issuing D2D hipMemcpyAsync blits.
     if (shift_pre_ && ctl) std::swap(D.b_pre, D.b_pre_prev);
@@ -5408,7 +5432,8 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
                           width == kFlashWidth && (n_rot % 64u) == 0u &&
                           flash_q_e4m3_enabled();
   const bool defer_bkvn = kv_fuse_batch_norm_enabled() && attn_ok_ && a_ring_ &&
-                          b_nb_ <= kNarrowTok && width == a_width_ && n_rot == a_rot_ &&
+                          (b_nb_ <= kNarrowTok || kv_fuse_batch_norm_prefill_enabled()) &&
+                          width == a_width_ && n_rot == a_rot_ &&
                           width >= 256u && width <= 1024u && (width % 64u) == 0u &&
                           (n_rot % 2u) == 0u && n_rot <= width;
   if (!defer_bkvn && !ensure_b_kv(width)) { b_kvn_pending_ = false; return false; }
@@ -5622,6 +5647,7 @@ bool DenseGpu::batch_kv_commit(uint32_t layer, uint32_t b0, uint32_t n, uint32_t
     b_kvn_pending_ = false;
     return false;                      // a sub-batch may not lap its own ring
   }
+  bool any_fallback = false;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -5636,6 +5662,7 @@ bool DenseGpu::batch_kv_commit(uint32_t layer, uint32_t b0, uint32_t n, uint32_t
     if (!done) {
       if (!ensure_b_kv(width)) { b_kvn_pending_ = false; return false; }
       if (b_kvn_pending_ && b_kvn_src_[d] && b_kvn_nb_) {
+        any_fallback = true;
         batch_rms_norm_rope_hip(b_kvn_src_[d], b_kvn_w_[d], D.b_kv, width, n_rot, b_kvn_pos0_,
                                 b_kvn_rope_, b_kvn_eps_, b_kvn_nb_, D.stream);
       }
@@ -5643,6 +5670,7 @@ bool DenseGpu::batch_kv_commit(uint32_t layer, uint32_t b0, uint32_t n, uint32_t
                           width, n_rot, D.stream);
     }
   }
+  if (any_fallback) b_kvn_pending_ = false;
   return true;
 }
 
@@ -6879,6 +6907,7 @@ bool DenseGpu::batch_attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_
                               uint32_t n_rot, RopeDerived rope, uint32_t n_groups, uint64_t rank,
                               uint64_t hidden) {
   if (!b_nb_ || hwa < 0 || hwb < 0) return false;
+  b_kvn_pending_ = false;
   AFF_TRACE(26);
   if ((size_t)hwa >= ent_.size() || (size_t)hwb >= ent_.size()) return false;
   const Entry& A = ent_[hwa]; const Entry& B = ent_[hwb];
@@ -7015,6 +7044,36 @@ bool DenseGpu::batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
                        ((size_t)n_embd * b_live_ * sizeof(float) <= impl_->tp.scratch_peer_bytes) &&
                        (!has_control || n_hc == 1 || n_hc == 2 || n_hc == 4 || n_hc == 8);
   const bool ar = b_ar_pending_ != 0 && ar_fits;
+  if (!ar_fits && b_ar_pending_ == n_embd && b_nb_ > kNarrowTok && (b_nb_ & 3u) == 0u &&
+      impl_->tp.ready && impl_->dev.size() == 2 && !xrank_trace_enabled() &&
+      (!has_control || n_hc == 1 || n_hc == 2 || n_hc == 4 || n_hc == 8)) {
+    uint16_t* out_p[kTpMaxRanks] = {};
+    float* blk_p[kTpMaxRanks] = {};
+    const uint16_t* hc_p[kTpMaxRanks] = {};
+    const float* post_p[kTpMaxRanks] = {};
+    const float* comb_p[kTpMaxRanks] = {};
+    for (size_t d = 0; d < 2; ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      keepalive_notify_active(D.id);
+      out_p[d] = has_control ? (D.b_hc_next ? D.b_hc_next : D.b_hc) : D.b_hc;
+      blk_p[d] = D.b_block;
+      hc_p[d] = D.b_hc;
+      post_p[d] = D.b_post;
+      comb_p[d] = D.b_comb;
+    }
+    if (tp_ar_fp8_batch_hc_expand(impl_->tp, out_p, blk_p, hc_p, post_p, comb_p, n_embd, n_hc,
+                                  b_nb_, has_control, /*zb=*/1)) {
+      b_ar_pending_ = 0;
+      for (size_t d = 0; d < 2; ++d) {
+        Impl::Dev& D = impl_->dev[d];
+        if (has_control && D.b_hc_next) std::swap(D.b_hc, D.b_hc_next);
+        D.b_ar_precollapsed = false;
+        D.b_ar_npart = 0;
+      }
+      if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+      return true;
+    }
+  }
   if (b_ar_pending_ && !ar_fits) {
     float* p[kMaxRanks];
     for (size_t d = 0; d < impl_->dev.size(); ++d) p[d] = impl_->dev[d].b_block;

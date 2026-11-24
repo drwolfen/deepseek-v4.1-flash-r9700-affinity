@@ -223,6 +223,14 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
                            size_t pf_bytes1 = 0,
                            uint32_t pf_blocks = 0);
 
+// Fused 2-rank staged FP8-wire all-reduce + batch HC post/expand over full padded prefill blocks.
+bool tp_ar_fp8_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
+                               float* const block[kTpMaxRanks],
+                               const uint16_t* const hc[kTpMaxRanks],
+                               const float* const post[kTpMaxRanks],
+                               const float* const comb[kTpMaxRanks], uint32_t n_embd,
+                               uint32_t n_hc, uint32_t nb, bool has_control, int zb = 1);
+
 // Blocks until both ranks' streams are drained.
 void tp_sync(TpContext& ctx);
 

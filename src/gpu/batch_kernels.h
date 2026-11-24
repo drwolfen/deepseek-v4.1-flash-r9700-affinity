@@ -309,7 +309,8 @@ void batch_stage_col_hip(const float* src, float* dst, uint32_t n, uint32_t cap,
 void batch_hc_fused_hip(const uint16_t* hc, const float* mix, const float* scale, const float* base,
                         const float* nw, float* pre, float* post, float* comb, float* cur,
                         float* norm, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t iters,
-                        float hc_eps, float rms_eps, int has_control, void* stream, const float* pre_in);
+                        float hc_eps, float rms_eps, int has_control, void* stream,
+                        const float* pre_in, uint8_t* q8 = nullptr, float* qs = nullptr);
 
 // Dim chunks in the narrow form below, and therefore both its block count and the row count of the
 // partial plane the caller has to own. Here rather than beside the kernels because the arena that
