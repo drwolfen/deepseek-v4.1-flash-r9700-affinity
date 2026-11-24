@@ -72,7 +72,10 @@ inline bool moe_bucket_caps_enabled() { return env_default_on("AFF_MOE_BUCKET_CA
 inline bool hybrid_tile128_enabled() { return env_default_on("AFF_HYBRID_TILE128"); }
 } // namespace
 
-bool bonus_d2d_enabled() { return env_default_on("AFF_BONUS_D2D"); }
+bool bonus_d2d_enabled() {
+  const char* s = std::getenv("AFF_BONUS_D2D");
+  return s && *s && std::strcmp(s, "0") != 0;
+}
 
 struct StaticPlacement::Impl {
   // One big slab per card rather than 7000 small allocations: the expert stride is uniform, so a

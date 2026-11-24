@@ -132,7 +132,7 @@ struct PlacementEngineStats {
   uint64_t bonus_d2d_promotes = 0, bonus_d2d_demotes = 0, bonus_d2d_bytes = 0;
 };
 
-// Runtime toggle (`AFF_BONUS_D2D`, default ON unless "0") for GPU bonus_slab D2D promote/evict.
+// Runtime toggle (`AFF_BONUS_D2D`, default OFF unless "1") for GPU bonus_slab D2D promote/evict.
 bool bonus_d2d_enabled();
 
 // What placement DID, not what dispatch is doing. Every field here is written once, by init().

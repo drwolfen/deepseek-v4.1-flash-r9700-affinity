@@ -416,12 +416,12 @@ __device__ __forceinline__ uint2 load_uint2_nt(
 #endif
 #endif
 
-// Host-cached gate for non-temporal loads on read-once decode weight/scale streams (default ON
-// unless `AFF_DENSE_NT_LOAD=0`).
+// Host-cached gate for non-temporal loads on dense/GEMV decode weight/scale streams (default OFF
+// to preserve gfx1201 64 MiB MALL + 8 MiB L2 reuse; opt-in with `AFF_DENSE_NT_LOAD=1`).
 inline bool dense_nt_load_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("AFF_DENSE_NT_LOAD");
-    return !s || !*s || (s[0] != '0' || s[1] != '\0');
+    return s && *s && !(s[0] == '0' && s[1] == '\0');
   }();
   return on;
 }
