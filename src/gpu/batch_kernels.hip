@@ -2321,9 +2321,9 @@ __global__ __launch_bounds__(kTokPerBlk * kBlkStripe) void batch_rms_norm_rope_k
   if (live)
     for (uint32_t i = s; i < n; i += kBlkStripe)
       out[(size_t)i * nb + b] = x[(size_t)i * nb + b] * inv * (w ? w[i] : 1.0f);
-  // Reached by every thread: the rotation below reads pairs another stripe just wrote, and a
-  // barrier some lanes skip is undefined rather than merely wrong.
-  aff::lds_barrier();
+  // Reached by every thread: the rotation below reads pairs another stripe just wrote to global,
+  // and a barrier some lanes skip or one that only orders LDS is unsafe across waves.
+  __syncthreads();
   if (!live) return;
   float* p = out + (size_t)(n - n_rot) * nb + b;
   for (uint32_t k = s; k < n_rot / 2; k += kBlkStripe)

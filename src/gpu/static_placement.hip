@@ -64,7 +64,11 @@ inline bool env_default_on(const char* name) {
 }
 inline bool batch_arena_alias_enabled() { return env_default_on("AFF_BATCH_ARENA_ALIAS"); }
 inline bool skip_bounce_pin_enabled() { return env_default_on("AFF_SKIP_BOUNCE_PIN"); }
-inline bool mover_ev_wait_enabled() { return env_default_on("AFF_MOVER_EV_WAIT"); }
+inline bool mover_ev_wait_enabled() {
+  const char* s = std::getenv("AFF_MOVER_EV_WAIT");
+  return s && *s && std::strcmp(s, "0") != 0;
+}
+inline bool moe_bucket_caps_enabled() { return env_default_on("AFF_MOE_BUCKET_CAPS"); }
 inline bool hybrid_tile128_enabled() { return env_default_on("AFF_HYBRID_TILE128"); }
 } // namespace
 
@@ -1104,7 +1108,7 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     const uint64_t bound = (uint64_t)batch_tok * k;
     const uint32_t inter_shard = (tp_parts_ > 1) ? shard_.rows[0] : inter;
     uint32_t n_tiles_init = 0;
-    if (mover_ev_wait_enabled()) {
+    if (moe_bucket_caps_enabled()) {
       uint32_t gcap[8] = {};
       n_tiles_init =
           aff::moe_plan_bucket_caps(batch_tok, k, n_expert, hybrid_tile128_enabled(), gcap);
@@ -2136,7 +2140,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         // that has not seen the routing cannot know where a packed class would start. `tile_cap` is
         // a function of nb_tok, k and n_expert, all of which it does know.
         const bool hybrid_tile128 = hybrid_tile128_enabled();
-        const bool use_bucket_caps = mover_ev_wait_enabled();
+        const bool use_bucket_caps = moe_bucket_caps_enabled();
         uint32_t gcap[8] = {}, goff[8] = {};
         uint32_t cap = 0, plane_tiles = 0;
         if (use_bucket_caps) {

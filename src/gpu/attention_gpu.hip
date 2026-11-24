@@ -576,7 +576,7 @@ __device__ __forceinline__ void row_scale(float* s_abs, float* s_scale, uint32_t
   if (i == 0) {
     float a = 0.0f;
     for (uint32_t g = 0; g < n_grp; ++g) a = fmaxf(a, s_scale[g]);
-    const float sc = exp2f(ceilf(log2f(fmaxf(a, 1e-6f) / 448.0f)));
+    const float sc = exp2f(ceilf(log2f(fmaxf(a, 1e-4f) / 448.0f)));
     s_scale[n_grp] = sc;
     *(float*)(slot + width) = sc;
   }
@@ -670,27 +670,47 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
 
   float v;
   if (Norm) {
-    float* red = s_abs + width;                     // 32 more floats; the launcher adds them
-    constexpr uint32_t kNT = 256;                   // rms_norm_rope_kernel's blockDim, exactly
-    if (i < kNT) {
-      float acc = 0.0f;
-      for (uint32_t j = i; j < width; j += kNT) {
-        const float f = kv[(size_t)j * nb + b0 + t];
-        acc += f * f;
+    float* red = s_abs + width;                     // 64 more floats; the launcher adds them
+    const float kv_i = (i < width) ? kv[(size_t)i * nb + b0 + t] : 0.0f;
+    if (nb == 1u) {
+      constexpr uint32_t kNT = 256;                 // rms_norm_rope_kernel's blockDim, exactly
+      if (i < kNT) {
+        float acc = 0.0f;
+        for (uint32_t j = i; j < width; j += kNT) {
+          const float f = kv[(size_t)j * nb + b0 + t];
+          acc += f * f;
+        }
+        acc = wave_reduce_add_dpp(acc);
+        if (lane == 0u) red[wave] = acc;
       }
-      acc = wave_reduce_add_dpp(acc);
-      if (lane == 0u) red[wave] = acc;
-    }
-    lds_barrier();
-    if (i == 0) {
-      float s = 0.0f;
-      for (uint32_t k = 0; k < kNT / 32u; ++k) s += red[k];
-      red[0] = rsqrtf(s / (float)width + nrm.eps);
+      lds_barrier();
+      if (i == 0u) {
+        float s = 0.0f;
+        for (uint32_t k = 0; k < kNT / 32u; ++k) s += red[k];
+        red[0] = rsqrtf(s / (float)width + nrm.eps);
+      }
+    } else {
+      if (i < width) s_abs[i] = kv_i;
+      lds_barrier();
+      if (i < 64u) {
+        float acc = 0.0f;
+        for (uint32_t j = i; j < width; j += 64u) {
+          const float f = s_abs[j];
+          acc += f * f;
+        }
+        red[i] = acc;
+      }
+      lds_barrier();
+      if (i == 0u) {
+        float s = 0.0f;
+        for (uint32_t k = 0; k < 64u; ++k) s += red[k];
+        red[0] = rsqrtf(s / (float)width + nrm.eps);
+      }
     }
     lds_barrier();
     const float inv = red[0];
     if (i < width)
-      s_abs[i] = kv[(size_t)i * nb + b0 + t] * inv * (nrm.w ? nrm.w[i] : 1.0f);
+      s_abs[i] = kv_i * inv * (nrm.w ? nrm.w[i] : 1.0f);
     lds_barrier();
     if (i < nope) {
       v = s_abs[i];
@@ -735,7 +755,7 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
     if (lane == 0u) s_wmax2[wave] = wmax;
     lds_barrier();
     const float rmax = wave_reduce_max_dpp((lane < n_waves) ? s_wmax2[lane] : 0.0f);
-    const float sc = exp2f(ceilf(log2f(fmaxf(rmax, 1e-6f) / 448.0f)));
+    const float sc = exp2f(ceilf(log2f(fmaxf(rmax, 1e-4f) / 448.0f)));
     if (i == 0u) *(float*)(slot + width) = sc;
     if (i < width) slot[i] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v / sc)));
     return;
@@ -826,7 +846,7 @@ bool kv_norm_commit_batch_hip(KvDtype d, const float* latent, const float* nw, f
       n_rot > width) {
     return false;
   }
-  const size_t lds = ((size_t)width + 32u) * sizeof(float);
+  const size_t lds = ((size_t)width + 64u) * sizeof(float);
   const dim3 g(n), b(width);
   hipStream_t st = (hipStream_t)stream;
   const uint32_t nope = width - n_rot;

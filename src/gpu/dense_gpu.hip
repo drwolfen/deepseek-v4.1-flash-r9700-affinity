@@ -4371,7 +4371,6 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
                   sizeof(float))
                : ((size_t)b_u_cap_ * nb * sizeof(float));
   b_kv_width_ = (uint32_t)width;
-  const bool fuse_kv = kv_fuse_batch_norm_enabled();
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -4392,7 +4391,7 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       {&D.b_emb, emb_aliases_y ? 0u : ((size_t)n_embd * nb * sizeof(float)),
        emb_aliases_y ? 0ull : n_embd, "emb"},
       {&D.b_q, (size_t)nq * nb * sizeof(float), nq, "q"},
-      {&D.b_kv, fuse_kv ? 0u : ((size_t)width * nb * sizeof(float)), fuse_kv ? 0ull : width, "kv"},
+      {&D.b_kv, (size_t)width * nb * sizeof(float), width, "kv"},
       // One float a head a token: the per-head RMS scale; omitted when no_qrms_ (V4.1).
       {&D.b_hinv, no_qrms_ ? 0u : ((size_t)(nq / width) * nb * sizeof(float)),
        no_qrms_ ? 0ull : (nq / width), "hinv"},
@@ -5181,9 +5180,9 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
                           width == kFlashWidth && (n_rot % 64u) == 0u &&
                           flash_q_e4m3_enabled();
   const bool defer_bkvn = kv_fuse_batch_norm_enabled() && attn_ok_ && a_ring_ &&
-                          width == a_width_ && n_rot == a_rot_ && width >= 256u &&
-                          width <= 1024u && (width % 64u) == 0u && (n_rot % 2u) == 0u &&
-                          n_rot <= width;
+                          b_nb_ <= kNarrowTok && width == a_width_ && n_rot == a_rot_ &&
+                          width >= 256u && width <= 1024u && (width % 64u) == 0u &&
+                          (n_rot % 2u) == 0u && n_rot <= width;
   if (!defer_bkvn && !ensure_b_kv(width)) { b_kvn_pending_ = false; return false; }
 
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
