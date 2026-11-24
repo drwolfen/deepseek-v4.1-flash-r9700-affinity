@@ -490,6 +490,9 @@ impl AffSam {
     pub fn push_slice(&mut self, slice: &[u32]) {
         self.tokens.reserve(slice.len());
         self.step_meta.reserve(slice.len());
+        self.states.reserve(slice.len().saturating_mul(2));
+        self.undo_ops.reserve(slice.len().saturating_mul(8));
+        self.stats_undo.reserve(slice.len().saturating_mul(8));
         for &tok in slice {
             self.push(tok);
         }

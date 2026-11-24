@@ -528,9 +528,42 @@ __device__ inline NarrowPlanLds narrow_plan_lds(char* raw, uint32_t n_expert, ui
   return L;
 }
 
-template <bool Decode16>
+inline bool moe_plan_fast_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_MOE_PLAN_FAST");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool actring_fast_rel_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_ACTRING_FAST_REL");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
+__device__ __forceinline__ void actring_publish_head(unsigned long long* head_ptr,
+                                                     unsigned long long next_head,
+                                                     bool fast_act_rel) {
+  __syncthreads();
+  if (!threadIdx.x) {
+    if (fast_act_rel) {
+#ifdef __HIP_DEVICE_COMPILE__
+      asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#endif
+      __hip_atomic_store(head_ptr, next_head, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    } else {
+      __threadfence_system();
+      *head_ptr = next_head;
+    }
+  }
+}
+
+template <bool Decode16, bool FastPlan = false>
 __global__ __launch_bounds__(kNarrowThreads) void moe_plan_narrow_kernel(
-    MoePlanArgs a, uint32_t last_group) {
+    MoePlanArgs a, uint32_t last_group, bool fast_act_rel) {
   extern __shared__ char raw[];
   __shared__ uint32_t s_slot_col[kMoePlanNarrowMaxSlots];
   __shared__ uint32_t s_nres, s_npool, s_taken;
@@ -586,13 +619,23 @@ __global__ __launch_bounds__(kNarrowThreads) void moe_plan_narrow_kernel(
   aff::lds_barrier();
 
   for (uint32_t j = tid; j < n_uniq; j += kNarrowThreads) L.start[j] = L.counts[L.uniq[j]];
-  for (uint32_t j = n_uniq + tid; j < NE; j += kNarrowThreads) L.start[j] = 0u;
-  aff::lds_barrier();
-  wg_excl_scan<kNarrowWaves>(L.start, L.tmp, NE, 1u);
-  for (uint32_t j = tid; j < n_uniq; j += kNarrowThreads) L.tmp[L.uniq[j]] = L.start[j];
-  aff::lds_barrier();
-  for (uint32_t e = tid; e < NE; e += kNarrowThreads) L.start[e] = L.tmp[e];
-  aff::lds_barrier();
+  if constexpr (FastPlan && Decode16) {
+    const uint32_t scan_n = n_uniq ? n_uniq : 1u;
+    for (uint32_t j = n_uniq + tid; j < scan_n; j += kNarrowThreads) L.start[j] = 0u;
+    aff::lds_barrier();
+    wg_excl_scan<kNarrowWaves>(L.start, L.tmp, scan_n, 1u);
+    for (uint32_t j = tid; j < n_uniq; j += kNarrowThreads) L.tmp[L.uniq[j]] = L.start[j];
+    aff::lds_barrier();
+  } else {
+    for (uint32_t j = n_uniq + tid; j < NE; j += kNarrowThreads) L.start[j] = 0u;
+    aff::lds_barrier();
+    wg_excl_scan<kNarrowWaves>(L.start, L.tmp, NE, 1u);
+    for (uint32_t j = tid; j < n_uniq; j += kNarrowThreads) L.tmp[L.uniq[j]] = L.start[j];
+    aff::lds_barrier();
+    for (uint32_t e = tid; e < NE; e += kNarrowThreads) L.start[e] = L.tmp[e];
+    aff::lds_barrier();
+  }
+  uint32_t* const s_exp_start = (FastPlan && Decode16) ? L.tmp : L.start;
 
   // ---- C. single-group arena column, staged into LDS slot_col[384] -------------------------------
   for (uint32_t i = tid; i < TOTAL; i += kNarrowThreads) {
@@ -609,7 +652,7 @@ __global__ __launch_bounds__(kNarrowThreads) void moe_plan_narrow_kernel(
       continue;
     }
     const unsigned long long below = L.gm[e] & ((1ull << t) - 1ull);
-    const uint32_t col = L.start[e] + (uint32_t)__popcll(below);
+    const uint32_t col = s_exp_start[e] + (uint32_t)__popcll(below);
     s_slot_col[i] = col;
     a.slot_col[i] = col;
     a.tok[col] = t;
@@ -620,57 +663,89 @@ __global__ __launch_bounds__(kNarrowThreads) void moe_plan_narrow_kernel(
   // Pure LDS barrier: Phases D and E read s_slot_col from LDS instead of draining global stores.
   aff::lds_barrier();
 
-  // ---- D. run: the per-token slot prefix ---------------------------------------------------------
-  if (tid < NB) {
-    uint32_t n = 0u;
-    for (uint32_t j = 0u; j < K; ++j)
-      if (s_slot_col[tid * K + j] != kNone) ++n;
-    L.run[tid] = n;
-  } else if (tid == NB) {
-    L.run[NB] = 0u;
-  }
-  aff::lds_barrier();
-  wg_excl_scan<kNarrowWaves>(L.run, L.tmp, NB + 1u, 1u);
-  if (tid <= NB) a.run[tid] = L.run[tid];
-
-  // ---- E. ord: each token's slots in ascending column --------------------------------------------
-  if (tid < NB) {
-    uint32_t c[kMoePlanMaxK], n = 0u;
-    for (uint32_t j = 0u; j < K; ++j) {
-      const uint32_t v = s_slot_col[tid * K + j];
-      if (v == kNone) continue;
-      uint32_t m = n++;
-      while (m && c[m - 1u] > v) { c[m] = c[m - 1u]; --m; }
-      c[m] = v;
+  // ---- D & E. run + ord --------------------------------------------------------------------------
+  if constexpr (FastPlan && Decode16) {
+    // NB <= 16 fits inside Wave 0; compute per-token prefix sum and sorted slot order in registers
+    // with zero extra LDS barriers.
+    if (tid < NB) {
+      uint32_t c[kMoePlanMaxK], n = 0u;
+      for (uint32_t j = 0u; j < K; ++j) {
+        const uint32_t v = s_slot_col[tid * K + j];
+        if (v == kNone) continue;
+        uint32_t m = n++;
+        while (m && c[m - 1u] > v) { c[m] = c[m - 1u]; --m; }
+        c[m] = v;
+      }
+      uint32_t inc = n;
+      #pragma unroll
+      for (uint32_t d = 1u; d <= 8u; d <<= 1) {
+        const uint32_t up = __shfl_up(inc, d, 32);
+        if ((tid & 31u) >= d) inc += up;
+      }
+      const uint32_t base = inc - n;
+      a.run[tid] = base;
+      if (tid + 1u == NB) a.run[NB] = inc;
+      for (uint32_t m = 0u; m < n; ++m) a.ord[base + m] = c[m];
     }
-    const uint32_t base = L.run[tid];
-    for (uint32_t m = 0u; m < n; ++m) a.ord[base + m] = c[m];
+  } else {
+    if (tid < NB) {
+      uint32_t n = 0u;
+      for (uint32_t j = 0u; j < K; ++j)
+        if (s_slot_col[tid * K + j] != kNone) ++n;
+      L.run[tid] = n;
+    } else if (tid == NB) {
+      L.run[NB] = 0u;
+    }
+    aff::lds_barrier();
+    wg_excl_scan<kNarrowWaves>(L.run, L.tmp, NB + 1u, 1u);
+    if (tid <= NB) a.run[tid] = L.run[tid];
+
+    // ---- E. ord: each token's slots in ascending column ------------------------------------------
+    if (tid < NB) {
+      uint32_t c[kMoePlanMaxK], n = 0u;
+      for (uint32_t j = 0u; j < K; ++j) {
+        const uint32_t v = s_slot_col[tid * K + j];
+        if (v == kNone) continue;
+        uint32_t m = n++;
+        while (m && c[m - 1u] > v) { c[m] = c[m - 1u]; --m; }
+        c[m] = v;
+      }
+      const uint32_t base = L.run[tid];
+      for (uint32_t m = 0u; m < n; ++m) a.ord[base + m] = c[m];
+    }
   }
 
   // ---- F. tiles (active buckets only) ------------------------------------------------------------
-  aff::lds_barrier();
-  for (uint32_t i = tid; i < kTcRows * NE; i += kNarrowThreads) L.tc[i] = 0u;
-  aff::lds_barrier();
-  for (uint32_t j = tid; j < n_uniq; j += kNarrowThreads) {
-    const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
-    if constexpr (Decode16) {
-      L.tc[cls * NE + j] = 1u;
-      atomicAdd(&s_gtot[cls * 4u], 1u);
-    } else {
-      const uint32_t q = c / kExpertWmmaTok, r = c % kExpertWmmaTok;
-      if (q) {
-        L.tc[(cls * 3u + 2u) * NE + j] += q;
-        atomicAdd(&s_gtot[cls * 4u + 2u], q);
-      }
-      if (r) {
-        const uint32_t b = plan_bucket(r);
-        L.tc[(cls * 3u + b) * NE + j] += 1u;
-        atomicAdd(&s_gtot[cls * 4u + b], 1u);
+  if constexpr (FastPlan && Decode16) {
+    if (!tid) {
+      s_gtot[0] = n_res;
+      s_gtot[4] = n_uniq - n_res;
+    }
+  } else {
+    aff::lds_barrier();
+    for (uint32_t i = tid; i < kTcRows * NE; i += kNarrowThreads) L.tc[i] = 0u;
+    aff::lds_barrier();
+    for (uint32_t j = tid; j < n_uniq; j += kNarrowThreads) {
+      const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
+      if constexpr (Decode16) {
+        L.tc[cls * NE + j] = 1u;
+        atomicAdd(&s_gtot[cls * 4u], 1u);
+      } else {
+        const uint32_t q = c / kExpertWmmaTok, r = c % kExpertWmmaTok;
+        if (q) {
+          L.tc[(cls * 3u + 2u) * NE + j] += q;
+          atomicAdd(&s_gtot[cls * 4u + 2u], q);
+        }
+        if (r) {
+          const uint32_t b = plan_bucket(r);
+          L.tc[(cls * 3u + b) * NE + j] += 1u;
+          atomicAdd(&s_gtot[cls * 4u + b], 1u);
+        }
       }
     }
+    aff::lds_barrier();
+    wg_excl_scan<kNarrowWaves>(L.tc, L.tmp, NE, kTcRows);
   }
-  aff::lds_barrier();
-  wg_excl_scan<kNarrowWaves>(L.tc, L.tmp, NE, kTcRows);
 
   const uint32_t cap = a.tile_cap;
   const bool custom_caps = a.plane_stride > 0u;
@@ -701,16 +776,17 @@ __global__ __launch_bounds__(kNarrowThreads) void moe_plan_narrow_kernel(
       }
     };
     if constexpr (Decode16) {
-      emit(cls * 4u, L.tc[cls * NE + j], L.start[e], c);
+      const uint32_t slot = FastPlan ? (cls == 0u ? j : (j - n_res)) : L.tc[cls * NE + j];
+      emit(cls * 4u, slot, s_exp_start[e], c);
     } else {
       const uint32_t q = c / kExpertWmmaTok, r = c % kExpertWmmaTok;
       const uint32_t sf = L.tc[(cls * 3u + 2u) * NE + j];
       for (uint32_t i = 0u; i < q; ++i)
-        emit(cls * 4u + 2u, sf + i, L.start[e] + i * kExpertWmmaTok, kExpertWmmaTok);
+        emit(cls * 4u + 2u, sf + i, s_exp_start[e] + i * kExpertWmmaTok, kExpertWmmaTok);
       if (r) {
         const uint32_t b = plan_bucket(r);
         const uint32_t at = L.tc[(cls * 3u + b) * NE + j] + (b == 2u ? q : 0u);
-        emit(cls * 4u + b, at, L.start[e] + q * kExpertWmmaTok, r);
+        emit(cls * 4u + b, at, s_exp_start[e] + q * kExpertWmmaTok, r);
       }
     }
   }
@@ -788,28 +864,21 @@ __global__ __launch_bounds__(kNarrowThreads) void moe_plan_narrow_kernel(
         rec->entries[pos].exp = (uint16_t)(kNarrowThreads + tid);
         rec->entries[pos].cnt = (uint16_t)(cnt1 > 65535u ? 65535u : cnt1);
       }
-      // Global/system stores to rec->entries must drain before thread 0 issues __threadfence_system().
-      __syncthreads();
-      if (!tid) {
-        __threadfence_system();
-        a.act->head = h + 1ull;
-      }
+      // Global/system stores to rec->entries must drain before thread 0 issues sys-release head.
+      actring_publish_head(&a.act->head, h + 1ull, fast_act_rel);
     } else {
       aff::lds_barrier();
       const unsigned long long h = s_head;
       ActRecord* const rec = &a.act->slot[h % kActSlots];
       for (uint32_t e = tid; e < kActExperts; e += kNarrowThreads)
         rec->counts[e] = e < NE ? L.counts[e] : 0u;
-      // Global/system stores to rec->counts must drain before thread 0 issues __threadfence_system().
-      __syncthreads();
       if (!tid) {
         rec->layer = a.layer;
         rec->mode = 0u;
         rec->count = n_act;
         rec->pad = 0u;
-        __threadfence_system();
-        a.act->head = h + 1ull;
       }
+      actring_publish_head(&a.act->head, h + 1ull, fast_act_rel);
     }
   }
   if (!tid) {
@@ -882,12 +951,23 @@ bool moe_plan_hip(const MoePlanArgs& a, void* stream) {
     constexpr size_t kNarrowStaticLds = kMoePlanNarrowMaxSlots * sizeof(uint32_t) + 256u;
     if (dyn_lds + kNarrowStaticLds <= device_lds_per_block()) {
       const uint32_t last_res = moe_plan_last_group(a.nb_tok);
+      const bool fast_rel = actring_fast_rel_enabled();
       if (a.nb_tok <= 16u) {
-        hipLaunchKernelGGL((moe_plan_narrow_kernel<true>), dim3(1), dim3(kNarrowThreads), dyn_lds,
-                           (hipStream_t)stream, a, last_res);
+        if (moe_plan_fast_enabled()) {
+          hipLaunchKernelGGL((moe_plan_narrow_kernel<true, true>), dim3(1), dim3(kNarrowThreads),
+                             dyn_lds, (hipStream_t)stream, a, last_res, fast_rel);
+        } else {
+          hipLaunchKernelGGL((moe_plan_narrow_kernel<true, false>), dim3(1), dim3(kNarrowThreads),
+                             dyn_lds, (hipStream_t)stream, a, last_res, fast_rel);
+        }
       } else {
-        hipLaunchKernelGGL((moe_plan_narrow_kernel<false>), dim3(1), dim3(kNarrowThreads), dyn_lds,
-                           (hipStream_t)stream, a, last_res);
+        if (moe_plan_fast_enabled()) {
+          hipLaunchKernelGGL((moe_plan_narrow_kernel<false, true>), dim3(1), dim3(kNarrowThreads),
+                             dyn_lds, (hipStream_t)stream, a, last_res, fast_rel);
+        } else {
+          hipLaunchKernelGGL((moe_plan_narrow_kernel<false, false>), dim3(1), dim3(kNarrowThreads),
+                             dyn_lds, (hipStream_t)stream, a, last_res, fast_rel);
+        }
       }
       return hipGetLastError() == hipSuccess;   // amdnas-fixes: an unbuilt plan must not be dispatched
     }

@@ -913,6 +913,14 @@ private:
   Stats stats_{};
 };
 
+inline bool suffix_gate_v2_enabled() {
+  static const bool on = [] {
+    const char* s = std::getenv("AFF_SUFFIX_GATE_V2");
+    return !s || !*s || std::strcmp(s, "0") != 0;
+  }();
+  return on;
+}
+
 // Utility- and acceptance-aware gate controlling whether SuffixDecoding preempts
 // the GPU DSpark drafter on a block. Tracks empirical suffix acceptance EMA and
 // exponential miss cooldown so prose streams stay on DSpark while code/structured
@@ -922,39 +930,53 @@ struct SuffixGate {
   uint32_t miss_streak = 0;
   uint32_t cooldown = 0;
   uint32_t steps = 0;
+  uint32_t good_steps = 0;
+  bool last_rejected = false;
 
   void reset() noexcept {
     acc_ema = 0.90f;
     miss_streak = 0;
     cooldown = 0;
     steps = 0;
+    good_steps = 0;
+    last_rejected = false;
   }
+
+  void observe_dspark() noexcept { last_rejected = false; }
 
   bool should_preempt(const SuffixDraftIndex::Proposal& prop, int min_match, float min_expect,
                       bool dspark_active, float dspark_exp_acc, float dspark_cost_ms,
                       float sfx_cost_ms, float min_gain = 1.05f) noexcept {
     if (prop.n < min_match || prop.expect < min_expect) return false;
+    const bool v2 = suffix_gate_v2_enabled();
     if (dspark_active) {
       // Never let bare 4-token (min_match) or cold 5-token collisions preempt GPU DSpark;
       // require a strong exact anchor (>= min_match + 2) to enter suffix mode, or
       // >= min_match + 1 once a proven high-acceptance streak is active.
-      const int req_match = (steps > 0 && miss_streak == 0 && acc_ema >= 0.80f)
-                                ? (min_match + 1)
-                                : (min_match + 2);
+      // After a rejected suffix block (edit boundary), require a stronger >= min_match + 6 anchor
+      // so short collisions skip cleanly onto one DSpark block before verbatim matching resumes.
+      int req_match = (steps > 0 && miss_streak == 0 && acc_ema >= 0.80f)
+                          ? (min_match + 1)
+                          : (min_match + 2);
+      if (v2 && last_rejected) req_match = std::max(req_match, min_match + 6);
       if (prop.match_len < req_match) {
         if (cooldown > 0) --cooldown;
         return false;
       }
     }
+    const bool proven_verbatim_relock =
+        v2 && good_steps >= 2u && prop.match_len >= 12 && prop.n >= 8 && prop.expect >= 8.0f;
     if (cooldown > 0) {
-      if (prop.match_len >= min_match + 2 && prop.n >= min_match + 2 && acc_ema >= 0.65f) {
+      if (proven_verbatim_relock ||
+          (prop.match_len >= min_match + 2 && prop.n >= min_match + 2 && acc_ema >= 0.65f)) {
         cooldown = 0;
       } else {
         --cooldown;
         return false;
       }
     }
-    const float eff_expect = prop.expect * acc_ema;
+    const float eff_acc = proven_verbatim_relock ? std::max(acc_ema, 0.85f) : acc_ema;
+    const float eff_expect = prop.expect * eff_acc;
     if (eff_expect < min_expect) return false;
     if (!dspark_active) return true;
     if (eff_expect <= dspark_exp_acc) return false;
@@ -965,9 +987,13 @@ struct SuffixGate {
 
   void observe(uint32_t nd, uint32_t k) noexcept {
     if (nd == 0) return;
+    const bool v2 = suffix_gate_v2_enabled();
     const float rate = static_cast<float>(k) / static_cast<float>(nd);
-    acc_ema = 0.55f * acc_ema + 0.45f * rate;
+    const float alpha = (v2 && good_steps >= 3u && miss_streak == 0u) ? 0.25f : 0.45f;
+    acc_ema = (1.0f - alpha) * acc_ema + alpha * rate;
     ++steps;
+    last_rejected = (k < nd && k * 2u >= nd);
+    if (k >= 4u && (k * 2u >= nd)) ++good_steps;
     if (k < 2u || (k * 2u < nd)) {
       ++miss_streak;
       cooldown = std::min<uint32_t>(16u, 2u << std::min<uint32_t>(miss_streak - 1u, 3u));

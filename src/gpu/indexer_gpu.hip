@@ -1721,13 +1721,25 @@ bool idx_cand_gather_enabled() {
   return !s || !*s || std::strcmp(s, "0") != 0;
 }
 
+inline uint32_t idx_narrow_max_nb() {
+  static const uint32_t cap = []() -> uint32_t {
+    const char* narrow_env = std::getenv("AFF_IDX_NARROW");
+    if (narrow_env && *narrow_env && std::strcmp(narrow_env, "0") == 0) return 1u;
+    const char* max_env = std::getenv("AFF_IDX_NARROW_MAX_NB");
+    if (!max_env || !*max_env) return 16u;
+    char* end = nullptr;
+    const long x = std::strtol(max_env, &end, 10);
+    if (end == max_env) return 16u;
+    return (uint32_t)(x < 1L ? 1L : (x > 16L ? 16L : x));
+  }();
+  return cap;
+}
+
 void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, const float* ks,
                         const float* hw, float* out, uint32_t nb, uint32_t n_keys,
                         uint32_t n_head, void* stream) {
   if (!nb || !n_keys || !n_head) return;
-  const char* narrow_env = std::getenv("AFF_IDX_NARROW");
-  const bool idx_narrow = !(narrow_env && *narrow_env && std::strcmp(narrow_env, "0") == 0);
-  const uint32_t dec_max_nb = idx_narrow ? 8u : 1u;
+  const uint32_t dec_max_nb = idx_narrow_max_nb();
   if (nb <= dec_max_nb && n_head <= kIdxDecHeads && (n_head % 16u) == 0u) {
     const uint32_t kpb = kWaves * 16u;                // 64 keys a block
     const char* mt_env = std::getenv("AFF_IDX_DEC_MULTITOK");
@@ -1824,9 +1836,7 @@ void indexer_scores_cand_hip(const uint8_t* q8, const float* qs, const uint8_t* 
   const uint32_t eff_blocks = cand_max_blocks < cand_stride ? cand_max_blocks : cand_stride;
   const uint32_t n_cand_max = eff_blocks * cand_block;
   if (!n_cand_max) return;
-  const char* narrow_env = std::getenv("AFF_IDX_NARROW");
-  const bool idx_narrow = !(narrow_env && *narrow_env && std::strcmp(narrow_env, "0") == 0);
-  const uint32_t dec_max_nb = idx_narrow ? 8u : 1u;
+  const uint32_t dec_max_nb = idx_narrow_max_nb();
   const bool exact_head_order = !(nb <= dec_max_nb && n_head <= kIdxDecHeads && (n_head % 16u) == 0u);
   constexpr uint32_t kpb = kWaves * 16u;
   const uint32_t gx = (n_cand_max + kpb - 1u) / kpb;

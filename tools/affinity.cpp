@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <dirent.h>
+#include <future>
 #include <thread>
 #include <random>
 #include <cstdio>
@@ -2224,6 +2225,16 @@ int main(int argc, char** argv) {
     const char* s = std::getenv("AFF_PERSIST_SPEC_EMA");
     return s && *s && std::strcmp(s, "0") != 0;
   }();
+  auto launch_suffix_acquire = [&](const std::vector<uint32_t>& seq, const SamplerConfig* sc_opt)
+      -> std::future<aff::SuffixSessionPool::Lease> {
+    const char* v = std::getenv("AFF_DRAFT_SUFFIX");
+    const bool draft_sfx_on = !(v && *v && std::strcmp(v, "0") == 0);
+    const bool need = draft_sfx_on || (sc_opt && sc_opt->dry_delta > 0.0f && sc_opt->dry_ngram > 0);
+    if (!need || seq.size() < 256u) return {};
+    return std::async(std::launch::async, [&suffix_pool, seq]() {
+      return suffix_pool.acquire(seq, 1ull);
+    });
+  };
   // `emit` takes each accepted token and returns false to stop. Returns how many were emitted.
   auto spec_decode = [&](uint32_t slot, SeqState& st, const Model::BlockOut& seed_blk, uint32_t first,
                          std::vector<uint32_t>& hist, uint32_t max_new, bool ignore_eos_,
@@ -2236,7 +2247,8 @@ int main(int argc, char** argv) {
                          ThinkingBudget* budget = nullptr,
                          const std::function<bool()>& check_think_closed = nullptr,
                          const std::function<void(uint32_t)>& on_think_ckpt = nullptr,
-                         const size_t* dry_floor = nullptr) -> uint32_t {
+                         const size_t* dry_floor = nullptr,
+                         std::future<aff::SuffixSessionPool::Lease>* pre_sfx_fut = nullptr) -> uint32_t {
     const uint32_t B = dspark_on ? c.dspark_block : 0u;
     const bool draft_on = dspark_on && c.dspark_block > 0;
     (void)aff::pin_thread_numa0();
@@ -2299,9 +2311,14 @@ int main(int argc, char** argv) {
     }();
     const bool need_suffix_idx =
         draft_suffix_on || (sc && sc->dry_delta > 0.0f && sc->dry_ngram > 0);
-    aff::SuffixSessionPool::Lease sfx_lease =
-        need_suffix_idx ? suffix_pool.acquire(hist, 1ull)
-                        : aff::SuffixSessionPool::Lease{};
+    aff::SuffixSessionPool::Lease sfx_lease;
+    if (need_suffix_idx) {
+      if (pre_sfx_fut && pre_sfx_fut->valid()) {
+        sfx_lease = pre_sfx_fut->get();
+      } else {
+        sfx_lease = suffix_pool.acquire(hist, 1ull);
+      }
+    }
     aff::SuffixDraftIndex* suffix_idx = need_suffix_idx ? &sfx_lease.index() : nullptr;
     std::vector<uint32_t> dry_probe_ngram;
     // DRY ids for THIS block: the tokens that continued a repeated key.
@@ -2430,6 +2447,14 @@ int main(int argc, char** argv) {
       if (end == v) return 12u;
       return (uint32_t)std::clamp<long>(x, 1L, (long)(aff::kSpecTok - 1u));
     }();
+    const uint32_t sfx_burst_max = [sfx_max] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX_BURST_MAX");
+      if (!v || !*v) return (uint32_t)std::max<uint32_t>(sfx_max, aff::kSpecTok - 1u);
+      char* end = nullptr;
+      const long x = std::strtol(v, &end, 10);
+      if (end == v) return (uint32_t)std::max<uint32_t>(sfx_max, aff::kSpecTok - 1u);
+      return (uint32_t)std::clamp<long>(x, (long)sfx_max, (long)(aff::kSpecTok - 1u));
+    }();
     const float sfx_min_expect = [] {
       const char* v = std::getenv("AFF_DRAFT_SUFFIX_MIN_EXPECT");
       if (!v || !*v) return 2.0f;
@@ -2557,9 +2582,13 @@ int main(int argc, char** argv) {
         const uint32_t max_nd = std::min<uint32_t>(aff::kSpecTok - 1u, rem_out - 1u);
         const bool dspark_eligible = draft_on && st.pos && !skip_draft;
         if (draft_suffix_on && suffix_idx && max_nd >= (uint32_t)sfx_min_match) {
+          const bool burst_ok = aff::suffix_gate_v2_enabled() && sfx_gate.good_steps >= 2u &&
+                                sfx_gate.miss_streak == 0u && sfx_gate.acc_ema >= 0.85f &&
+                                suffix_idx->match_len() >= 12u;
+          const uint32_t eff_sfx_max = burst_ok ? sfx_burst_max : sfx_max;
           auto prop = suffix_idx->propose(
               hist, 1ull, sfx_min_match,
-              (int)std::min<uint32_t>(sfx_max, max_nd), sfx_min_score, suffix_buf.data());
+              (int)std::min<uint32_t>(eff_sfx_max, max_nd), sfx_min_score, suffix_buf.data());
           bool accept_suffix = false;
           if (draft_suffix_dynamic_on) {
             const uint32_t max_d = std::min<uint32_t>(B, kMaxQ - 1u);
@@ -2568,7 +2597,11 @@ int main(int argc, char** argv) {
             const float dspark_cost_ms = cost_ema[std::min<uint32_t>(B + 1u, kMaxQ - 1u)];
             const uint32_t prop_nd =
                 std::min<uint32_t>(prop.n > 0 ? static_cast<uint32_t>(prop.n) : 0u, max_nd);
-            const float sfx_cost_ms = cost_ema[std::min<uint32_t>(prop_nd + 1u, kMaxQ - 1u)];
+            const float raw_sfx_ms = cost_ema[std::min<uint32_t>(prop_nd + 1u, kMaxQ - 1u)];
+            // Suffix proposals skip GPU DSpark drafting (~20 ms across 3 stages + Markov head).
+            const float sfx_cost_ms = aff::suffix_gate_v2_enabled()
+                ? std::max(raw_sfx_ms - 20.0f, cost_ema[1])
+                : raw_sfx_ms;
             accept_suffix = sfx_gate.should_preempt(prop, sfx_min_match, sfx_min_expect,
                                                     dspark_eligible, dspark_exp_acc,
                                                     dspark_cost_ms, sfx_cost_ms, sfx_gain);
@@ -2583,6 +2616,7 @@ int main(int argc, char** argv) {
           }
         }
         if (!used_suffix && dspark_eligible) {
+          sfx_gate.observe_dspark();
           bool depth_stop = false;
           if (draft_depth_stop_on && !probe_in_flight) {
             if (adaptive_width_on && B >= 2 && my_blocks >= 4 &&
@@ -3047,6 +3081,10 @@ int main(int argc, char** argv) {
     blk.tap_keep = c.sliding;
 
     const auto t0 = std::chrono::steady_clock::now();
+    std::future<aff::SuffixSessionPool::Lease> sfx_fut =
+        (spec && force_ids.empty() && prefill_reps <= 1)
+            ? launch_suffix_acquire(ids, sampling_set ? &sample_cfg : nullptr)
+            : std::future<aff::SuffixSessionPool::Lease>{};
     kv_reserve_for(st.pos + (uint64_t)ids.size() + 2);
     watch_prefill(true);
     // --no-routed-experts has to reach here too, not only --dump-logits, or the one flag for
@@ -3200,7 +3238,7 @@ int main(int argc, char** argv) {
         aff::ui::tok(tok.vocab_size() ? tok.decode_one(id) : std::to_string(id) + " ");
         return true;
       }, sampling_set ? &sample_cfg : nullptr,
-         force_ids.empty() ? nullptr : &force_ids);
+         force_ids.empty() ? nullptr : &force_ids, nullptr, nullptr, nullptr, nullptr, &sfx_fut);
     dash.stage(aff::ui::Stage::Done);
     // Down before anything below prints. The summary, the fingerprint and the placement report are
     // the run's result and belong on a restored terminal, in the order and on the streams they have
@@ -3758,6 +3796,15 @@ int main(int argc, char** argv) {
     // positions of ITS OWN call, so a split that leaves the second call shorter than the window
     // seeds the draft with fewer rows and changes what it proposes. A boundary that close to the
     // end is also worth nothing, so it is simply not taken.
+    const bool dry_requested =
+        req.dry_delta < 0.0f ? false : (req.dry_delta > 0.0f || sample_cfg.dry_delta > 0.0f);
+    std::future<aff::SuffixSessionPool::Lease> sfx_fut = [&] {
+      if (!n_pre && !ids.size()) return std::future<aff::SuffixSessionPool::Lease>{};
+      SamplerConfig dry_hint;
+      dry_hint.dry_delta = dry_requested ? 1.0f : 0.0f;
+      dry_hint.dry_ngram = sample_cfg.dry_ngram;
+      return launch_suffix_acquire(ids, &dry_hint);
+    }();
     uint32_t promote = 0;
     if (prefix_cache.ready() && pv.count == 0) {
       const uint64_t b = (uint64_t)matched_blocks * prefix_cache.block_tokens();
@@ -4220,7 +4267,7 @@ int main(int argc, char** argv) {
       }
       if (hit_stop) { raw.resize(stop_at); return false; }
       return true;
-    }, &sc, nullptr, budget_ptr, check_think_closed, on_think_ckpt, &dry_floor);
+    }, &sc, nullptr, budget_ptr, check_think_closed, on_think_ckpt, &dry_floor, &sfx_fut);
     const auto t_dec_end = std::chrono::steady_clock::now();
     if (arm_budget && budget.force_closed()) {
       aff::ui::err("server: thinking budget force-closed </think> at %d/%u tokens (reason=%s)\n",

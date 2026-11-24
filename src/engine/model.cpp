@@ -1988,7 +1988,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
           }
         }
       } else {
-        parallel_for((uint64_t)live, 32, [&](uint64_t t0, uint64_t t1) {
+        parallel_for((uint64_t)live, 2, [&](uint64_t t0, uint64_t t1) {
           for (uint64_t t = t0; t < t1; ++t) {
             const int64_t* const idp = eng_ids_.data() + (size_t)t * eng_c_.n_layer * eng_c_.n_cols;
             if (use_raw_eng) {
@@ -2004,7 +2004,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
           const uint32_t tail_layers = eng_c_.n_layer - 1u;
           const uint64_t tail_jobs = (uint64_t)tail_layers * live;
           bg->launch([this, bg, live, eng_in_dim, eng_raw_stride, use_raw_eng, tail_jobs] {
-            bg->parallel_for_tail(tail_jobs, 32, [&](uint64_t j0, uint64_t j1) {
+            bg->parallel_for_tail(tail_jobs, 2, [&](uint64_t j0, uint64_t j1) {
               for (uint64_t j = j0; j < j1; ++j) {
                 const uint32_t i = 1u + (uint32_t)(j / live);
                 const uint64_t t = j % live;

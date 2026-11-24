@@ -363,6 +363,7 @@ struct DenseGpu::Impl {
     uint8_t* a_cand = nullptr;
     uint16_t* a_cand_ids = nullptr; uint32_t* a_cand_n = nullptr;
     float*   i_bsc = nullptr;                             // the block scores it selects over
+    uint32_t i_bsc_rows = 0;                              // allocated rows in i_bsc
     uint32_t* i_ncb = nullptr; uint32_t* hi_ncb = nullptr;  // per-token block counts
 
     // ---- small f32 vectors and the router gate --------------------------------------------------
@@ -458,6 +459,7 @@ struct DenseGpu::Impl {
     uint32_t q_active_dim = 0;
     float* h_tm = nullptr;                                // pinned, b_mid_ * b_cap_ floats
     uint8_t* b_allow = nullptr;                           // device, the same plane
+    uint32_t b_allow_rows = 0;                            // allocated rows in b_allow
     uint8_t* b_cand = nullptr;                            // the chunk's candidate blocks
     uint16_t* b_cand_ids = nullptr; uint32_t* b_cand_n = nullptr; // compact W3-2a candidate list
     // Engram. `e_in` is the dequantised table lookup, dim-major [n_cols*head_dim][tile]; `e_out`
@@ -506,6 +508,7 @@ struct DenseGpu::Impl {
     uint32_t* i_nc = nullptr;  uint32_t* hi_nc = nullptr;   // per-token key counts
     uint32_t i_cap_tok = 0, i_cap_key = 0;
     size_t i_q8_bytes = 0;
+    size_t i_sc_bytes = 0;
     // The router's top-k, rank 0 only. sel/wt/nsel come back; bias and the residency mask go out.
     uint32_t* b_rsel = nullptr;  float* b_rwt = nullptr;  uint32_t* b_rn = nullptr;
     float* b_rbias = nullptr;                    // [n_router][r_bias_stride], one slice a layer
@@ -759,6 +762,22 @@ static bool ensure_comp_scratch(DevT& D, uint32_t tok, uint32_t width,
     }
   }
   return true;
+}
+
+inline bool idx_dyn_tile_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_IDX_DYN_TILE");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool idx_compact_alloc_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_IDX_COMPACT_ALLOC");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
 }
 
 inline uint32_t lmhead_fp8_max_t_cfg() {
@@ -3794,11 +3813,13 @@ bool DenseGpu::kv_part_bufs(KvPart part, uint32_t layer, size_t rank, uint64_t* 
       break;
     case KvPart::Idx8:
       if (layer >= D.a_idx8_s[slot_].size()) return false;
-      bufs[0] = D.a_idx8_s[slot_][layer]; *row_bytes = kIdxDim; *rows_each = a_maxcomp_;
+      bufs[0] = D.a_idx8_s[slot_][layer]; *row_bytes = kIdxDim;
+      *rows_each = idx_compact_alloc_enabled() ? a_comp_rows_[layer] : a_maxcomp_;
       break;
     case KvPart::IdxScale:
       if (layer >= D.a_idxs_s[slot_].size()) return false;
-      bufs[0] = D.a_idxs_s[slot_][layer]; *row_bytes = sizeof(float); *rows_each = a_maxcomp_;
+      bufs[0] = D.a_idxs_s[slot_][layer]; *row_bytes = sizeof(float);
+      *rows_each = idx_compact_alloc_enabled() ? a_comp_rows_[layer] : a_maxcomp_;
       break;
     case KvPart::Hist:
       if (!ratio) return false;
@@ -4485,6 +4506,7 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
                           : (uint32_t)std::min<uint64_t>(nb, std::max<uint64_t>(1, budget / row));
       if (!hip_try(hipMalloc(&D.b_allow, (size_t)tile * a_maxcomp_), "hipMalloc batch masks", err))
         return false;
+      D.b_allow_rows = tile;
     }
     if (!hip_try(hipMalloc(&D.b_ncomp, (size_t)nb * sizeof(uint32_t)), "hipMalloc ncomp", err))
       return false;
@@ -4762,6 +4784,7 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
       cand_topk_cap_ = use_gather_cand ? cand_topk_blocks : 0u;
       if (!hip_try(hipMalloc(&D.i_bsc, (size_t)i_tile_ * bc * sizeof(float)), "block scores", err))
         return false;
+      D.i_bsc_rows = i_tile_;
       if (use_gather_cand) {
         if (!hip_try(hipMalloc(&D.a_cand_ids, (size_t)cand_topk_cap_ * sizeof(uint16_t)),
                      "candidate block ids (decode)", err) ||
@@ -5463,6 +5486,7 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
     D.i_qs = reinterpret_cast<float*>(base + tail_off + q8_bytes);
     D.i_w = reinterpret_cast<float*>(base + tail_off + q8_bytes + qs_bytes);
     D.i_q8_bytes = (size_t)cap * n_head * dim;
+    D.i_sc_bytes = bot_bytes;
     D.b_q_i_tail_off = tail_off;
   } else {
     if (hipMalloc(&D.i_q, (size_t)cap * n_head * dim * sizeof(float)) != hipSuccess) return false;
@@ -5471,6 +5495,7 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
     if (hipMalloc(&D.i_qs, (size_t)cap * sizeof(float)) != hipSuccess) return false;
     if (hipMalloc(&D.i_w, (size_t)cap * n_head * sizeof(float)) != hipSuccess) return false;
     if (hipMalloc(&D.i_sc, (size_t)i_tile_ * row) != hipSuccess) return false;
+    D.i_sc_bytes = sc_bytes;
   }
   if (hipHostMalloc((void**)&D.hi_w, (size_t)cap * n_head * sizeof(float)) != hipSuccess)
     return false;
@@ -5564,8 +5589,9 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
     compressor_hist_reset_hip(D.ci_hkv_s[slot_][layer], D.ci_hsc_s[slot_][layer], idx_width, hist, D.stream);
   }
   if (idx_keys || idx_width) {
-    if (hipMalloc(&D.a_idx8_s[slot_][layer], (size_t)a_maxcomp_ * kIdxDim) != hipSuccess) return false;
-    if (hipMalloc(&D.a_idxs_s[slot_][layer], (size_t)a_maxcomp_ * sizeof(float)) != hipSuccess) return false;
+    const uint32_t irows = idx_compact_alloc_enabled() ? a_comp_rows_[layer] : a_maxcomp_;
+    if (hipMalloc(&D.a_idx8_s[slot_][layer], (size_t)irows * kIdxDim) != hipSuccess) return false;
+    if (hipMalloc(&D.a_idxs_s[slot_][layer], (size_t)irows * sizeof(float)) != hipSuccess) return false;
   }
   D.c_ratio[layer] = ratio;
   return true;
@@ -6382,8 +6408,23 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
       if ((int64_t)layer > (int64_t)a.cand_source && b_cand_src_[slot_] != (int64_t)a.cand_source)
         return false;
     }
-    for (uint32_t t0 = 0; t0 < n; t0 += i_tile_) {
-      const uint32_t nt = std::min(i_tile_, n - t0);
+    uint32_t eff_tile = i_tile_;
+    if (idx_dyn_tile_enabled() && D.i_sc_bytes) {
+      const uint32_t eff_row_elems = (use_gather_cand && (int64_t)layer > (int64_t)a.cand_source)
+                                       ? (a.cand_topk_blocks * cand_block_)
+                                       : n_keys;
+      const size_t row_b = (size_t)std::max<uint32_t>(1u, eff_row_elems) * sizeof(float);
+      eff_tile = (uint32_t)std::min<size_t>(n, std::max<size_t>(1u, D.i_sc_bytes / row_b));
+      if (cand_block_ && a.cand_source >= 0 &&
+          ((layer == (uint32_t)a.cand_source) || (!use_gather_cand && D.b_cand))) {
+        const uint32_t bsc_cap = D.i_bsc_rows ? D.i_bsc_rows : i_tile_;
+        if (layer == (uint32_t)a.cand_source) eff_tile = std::min(eff_tile, bsc_cap);
+      }
+      if (!(gather && flash_ok) && !b_allow_dense_ && D.b_allow_rows)
+        eff_tile = std::min(eff_tile, D.b_allow_rows);
+    }
+    for (uint32_t t0 = 0; t0 < n; t0 += eff_tile) {
+      const uint32_t nt = std::min(eff_tile, n - t0);
       uint8_t* const mrow = (gather && flash_ok)
                                 ? nullptr
                                 : (D.b_allow ? (b_allow_dense_ ? D.b_allow + (size_t)t0 * a_maxcomp_
@@ -7841,8 +7882,9 @@ bool DenseGpu::batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n
   const Entry& e = ent_[h];
   if (e.split == Split::Col || e.cols != n_embd) return false;
   const size_t R = impl_->dev.size();
-  const bool tm_fast = head_tm_fast_enabled() && n <= 6u;
-  const uint32_t bf16_mx_max = tm_fast ? 6u : kMvMultiXFast;
+  const bool tm_fast_bf16 = head_tm_fast_enabled() && n <= 6u;
+  const bool tm_fast_fp8 = head_tm_fast_enabled() && n <= kNarrowTok;
+  const uint32_t bf16_mx_max = tm_fast_bf16 ? 6u : kMvMultiXFast;
   const bool bf16_mx = e.quant == AFF_BF16 && n <= bf16_mx_max;
   uint64_t band[kMaxRanks] = {};                  // nr per card, for the combine below
   static auto launch_w4_head = [](const uint8_t* w4, const uint16_t* sc, const float* x_tm,
@@ -7872,8 +7914,8 @@ bool DenseGpu::batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n
     const bool use_b12 = !use_w4 && !use_fp8 && !e.sh[d].data && e.sh[d].b12_sm &&
                          (n_embd % 256) == 0;
     // Under AFF_HEAD_TM_FAST=1, extend direct token-major output (skipping memset+transpose) up to
-    // n <= 6 (verify B+1 = 6) for multix/W4/FP8/BF16x12 paths; batch_argmax consumes matching layout.
-    const bool mx = bf16_mx || (tm_fast && (use_w4 || use_fp8 || use_b12));
+    // n <= kNarrowTok for W4/FP8 heads and n <= 6 for BF16x12/multix; batch_argmax consumes matching layout.
+    const bool mx = bf16_mx || (tm_fast_fp8 && (use_w4 || use_fp8)) || (tm_fast_bf16 && use_b12);
     // The padding columns go through the transpose and the GEMM like any other, so the source of
     // them has to be finite; b_emb is the arena's upload slot and nothing else reads it here.
     if (x) {

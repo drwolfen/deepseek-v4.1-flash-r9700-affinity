@@ -635,6 +635,69 @@ void test_lru_lcp_pool_reuse() {
   std::printf("PASS: test_lru_lcp_pool_reuse\n");
 }
 
+void test_suffix_gate_deadlock_recovery() {
+  aff::SuffixGate gate;
+  gate.reset();
+  const float dsp_acc = 4.68f;
+  const float dsp_ms = 120.0f;
+
+  // Simulate 10 proven suffix blocks (`12/12` accepted -> `good_steps == 10`).
+  for (int b = 0; b < 10; ++b) {
+    aff::SuffixDraftIndex::Proposal p{/*n=*/12, /*match_len=*/12, /*score=*/1.0f, /*expect=*/12.0f};
+    const float sfx_ms = std::max(204.0f - 20.0f, 48.0f);
+    REQUIRE(gate.should_preempt(p, 4, 2.0f, true, dsp_acc, dsp_ms, sfx_ms, 1.05f));
+    gate.observe(12, 12);
+  }
+  REQUIRE(gate.good_steps == 10u);
+
+  // Edit boundary causes partial rejection (`11/12`), then short `m=7` trap right after rejection.
+  gate.observe(12, 11);
+  REQUIRE(gate.last_rejected);
+  aff::SuffixDraftIndex::Proposal trap{/*n=*/12, /*match_len=*/7, /*score=*/1.0f, /*expect=*/12.0f};
+  // Post-divergence guard requires match_len >= min_match + 6 (10), so m=7 is skipped cleanly!
+  REQUIRE(!gate.should_preempt(trap, 4, 2.0f, true, dsp_acc, dsp_ms, 184.0f, 1.05f));
+
+  // Even after harsh 0/12 misses that drop acc_ema below 0.65 and trigger cooldown, a verbatim
+  // streak (match_len >= 12, n >= 8, expect >= 8.0) breaks the old deadlock immediately once m >= 12.
+  gate.observe(12, 0);
+  gate.observe(12, 0);
+  REQUIRE(gate.miss_streak == 2u);
+  REQUIRE(gate.cooldown == 4u);
+  REQUIRE(gate.acc_ema < 0.65f);
+  gate.observe_dspark();
+  aff::SuffixDraftIndex::Proposal verbatim{
+      /*n=*/12, /*match_len=*/14, /*score=*/1.0f, /*expect=*/12.0f};
+  REQUIRE(gate.should_preempt(verbatim, 4, 2.0f, true, dsp_acc, dsp_ms, 184.0f, 1.05f));
+  std::printf("PASS: test_suffix_gate_deadlock_recovery\n");
+}
+
+void test_suffix_gate_prose_unchanged() {
+  aff::SuffixGate gate;
+  gate.reset();
+  const float dsp_acc = 2.6f;
+  const float dsp_ms = 120.0f;
+  // Prose with good_steps == 0 gets one 0/6 miss and stays backed off even on n=10, m=12.
+  gate.observe(6, 0);
+  REQUIRE(gate.good_steps == 0u);
+  aff::SuffixDraftIndex::Proposal p{/*n=*/10, /*match_len=*/12, /*score=*/1.0f, /*expect=*/8.5f};
+  REQUIRE(!gate.should_preempt(p, 4, 2.0f, true, dsp_acc, dsp_ms, 160.0f, 1.05f));
+  std::printf("PASS: test_suffix_gate_prose_unchanged\n");
+}
+
+void test_suffix_burst_depth_15() {
+  aff::SuffixDraftIndex idx(/*use_rust=*/true);
+  std::vector<uint32_t> prompt;
+  for (uint32_t i = 0; i < 64; ++i) prompt.push_back(1000u + (i % 32u));
+  idx.append_delta(prompt.data(), prompt.size());
+  // Last 12 tokens: 20..31; next 15 repeated tokens wrap 0..14 from index 32..46.
+  std::vector<int32_t> out(16, -1);
+  auto prop = idx.propose(prompt, 1ull, 4, 15, 0.35f, out.data());
+  REQUIRE(prop.n == 15);
+  REQUIRE(prop.match_len >= 12);
+  for (int i = 0; i < 15; ++i) REQUIRE(out[i] == static_cast<int32_t>(1000u + i));
+  std::printf("PASS: test_suffix_burst_depth_15\n");
+}
+
 }  // namespace
 
 int main() {
@@ -652,6 +715,9 @@ int main() {
   test_unbounded_match_len_24();
   test_non_destructive_rollback_and_contains_ngram();
   test_lru_lcp_pool_reuse();
+  test_suffix_gate_deadlock_recovery();
+  test_suffix_gate_prose_unchanged();
+  test_suffix_burst_depth_15();
   std::printf("ALL suffix_draft tests passed\n");
   return 0;
 }
