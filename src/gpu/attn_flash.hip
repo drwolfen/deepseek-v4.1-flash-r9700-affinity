@@ -671,13 +671,18 @@ static uint32_t flash_split_slices(uint32_t n_tok, uint32_t head_tiles, uint32_t
                                    const FlashSplit* sp) {
   if (!sp || !sp->o || !sp->ml || !sp->slots || n_tok > sp->tok_cap) return 1u;
   constexpr uint32_t kTargetBlocks = 128u;
-  static const uint32_t env_min_tiles = [] {
+  const uint32_t env_min_tiles = [] {
     const char* s = std::getenv("AFF_FLASH_MIN_TILES");
     if (!s || !*s) return 0u;
     const long v = std::strtol(s, nullptr, 10);
     return v > 0 ? (uint32_t)v : 1u;
   }();
-  const uint32_t min_tiles = env_min_tiles ? env_min_tiles : (n_tok <= 16u ? 1u : 4u);
+  static const bool split_v2 = [] {
+    const char* v = std::getenv("AFF_FLASH_SPLIT_V2");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  const uint32_t min_tiles =
+      env_min_tiles ? env_min_tiles : (n_tok <= 16u ? (split_v2 ? 2u : 1u) : 4u);
   const uint32_t nat = n_tok * head_tiles;
   if (!nat || nat >= kTargetBlocks) return 1u;
   const uint32_t tiles = (n_keys + kKT - 1u) / kKT;

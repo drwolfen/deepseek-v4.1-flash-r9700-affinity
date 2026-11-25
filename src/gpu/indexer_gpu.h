@@ -63,6 +63,13 @@ void idx_rope_qat_hip(float* q, uint32_t n, uint32_t n_head, uint32_t n_rot, uin
                       float freq_scale, float theta_scale, float ext_factor, float lo, float hi,
                       void* stream, bool hadamard = true);
 
+// Fused query RoPE+QAT+E4M3 quantization (`q` [n][n_head][128] f32 -> `q8` [n][n_head*128] E4M3,
+// `qs` [n] f32). Returns false (without launching) if n_head > 64 so callers fall back cleanly.
+bool idx_rope_qat_quant_hip(const float* q, uint8_t* q8, float* qs, uint32_t n, uint32_t n_head,
+                            uint32_t n_rot, uint32_t pos0, float freq_scale, float theta_scale,
+                            float ext_factor, float lo, float hi, void* stream,
+                            bool hadamard = true);
+
 // f32 [n][dim] -> E4M3 [n][dim] + one f32 scale a row, on device. `dim` is n_head*kIdxDim for a
 // query token and kIdxDim for a key.
 void idx_quant_rows_hip(const float* src, uint8_t* dst, float* scale, uint32_t n, uint32_t dim,

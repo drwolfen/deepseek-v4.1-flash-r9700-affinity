@@ -779,6 +779,94 @@ __global__ void kv_commit_batch_kernel(const float* __restrict__ kv, uint32_t nb
   }
 }
 
+__device__ __forceinline__ uint32_t kv_lds_swz(uint32_t tk, uint32_t d) {
+  const uint32_t swz = ((tk & 15u) << 1) | ((tk >> 3) & 1u);
+  return d ^ swz;
+}
+
+// Coalesced KV norm+rope+FP8R commit for width=512, n_rot=64: 16 tokens per WG read dim-major
+// kv in contiguous 64-byte chunks along the token axis, then each wave owns one token in registers
+// with bit-identical 64-bucket RMS sum, DPP RoPE/QAT, and coalesced 32-byte slot writes.
+__global__ __launch_bounds__(256) void kv_norm_commit_fp8r_coalesced_kernel(
+    const float* __restrict__ kv, uint32_t nb, uint32_t b0, uint32_t n, uint8_t* __restrict__ raw,
+    uint64_t rb, uint32_t pos0, uint32_t ring, KvNorm nrm) {
+  __shared__ float s_buf[16][512];
+  const uint32_t t0 = blockIdx.x * 16u;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t tk_ld = tid & 15u, d0 = tid >> 4;
+  const bool tok_live = (t0 + tk_ld) < n;
+#pragma unroll
+  for (uint32_t step = 0u; step < 32u; ++step) {
+    const uint32_t d = step * 16u + d0;
+    const float v = tok_live ? kv[(size_t)d * nb + b0 + t0 + tk_ld] : 0.0f;
+    s_buf[tk_ld][kv_lds_swz(tk_ld, d)] = v;
+  }
+  lds_barrier();
+
+  const uint32_t lane = tid & 31u, wave = tid >> 5;
+  for (uint32_t pass = 0u; pass < 2u; ++pass) {
+    const uint32_t tk = pass * 8u + wave;
+    float v[16];
+    float acc0 = 0.0f, acc1 = 0.0f;
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+      const float x0 = s_buf[tk][kv_lds_swz(tk, lane + (uint32_t)m * 64u)];
+      const float x1 = s_buf[tk][kv_lds_swz(tk, lane + 32u + (uint32_t)m * 64u)];
+      v[m] = x0;
+      v[8 + m] = x1;
+      acc0 += x0 * x0;
+      acc1 += x1 * x1;
+    }
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 32; ++k) s += __shfl(acc0, k, 32);
+#pragma unroll
+    for (int k = 0; k < 32; ++k) s += __shfl(acc1, k, 32);
+    const float inv = rsqrtf(s / 512.0f + nrm.eps);
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+      v[m] = v[m] * inv * (nrm.w ? nrm.w[lane + (uint32_t)m * 64u] : 1.0f);
+      v[8 + m] = v[8 + m] * inv * (nrm.w ? nrm.w[lane + 32u + (uint32_t)m * 64u] : 1.0f);
+    }
+    {
+      const float p7 = dpp_xor_lane<1u>(v[7]);
+      const float p15 = dpp_xor_lane<1u>(v[15]);
+      float c0, sn0, c1, sn1;
+      rope_cs(lane >> 1, pos0 + t0 + tk, nrm.freq_scale, nrm.theta_scale, nrm.ext_factor,
+              nrm.lo, nrm.hi, 1.0f, &c0, &sn0);
+      rope_cs(16u + (lane >> 1), pos0 + t0 + tk, nrm.freq_scale, nrm.theta_scale, nrm.ext_factor,
+              nrm.lo, nrm.hi, 1.0f, &c1, &sn1);
+      v[7]  = (lane & 1u) ? (p7  * sn0 + v[7]  * c0) : (v[7]  * c0 - p7  * sn0);
+      v[15] = (lane & 1u) ? (p15 * sn1 + v[15] * c1) : (v[15] * c1 - p15 * sn1);
+    }
+#pragma unroll
+    for (int m = 0; m < 7; ++m) {
+      float amax = fmaxf(fabsf(v[m]), fabsf(v[8 + m]));
+      amax = wave_reduce_max_dpp(amax);
+      const float qsc = exp2f(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.0f)));
+      v[m]     = e4m3_decode(e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v[m]     / qsc)))) * qsc;
+      v[8 + m] = e4m3_decode(e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v[8 + m] / qsc)))) * qsc;
+    }
+    float lmax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      v[j] = __half2float(__float2half(v[j]));
+      lmax = fmaxf(lmax, fabsf(v[j]));
+    }
+    const float rmax = wave_reduce_max_dpp(lmax);
+    const float sc = exp2f(ceilf(log2f(fmaxf(rmax, 1e-4f) / 448.0f)));
+    if (t0 + tk < n) {
+      uint8_t* const slot = raw + (size_t)((pos0 + t0 + tk) % ring) * rb;
+      if (lane == 0u) *(float*)(slot + 512u) = sc;
+#pragma unroll
+      for (int m = 0; m < 8; ++m) {
+        slot[lane + (uint32_t)m * 64u]       = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v[m]     / sc)));
+        slot[lane + 32u + (uint32_t)m * 64u] = e4m3_enc(fminf(448.0f, fmaxf(-448.0f, v[8 + m] / sc)));
+      }
+    }
+  }
+}
+
 } // namespace
 
 
@@ -852,6 +940,14 @@ bool kv_norm_commit_batch_hip(KvDtype d, const float* latent, const float* nw, f
   const uint32_t nope = width - n_rot;
   const uint64_t rb = kv_row_bytes(d, width, n_rot);
   const KvNorm nrm{nw, eps, n_rot, pos0, freq_scale, theta_scale, ext_factor, lo, hi};
+  const char* const coal_env = std::getenv("AFF_KV_COMMIT_COALESCED");
+  const bool use_coal = !(coal_env && *coal_env && std::strcmp(coal_env, "0") == 0);
+  if (use_coal && d == KvDtype::FP8R && width == 512u && n_rot == 64u && n >= 4u && nb > 1u) {
+    hipLaunchKernelGGL(kv_norm_commit_fp8r_coalesced_kernel, dim3((n + 15u) / 16u), dim3(256), 0,
+                       st, latent, nb, b0, n, raw, rb, pos0, ring, nrm);
+    AFF_HIP_CHECK(hipGetLastError());
+    return true;
+  }
   switch (d) {
     case KvDtype::F32:
       hipLaunchKernelGGL((kv_commit_batch_kernel<0, true>), g, b, lds, st, latent, nb, b0, raw, rb,

@@ -341,6 +341,7 @@ if(AFF_HIP)
     aff_hip_test(test_wave2_kernels wave2_kernels)
     aff_hip_test(test_v41_indexer test_v41_indexer)
     aff_hip_test(test_engram_split_gate engram_split_gate)
+    aff_hip_test(test_v510_kernels v510_kernels)
   endif()
 
   # ---- benches ----------------------------------------------------------------------------------

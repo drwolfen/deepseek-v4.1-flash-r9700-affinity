@@ -14,6 +14,16 @@
 namespace aff {
 namespace {
 
+inline bool idx_cand_multitok_enabled() {
+  const char* s = std::getenv("AFF_IDX_CAND_MULTITOK");
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
+
+inline bool idx_topk_v2_enabled() {
+  const char* s = std::getenv("AFF_IDX_TOPK_V2");
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
+
 constexpr uint32_t kD = kIdxDim;             // 128
 constexpr uint32_t kWaves = 4;
 constexpr uint32_t kThreads = kWaves * 32;   // 128
@@ -182,16 +192,16 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
 // enough to accumulate index_topk compressed rows, so every other hash must come back unchanged.
 constexpr uint32_t kIdxDecHeads = 64;
 
-template <bool MultiTok>
+template <bool MultiTok, uint32_t MaxHeads = kIdxDecHeads>
 __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
     const uint8_t* __restrict__ q8, const float* __restrict__ qs, const uint8_t* __restrict__ k8,
     const float* __restrict__ ks, const float* __restrict__ hw, float* __restrict__ out,
     uint32_t n_keys, uint32_t n_head, uint32_t nb) {
-  // Double-buffer Q and weights in MultiTok (17,920 B <= 18,432 B) so K fragments stay in
-  // registers across all nb tokens with 1 barrier per token and zero redundant K global reads.
+  // Double-buffer Q and weights in MultiTok (<=17,920 B at MaxHeads=64, 8,960 B at MaxHeads=32
+  // for 6 WGs/WGP) so K fragments stay in registers across nb tokens.
   constexpr uint32_t kQBufs = MultiTok ? 2u : 1u;
-  __shared__ __align__(16) uint8_t s_q[kQBufs][kIdxDecHeads * kQLd];
-  __shared__ float s_w[kQBufs][kIdxDecHeads];
+  __shared__ __align__(16) uint8_t s_q[kQBufs][MaxHeads * kQLd];
+  __shared__ float s_w[kQBufs][MaxHeads];
 
   const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
   const uint32_t c = lane & 15u, hlf = lane >> 4;
@@ -292,6 +302,142 @@ __global__ __launch_bounds__(32) void idx_quant128_kernel(const float* __restric
   pk = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, pk, false);
   pk = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, pk, true);
   reinterpret_cast<uint32_t*>(dst + (size_t)r * 128u)[tid] = static_cast<uint32_t>(pk);
+}
+
+__device__ __forceinline__ float yarn_ramp_dev(float low, float high, int i) {
+  const float y = ((float)i / 2.0f - low) / fmaxf(0.001f, high - low);
+  return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+}
+
+__device__ __forceinline__ uint32_t e2m1_code_d(float x) {
+  const float a = fminf(fabsf(x), 6.0f);
+  uint32_t m;
+  if (a <= 0.25f) m = 0u;
+  else if (a < 0.75f) m = 1u;
+  else if (a <= 1.25f) m = 2u;
+  else if (a < 1.75f) m = 3u;
+  else if (a <= 2.5f) m = 4u;
+  else if (a < 3.5f) m = 5u;
+  else if (a <= 5.0f) m = 6u;
+  else m = 7u;
+  return (x < 0.0f ? 8u : 0u) | m;
+}
+
+__device__ __forceinline__ float e2m1_from_code_d(uint32_t code) {
+  static constexpr float kE2M1Mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  const float r = kE2M1Mag[code & 7u];
+  return (code & 8u) ? -r : r;
+}
+
+__device__ __forceinline__ uint32_t pack4_e4m3_clamped(float f0, float f1, float f2, float f3,
+                                                       float inv) {
+  const float c0 = fminf(448.0f, fmaxf(-448.0f, f0 * inv));
+  const float c1 = fminf(448.0f, fmaxf(-448.0f, f1 * inv));
+  const float c2 = fminf(448.0f, fmaxf(-448.0f, f2 * inv));
+  const float c3 = fminf(448.0f, fmaxf(-448.0f, f3 * inv));
+#if __has_builtin(__builtin_amdgcn_cvt_pk_fp8_f32)
+  int pk = 0;
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, pk, false);
+  pk = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, pk, true);
+  return static_cast<uint32_t>(pk);
+#else
+  return (uint32_t)e4m3_enc(c0) | ((uint32_t)e4m3_enc(c1) << 8) |
+         ((uint32_t)e4m3_enc(c2) << 16) | ((uint32_t)e4m3_enc(c3) << 24);
+#endif
+}
+
+// Fused RoPE tail + Hadamard/QAT + E4M3 query quantization: one WG per token keeps 4-bit E2M1
+// codes + per-32 scales in 5.6 KiB LDS across heads, eliminating intermediate i_q round-trips.
+template <bool HADAMARD>
+__global__ __launch_bounds__(128) void idx_rope_qat_quant_kernel(
+    const float* __restrict__ q, uint8_t* __restrict__ q8, float* __restrict__ qs, uint32_t n_head,
+    uint32_t n_rot, uint32_t pos0, float freq_scale, float theta_scale, float ext_factor, float lo,
+    float hi) {
+  __shared__ uint8_t s_nib[64u * 64u];
+  __shared__ float s_sc32[64u * 4u];
+  __shared__ float s_had[kIdxDim];
+  __shared__ float s_wmax[4];
+
+  const uint32_t t = blockIdx.x, i = threadIdx.x;
+  const uint32_t lane = i & 31u, wave = i >> 5;
+  const uint32_t n_nope = kIdxDim - n_rot;
+  const bool is_rot = (i >= n_nope);
+  float c = 1.0f, sn = 0.0f;
+  if (is_rot) {
+    const uint32_t j = i - n_nope;
+    const float theta_extrap = (float)(pos0 + t) * powf(theta_scale, (float)(j >> 1));
+    float theta = freq_scale * theta_extrap;
+    if (ext_factor != 0.0f) {
+      const float mix = yarn_ramp_dev(lo, hi, (int)(j & ~1u)) * ext_factor;
+      theta = theta * (1.0f - mix) + theta_extrap * mix;
+    }
+    c = __cosf(theta);
+    sn = __sinf(theta);
+  }
+
+  float tok_amax = 0.0f;
+  for (uint32_t h = 0u; h < n_head; ++h) {
+    float v = q[((size_t)t * n_head + h) * kIdxDim + i];
+    if (is_rot) {
+      const float partner = dpp_xor_lane<1u>(v);
+      const uint32_t j = i - n_nope;
+      v = (j & 1u) ? (partner * sn + v * c) : (v * c - partner * sn);
+    }
+    if constexpr (HADAMARD) {
+      s_had[i] = v;
+      lds_barrier();
+      for (uint32_t stride = 1u; stride < kIdxDim; stride <<= 1) {
+        float a = 0.0f, b = 0.0f;
+        uint32_t ia = 0u, ib = 0u;
+        if (i < kIdxDim / 2u) {
+          const uint32_t base = (i / stride) * 2u * stride, off = i % stride;
+          ia = base + off;
+          ib = base + stride + off;
+          a = s_had[ia];
+          b = s_had[ib];
+        }
+        lds_barrier();
+        if (i < kIdxDim / 2u) {
+          s_had[ia] = a + b;
+          s_had[ib] = a - b;
+        }
+        lds_barrier();
+      }
+      v = s_had[i] * 0.08838834764831845f;
+    }
+    float amax = wave_reduce_max_dpp(fabsf(v));
+    amax = fmaxf(amax, 7.052966104933725e-38f);
+    const float sc32 = exp2f(ceilf(log2f(amax / 6.0f)));
+    const uint32_t code = e2m1_code_d(v / sc32);
+    const float qv = e2m1_from_code_d(code) * sc32;
+    tok_amax = fmaxf(tok_amax, fabsf(qv));
+    const uint32_t pcode = dpp_xor_lane<1u>(code);
+    if ((i & 1u) == 0u) s_nib[h * 64u + (i >> 1)] = static_cast<uint8_t>(code | (pcode << 4));
+    if (lane == 0u) s_sc32[h * 4u + wave] = sc32;
+  }
+
+  tok_amax = wave_reduce_max_dpp(tok_amax);
+  if (lane == 0u) s_wmax[wave] = tok_amax;
+  lds_barrier();
+  const float amax_all = fmaxf(fmaxf(s_wmax[0], s_wmax[1]), fmaxf(s_wmax[2], s_wmax[3]));
+  const float sc = amax_all > 0.0f ? amax_all * (1.0f / 448.0f) : 1.0f;
+  if (i == 0u) qs[t] = sc;
+  const float inv = 1.0f / sc;
+
+  for (uint32_t hb = 0u; hb < n_head; hb += 4u) {
+    const uint32_t h = hb + wave;
+    if (h < n_head) {
+      const float sc32 = s_sc32[h * 4u + (lane >> 3)];
+      const uint8_t b0 = s_nib[h * 64u + 2u * lane + 0u];
+      const uint8_t b1 = s_nib[h * 64u + 2u * lane + 1u];
+      const float f0 = e2m1_from_code_d(b0 & 0x0Fu) * sc32;
+      const float f1 = e2m1_from_code_d(b0 >> 4) * sc32;
+      const float f2 = e2m1_from_code_d(b1 & 0x0Fu) * sc32;
+      const float f3 = e2m1_from_code_d(b1 >> 4) * sc32;
+      reinterpret_cast<uint32_t*>(q8 + ((size_t)t * n_head + h) * kIdxDim)[lane] =
+          pack4_e4m3_clamped(f0, f1, f2, f3, inv);
+    }
+  }
 }
 
 __global__ __launch_bounds__(256) void idx_quant_kernel(const float* __restrict__ src,
@@ -481,6 +627,108 @@ __device__ __forceinline__ void hist_scan(uint32_t* h, uint32_t* s_b, uint32_t* 
   // No bucket reaching `need` cannot happen — the total is at least k at the first pass and at
   // least `need` at every later one — but the serial walk fell out with the whole sum, so match it.
   *acc = *s_any ? (bb + 1u < 256u ? h[bb + 1u] : 0u) : h[0];
+}
+
+template <uint32_t NBINS>
+__device__ __forceinline__ void hist_scan_v2(uint32_t* h, uint32_t* s_b, uint32_t* s_any,
+                                             uint32_t need, uint32_t tid,
+                                             uint32_t* b, uint32_t* acc) {
+  static_assert(NBINS == 1024u || NBINS == 2048u, "NBINS must be 1024 or 2048");
+  __shared__ uint32_t s_wsum[32];
+  __shared__ uint32_t s_bm[32];
+  const uint32_t lane = tid & 31u, wave = tid >> 5;
+  uint32_t hi_sum = 0u;
+  bool found = false;
+  uint32_t bb = 0u;
+
+  if constexpr (NBINS == 2048u) {
+    uint32_t v = h[1024u + tid];
+#pragma unroll
+    for (uint32_t off = 1u; off < 32u; off <<= 1) {
+      const uint32_t nbr = (uint32_t)__shfl_down((int)v, (int)off, 32);
+      if (lane + off < 32u) v += nbr;
+    }
+    if (lane == 0u) s_wsum[wave] = v;
+    lds_barrier();
+    if (wave == 0u) {
+      const uint32_t wv = s_wsum[lane];
+      uint32_t incl = wv;
+#pragma unroll
+      for (uint32_t off = 1u; off < 32u; off <<= 1) {
+        const uint32_t nbr = (uint32_t)__shfl_down((int)incl, (int)off, 32);
+        if (lane + off < 32u) incl += nbr;
+      }
+      s_wsum[lane] = incl - wv;
+    }
+    lds_barrier();
+    v += s_wsum[wave];
+    h[1024u + tid] = v;
+    const uint32_t bm = (uint32_t)__ballot(v >= need);
+    if (lane == 0u) s_bm[wave] = bm;
+    lds_barrier();
+    if (tid == 0u) {
+      uint32_t any = 0u, b_hi = 0u;
+      for (uint32_t w = 32u; w-- > 0u;) {
+        if (s_bm[w]) {
+          b_hi = 1024u | (w << 5) | (31u - (uint32_t)__clz((int)s_bm[w]));
+          any = 1u;
+          break;
+        }
+      }
+      *s_b = b_hi;
+      *s_any = any;
+    }
+    lds_barrier();
+    hi_sum = h[1024u];
+    found = (*s_any != 0u);
+    bb = *s_b;
+  }
+
+  {
+    uint32_t v = h[tid];
+#pragma unroll
+    for (uint32_t off = 1u; off < 32u; off <<= 1) {
+      const uint32_t nbr = (uint32_t)__shfl_down((int)v, (int)off, 32);
+      if (lane + off < 32u) v += nbr;
+    }
+    if (lane == 0u) s_wsum[wave] = v;
+    lds_barrier();
+    if (wave == 0u) {
+      const uint32_t wv = s_wsum[lane];
+      uint32_t incl = wv;
+#pragma unroll
+      for (uint32_t off = 1u; off < 32u; off <<= 1) {
+        const uint32_t nbr = (uint32_t)__shfl_down((int)incl, (int)off, 32);
+        if (lane + off < 32u) incl += nbr;
+      }
+      s_wsum[lane] = incl - wv;
+    }
+    lds_barrier();
+    v += s_wsum[wave] + hi_sum;
+    h[tid] = v;
+    if (!found) {
+      const uint32_t bm = (uint32_t)__ballot(v >= need);
+      if (lane == 0u) s_bm[wave] = bm;
+      lds_barrier();
+      if (tid == 0u) {
+        uint32_t any = 0u, b_lo = 0u;
+        for (uint32_t w = 32u; w-- > 0u;) {
+          if (s_bm[w]) {
+            b_lo = (w << 5) | (31u - (uint32_t)__clz((int)s_bm[w]));
+            any = 1u;
+            break;
+          }
+        }
+        *s_b = b_lo;
+        *s_any = any;
+      }
+      lds_barrier();
+      found = (*s_any != 0u);
+      bb = *s_b;
+    }
+  }
+  *b = bb;
+  *acc = found ? (bb + 1u < NBINS ? h[bb + 1u] : 0u) : h[0];
 }
 
 // ---- the mask, compacted into the ascending LIST of rows it admits ------------------------------
@@ -732,13 +980,15 @@ __device__ __forceinline__ void tie_admit_cand(const uint32_t* tie, uint32_t nt,
   }
 }
 
+template <bool V2>
 __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
     const float* __restrict__ scores, uint8_t* __restrict__ mask,
     const uint32_t* __restrict__ nkeys, uint32_t stride, uint32_t max_keys, uint32_t mstride,
     uint32_t mlen, uint32_t k, uint32_t* __restrict__ adm, uint32_t* __restrict__ admn,
     uint32_t adm_stride, uint16_t* __restrict__ cand_ids_out, uint32_t* __restrict__ cand_n_out,
     uint32_t cand_stride) {
-  __shared__ uint32_t s_hist[256];
+  constexpr uint32_t HCAP = V2 ? 2048u : 256u;
+  __shared__ uint32_t s_hist[HCAP];
   __shared__ uint32_t s_tie[kTieCap];
   __shared__ uint32_t s_wc[2u * kTopkWaves];
   __shared__ uint32_t s_prefix, s_need, s_gt, s_b, s_any, s_nt, s_base, s_tie_end;
@@ -799,13 +1049,20 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
   if (tid == 0) { s_prefix = 0; s_need = k; s_gt = 0; }
   lds_barrier();
 
-  // Narrow the key eight bits at a time. Vectorized 16-byte uint4 loads when 16B aligned.
+  // Narrow the key eight bits at a time (or 11-11-10 in V2). Vectorized 16-byte uint4 loads when 16B aligned.
   const bool sc_aligned16 = (reinterpret_cast<uintptr_t>(sc) & 15u) == 0u;
   const uint32_t T8 = sc_aligned16 ? (n_keys >> 3) : 0u;
-  for (int sh = 24; sh >= 0; sh -= 8) {
-    if (tid < 256u) s_hist[tid] = 0;
+  constexpr int n_passes = V2 ? 3 : 4;
+  for (int pass = 0; pass < n_passes; ++pass) {
+    const int sh = V2 ? (pass == 0 ? 21 : (pass == 1 ? 10 : 0)) : (24 - pass * 8);
+    const uint32_t nbins = V2 ? (pass < 2 ? 2048u : 1024u) : 256u;
+    const uint32_t bmsk = nbins - 1u;
+    const uint32_t msk =
+        V2 ? (pass == 0 ? 0u : (pass == 1 ? 0xFFE00000u : 0xFFFFFC00u))
+           : (pass == 0 ? 0u : (0xFFFFFFFFu << (sh + 8)));
+    for (uint32_t bi = tid; bi < nbins; bi += kTopkThr) s_hist[bi] = 0u;
     lds_barrier();
-    const uint32_t pre = s_prefix, msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+    const uint32_t pre = s_prefix;
     for (uint32_t i = tid; i < T8; i += kTopkThr) {
       const uint4 v0 = ((const uint4*)sc)[2 * i + 0];
       const uint4 v1 = ((const uint4*)sc)[2 * i + 1];
@@ -816,17 +1073,22 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         const uint32_t key = ks[j];
-        hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+        hist_add(s_hist, (key >> sh) & bmsk, (key > KEY_NEG_INF) && ((key & msk) == pre));
       }
     }
     for (uint32_t i = T8 * 8u + tid; i < n_keys; i += kTopkThr) {
       const uint32_t key = mono(sc[i]);
-      hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+      hist_add(s_hist, (key >> sh) & bmsk, (key > KEY_NEG_INF) && ((key & msk) == pre));
     }
     lds_barrier();
     uint32_t b = 0, acc = 0;
-    hist_scan(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
-    if (sh == 24 && !s_any) {
+    if constexpr (V2) {
+      if (pass < 2) hist_scan_v2<2048u>(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
+      else          hist_scan_v2<1024u>(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
+    } else {
+      hist_scan(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
+    }
+    if (pass == 0 && !s_any) {
       // Fewer than k finite entries: take all finite entries
       if (tid == 0) {
         s_prefix = KEY_NEG_INF;
@@ -926,7 +1188,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_mask_kernel(
 // than the launches it would save — does the 256-entry scan and leaves the prefix
 // for the next launch. It also zeroes the histogram behind itself, so the buffer needs clearing
 // once at allocation and never again.
-constexpr uint32_t kTopkHist = 256;
+constexpr uint32_t kTopkHist = 2048;
 
 // Blocks the spread select launches: one a workgroup processor, cached per device.
 uint32_t topk_blocks() {
@@ -940,7 +1202,7 @@ uint32_t topk_blocks() {
 // state[t]: prefix, need, gt, arrivals.
 __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
     const float* __restrict__ scores, const uint32_t* __restrict__ nkeys, uint32_t stride,
-    uint32_t max_keys, uint32_t k, int sh, uint32_t* __restrict__ hist,
+    uint32_t max_keys, uint32_t k, int sh, uint32_t nbins, uint32_t msk, uint32_t* __restrict__ hist,
     uint32_t* __restrict__ state) {
   __shared__ uint32_t s_h[kTopkHist];
   __shared__ uint32_t s_last, s_b, s_any;
@@ -950,24 +1212,27 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
   const uint32_t n_keys = nk0 < max_keys ? nk0 : max_keys;
   uint32_t* g_h = hist + (size_t)t * kTopkHist;
   uint32_t* g_s = state + (size_t)t * 4u;
+  const bool is_first = (msk == 0u);
   // Fewer keys than the budget admits all of them and never consults the threshold, so no pass runs
   // and nothing here may touch the counter — it has to come out of this call as it went in.
   if (n_keys <= k) return;
-  if (sh < 24 && g_s[0] == KEY_NEG_INF && g_s[1] == 0u) return;
+  if (!is_first && g_s[0] == KEY_NEG_INF && g_s[1] == 0u) return;
 
-  if (tid < kTopkHist) s_h[tid] = 0;
+  const uint32_t bmsk = nbins - 1u;
+  for (uint32_t bi = tid; bi < nbins; bi += kTopkThr) s_h[bi] = 0u;
   lds_barrier();
-  const uint32_t pre = (sh == 24) ? 0u : g_s[0];
-  const uint32_t msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+  const uint32_t pre = is_first ? 0u : g_s[0];
   const uint32_t per = (n_keys + gridDim.x - 1u) / gridDim.x;
   const uint32_t lo = blockIdx.x * per;
   const uint32_t hi = (lo + per < n_keys) ? lo + per : n_keys;
   for (uint32_t i = lo + tid; i < hi; i += kTopkThr) {
     const uint32_t key = mono(sc[i]);
-    hist_add(s_h, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+    hist_add(s_h, (key >> sh) & bmsk, (key > KEY_NEG_INF) && ((key & msk) == pre));
   }
   lds_barrier();
-  if (tid < kTopkHist && s_h[tid]) atomicAdd(&g_h[tid], s_h[tid]);
+  for (uint32_t bi = tid; bi < nbins; bi += kTopkThr) {
+    if (s_h[bi]) atomicAdd(&g_h[bi], s_h[bi]);
+  }
   // Every thread drains its own global stores/atomics, then the barrier orders all of them before
   // the release arrival count below — making "I am the last" mean "every block's counts landed".
 #ifdef __HIP_DEVICE_COMPILE__
@@ -992,20 +1257,25 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_hist_kernel(
 #else
   __threadfence();
 #endif
-  const uint32_t need = (sh == 24) ? k : g_s[1];
-  if (tid < kTopkHist) { s_h[tid] = g_h[tid]; g_h[tid] = 0; }   // zeroed for the next pass
+  const uint32_t need = is_first ? k : g_s[1];
+  for (uint32_t bi = tid; bi < nbins; bi += kTopkThr) {
+    s_h[bi] = g_h[bi];
+    g_h[bi] = 0u;
+  }
   lds_barrier();
   uint32_t b = 0, acc = 0;
-  hist_scan(s_h, &s_b, &s_any, need, tid, &b, &acc);
+  if (nbins == 2048u)      hist_scan_v2<2048u>(s_h, &s_b, &s_any, need, tid, &b, &acc);
+  else if (nbins == 1024u) hist_scan_v2<1024u>(s_h, &s_b, &s_any, need, tid, &b, &acc);
+  else                     hist_scan(s_h, &s_b, &s_any, need, tid, &b, &acc);
   if (tid == 0) {
-    if (sh == 24 && !s_any) {
+    if (is_first && !s_any) {
       g_s[0] = KEY_NEG_INF;
       g_s[1] = 0u;
       g_s[2] = 0u;
     } else {
       g_s[0] = pre | (b << sh);
       g_s[1] = need - acc;
-      g_s[2] = ((sh == 24) ? 0u : g_s[2]) + acc;        // strictly above the bucket descended into
+      g_s[2] = (is_first ? 0u : g_s[2]) + acc;        // strictly above the bucket descended into
     }
     g_s[3] = 0;
   }
@@ -1142,11 +1412,6 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_tie_kernel(
 //
 // One block a (token, head) row of 128: the Hadamard is a 7-stage butterfly through LDS, and the
 // E2M1 groups are 32 wide, which is exactly a wave, so the group amax is a wave reduction.
-__device__ __forceinline__ float yarn_ramp_dev(float low, float high, int i) {
-  const float y = ((float)i / 2.0f - low) / fmaxf(0.001f, high - low);
-  return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
-}
-
 template <bool HADAMARD>
 __global__ __launch_bounds__(128) void idx_rope_qat_kernel(float* __restrict__ q, uint32_t n_head,
                                                            uint32_t n_rot, uint32_t pos0,
@@ -1243,6 +1508,29 @@ __global__ void idx_block_max_kernel(const float* __restrict__ sc, float* __rest
   bsc[(size_t)t * bstride + b] = m;
 }
 
+// Coalesced 8-key block-max for block == 8: 32 consecutive lanes read consecutive scores and
+// reduce in-register over 8-lane sub-blocks with 3 DPP XOR ops.
+__global__ __launch_bounds__(256) void idx_block_max_b8_kernel(
+    const float* __restrict__ sc, float* __restrict__ bsc, const uint32_t* __restrict__ nkeys,
+    uint32_t sstride, uint32_t bstride, uint32_t nb_blocks, uint32_t keys_all) {
+  const uint32_t t = blockIdx.y;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t blk = blockIdx.x * 32u + (tid >> 3);
+  const uint32_t lane8 = tid & 7u;
+  const uint32_t nk0 = nkeys ? nkeys[t] : keys_all;
+  const uint32_t keys = nk0 < keys_all ? nk0 : keys_all;
+  const uint32_t lo = blk * 8u;
+  const uint32_t s = lo + lane8;
+  float v = (blk < nb_blocks && s < keys) ? sc[(size_t)t * sstride + s] : -INFINITY;
+  v = fmaxf(v, dpp_xor_lane<1u>(v));
+  v = fmaxf(v, dpp_xor_lane<2u>(v));
+  v = fmaxf(v, dpp_xor_lane<4u>(v));
+  if (lane8 == 0u && blk < nb_blocks) {
+    if (lo < keys && keys && blk == (keys - 1u) / 8u) v = INFINITY;
+    bsc[(size_t)t * bstride + blk] = v;
+  }
+}
+
 // Level two's input: everything outside the published set becomes unreachable, so the layer's own
 // top-k can only pick inside it. In place, because the score plane is consumed by the top-k
 // immediately and read by nothing else.
@@ -1262,15 +1550,16 @@ __global__ void idx_apply_cand_kernel(float* __restrict__ sc, const uint8_t* __r
 // Consumer layers (24, 28, 32, 36) score ONLY the `cand_n[t] * cand_block` keys named in
 // `cand_ids[t][0..cand_n[t]-1]` and run top-k directly over those compact scores, emitting
 // ascending global key indices into `adm` (or setting dense `mask` bits).
-template <bool ExactHeadOrder, uint32_t FixedBlock>
+template <bool ExactHeadOrder, uint32_t FixedBlock, uint32_t KPT = 1u,
+          uint32_t MaxHeads = kIdxDecHeads>
 __global__ __launch_bounds__(kThreads) void indexer_scores_cand_kernel(
     const uint8_t* __restrict__ q8, const float* __restrict__ qs, const uint8_t* __restrict__ k8,
     const float* __restrict__ ks, const float* __restrict__ hw,
     const uint16_t* __restrict__ cand_ids, const uint32_t* __restrict__ cand_n,
     const uint32_t* __restrict__ nkeys, float* __restrict__ out, uint32_t n_keys, uint32_t n_head,
     uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks, uint32_t out_stride) {
-  __shared__ __align__(16) uint8_t s_q[kIdxDecHeads * kQLd];
-  __shared__ float s_w[kIdxDecHeads];
+  __shared__ __align__(16) uint8_t s_q[MaxHeads * kQLd];
+  __shared__ float s_w[MaxHeads];
 
   const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
   const uint32_t c = lane & 15u, hlf = lane >> 4;
@@ -1280,57 +1569,64 @@ __global__ __launch_bounds__(kThreads) void indexer_scores_cand_kernel(
   const uint32_t nc0 = cand_n ? cand_n[tok] : nc_cap;
   const uint32_t nc = nc0 < nc_cap ? nc0 : nc_cap;
   const uint32_t n_cand_keys = nc * cand_block;
-  constexpr uint32_t kpb = kWaves * 16u;
+  constexpr uint32_t kpb = KPT * kWaves * 16u;
   if (blockIdx.x * kpb >= n_cand_keys) return;
 
-  const uint32_t u = blockIdx.x * kpb + wave * 16u + c;
   const uint32_t tok_keys0 = nkeys ? nkeys[tok] : n_keys;
   const uint32_t tok_keys = tok_keys0 < n_keys ? tok_keys0 : n_keys;
-  const bool in_cand = (u < n_cand_keys) && (u < out_stride);
-  uint32_t key = 0u;
-  bool live_key = false;
-  if (in_cand) {
-    const uint32_t blk_w = (FixedBlock > 0u) ? FixedBlock : cand_block;
-    const uint32_t j = (FixedBlock > 0u) ? (u / FixedBlock) : (u / cand_block);
-    const uint32_t r = (FixedBlock > 0u) ? (u & (FixedBlock - 1u)) : (u - j * cand_block);
-    const uint32_t b = (uint32_t)cand_ids[(size_t)tok * cand_stride + j];
-    key = b * blk_w + r;
-    live_key = (key < tok_keys);
-  }
-
-  // Inactive/tail-padded lanes read row 0 safely and drop/mask on store so DPP lane-exchange stays
-  // well-defined across all 32 lanes of the wave.
-  const uint8_t* row_kp = k8 + (size_t)(live_key ? key : 0u) * kD;
-  wmma::i2v bf[kD / 16u];
-  if ((reinterpret_cast<uintptr_t>(k8) & 15u) == 0u) {
-    const uint4* ku4 = reinterpret_cast<const uint4*>(row_kp);
+  uint32_t u[KPT];
+  bool in_cand[KPT];
+  bool live_key[KPT];
+  float kscale[KPT];
+  wmma::i2v bf[KPT][kD / 16u];
+  const bool k8_aligned16 = (reinterpret_cast<uintptr_t>(k8) & 15u) == 0u;
 #pragma unroll
-    for (uint32_t d2 = 0; d2 < kD / 32u; ++d2) {
-      const uint4 uv = ku4[2u * d2 + hlf];
-      const uint32_t ex0 = dpp_xor_lane<16>(hlf == 0u ? uv.z : uv.x);
-      const uint32_t ex1 = dpp_xor_lane<16>(hlf == 0u ? uv.w : uv.y);
-      bf[2u * d2 + 0u] = wmma::i2v{
-          static_cast<int>(hlf == 0u ? uv.x : ex0),
-          static_cast<int>(hlf == 0u ? uv.y : ex1)};
-      bf[2u * d2 + 1u] = wmma::i2v{
-          static_cast<int>(hlf == 0u ? ex0 : uv.z),
-          static_cast<int>(hlf == 0u ? ex1 : uv.w)};
+  for (uint32_t kp = 0u; kp < KPT; ++kp) {
+    u[kp] = blockIdx.x * kpb + (kp * kWaves + wave) * 16u + c;
+    in_cand[kp] = (u[kp] < n_cand_keys) && (u[kp] < out_stride);
+    uint32_t key = 0u;
+    live_key[kp] = false;
+    if (in_cand[kp]) {
+      const uint32_t blk_w = (FixedBlock > 0u) ? FixedBlock : cand_block;
+      const uint32_t j = (FixedBlock > 0u) ? (u[kp] / FixedBlock) : (u[kp] / cand_block);
+      const uint32_t r = (FixedBlock > 0u) ? (u[kp] & (FixedBlock - 1u)) : (u[kp] - j * cand_block);
+      const uint32_t b = (uint32_t)cand_ids[(size_t)tok * cand_stride + j];
+      key = b * blk_w + r;
+      live_key[kp] = (key < tok_keys);
     }
-  } else {
-    const uint8_t* kp = row_kp + hlf * 8u;
+    const uint8_t* row_kp = k8 + (size_t)(live_key[kp] ? key : 0u) * kD;
+    if (k8_aligned16) {
+      const uint4* ku4 = reinterpret_cast<const uint4*>(row_kp);
 #pragma unroll
-    for (uint32_t d = 0; d < kD / 16u; ++d) bf[d] = *(const wmma::i2v*)(kp + d * 16u);
+      for (uint32_t d2 = 0; d2 < kD / 32u; ++d2) {
+        const uint4 uv = ku4[2u * d2 + hlf];
+        const uint32_t ex0 = dpp_xor_lane<16>(hlf == 0u ? uv.z : uv.x);
+        const uint32_t ex1 = dpp_xor_lane<16>(hlf == 0u ? uv.w : uv.y);
+        bf[kp][2u * d2 + 0u] = wmma::i2v{
+            static_cast<int>(hlf == 0u ? uv.x : ex0),
+            static_cast<int>(hlf == 0u ? uv.y : ex1)};
+        bf[kp][2u * d2 + 1u] = wmma::i2v{
+            static_cast<int>(hlf == 0u ? ex0 : uv.z),
+            static_cast<int>(hlf == 0u ? ex1 : uv.w)};
+      }
+    } else {
+      const uint8_t* kp_p = row_kp + hlf * 8u;
+#pragma unroll
+      for (uint32_t d = 0; d < kD / 16u; ++d) bf[kp][d] = *(const wmma::i2v*)(kp_p + d * 16u);
+    }
+    kscale[kp] = live_key[kp] ? ks[key] : 0.0f;
   }
-  const float kscale = live_key ? ks[key] : 0.0f;
 
   const uint8_t* const q8_b = q8 + (size_t)tok * n_head * kD;
   const float* const hw_b = hw + (size_t)tok * n_head;
   const float qs_b = qs[tok];
-  float sum = 0.0f;
+  float sum[KPT];
+#pragma unroll
+  for (uint32_t kp = 0u; kp < KPT; ++kp) sum[kp] = 0.0f;
 
-  for (uint32_t hg = 0; hg < n_head; hg += kIdxDecHeads) {
+  for (uint32_t hg = 0; hg < n_head; hg += MaxHeads) {
     if (hg > 0u) lds_barrier();
-    const uint32_t n_stage = (n_head - hg < kIdxDecHeads) ? (n_head - hg) : kIdxDecHeads;
+    const uint32_t n_stage = (n_head - hg < MaxHeads) ? (n_head - hg) : MaxHeads;
     const uint32_t n_stage_pad = (n_stage + 15u) & ~15u;
     for (uint32_t i = tid; i < n_stage_pad * (kD / 16u); i += kThreads) {
       const uint32_t row = i / (kD / 16u), dq = (i % (kD / 16u)) * 16u;
@@ -1341,48 +1637,53 @@ __global__ __launch_bounds__(kThreads) void indexer_scores_cand_kernel(
       *(uint64_t*)(dst + 0) = *(const uint64_t*)&qv.x;
       *(uint64_t*)(dst + 8) = *(const uint64_t*)&qv.z;
     }
-    if (tid < kIdxDecHeads) s_w[tid] = (tid < n_stage) ? hw_b[hg + tid] : 0.0f;
+    if (tid < MaxHeads) s_w[tid] = (tid < n_stage) ? hw_b[hg + tid] : 0.0f;
     lds_barrier();
 
     for (uint32_t mt = 0; mt < n_stage; mt += 16u) {
-      wmma::f8v acc = wmma::acc_zero();
+      wmma::i2v af[kD / 16u];
       const uint8_t* qp = s_q + (size_t)(mt + c) * kQLd + hlf * 8u;
 #pragma unroll
-      for (uint32_t d = 0; d < kD / 16u; ++d)
-        acc = wmma::mma_fp8(*(const wmma::i2v*)(qp + d * 16u), bf[d], acc);
-      if constexpr (!ExactHeadOrder) {
+      for (uint32_t d = 0; d < kD / 16u; ++d) af[d] = *(const wmma::i2v*)(qp + d * 16u);
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-          sum += s_w[mt + hlf * 8u + (uint32_t)j] * fmaxf(acc[j], 0.0f);
-      } else {
-        // Exact h = 0..n_head-1 left-to-right accumulation order matching `indexer_kernel`:
-        // hlf==1 passes its 8 heads to hlf==0 via single-instruction permlanex16 so hlf==0
-        // sums heads mt+0..mt+7 then mt+8..mt+15 sequentially under -ffp-contract=off.
-        float v[8];
+      for (uint32_t kp = 0u; kp < KPT; ++kp) {
+        wmma::f8v acc = wmma::acc_zero();
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const uint32_t hr = mt + hlf * 8u + (uint32_t)j;
-          v[j] = (hr < n_stage) ? (s_w[hr] * fmaxf(acc[j], 0.0f)) : 0.0f;
-        }
-        float uval[8];
+        for (uint32_t d = 0; d < kD / 16u; ++d) acc = wmma::mma_fp8(af[d], bf[kp][d], acc);
+        if constexpr (!ExactHeadOrder) {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) uval[j] = dpp_xor_lane<16u>(v[j]);
-        if (hlf == 0u) {
+          for (int j = 0; j < 8; ++j)
+            sum[kp] += s_w[mt + hlf * 8u + (uint32_t)j] * fmaxf(acc[j], 0.0f);
+        } else {
+          float v[8];
 #pragma unroll
           for (int j = 0; j < 8; ++j) {
-            if (mt + (uint32_t)j < n_stage) sum += v[j];
+            const uint32_t hr = mt + hlf * 8u + (uint32_t)j;
+            v[j] = (hr < n_stage) ? (s_w[hr] * fmaxf(acc[j], 0.0f)) : 0.0f;
           }
+          float uval[8];
 #pragma unroll
-          for (int j = 0; j < 8; ++j) {
-            if (mt + 8u + (uint32_t)j < n_stage) sum += uval[j];
+          for (int j = 0; j < 8; ++j) uval[j] = dpp_xor_lane<16u>(v[j]);
+          if (hlf == 0u) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              if (mt + (uint32_t)j < n_stage) sum[kp] += v[j];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              if (mt + 8u + (uint32_t)j < n_stage) sum[kp] += uval[j];
+            }
           }
         }
       }
     }
   }
-  if constexpr (!ExactHeadOrder) sum += dpp_xor_lane<16u>(sum);
-  if (hlf == 0u && in_cand) {
-    out[(size_t)tok * out_stride + u] = live_key ? (sum * qs_b * kscale) : -INFINITY;
+#pragma unroll
+  for (uint32_t kp = 0u; kp < KPT; ++kp) {
+    if constexpr (!ExactHeadOrder) sum[kp] += dpp_xor_lane<16u>(sum[kp]);
+    if (hlf == 0u && in_cand[kp]) {
+      out[(size_t)tok * out_stride + u[kp]] = live_key[kp] ? (sum[kp] * qs_b * kscale[kp]) : -INFINITY;
+    }
   }
 }
 
@@ -1402,14 +1703,15 @@ __global__ __launch_bounds__(kTopkThr) void idx_clear_mask_kernel(
   clear_mask_row(row, 0u, mlen, threadIdx.x);
 }
 
-template <uint32_t FixedBlock>
+template <uint32_t FixedBlock, bool V2>
 __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_mask_kernel(
     const float* __restrict__ cand_scores, uint8_t* __restrict__ mask,
     const uint16_t* __restrict__ cand_ids, const uint32_t* __restrict__ cand_n, uint32_t sstride,
     uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks, uint32_t mstride,
     uint32_t mlen, uint32_t k, uint32_t* __restrict__ adm, uint32_t* __restrict__ admn,
     uint32_t adm_stride) {
-  __shared__ uint32_t s_hist[256];
+  constexpr uint32_t HCAP = V2 ? 2048u : 256u;
+  __shared__ uint32_t s_hist[HCAP];
   __shared__ uint32_t s_tie[kTieCap];
   __shared__ uint32_t s_wc[2u * kTopkWaves];
   __shared__ uint32_t s_prefix, s_need, s_gt, s_b, s_any, s_nt, s_base, s_tie_end;
@@ -1445,10 +1747,17 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_mask_kernel(
 
   const bool sc_aligned16 = (reinterpret_cast<uintptr_t>(sc) & 15u) == 0u;
   const uint32_t T8 = sc_aligned16 ? (n_keys >> 3) : 0u;
-  for (int sh = 24; sh >= 0; sh -= 8) {
-    if (tid < 256u) s_hist[tid] = 0;
+  constexpr int n_passes = V2 ? 3 : 4;
+  for (int pass = 0; pass < n_passes; ++pass) {
+    const int sh = V2 ? (pass == 0 ? 21 : (pass == 1 ? 10 : 0)) : (24 - pass * 8);
+    const uint32_t nbins = V2 ? (pass < 2 ? 2048u : 1024u) : 256u;
+    const uint32_t bmsk = nbins - 1u;
+    const uint32_t msk =
+        V2 ? (pass == 0 ? 0u : (pass == 1 ? 0xFFE00000u : 0xFFFFFC00u))
+           : (pass == 0 ? 0u : (0xFFFFFFFFu << (sh + 8)));
+    for (uint32_t bi = tid; bi < nbins; bi += kTopkThr) s_hist[bi] = 0u;
     lds_barrier();
-    const uint32_t pre = s_prefix, msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+    const uint32_t pre = s_prefix;
     for (uint32_t i = tid; i < T8; i += kTopkThr) {
       const uint4 v0 = ((const uint4*)sc)[2 * i + 0];
       const uint4 v1 = ((const uint4*)sc)[2 * i + 1];
@@ -1459,17 +1768,22 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_mask_kernel(
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         const uint32_t key = ks[j];
-        hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+        hist_add(s_hist, (key >> sh) & bmsk, (key > KEY_NEG_INF) && ((key & msk) == pre));
       }
     }
     for (uint32_t i = T8 * 8u + tid; i < n_keys; i += kTopkThr) {
       const uint32_t key = mono(sc[i]);
-      hist_add(s_hist, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+      hist_add(s_hist, (key >> sh) & bmsk, (key > KEY_NEG_INF) && ((key & msk) == pre));
     }
     lds_barrier();
     uint32_t b = 0, acc = 0;
-    hist_scan(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
-    if (sh == 24 && !s_any) {
+    if constexpr (V2) {
+      if (pass < 2) hist_scan_v2<2048u>(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
+      else          hist_scan_v2<1024u>(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
+    } else {
+      hist_scan(s_hist, &s_b, &s_any, s_need, tid, &b, &acc);
+    }
+    if (pass == 0 && !s_any) {
       if (tid == 0) {
         s_prefix = KEY_NEG_INF;
         s_need = 0;
@@ -1536,7 +1850,7 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_mask_kernel(
 __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_hist_kernel(
     const float* __restrict__ cand_scores, const uint32_t* __restrict__ cand_n, uint32_t sstride,
     uint32_t cand_stride, uint32_t cand_block, uint32_t cand_max_blocks, uint32_t k, int sh,
-    uint32_t* __restrict__ hist, uint32_t* __restrict__ state) {
+    uint32_t nbins, uint32_t msk, uint32_t* __restrict__ hist, uint32_t* __restrict__ state) {
   __shared__ uint32_t s_h[kTopkHist];
   __shared__ uint32_t s_last, s_b, s_any;
   const uint32_t t = blockIdx.y, tid = threadIdx.x;
@@ -1545,22 +1859,25 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_hist_kernel(
       cand_row_len(cand_n, t, sstride, cand_stride, cand_block, cand_max_blocks);
   uint32_t* g_h = hist + (size_t)t * kTopkHist;
   uint32_t* g_s = state + (size_t)t * 4u;
+  const bool is_first = (msk == 0u);
   if (n_keys <= k) return;
-  if (sh < 24 && g_s[0] == KEY_NEG_INF && g_s[1] == 0u) return;
+  if (!is_first && g_s[0] == KEY_NEG_INF && g_s[1] == 0u) return;
 
-  if (tid < kTopkHist) s_h[tid] = 0;
+  const uint32_t bmsk = nbins - 1u;
+  for (uint32_t bi = tid; bi < nbins; bi += kTopkThr) s_h[bi] = 0u;
   lds_barrier();
-  const uint32_t pre = (sh == 24) ? 0u : g_s[0];
-  const uint32_t msk = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+  const uint32_t pre = is_first ? 0u : g_s[0];
   const uint32_t per = (n_keys + gridDim.x - 1u) / gridDim.x;
   const uint32_t lo = blockIdx.x * per;
   const uint32_t hi = (lo + per < n_keys) ? lo + per : n_keys;
   for (uint32_t i = lo + tid; i < hi; i += kTopkThr) {
     const uint32_t key = mono(sc[i]);
-    hist_add(s_h, (key >> sh) & 0xFFu, (key > KEY_NEG_INF) && ((key & msk) == pre));
+    hist_add(s_h, (key >> sh) & bmsk, (key > KEY_NEG_INF) && ((key & msk) == pre));
   }
   lds_barrier();
-  if (tid < kTopkHist && s_h[tid]) atomicAdd(&g_h[tid], s_h[tid]);
+  for (uint32_t bi = tid; bi < nbins; bi += kTopkThr) {
+    if (s_h[bi]) atomicAdd(&g_h[bi], s_h[bi]);
+  }
 #ifdef __HIP_DEVICE_COMPILE__
   asm volatile("s_wait_storecnt 0x0" ::: "memory");
 #else
@@ -1580,20 +1897,25 @@ __global__ __launch_bounds__(kTopkThr) void idx_topk_cand_hist_kernel(
 #else
   __threadfence();
 #endif
-  const uint32_t need = (sh == 24) ? k : g_s[1];
-  if (tid < kTopkHist) { s_h[tid] = g_h[tid]; g_h[tid] = 0; }
+  const uint32_t need = is_first ? k : g_s[1];
+  for (uint32_t bi = tid; bi < nbins; bi += kTopkThr) {
+    s_h[bi] = g_h[bi];
+    g_h[bi] = 0u;
+  }
   lds_barrier();
   uint32_t b = 0, acc = 0;
-  hist_scan(s_h, &s_b, &s_any, need, tid, &b, &acc);
+  if (nbins == 2048u)      hist_scan_v2<2048u>(s_h, &s_b, &s_any, need, tid, &b, &acc);
+  else if (nbins == 1024u) hist_scan_v2<1024u>(s_h, &s_b, &s_any, need, tid, &b, &acc);
+  else                     hist_scan(s_h, &s_b, &s_any, need, tid, &b, &acc);
   if (tid == 0) {
-    if (sh == 24 && !s_any) {
+    if (is_first && !s_any) {
       g_s[0] = KEY_NEG_INF;
       g_s[1] = 0u;
       g_s[2] = 0u;
     } else {
       g_s[0] = pre | (b << sh);
       g_s[1] = need - acc;
-      g_s[2] = ((sh == 24) ? 0u : g_s[2]) + acc;
+      g_s[2] = (is_first ? 0u : g_s[2]) + acc;
     }
     g_s[3] = 0;
   }
@@ -1713,15 +2035,26 @@ void idx_topk_mask_dispatch(const float* scores, uint8_t* mask, const uint32_t* 
   // `device_cus` doubles. Queried once a device: this is on the dispatch path and
   // hipGetDeviceProperties is a driver call.
   const uint32_t blocks = topk_blocks();
-  // Spread it only when the token count cannot fill the card by itself. Six launches for one select
-  // is a real cost — an added kernel is never free here — so it has to buy back more than that,
-  // which needs both a small grid and enough keys for the passes to dominate.
+  const bool topk_v2 = idx_topk_v2_enabled();
+  // Spread it only when the token count cannot fill the card by itself.
   if (sp && sp->hist && sp->tie && nb <= sp->tok_cap && nb < blocks && max_keys >= 4096u) {
     const dim3 g(blocks, nb), b(kTopkThr);
-    for (int sh = 24; sh >= 0; sh -= 8) {
-      hipLaunchKernelGGL(idx_topk_hist_kernel, g, b, 0, st, scores, nkeys, stride, max_keys, k, sh,
-                         sp->hist, sp->state);
-      AFF_HIP_CHECK(hipGetLastError());
+    if (topk_v2) {
+      static constexpr int sh[3] = {21, 10, 0};
+      static constexpr uint32_t nbins[3] = {2048u, 2048u, 1024u};
+      static constexpr uint32_t pmask[3] = {0u, 0xFFE00000u, 0xFFFFFC00u};
+      for (int p = 0; p < 3; ++p) {
+        hipLaunchKernelGGL(idx_topk_hist_kernel, g, b, 0, st, scores, nkeys, stride, max_keys, k,
+                           sh[p], nbins[p], pmask[p], sp->hist, sp->state);
+        AFF_HIP_CHECK(hipGetLastError());
+      }
+    } else {
+      for (int sh = 24; sh >= 0; sh -= 8) {
+        const uint32_t pm = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+        hipLaunchKernelGGL(idx_topk_hist_kernel, g, b, 0, st, scores, nkeys, stride, max_keys, k,
+                           sh, 256u, pm, sp->hist, sp->state);
+        AFF_HIP_CHECK(hipGetLastError());
+      }
     }
     hipLaunchKernelGGL(idx_topk_mark_kernel, g, b, 0, st, scores, mask, nkeys, stride, max_keys,
                        mstride, mlen, k, sp->state, sp->tie);
@@ -1732,9 +2065,15 @@ void idx_topk_mask_dispatch(const float* scores, uint8_t* mask, const uint32_t* 
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }
-  hipLaunchKernelGGL(idx_topk_mask_kernel, dim3(nb), dim3(kTopkThr), 0, st, scores, mask, nkeys,
-                     stride, max_keys, mstride, mlen, k, adm, admn, adm_stride, cand_ids_out,
-                     cand_n_out, cand_stride);
+  if (topk_v2) {
+    hipLaunchKernelGGL((idx_topk_mask_kernel<true>), dim3(nb), dim3(kTopkThr), 0, st, scores, mask,
+                       nkeys, stride, max_keys, mstride, mlen, k, adm, admn, adm_stride,
+                       cand_ids_out, cand_n_out, cand_stride);
+  } else {
+    hipLaunchKernelGGL((idx_topk_mask_kernel<false>), dim3(nb), dim3(kTopkThr), 0, st, scores, mask,
+                       nkeys, stride, max_keys, mstride, mlen, k, adm, admn, adm_stride,
+                       cand_ids_out, cand_n_out, cand_stride);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -1766,16 +2105,21 @@ void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, c
   const uint32_t dec_max_nb = idx_narrow_max_nb();
   if (nb <= dec_max_nb && n_head <= kIdxDecHeads && (n_head % 16u) == 0u) {
     const uint32_t kpb = kWaves * 16u;                // 64 keys a block
+    const uint32_t gx = (n_keys + kpb - 1u) / kpb;
     const char* mt_env = std::getenv("AFF_IDX_DEC_MULTITOK");
     const bool dec_multitok = !(mt_env && *mt_env && std::strcmp(mt_env, "0") == 0);
-    if (dec_multitok && nb > 1u) {
-      const dim3 g((n_keys + kpb - 1u) / kpb, 1u, 1u);
-      hipLaunchKernelGGL((indexer_dec_kernel<true>), g, dim3(kThreads), 0,
-                         (hipStream_t)stream, q8, qs, k8, ks, hw, out, n_keys, n_head, nb);
+    const bool use_mt = dec_multitok && nb > 1u && (!idx_cand_multitok_enabled() || gx >= 64u);
+    auto launch_dec = [&]<bool MT, uint32_t MH>() {
+      const dim3 g(gx, 1u, MT ? 1u : nb);
+      hipLaunchKernelGGL((indexer_dec_kernel<MT, MH>), g, dim3(kThreads), 0, (hipStream_t)stream,
+                         q8, qs, k8, ks, hw, out, n_keys, n_head, nb);
+    };
+    if (use_mt) {
+      if (n_head <= 32u) launch_dec.template operator()<true, 32u>();
+      else               launch_dec.template operator()<true, kIdxDecHeads>();
     } else {
-      const dim3 g((n_keys + kpb - 1u) / kpb, 1u, nb);
-      hipLaunchKernelGGL((indexer_dec_kernel<false>), g, dim3(kThreads), 0,
-                         (hipStream_t)stream, q8, qs, k8, ks, hw, out, n_keys, n_head, nb);
+      if (n_head <= 32u) launch_dec.template operator()<false, 32u>();
+      else               launch_dec.template operator()<false, kIdxDecHeads>();
     }
     AFF_HIP_CHECK(hipGetLastError());
     return;
@@ -1799,6 +2143,24 @@ void idx_rope_qat_hip(float* q, uint32_t n, uint32_t n_head, uint32_t n_rot, uin
                        (hipStream_t)stream, q, n_head, n_rot, pos0, freq_scale, theta_scale,
                        ext_factor, lo, hi);
   AFF_HIP_CHECK(hipGetLastError());
+}
+
+bool idx_rope_qat_quant_hip(const float* q, uint8_t* q8, float* qs, uint32_t n, uint32_t n_head,
+                            uint32_t n_rot, uint32_t pos0, float freq_scale, float theta_scale,
+                            float ext_factor, float lo, float hi, void* stream, bool hadamard) {
+  if (!n || !n_head) return true;
+  if (n_head > 64u) return false;
+  if (hadamard) {
+    hipLaunchKernelGGL(idx_rope_qat_quant_kernel<true>, dim3(n), dim3(kIdxDim), 0,
+                       (hipStream_t)stream, q, q8, qs, n_head, n_rot, pos0, freq_scale,
+                       theta_scale, ext_factor, lo, hi);
+  } else {
+    hipLaunchKernelGGL(idx_rope_qat_quant_kernel<false>, dim3(n), dim3(kIdxDim), 0,
+                       (hipStream_t)stream, q, q8, qs, n_head, n_rot, pos0, freq_scale,
+                       theta_scale, ext_factor, lo, hi);
+  }
+  AFF_HIP_CHECK(hipGetLastError());
+  return true;
 }
 
 void idx_quant_rows_hip(const float* src, uint8_t* dst, float* scale, uint32_t n, uint32_t dim,
@@ -1862,32 +2224,49 @@ void indexer_scores_cand_hip(const uint8_t* q8, const float* qs, const uint8_t* 
   if (!n_cand_max) return;
   const uint32_t dec_max_nb = idx_narrow_max_nb();
   const bool exact_head_order = !(nb <= dec_max_nb && n_head <= kIdxDecHeads && (n_head % 16u) == 0u);
-  constexpr uint32_t kpb = kWaves * 16u;
-  const uint32_t gx = (n_cand_max + kpb - 1u) / kpb;
+  const bool cand_kpt2 =
+      idx_cand_multitok_enabled() && exact_head_order && n_cand_max >= 256u;
   constexpr uint32_t kMaxGridZ = 65535u;
   hipStream_t st = (hipStream_t)stream;
 
-  auto launch = [&]<bool Exact, uint32_t FixedBlk>() {
+  auto launch = [&]<bool Exact, uint32_t FixedBlk, uint32_t KPT>() {
+    const uint32_t kpb = KPT * kWaves * 16u;
+    const uint32_t gx = (n_cand_max + kpb - 1u) / kpb;
     for (uint32_t t_off = 0; t_off < nb; t_off += kMaxGridZ) {
       const uint32_t chunk = std::min(nb - t_off, kMaxGridZ);
       const dim3 g(gx, 1u, chunk);
-      hipLaunchKernelGGL((indexer_scores_cand_kernel<Exact, FixedBlk>), g, dim3(kThreads), 0, st,
-                         q8 + (size_t)t_off * n_head * kD, qs + t_off, k8, ks,
-                         hw + (size_t)t_off * n_head, cand_ids + (size_t)t_off * cand_stride,
-                         cand_n ? cand_n + t_off : nullptr, nkeys ? nkeys + t_off : nullptr,
-                         out + (size_t)t_off * out_stride, n_keys, n_head, cand_stride, cand_block,
-                         eff_blocks, out_stride);
+      if (n_head <= 32u) {
+        hipLaunchKernelGGL((indexer_scores_cand_kernel<Exact, FixedBlk, KPT, 32u>), g,
+                           dim3(kThreads), 0, st, q8 + (size_t)t_off * n_head * kD, qs + t_off, k8,
+                           ks, hw + (size_t)t_off * n_head, cand_ids + (size_t)t_off * cand_stride,
+                           cand_n ? cand_n + t_off : nullptr, nkeys ? nkeys + t_off : nullptr,
+                           out + (size_t)t_off * out_stride, n_keys, n_head, cand_stride,
+                           cand_block, eff_blocks, out_stride);
+      } else {
+        hipLaunchKernelGGL((indexer_scores_cand_kernel<Exact, FixedBlk, KPT, kIdxDecHeads>), g,
+                           dim3(kThreads), 0, st, q8 + (size_t)t_off * n_head * kD, qs + t_off, k8,
+                           ks, hw + (size_t)t_off * n_head, cand_ids + (size_t)t_off * cand_stride,
+                           cand_n ? cand_n + t_off : nullptr, nkeys ? nkeys + t_off : nullptr,
+                           out + (size_t)t_off * out_stride, n_keys, n_head, cand_stride,
+                           cand_block, eff_blocks, out_stride);
+      }
       AFF_HIP_CHECK(hipGetLastError());
     }
   };
   if (exact_head_order) {
-    if (cand_block == 16u) launch.template operator()<true, 16u>();
-    else if (cand_block == 8u) launch.template operator()<true, 8u>();
-    else launch.template operator()<true, 0u>();
+    if (cand_kpt2) {
+      if (cand_block == 16u) launch.template operator()<true, 16u, 2u>();
+      else if (cand_block == 8u) launch.template operator()<true, 8u, 2u>();
+      else launch.template operator()<true, 0u, 2u>();
+    } else {
+      if (cand_block == 16u) launch.template operator()<true, 16u, 1u>();
+      else if (cand_block == 8u) launch.template operator()<true, 8u, 1u>();
+      else launch.template operator()<true, 0u, 1u>();
+    }
   } else {
-    if (cand_block == 16u) launch.template operator()<false, 16u>();
-    else if (cand_block == 8u) launch.template operator()<false, 8u>();
-    else launch.template operator()<false, 0u>();
+    if (cand_block == 16u) launch.template operator()<false, 16u, 1u>();
+    else if (cand_block == 8u) launch.template operator()<false, 8u, 1u>();
+    else launch.template operator()<false, 0u, 1u>();
   }
 }
 
@@ -1913,16 +2292,31 @@ void idx_topk_mask_cand_hip(const float* cand_scores, uint8_t* mask, const uint1
   const uint32_t eff_blocks = cand_max_blocks < cand_stride ? cand_max_blocks : cand_stride;
   const uint32_t max_cand_keys = std::min(sstride, eff_blocks * cand_block);
   const uint32_t blocks = topk_blocks();
+  const bool topk_v2 = idx_topk_v2_enabled();
   const bool use_spread =
       sp && sp->hist && sp->tie && nb <= sp->tok_cap && nb < blocks && max_cand_keys >= 4096u;
 
   auto run = [&]<uint32_t FixedBlk>() {
     if (use_spread) {
       const dim3 g(blocks, nb), b(kTopkThr);
-      for (int sh = 24; sh >= 0; sh -= 8) {
-        hipLaunchKernelGGL(idx_topk_cand_hist_kernel, g, b, 0, st, cand_scores, cand_n, sstride,
-                           cand_stride, cand_block, eff_blocks, k, sh, sp->hist, sp->state);
-        AFF_HIP_CHECK(hipGetLastError());
+      if (topk_v2) {
+        static constexpr int sh[3] = {21, 10, 0};
+        static constexpr uint32_t nbins[3] = {2048u, 2048u, 1024u};
+        static constexpr uint32_t pmask[3] = {0u, 0xFFE00000u, 0xFFFFFC00u};
+        for (int p = 0; p < 3; ++p) {
+          hipLaunchKernelGGL(idx_topk_cand_hist_kernel, g, b, 0, st, cand_scores, cand_n, sstride,
+                             cand_stride, cand_block, eff_blocks, k, sh[p], nbins[p], pmask[p],
+                             sp->hist, sp->state);
+          AFF_HIP_CHECK(hipGetLastError());
+        }
+      } else {
+        for (int sh = 24; sh >= 0; sh -= 8) {
+          const uint32_t pm = (sh == 24) ? 0u : (0xFFFFFFFFu << (sh + 8));
+          hipLaunchKernelGGL(idx_topk_cand_hist_kernel, g, b, 0, st, cand_scores, cand_n, sstride,
+                             cand_stride, cand_block, eff_blocks, k, sh, 256u, pm, sp->hist,
+                             sp->state);
+          AFF_HIP_CHECK(hipGetLastError());
+        }
       }
       if (mask) {
         hipLaunchKernelGGL(idx_clear_mask_kernel, dim3(nb), dim3(kTopkThr), 0, st, mask, mstride,
@@ -1939,9 +2333,15 @@ void idx_topk_mask_cand_hip(const float* cand_scores, uint8_t* mask, const uint1
       AFF_HIP_CHECK(hipGetLastError());
       return;
     }
-    hipLaunchKernelGGL((idx_topk_cand_mask_kernel<FixedBlk>), dim3(nb), dim3(kTopkThr), 0, st,
-                       cand_scores, mask, cand_ids, cand_n, sstride, cand_stride, cand_block,
-                       eff_blocks, mstride, mlen, k, adm, admn, adm_stride);
+    if (topk_v2) {
+      hipLaunchKernelGGL((idx_topk_cand_mask_kernel<FixedBlk, true>), dim3(nb), dim3(kTopkThr), 0,
+                         st, cand_scores, mask, cand_ids, cand_n, sstride, cand_stride, cand_block,
+                         eff_blocks, mstride, mlen, k, adm, admn, adm_stride);
+    } else {
+      hipLaunchKernelGGL((idx_topk_cand_mask_kernel<FixedBlk, false>), dim3(nb), dim3(kTopkThr), 0,
+                         st, cand_scores, mask, cand_ids, cand_n, sstride, cand_stride, cand_block,
+                         eff_blocks, mstride, mlen, k, adm, admn, adm_stride);
+    }
     AFF_HIP_CHECK(hipGetLastError());
   };
 
@@ -1989,15 +2389,22 @@ void idx_block_max_hip(const float* scores, float* bsc, const uint32_t* nkeys, u
                        uint32_t sstride, uint32_t bstride, uint32_t nb_blocks, uint32_t block,
                        uint32_t keys_all, void* stream) {
   if (!nb || !nb_blocks || !block) return;
+  const bool use_b8 = (block == 8u) && idx_topk_v2_enabled();
   constexpr uint32_t kMaxGridY = 65535;
   for (uint32_t t_off = 0; t_off < nb; t_off += kMaxGridY) {
     const uint32_t chunk = std::min(nb - t_off, kMaxGridY);
-    const dim3 g((nb_blocks + 255u) / 256u, chunk), b(256);
-    hipLaunchKernelGGL(idx_block_max_kernel, g, b, 0, (hipStream_t)stream,
-                       scores + (size_t)t_off * sstride,
-                       bsc + (size_t)t_off * bstride,
-                       nkeys ? nkeys + t_off : nullptr,
-                       sstride, bstride, nb_blocks, block, keys_all);
+    if (use_b8) {
+      const dim3 g((nb_blocks + 31u) / 32u, chunk), b(256);
+      hipLaunchKernelGGL(idx_block_max_b8_kernel, g, b, 0, (hipStream_t)stream,
+                         scores + (size_t)t_off * sstride, bsc + (size_t)t_off * bstride,
+                         nkeys ? nkeys + t_off : nullptr, sstride, bstride, nb_blocks, keys_all);
+    } else {
+      const dim3 g((nb_blocks + 255u) / 256u, chunk), b(256);
+      hipLaunchKernelGGL(idx_block_max_kernel, g, b, 0, (hipStream_t)stream,
+                         scores + (size_t)t_off * sstride, bsc + (size_t)t_off * bstride,
+                         nkeys ? nkeys + t_off : nullptr, sstride, bstride, nb_blocks, block,
+                         keys_all);
+    }
     AFF_HIP_CHECK(hipGetLastError());
   }
 }

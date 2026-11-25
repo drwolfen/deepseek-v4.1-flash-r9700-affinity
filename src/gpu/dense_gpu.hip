@@ -727,6 +727,32 @@ inline bool alias_bdx_enabled() {
   return on;
 }
 
+inline bool idx_full_bq_enabled() {
+  const char* v = std::getenv("AFF_IDX_FULL_BQ");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool fuse_idx_q_enabled() {
+  const char* v = std::getenv("AFF_FUSE_IDX_Q");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool flash_split_v2_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_FLASH_SPLIT_V2");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+inline bool idx_topk_v2_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("AFF_IDX_TOPK_V2");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
 inline bool moe_cross_alias_enabled() {
   static const bool on = [] {
     const char* v = std::getenv("AFF_MOE_CROSS_ALIAS");
@@ -5117,10 +5143,10 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
       }
     }
     // The flash key split. kSplitTok is the launch size above which the natural grid already fills
-    // the device, so the arena never has to hold a prefill chunk: at 32 heads a card and 512 dims a
-    // head it is 8 * 32 * 512 * 4 B = 512 KiB a slice, 16 MiB for all 32 of them.
+    // the device, so the arena never has to hold a prefill chunk.
     if (a_width_ == kFlashWidth && !D.fsplit.o) {
-      constexpr uint32_t kSplitTok = 8, kSplitSlots = 32;
+      const uint32_t kSplitTok = flash_split_v2_enabled() ? 16u : 8u;
+      constexpr uint32_t kSplitSlots = 32;
       uint64_t mlb = 0;
       const uint64_t ob = flash_split_bytes(kSplitTok, a_hpr_, kSplitSlots, &mlb);
       if (v2_alias && D.b_y && by_bytes >= ob) {
@@ -5134,7 +5160,7 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
       D.fsplit.slots = kSplitSlots;
     }
     if (!D.topk.hist) {
-      constexpr uint32_t kTopkTok = 8;
+      const uint32_t kTopkTok = idx_topk_v2_enabled() ? 16u : 8u;
       uint64_t sb = 0, tb = 0;
       const uint64_t hb = idx_topk_scratch_bytes(kTopkTok, &sb, &tb);
       if (!hip_try(hipMalloc(&D.topk.hist, hb), "top-k histogram", err) ||
@@ -5830,7 +5856,10 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
     D.i_qs = reinterpret_cast<float*>(base + tail_off + q8_bytes);
     D.i_w = reinterpret_cast<float*>(base + tail_off + q8_bytes + qs_bytes);
     D.i_q8_bytes = (size_t)cap * n_head * dim;
-    D.i_sc_bytes = bot_bytes;
+    D.i_sc_bytes = idx_full_bq_enabled() ? (usable_bq - tail_bytes) : bot_bytes;
+    if (idx_full_bq_enabled()) {
+      i_tile_ = (uint32_t)std::min<size_t>(cap, std::max<size_t>(1, row ? D.i_sc_bytes / row : cap));
+    }
     D.b_q_i_tail_off = tail_off;
   } else {
     if (hipMalloc(&D.i_q, (size_t)cap * n_head * dim * sizeof(float)) != hipSuccess) return false;
@@ -6739,9 +6768,14 @@ bool DenseGpu::indexer_one(const Model::IndexArgs& a) {
       launch_mv({e.sh[d].data, e.sh[d].scales, e.quant, e.sh[d].ps}, D.d_qrn,
                 (uint32_t)(n_head * a.dim), (uint32_t)a.qr, D.i_q, st);
     }
-    idx_rope_qat_hip(D.i_q, 1, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
-                     a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
-    idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head * a.dim, st);
+    if (!fuse_idx_q_enabled() ||
+        !idx_rope_qat_quant_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head, a.n_rot, a.pos0,
+                                a.rope.freq_scale, a.rope.theta_scale, a.rope.ext_factor, a.rope.lo,
+                                a.rope.hi, st, a.hadamard)) {
+      idx_rope_qat_hip(D.i_q, 1, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
+                       a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
+      idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, 1, n_head * a.dim, st);
+    }
     const bool gather = topk <= kAdmCap;
     const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
     const uint32_t mlen = a.n_mask > a_maxcomp_ ? a_maxcomp_ : a.n_mask;
@@ -6877,12 +6911,17 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
                                    hipMemcpyHostToDevice, st));
       AFF_HIP_CHECK(D.ncomp_idxb.done(bs, st));
     }
-    // RoPE and QAT here, not on the host: i_q holds the projection's RAW output, and i_w the head
+    // RoPE, QAT, and E4M3 quantization here: i_q holds the projection's RAW output, and i_w the head
     // weights — batch_indexer_q and batch_compress wrote both, on device.
-    idx_rope_qat_hip(D.i_q, n, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
-                     a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
-    // One scale a token over all 64 heads; the keys' own scales came with them.
-    idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, n, n_head * a.dim, st);
+    if (!fuse_idx_q_enabled() ||
+        !idx_rope_qat_quant_hip(D.i_q, D.i_q8, D.i_qs, n, n_head, a.n_rot, a.pos0,
+                                a.rope.freq_scale, a.rope.theta_scale, a.rope.ext_factor, a.rope.lo,
+                                a.rope.hi, st, a.hadamard)) {
+      idx_rope_qat_hip(D.i_q, n, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
+                       a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
+      // One scale a token over all 64 heads; the keys' own scales came with them.
+      idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, n, n_head * a.dim, st);
+    }
     // Scores in TILES of `i_tile_` tokens, because the score plane is [tokens][every candidate row]
     // and the candidate count is the context. Holding a whole 1536-token chunk of it costs 1.50 GiB
     // a card at a 1M cache, to carry values that idx_topk_mask consumes immediately and never reads
@@ -6918,6 +6957,9 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
       }
       if (!(gather && flash_ok) && !b_allow_dense_ && D.b_allow_rows)
         eff_tile = std::min(eff_tile, D.b_allow_rows);
+      if (idx_full_bq_enabled() && eff_tile < n && eff_tile >= kIdxTokTile) {
+        eff_tile &= ~(kIdxTokTile - 1u);
+      }
     }
     for (uint32_t t0 = 0; t0 < n; t0 += eff_tile) {
       const uint32_t nt = std::min(eff_tile, n - t0);
