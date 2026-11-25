@@ -52,6 +52,12 @@ RUN cd /opt/affinity-src \
       build/test_v510_kernels \
       build/test_v511_kernels \
       build/test_cpu_dispatch
-RUN if getent passwd ubuntu >/dev/null; then userdel ubuntu; fi; if getent group ubuntu >/dev/null; then groupdel ubuntu; fi
+RUN if getent passwd ubuntu >/dev/null; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi \
+ && if getent group ubuntu >/dev/null; then groupdel ubuntu 2>/dev/null || true; fi \
+ && rm -rf /home/ubuntu /root/.bash_history /tmp/* /var/tmp/*
+LABEL org.opencontainers.image.title="affinity" \
+      org.opencontainers.image.version="${AFF_VERSION}" \
+      org.opencontainers.image.revision="${AFF_GIT_SHA}" \
+      org.opencontainers.image.source="https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity"
 WORKDIR /opt
 ENTRYPOINT ["/opt/affinity-src/build/affinity"]

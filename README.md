@@ -38,7 +38,7 @@ This repository captures the full stack: engine source (RDNA 4 HIP kernels + hos
 14. [Wave 4 Bake-Off: `affinity` vs `StillDeadcode/radiance v2.1.0`](#wave-4-bake-off-affinity-vs-stilldeadcoderadiance-v210)
 15. [Rework and Patches (`v1.0.0` → `v5.11.0`)](#rework-and-patches-v100--v5110)
 16. [Production Safety Invariants & Environment Variable Reference](#production-safety-invariants--environment-variable-reference)
-17. [Build, Test, Deploy & Rollback Guide](#build-test-deploy--rollback-guide)
+17. [Build, Test & Deploy Guide](#build-test--deploy-guide)
 18. [Credits](#credits)
 
 ---
@@ -96,23 +96,39 @@ This repository captures the full stack: engine source (RDNA 4 HIP kernels + hos
 
 DeepSeek-V4.1-Flash uses 40 layers, 384 routed experts (top-6 active per token), `hidden_size = 5120`, and `vocab_size = 129,280`. At 2.875 bpw the routed experts total ~93 GiB and the full quantized container is **191.32 GiB** — exceeding 64 GiB aggregate VRAM, so Affinity splits weights across GPU HBM/GDDR, 2 MiB transparent hugepages in host RAM, mmap'd NVMe tables, and GPU caches:
 
-| Subsystem | Placement / Backing | Measured Footprint (`v5.10.0` Live Ledger) |
+| Subsystem | Placement / Backing | Measured Footprint (`v5.11.0` Live Ledger) |
 |---|---|---|
-| **Dense Weights** | TP=2 sharded across both GPUs (`AFF_ROUTER_RANK0_ONLY=1` rank-0 routers; `AFF_ENGRAM_TP_SHARD=1` row-sharded `engram_wkv`; shared group-128 FP8 E4M3 LM head) | **`4,252 / 4,092 MiB`** GPU0/GPU1 (`110 MiB` runtime) |
-| **Routed MoE Experts (GPU)** | 2-way shards (`6.08 MiB/shard`), demand placement with `32` shadow slots (`0.00 GiB` D2H); card-1 asymmetric bonus slab (`58` shards / `352.6 MiB`, `AFF_BONUS_D2D=0` static pin) | **`3,946` live resident slots** (`23,830 / 24,184 MiB` GPU0/GPU1 slabs, **`+12`** vs `v5.9.0`) |
+| **Dense Weights** | TP=2 sharded across both GPUs (`AFF_DENSE_WEIGHT_SLAB=1` best-fit 2 MiB slab; `AFF_ROUTER_RANK=auto` selecting Rank 1 routers; `AFF_ENGRAM_TP_SHARD=1` row-sharded `engram_wkv`; shared group-128 FP8 E4M3 LM head) | **`3,962 / 4,090 MiB`** GPU0/GPU1 (`-290 / -2 MiB` vs `v5.10.0`) |
+| **Routed MoE Experts (GPU)** | 2-way shards (`6.08 MiB/shard`), demand placement with `32` shadow slots (`0.00 GiB` D2H); symmetric auto-rank slab balance (`10` bonus shards, `AFF_BONUS_D2D=0` static pin) | **`3,948` live resident slots** (`3,938` shared + `10` bonus, `24,136 / 24,198 MiB` GPU0/GPU1 slabs, **`+2` total / `+50` shared** vs `v5.10.0`) |
 | **Routed MoE Experts (Host Pool)** | Immutable zero-D2H 2 MiB THP host pool (`AFF_POOL_FULL=1`, `--cap-add SYS_NICE` -> `MPOL_PREFERRED` Node 0), PCIe DMA read-in-place (`8/32 WGPs` contiguous SE0 `0x000000ff`) | **`15,360` experts pinned in `182.36 GiB` RAM** (`47,804,160 / 47,804,160` = `100.0%` Node 0, `0` on SSD tier) |
-| **DSpark Speculative Drafter** | 3 blocks, block width 5, taps `[37, 38, 39]`, `384/384` draft experts resident; `mtp_main_proj` col-sharded (`AFF_MTP_PROJ_TP_SHARD=1`), `mtp_markov_w1` UVA host (`63.1 MiB`), `mtp_markov_w2` `fp8_g128` | **`324 / 318 MiB`** dense (`-38 MiB/card`) + `2,336 MiB` draft expert slab + `2 MiB/card` arena |
-| **KV Cache & Prefill Arena** | Virtual span `327,680` positions reserved / `262,144` backed; `v2` dense/MoE cross-aliasing (`AFF_HC_INPLACE=1`, `AFF_DENSE_ARENA_ALIAS_V2=1`, `AFF_MOE_CROSS_ALIAS=1`, `AFF_LAZY_BKV=1`, `AFF_KV_ALIGN_COMMIT=1`, `AFF_KV_SKIP_DEAD_NCOMP=1`, `AFF_ALIAS_BG=1`, `AFF_ALIAS_BDX=1`) + `VirtualSpan` fused indexer (`AFF_IDX_VMEM=1`, `AFF_FUSE_IDX_Q=1`) | `346 / 346 MiB` KV (`0.67 GiB`) + **`592 / 592 MiB`** prefill (**`-62 MiB`**) + **`102 / 102 MiB`** comp/idx (**`-10 MiB`**) |
-| **Engram Tables & ViT** | `32`-layer BF16 DeepSeek ViT on CPU; `188.8 GiB` Engram n-gram tables host-mmapped (`AFF_ENGRAM_WARM=1`, spills safely to Node 1 at `0.00 pgscank/s`, AVX2 decode overlap) | Host page cache mmap |
+| **DSpark Speculative Drafter** | 3 blocks, block width 5, taps `[37, 38, 39]`, `384/384` draft experts resident; `mtp_main_proj` col-sharded (`AFF_MTP_PROJ_TP_SHARD=1`), `mtp_markov_w1` UVA host (`63.1 MiB`), `mtp_markov_w2` `fp8_g128` | `324 / 318 MiB` dense + `2,336 MiB` draft expert slab + `2 MiB/card` arena |
+| **KV Cache & Prefill Arena** | Virtual span `327,680` positions reserved / `262,144` backed; 2 MiB KV/SplitK slack trim, `v2` dense/MoE cross-aliasing (`AFF_HC_INPLACE=1`, `AFF_DENSE_ARENA_ALIAS_V2=1`, `AFF_MOE_CROSS_ALIAS=1`, `AFF_LAZY_BKV=1`, `AFF_KV_ALIGN_COMMIT=1`, `AFF_KV_SKIP_DEAD_NCOMP=1`, `AFF_ALIAS_BG=1`, `AFF_ALIAS_BDX=1`) + `VirtualSpan` fused indexer | **`338 / 338 MiB`** KV (**`-8 MiB/card`**) + `592 / 592 MiB` prefill + `102 / 102 MiB` comp/idx |
+| **Engram Tables & ViT** | `32`-layer BF16 DeepSeek ViT on CPU; `188.8 GiB` Engram n-gram tables host-mmapped (`AFF_ENGRAM_WARM=1`, spills safely to Node 1 at `0.00 pgscank/s`, runtime SIMD decode overlap) | Host page cache mmap |
 | **Persistent Prefix Cache** | Multi-slot NVMe state-only delta checkpoints (`AFF_PCACHE_DELTA=1`, parallel block restore `AFF_PCACHE_PAR_RESTORE=1`) | `64.0 GiB` configured (`512`-tok blocks, `60,505` block slots, `1,793` checkpoint slots) |
-| **Total Card & Host Totals** | `[357, 354] MiB` free VRAM at load (`[341, 330] MiB` post-smoke, `gpu_headroom_mib=384`) | **`32,048 / 32,238 MiB`** in use (`32,624 MiB/card`) · **`182.36 GiB`** immutable THP host pool (`+ 0.92 GiB` other = `183.28 GiB` peak) |
+| **Total Card & Host Totals** | **`[355, 353] MiB`** free VRAM at load (**`[326, 333] MiB`** post-smoke, `gpu_headroom_mib=384`) | **`32,624 MiB/card`** (`24,136 / 24,198` MoE + `3,962 / 4,090` dense + `338 / 338` KV + arenas/draft) · **`182.36 GiB`** immutable THP host pool |
 
-> **Residency progression (`v5.4.0 -> v5.10.0`):** `v5.4.0` held `3,563` clean (`3,593` live) experts. `v5.5.0` `bf16x12` target LM head reached `3,617` (`+24`). `v5.6.0` group-128 E4M3 LM head reached `3,644` (`+27`). `v5.6.2` shared FP8 LM head + rank-0 routers reached `3,699` (`+55`). `v5.7.0` `mtp_markov_w1` UVA + `w2` FP8 reached `3,718` (`+19`). `v5.8.0` prefill/indexer aliasing reached `3,813` (`+95`). `v5.9.0` added `v2` dense/MoE arena cross-aliasing, `VirtualSpan` lazy indexer E4M3 commits, and TP-sharded `engram_wkv` / `mtp_main_proj` (`3,934` live, `+121`). **`v5.10.0`** adds lazy `b_kv` / dead `n_comp` skip, disjoint `b_g` / `b_dx` aliasing, and fused indexer Q (`prefill arena` `654 -> 592`, `compressor+indexer` `112 -> 102`), expanding GPU-resident capacity to **`3,946` live experts** (**`+12`** vs `v5.9.0`, **`+353`** vs `v5.4.0` live).
+> **Residency progression (`v5.4.0 -> v5.11.0`):** `v5.4.0` held `3,563` clean (`3,593` live) experts. `v5.5.0` `bf16x12` target LM head reached `3,617` (`+24`). `v5.6.0` group-128 E4M3 LM head reached `3,644` (`+27`). `v5.6.2` shared FP8 LM head + rank-0 routers reached `3,699` (`+55`). `v5.7.0` `mtp_markov_w1` UVA + `w2` FP8 reached `3,718` (`+19`). `v5.8.0` prefill/indexer aliasing reached `3,813` (`+95`). `v5.9.0` added `v2` dense/MoE arena cross-aliasing, `VirtualSpan` lazy indexer E4M3 commits, and TP-sharded `engram_wkv` / `mtp_main_proj` (`3,934` live, `+121`). `v5.10.0` added lazy `b_kv` / dead `n_comp` skip, disjoint `b_g` / `b_dx` aliasing, and fused indexer Q (`3,946` live, `+12`). **`v5.11.0`** adds the 2 MiB best-fit dense weight slab (`AFF_DENSE_WEIGHT_SLAB=1`, `-290 MiB` GPU0 dense), 2 MiB KV/SplitK trim (`346 -> 338 MiB/card`), and `AFF_ROUTER_RANK=auto`, expanding symmetric GPU capacity to **`3,948` live experts** (`3,938` shared + `10` bonus, **`+50` shared** vs `v5.10.0`, **`+355`** vs `v5.4.0` live).
 
 ### Minimum RAM Floor
 
 - **~200 GiB RAM** (`--host-pool-mib 200000`) is recommended for the default zero-D2H `AFF_POOL_FULL=1` full immutable pool (`182.4 GiB` pinned for all `15,360` experts + OS headroom). Hosts with tighter RAM can set `AFF_POOL_FULL=0` (~`160 GiB` floor, pinning only non-resident experts at `140–143 GiB`).
 - Below that threshold, demand-paged experts spill to the SSD staging tier (4 slots / `48.6 MiB`) and generation collapses toward SSD read latency (~8 tok/s instead of ~22–51 tok/s).
+
+### Minimum CPU Floor
+
+- **Release / Docker Minimum ISA (`AVX1`, `-DAFF_CPU_ARCH=avx` default):** Starting in `v5.11.0`, every prebuilt release and container image compiles baseline C++ and Rust (`libaff_rust_accel.a`) translation units strictly for **`AVX` (`-mavx -mno-avx2 -mno-fma -mno-f16c -mno-avx512f`)**, eliminating host `SIGILL` crashes when deploying across older Xeon/EPYC or non-AVX-512 consumer chips.
+- **Runtime Multi-ISA Dispatch (`src/engine/cpu_dispatch.{h,cpp}`):** At startup, Affinity queries `CPUID` + `OSXSAVE`/`XGETBV` (`hw_max_cpu_isa()`) and dynamically routes CPU hot paths (`EngramTables::gather_mxfp8`, `expert_kernel`, `matvec_bf16`, `matvec_fp8`, `blockquant`, `scan_clean_ascii_avx2`, `ops`, `vit`, and Rust SAM) to the highest safe SIMD tier supported by the host (`AFF_CPU_ISA=scalar|avx1|avx2|avx512|avx512vbmi` overrides automatic selection for debugging or regression testing).
+- **Non-AVX Fallback (`-DAFF_CPU_ARCH=portable`):** CPUs lacking `AVX1` (SSE2-only `x86-64` / `qemu64`) are supported by rebuilding from source with `-DAFF_CPU_ARCH=portable` (`Scalar` fallback). Both `avx` and `portable` builds are statically audited with `audit_cpu_isa.py` (`0` out-of-band instructions) and verified under QEMU TCG across `qemu64` (portable) and `SandyBridge`..`Icelake-Server` (`avx`).
+
+| Dispatch Tier (`CpuIsa`) | Build Requirement | Required x86 Features | Compatible Intel Models | Compatible AMD Models |
+|---|---|---|---|---|
+| **`Avx1` (Release Default Floor)** | `-DAFF_CPU_ARCH=avx` (default) | `AVX1` (`OSXSAVE`) | **Sandy Bridge** (`Core i3/i5/i7-2xxx`, `Xeon E5-2600 v1`), **Ivy Bridge** (`Core 3xxx`, `Xeon E5-2600 v2`), AVX-enabled `Pentium`/`Celeron`/`N-series` (minimum x86 AVX generation) | **Bulldozer / Piledriver / Steamroller / Excavator** (`FX-4xxx/6xxx/8xxx/9xxx`, `Opteron 42xx/43xx/62xx/63xx`, `PRO A-Series`) |
+| **`Avx2` (Dispatched Runtime)** | Included in `avx` binary | `AVX2 + FMA + F16C` | **Haswell** (`4xxx`, `Xeon E5 v3`), **Broadwell** (`5xxx`, `Xeon E5 v4`), **Skylake–Comet Lake** (`6xxx–10xxx`), **Alder Lake / Raptor Lake / Meteor Lake / Arrow Lake** (`12xxx–14xxx`, `Core Ultra`) | **Zen 1 / Zen+ / Zen 2 / Zen 3** (`Ryzen 1000–5000`, `Threadripper 1000–3000`, `EPYC 7001 Naples / 7002 Rome / 7003 Milan`) |
+| **`Avx512` (Dispatched Runtime)** | Included in `avx` binary | `AVX-512F/BW/DQ/VL + FMA` | **Skylake-SP / Skylake-X**, **Cascade Lake**, **Cooper Lake** (`Xeon Scalable 1st/2nd/3rd Gen 4S/8S`, `Core X 7xxx/9xxx/10xxx`) | Covered below under **`Avx512Vbmi`** (all AMD AVX-512 CPUs also implement `VBMI`) |
+| **`Avx512Vbmi` (Full Speedup)** | Included in `avx` binary | `+ AVX-512VBMI` | **Cannon Lake**, **Ice Lake-SP/X** (`Xeon Scalable 3rd Gen`), **Tiger Lake / Rocket Lake** (`11xxx`), **Sapphire Rapids / Emerald Rapids / Granite Rapids** (`Xeon Scalable 4th–6th Gen`, `Xeon W-2400/3400/3500`) | **Zen 4 / Zen 5** (`Ryzen 7000/8000/9000`, `Threadripper 7000`, `EPYC 9004 Genoa/Bergamo/Siena`, `EPYC 9005 Turin`) |
+| **`Scalar` (SSE2 Build Floor)** | `-DAFF_CPU_ARCH=portable` (source build) | `x86-64` (`SSE2`) | **Core 2**, **Nehalem**, **Westmere** (`Xeon 5500/5600`), pre-AVX Pentium/Celeron, `qemu64` | **K8 / K10** (`Athlon 64`, `Phenom II`, `Opteron 2xxx/8xxx/61xx`), `qemu64` |
+
+> **Practical Platform Note:** While any `AVX1` CPU executes the binary cleanly without illegal-instruction traps, serving full `DeepSeek-V4.1-Flash` (`191.32 GiB` hybrid MoE + `188.8 GiB` Engram + `32`-layer CPU ViT) alongside the `~200 GiB RAM` pool practically favors multi-channel DDR4/DDR5 ECC server or workstation platforms with **`>= 24–32+` physical cores** and dedicated PCIe x16 slots per R9700 (e.g., dual `Xeon E5 v3/v4`, `Xeon Scalable`, `AMD EPYC 7002/7003/9004/9005`, or `Threadripper`).
 
 ---
 
@@ -388,7 +404,7 @@ All 3 arms ran back-to-back in an isolated single-tenant GPU window with identic
 
 ![Prefill (pp / tp) and Decode (tg) Progression Across Releases](docs/assets/performance-progression.svg)
 
-> **Reading the chart:** Top panel plots token generation (**`tg`**, tok/s) — warm `l64k`/`l4k` decode and 4-prompt `temp=0.0` DSpark streaming. Bottom panel plots prompt processing / prefill throughput (**`pp` / `tp`**, tok/s) — cold uncached `l64k`/`l16k` `pp1` and stride-resumed `l64k` `pp2`. Releases left of the dashed divider (`v4.2.0–v5.0.0`) used the legacy median harness; `v5.1.2–v5.11.0` use the standardized paired `bench_pp_tg.py` + 4-prompt DSpark suite on dual R9700 (`gfx1201`) (note `v5.10.0` plots paired FAST-regime `l4k`/`l16k`/`4p`; `64k` was not run in the FAST sweep, and `v5.11.0` plots verified `final_v511`).
+> **Reading the chart:** Top panel plots token generation (**`tg`**, tok/s) — warm `l64k`/`l4k` decode and 4-prompt `temp=0.0` DSpark streaming. Bottom panel plots prompt processing / prefill throughput (**`pp` / `tp`**, tok/s) — cold uncached `l64k`/`l16k` `pp1` and stride-resumed `l64k` `pp2`. Releases left of the dashed divider (`v4.2.0–v5.0.0`) used the legacy median harness; `v5.1.2–v5.11.0` use the standardized paired `bench_pp_tg.py` + 4-prompt DSpark suite on dual R9700 (`gfx1201`) (note `v5.10.0` plots paired FAST-regime `l4k`/`l16k`/`4p` and dashed bridge lines smoothly connect `v5.9.0 -> v5.11.0` across unmeasured `64k`; `v5.11.0` plots verified `final_v511`).
 
 Full historical methodology and charts are in [`docs/v5.11.0-gfx1201-slab-cache-isa-avx-benchmark.md`](docs/v5.11.0-gfx1201-slab-cache-isa-avx-benchmark.md), [`docs/v5.10.0-kv-radiance22-dspark-benchmark.md`](docs/v5.10.0-kv-radiance22-dspark-benchmark.md), [`docs/v5.9.0-gfx1201-xfer-codeedit-benchmark.md`](docs/v5.9.0-gfx1201-xfer-codeedit-benchmark.md), [`docs/v5.8.0-gfx1201-rust-asm-cache-benchmark.md`](docs/v5.8.0-gfx1201-rust-asm-cache-benchmark.md), [`docs/v5.7.0-wave2-dspark-fp8-pcie-benchmark.md`](docs/v5.7.0-wave2-dspark-fp8-pcie-benchmark.md), [`docs/v5.6.2-dspark-bugfix-and-quickwins-benchmark.md`](docs/v5.6.2-dspark-bugfix-and-quickwins-benchmark.md), [`docs/v5.6.1-suffix-gate-benchmark.md`](docs/v5.6.1-suffix-gate-benchmark.md), [`docs/v5.6.0-fp8-e4m3-benchmark.md`](docs/v5.6.0-fp8-e4m3-benchmark.md), [`docs/v5.5.0-radiance-port-benchmark.md`](docs/v5.5.0-radiance-port-benchmark.md), [`docs/v5.4.0-optimization-and-engine-assessment.md`](docs/v5.4.0-optimization-and-engine-assessment.md), [`docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md`](docs/benchmarks/2026-11-15-v5.0-and-radiance-v2.1-bakeoff.md), and [`docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md`](docs/benchmarks/2026-11-18-v5.2-deepseek-optimization.md).
 
@@ -465,18 +481,22 @@ All historical branches are unified on `main`.
 
 ### v5.11.0 Patches (Wave 14 — `gfx1201` Slab, Cache Hierarchy, Multi-ISA AVX & Think-Ckpt Fix)
 
-- **Wave 1A (`facc47f`) — 2 MiB Dense Weight Slab, KV/SplitK Trim & Auto-Rank Router Rebalance (`+2` Symmetric Experts -> `3,948`)**: `AFF_DENSE_WEIGHT_SLAB=1` packs dense allocations into shared `2 MiB` HIP slabs (`dense_vram` `4,252 -> 3,962 MiB` on GPU0), trims KV/SplitK slack (`346 -> 338 MiB/card`), and adds `AFF_ROUTER_RANK=auto` (`src/gpu/dense_gpu.{h,hip}`, `tests/test_gpu_ports.hip`) raising shared GPU experts `3,888 -> 3,938` (`3,948` total).
-- **Wave 1B (`6f7428c`) — Portable Multi-ISA CPU SIMD Dispatch (`AFF_CPU_ARCH=avx` Default)**: Runtime CPUID/XGETBV dispatcher (`src/engine/cpu_dispatch.{h,cpp}`, `AFF_CPU_ISA=scalar|avx1|avx2|avx512|avx512vbmi`) with targeted `__attribute__((target(...)))` kernels across 9 engine/server/vision files and baseline-safe Rust accel; `0` violations in `audit_cpu_isa.py` and QEMU pass across `SandyBridge`..`Icelake-Server` (plus `qemu64` under `portable`).
-- **Wave 2 (`2f20816`) — `gfx1201` L0/L1/L2/MALL Cache Tuning**: `AFF_LMHEAD_NT=1`, `prefetch_load_nt` K-tail guard, `AFF_GEMM_SWIZZLE=8` across `MTW={1,2}` (`src/gpu/batch_kernels.hip`), `AFF_IDX_SCORE_NT_STORE=1` (`>= 4 MiB`, `src/gpu/indexer_gpu.hip`), and `AFF_FLASH_LONGCTX_NT=1` (`>= 32 MiB`, `src/gpu/attn_flash.hip`; retaining `__builtin_amdgcn_global_load_tr_b64_v2i32` after ISA check showed raw `global_load_tr_b64` inline asm lacked LLVM `s_wait_loadcnt` before `v_wmma`).
-- **Wave 3 (`09827f3`, `e942b66`) & Defaults Lock (`0be7640`)**: Opt-in `AFF_DSPARK_PRELOAD=0`, `AFF_LMHEAD_WMMA=0` (`lmhead_fp8_g128_wmma_kernel`), and `AFF_DRAFT_KV_FP8_WMMA=0` verified by `tests/test_v511_kernels.hip` and kept OFF after 5-arm FAST ablation.
-- **Forced Think-Close BPE Fix (`457d252`)**: Changed `think_close_ids` from `\n</think>\n\n` to `</think>\n\n` (`tools/affinity.cpp`, `tests/test_thinking_budget.cpp`), preserving Turn-2 prefix-cache checkpoints across `hard_limit` closures.
+| Patch / Commit | Change | Measured Effect / Purpose |
+|---|---|---|
+| [`facc47f`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/facc47f) | **Wave 1A (`src/gpu/dense_gpu.{h,hip}`, `tests/test_gpu_ports.hip`)**: Best-fit 2 MiB dense weight slab (`AFF_DENSE_WEIGHT_SLAB=1`), KV/SplitK slack trim, and `AFF_ROUTER_RANK=auto` router rebalance | Cuts GPU0 `dense_vram` (`4,252 -> 3,962 MiB`), trims KV (`346 -> 338 MiB/card`), and grows symmetric shared experts `3,888 -> 3,938` (**`3,948` total**, `+2`) |
+| [`6f7428c`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/6f7428c) | **Wave 1B (`src/engine/cpu_dispatch.{h,cpp}`, `src/rust_accel/lib.rs`, `CMakeLists.txt`, `Dockerfile`, 9 CPU files)**: Runtime CPUID/XGETBV multi-ISA dispatcher (`Scalar`/`Avx1`/`Avx2`/`Avx512`/`Avx512Vbmi`) + `AFF_CPU_ARCH=avx` default | Eliminates `-march=native` `SIGILL` (`0` violations in `audit_cpu_isa.py`; QEMU pass `SandyBridge`..`Icelake-Server` + `qemu64` under `portable`) |
+| [`2f20816`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/2f20816) | **Wave 2 (`src/gpu/{batch_kernels,indexer_gpu,attn_flash}.hip`)**: `AFF_LMHEAD_NT=1`, `prefetch_load_nt` K-tail guard, `AFF_GEMM_SWIZZLE=8` (`MTW={1,2}`), `AFF_IDX_SCORE_NT_STORE=1` (`>= 4 MiB`), `AFF_FLASH_LONGCTX_NT=1` (`>= 32 MiB`) | Improves 64 MiB MALL / L2 reuse (`32,476` `gfx1201` kernels clean; keeps `__builtin_amdgcn_global_load_tr_b64_v2i32` after ISA check caught missing LLVM waitcnt on raw NT asm) |
+| [`09827f3`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/09827f3) · [`e942b66`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e942b66) · [`0be7640`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/0be7640) | **Wave 3 & Defaults Lock (`src/gpu/{batch_kernels,dense_gpu,attn_flash}.hip`, `tests/test_v511_kernels.hip`)**: Opt-in `AFF_DSPARK_PRELOAD=0`, `AFF_LMHEAD_WMMA=0`, `AFF_DRAFT_KV_FP8_WMMA=0`, version bump | Locks all 3 Wave 3 toggles OFF after 5-arm FAST ablation showed default `v5.11.0` leads on `tg1` (`58.88`), `tg2` (`60.78`), and `step_c` (`25.04`) |
+| [`457d252`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/457d252) · [`de87e6d`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/de87e6d) | **Forced Think-Close BPE Fix & Release Docs (`tools/affinity.cpp`, `tests/test_thinking_budget.cpp`, `docs/`)**: Injects `</think>\n\n` (`{128822, 271}`) without leading `\n` | Preserves Turn-2 prefix-cache checkpoints across `hard_limit` closures (`test_b_think_ckpt` `2,500/2,618` restored), reaching **`60.78 tok/s` `l16k tg2`** (`+9.06%`) & **`48.13 tok/s` `code_edit`** |
 
 ### v5.10.0 Patches (Wave 13 — `/btw` KV Storage, Radiance `v2.2` & DSpark)
 
-- **Wave 1 (`058a7cb`) — `/btw` KV Verification, Split-Gate Engram & Aliasing (`+12` Experts to `3,946`)**: `AFF_DRAFT_PROJ_FIXED_AR=1` (`src/gpu/tp_allreduce.hip`, `src/gpu/dense_gpu.hip`), `AFF_ENGRAM_SPLIT_GATE=1` (`engram_gate_partial_tok_kernel` / `engram_gate_apply_tok_kernel`, 40–45 MiB/tile P2P reduction, verified by `tests/test_engram_split_gate.hip`), plus `AFF_LAZY_BKV=1`, `AFF_KV_ALIGN_COMMIT=1`, `AFF_KV_SKIP_DEAD_NCOMP=1`, `AFF_ALIAS_BG=1`, `AFF_ALIAS_BDX=1`, `AFF_SKIP_SINGLE_ARENA=1` shrinking `prefill arena` (`654 -> 592 MiB/card`). Added opt-in `AFF_POOL_MLOCK` (`src/engine/host_pool.cpp:254`).
-- **Wave 2 (`84e4a3d`) — Radiance `v2.2`-Inspired Indexer, Coalesced KV Commit & Split Flash v2**: `AFF_FUSE_IDX_Q=1` (`idx_rope_qat_quant_kernel`), `AFF_IDX_TOPK_V2=1` (`idx_block_max_b8_kernel` + 11-bit radix top-k), `AFF_IDX_CAND_MULTITOK=1`, `AFF_IDX_FULL_BQ=1` (`src/gpu/indexer_gpu.hip`, `src/gpu/dense_gpu.hip`, cutting `compressor+indexer` `112 -> 102 MiB/card`), `AFF_KV_COMMIT_COALESCED=1` (`kv_norm_commit_fp8r_coalesced_kernel`), and `AFF_FLASH_SPLIT_V2=1` (`src/gpu/attention_gpu.hip`, `src/gpu/attn_flash.hip`); covered by `tests/test_v510_kernels.hip`.
-- **Wave 3 (`479a9ea`) — DSpark Placement Control, Pruning & Noise Cache**: `--dspark-vram-experts N` (`tools/affinity.cpp`), `AFF_DRAFT_ADAPTIVE_Q1=1`, `AFF_MARKOV_EXACT_PRUNE=1` (`markov_w2_norm_*` + `markov_step_pruned_*`), and `AFF_DRAFT_NOISE_CACHE=1` (`batch_hc_seed_draft_bf16_kernel`) across `src/engine/model.{h,cpp}` and `src/gpu/{dense_gpu,batch_kernels}.{h,hip}`.
-- **Wave 4 (`ec6c830`), Stabilization (`edd3428`, `179aef6`) & Defaults Lock (`e0ac5c3`)**: `AFF_PCACHE_PIPELINE=1` (double-buffered `gather[0..1]` + exact `payload_bytes` delta reads in `src/engine/prefix_cache.cpp`), `aff::FastDivU32` (`src/gpu/hip_common.h`) in `swiglu_all_kernel` (`src/gpu/batch_kernels.{h,hip}`), RAII `HipDeviceGuard` multi-GPU fix in `ensure_by`/`ensure_b_kv`/`ensure_btm` + `b_g` hoist (`tests/test_gpu_ports.hip`), and empirical locking of `AFF_POOL_MLOCK=0` (`140.93 ms/blk`) & `AFF_FUSE_WOA_Q8=0` (`batch_gemm_fp8_grouped_b32_q8_hip`, `141.52 ms/blk`) opt-in OFF while retaining `384/384` all-VRAM DSpark default.
+| Patch / Commit | Change | Measured Effect / Purpose |
+|---|---|---|
+| [`058a7cb`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/058a7cb) | **Wave 1 (`src/gpu/{tp_allreduce,dense_gpu}.hip`, `src/engine/host_pool.cpp`, `tests/test_engram_split_gate.hip`)**: `AFF_DRAFT_PROJ_FIXED_AR=1`, `AFF_ENGRAM_SPLIT_GATE=1` (40–45 MiB/tile P2P), `AFF_LAZY_BKV=1`, `AFF_KV_ALIGN_COMMIT=1`, `AFF_KV_SKIP_DEAD_NCOMP=1`, `AFF_ALIAS_BG=1`, `AFF_ALIAS_BDX=1`, `AFF_SKIP_SINGLE_ARENA=1`, opt-in `AFF_POOL_MLOCK` | Shrinks `prefill arena` (`654 -> 592 MiB/card`) bit-identically and verifies zero-spill `/btw` KV handling (`+12` experts to **`3,946`** live) |
+| [`84e4a3d`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/84e4a3d) | **Wave 2 (`src/gpu/{indexer_gpu,dense_gpu,attention_gpu,attn_flash}.hip`, `tests/test_v510_kernels.hip`)**: `AFF_FUSE_IDX_Q=1` (`idx_rope_qat_quant_kernel`), `AFF_IDX_TOPK_V2=1` (`idx_block_max_b8_kernel` + 11-bit radix top-k), `AFF_IDX_CAND_MULTITOK=1`, `AFF_IDX_FULL_BQ=1`, `AFF_KV_COMMIT_COALESCED=1`, `AFF_FLASH_SPLIT_V2=1` | Ports Radiance `v2.2` coalesced KV commit & indexer optimizations, cutting `compressor+indexer` (`112 -> 102 MiB/card`) |
+| [`479a9ea`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/479a9ea) | **Wave 3 (`tools/affinity.cpp`, `src/engine/model.{h,cpp}`, `src/gpu/{dense_gpu,batch_kernels}.{h,hip}`)**: `--dspark-vram-experts N`, `AFF_DRAFT_ADAPTIVE_Q1=1`, `AFF_MARKOV_EXACT_PRUNE=1`, `AFF_DRAFT_NOISE_CACHE=1` | Adds DSpark VRAM placement bounds, Cauchy-Schwarz Markov pruning, and cached draft noise seeds (`batch_hc_seed_draft_bf16_kernel`) |
+| [`ec6c830`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/ec6c830) · [`edd3428`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/edd3428) · [`179aef6`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/179aef6) · [`e0ac5c3`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/e0ac5c3) · [`c0fd9b3`](https://github.com/drwolfen/deepseek-v4.1-flash-r9700-affinity/commit/c0fd9b3) | **Wave 4, Multi-GPU Fix & Defaults Lock (`src/engine/prefix_cache.cpp`, `src/gpu/{hip_common.h,batch_kernels.{h,hip}}`, `tests/test_gpu_ports.hip`, `docs/`)**: `AFF_PCACHE_PIPELINE=1`, `aff::FastDivU32` SwiGLU, RAII `HipDeviceGuard`, `AFF_POOL_MLOCK=0` & `AFF_FUSE_WOA_Q8=0` | Fixes multi-GPU `ensure_*` device state, accelerates pipelined delta restore, and keeps 384/384 DSpark VRAM residency (`c0fd9b3` release docs) |
 
 ### v5.9.0 Patches (Wave 12 — `gfx1201` Transfer/VRAM Reclamation, Fusions & `code_edit` Recovery)
 
@@ -801,7 +821,16 @@ See [`CHANGELOG.md`](CHANGELOG.md) and [`THIRD_PARTY.md`](THIRD_PARTY.md) for fu
 
 ---
 
-## Build, Test, Deploy & Rollback Guide
+## Build, Test & Deploy Guide
+
+### Pulling the Prebuilt Docker Image (GHCR)
+
+A full sanitized container image containing engine source (`/opt/affinity-src`), ROCm `10.1.0-full` runtime, prebuilt `gfx1201` + portable **`AFF_CPU_ARCH=avx`** binaries, and all unit/GPU test suites (with zero credentials, API keys, host paths, or non-code local docs) is published on GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/drwolfen/deepseek-v4.1-flash-r9700-affinity:v5.11.0
+docker tag ghcr.io/drwolfen/deepseek-v4.1-flash-r9700-affinity:v5.11.0 deepseek-affinity:v5.11.0
+```
 
 ### Building the Docker Image & Portable CPU ISA Selection
 
@@ -908,15 +937,6 @@ curl -sS http://127.0.0.1:8000/health
 # {"status":"ok","version":"v5.11.0","git_sha":"457d252","resident_experts":3948,"free_vram_mib":[...]}
 ```
 
-### Rollback to `v5.10.0`
-
-```sh
-systemctl --user stop deepseek-v41-affinity.service && \
-cp ~/.config/systemd/user/deepseek-v41-affinity.service.bak-v5.10.0 ~/.config/systemd/user/deepseek-v41-affinity.service && \
-systemctl --user daemon-reload && \
-systemctl --user start deepseek-v41-affinity.service
-```
-
 ---
 
 ## Credits
@@ -926,4 +946,4 @@ systemctl --user start deepseek-v41-affinity.service
 - Lucebox AI ([Luce-Org/lucebox](https://github.com/Luce-Org/lucebox)) for bounded replay, adaptive verify width, and evaluation corpus.
 - 05yuki ([05yuki/deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)) for INT4 LM head and tool namespace specs.
 - `dealignai` and `pqhaz` for the uncensored and abliterated weights.
-- Transformation of affinity into this R9700-tweaked engine was executed with DeepSeek-V4.1-Flash, Gemini 4 Carbon, Gemini 4 Argon, and Gemini 4 Hydrogen.
+- Transformation of affinity into this R9700-tweaked engine was executed with DeepSeek-V4.1-Flash, Gemini Neon, Gemini 4 Carbon, Gemini 4 Argon, and Gemini 4 Hydrogen.

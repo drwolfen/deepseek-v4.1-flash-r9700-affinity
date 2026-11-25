@@ -1,2 +1,17 @@
 .git
 build*
+backups
+docker-v433-build
+docs
+deploy
+scripts
+patches
+CHANGELOG.md
+README.md
+FORK.md
+tools/v41/*.txt
+tools/v41/__pycache__
+**/__pycache__
+.pytest_cache
+*.log
+*.tmp
