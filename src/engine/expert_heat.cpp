@@ -151,6 +151,36 @@ bool ExpertHeat::pick_demand(uint32_t* promote, uint32_t* demote) {
   return false;
 }
 
+bool ExpertHeat::pick_hint(uint32_t idx, uint32_t* demote, const uint32_t* protect_list,
+                           uint32_t n_protect) const {
+  if (!ready() || !demote || idx >= heat_.size()) return false;
+  if (busy_[idx] || ticks_ < cooldown_until_[idx] || tier_[idx] != ExpertTier::Pool) return false;
+  const size_t n = heat_.size();
+  uint32_t cold = UINT32_MAX, cold_res = 0;
+  float cold_h = 0.0f;
+  for (size_t i = 0; i < n; ++i) {
+    if (busy_[i] || protected_[i] || ticks_ < cooldown_until_[i] || tier_[i] != ExpertTier::Vram)
+      continue;
+    if (protect_list && n_protect) {
+      bool skip = false;
+      for (uint32_t p = 0; p < n_protect; ++p) {
+        if (protect_list[p] == (uint32_t)i) { skip = true; break; }
+      }
+      if (skip) continue;
+    }
+    const float h = heat_[i];
+    const uint32_t rc = res_count_[i / n_expert_];
+    if (cold == UINT32_MAX || h < cold_h || (h == cold_h && rc > cold_res)) {
+      cold = (uint32_t)i;
+      cold_h = h;
+      cold_res = rc;
+    }
+  }
+  if (cold == UINT32_MAX) return false;
+  *demote = cold;
+  return true;
+}
+
 void ExpertHeat::resident_per_layer(std::vector<uint32_t>* out) const {
   if (!out) return;
   out->assign(n_layer_, 0u);

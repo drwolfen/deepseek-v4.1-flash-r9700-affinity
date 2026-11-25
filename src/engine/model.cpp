@@ -3099,6 +3099,33 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
       dspark_conf_.clear();
     }
   }
+  static const bool dspark_preload_on = [] {
+    const char* v = std::getenv("AFF_DSPARK_PRELOAD");
+    return v && *v && std::strcmp(v, "0") != 0;
+  }();
+  if (dspark_preload_on && preload_hint_) {
+    const uint32_t n_hl = std::min<uint32_t>(cfg_.n_hash_layer, (uint32_t)layers_.size());
+    const uint32_t tgt_k = cfg_.n_expert_used;
+    if (n_hl > 0u && tgt_k > 0u) {
+      static thread_local std::vector<uint32_t> preload_exps;
+      for (uint32_t l = 0; l < n_hl; ++l) {
+        const auto& ht = layers_[l].hash_table;
+        if (ht.empty()) continue;
+        preload_exps.clear();
+        auto push_tok = [&](uint32_t tid) {
+          if (((size_t)tid + 1u) * tgt_k > ht.size()) return;
+          for (uint32_t k = 0; k < tgt_k; ++k) {
+            const int32_t eid = ht[(size_t)tid * tgt_k + k];
+            if (eid >= 0) preload_exps.push_back((uint32_t)eid);
+          }
+        };
+        push_tok(first_id);
+        for (uint32_t b = 0; b < B; ++b) push_tok(out[b]);
+        if (!preload_exps.empty())
+          preload_hint_(preload_ctx_, l, preload_exps.data(), (uint32_t)preload_exps.size());
+      }
+    }
+  }
   return true;
 }
 

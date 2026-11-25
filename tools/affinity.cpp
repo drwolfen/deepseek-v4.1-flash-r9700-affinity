@@ -1560,6 +1560,13 @@ int main(int argc, char** argv) {
     model.set_device_dispatch_pred([](void* v, uint32_t l) {
       return ((StaticPlacement*)v)->device_dispatch(l);
     }, &placement);
+    model.set_expert_preload_hint([](void* v, uint32_t layer, const uint32_t* experts, uint32_t n) {
+      FCtx* f = (FCtx*)v;
+      void* st[kMaxRanks] = {};
+      const size_t R = f->g->ranks();
+      for (size_t r = 0; r < R; ++r) st[r] = f->g->stream(r);
+      f->c->hint_preload(layer, experts, n, st);
+    }, &fctx);
     if (Model::force_resident_routing())
       aff::ui::out("AFF_FORCE_RESIDENT: routing restricted to VRAM-resident experts. "
                   "THE OUTPUT IS WRONG ON PURPOSE — this measures the all-resident ceiling.\n");

@@ -6862,6 +6862,142 @@ bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_sca
                                     out_col_stride, out_token_major != 0, stream);
 }
 
+template <bool NT_LOAD>
+__global__ __launch_bounds__(256) void lmhead_fp8_g128_wmma_kernel(
+    const uint8_t* __restrict__ fp8_data, const uint16_t* __restrict__ fp8_scales_bf16,
+    const float* __restrict__ x_tm, float* __restrict__ y, uint32_t rows, uint32_t cols,
+    uint32_t nt, uint32_t y_stride, int out_token_major) {
+  // 8 waves * 16 output rows/wave = 128 output rows per CTA; 16 token columns padded for WMMA.
+  // Stride 136 bytes (34 dwords) gives (34 * fc) mod 32 = 2 * fc, avoiding bank conflicts on uint2 reads.
+  __shared__ __align__(16) uint8_t s_x[16][136];
+  __shared__ float s_xs[16];
+
+  const uint32_t tid = threadIdx.x;
+  const uint32_t lane = tid & 31u;
+  const uint32_t wave = tid >> 5;
+  const uint32_t fc = wmma::frag_c(lane);
+  const uint32_t hlf = lane >> 4;
+  const uint32_t qt = tid >> 4;
+  const uint32_t qsub = tid & 15u;
+  const uint32_t n_groups = cols >> 7;
+  const uint32_t tm_stride = y_stride ? y_stride : rows;
+
+  for (uint32_t block_row = blockIdx.x * 128u; block_row < rows; block_row += gridDim.x * 128u) {
+    const uint32_t row0 = block_row + wave * 16u;
+    const uint32_t r_w = row0 + fc;
+    const bool valid_w = (r_w < rows);
+    wmma::f8v acc = wmma::acc_zero();
+
+    for (uint32_t g = 0; g < n_groups; ++g) {
+      if (qt < nt) {
+        const float* xsrc = x_tm + (size_t)qt * cols + (size_t)g * 128u + qsub * 8u;
+        const float4 a = *(const float4*)(xsrc);
+        const float4 b = *(const float4*)(xsrc + 4u);
+        float amax = fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w)));
+        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(b.x), fabsf(b.y)), fmaxf(fabsf(b.z), fabsf(b.w))));
+        // Half-wave reduction keeps qsub within [0..15] / [16..31].
+        amax = fmaxf(amax, __shfl_xor(amax, 8, 32));
+        amax = fmaxf(amax, __shfl_xor(amax, 4, 32));
+        amax = fmaxf(amax, __shfl_xor(amax, 2, 32));
+        amax = fmaxf(amax, __shfl_xor(amax, 1, 32));
+        const float xs = (amax > 0.0f) ? (amax * (1.0f / 448.0f)) : 0.0f;
+        const float inv = (xs > 0.0f) ? (1.0f / xs) : 0.0f;
+        if (qsub == 0u) s_xs[qt] = xs;
+        const float v0 = fminf(448.0f, fmaxf(-448.0f, a.x * inv));
+        const float v1 = fminf(448.0f, fmaxf(-448.0f, a.y * inv));
+        const float v2 = fminf(448.0f, fmaxf(-448.0f, a.z * inv));
+        const float v3 = fminf(448.0f, fmaxf(-448.0f, a.w * inv));
+        const float v4 = fminf(448.0f, fmaxf(-448.0f, b.x * inv));
+        const float v5 = fminf(448.0f, fmaxf(-448.0f, b.y * inv));
+        const float v6 = fminf(448.0f, fmaxf(-448.0f, b.z * inv));
+        const float v7 = fminf(448.0f, fmaxf(-448.0f, b.w * inv));
+        int p0 = 0, p1 = 0;
+        p0 = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, p0, false);
+        p0 = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, p0, true);
+        p1 = __builtin_amdgcn_cvt_pk_fp8_f32(v4, v5, p1, false);
+        p1 = __builtin_amdgcn_cvt_pk_fp8_f32(v6, v7, p1, true);
+        *(uint2*)(&s_x[qt][qsub * 8u]) = make_uint2((uint32_t)p0, (uint32_t)p1);
+      } else {
+        *(uint2*)(&s_x[qt][qsub * 8u]) = make_uint2(0u, 0u);
+        if (qsub == 0u) s_xs[qt] = 0.0f;
+      }
+      __syncthreads();
+
+      wmma::f8v grp = wmma::acc_zero();
+      const uint8_t* wptr = valid_w ? (fp8_data + (size_t)r_w * cols + (size_t)g * 128u) : nullptr;
+#pragma unroll
+      for (uint32_t s = 0; s < 4u; ++s) {
+        const uint4 v = valid_w ? aff::load_uint4_nt<NT_LOAD>(wptr + s * 32u + hlf * 16u)
+                                : make_uint4(0u, 0u, 0u, 0u);
+        const uint32_t send0 = (hlf == 0u) ? v.z : v.x;
+        const uint32_t send1 = (hlf == 0u) ? v.w : v.y;
+        const uint32_t recv0 = (uint32_t)__shfl_xor((int)send0, 16, 32);
+        const uint32_t recv1 = (uint32_t)__shfl_xor((int)send1, 16, 32);
+        wmma::i2v af0, af1;
+        af0[0] = (int)((hlf == 0u) ? v.x : recv0);
+        af0[1] = (int)((hlf == 0u) ? v.y : recv1);
+        af1[0] = (int)((hlf == 0u) ? recv0 : v.z);
+        af1[1] = (int)((hlf == 0u) ? recv1 : v.w);
+
+        const uint2 b0u = *(const uint2*)(&s_x[fc][s * 32u + hlf * 8u]);
+        const uint2 b1u = *(const uint2*)(&s_x[fc][s * 32u + 16u + hlf * 8u]);
+        wmma::i2v bf0, bf1;
+        bf0[0] = (int)b0u.x; bf0[1] = (int)b0u.y;
+        bf1[0] = (int)b1u.x; bf1[1] = (int)b1u.y;
+        grp = wmma::mma_fp8(af0, bf0, grp);
+        grp = wmma::mma_fp8(af1, bf1, grp);
+      }
+
+      const float ws_my = (hlf == 0u && valid_w)
+                              ? wmma::bf16_to_f32(fp8_scales_bf16[(size_t)r_w * n_groups + g])
+                              : 0.0f;
+      const float xs = s_xs[fc];
+#pragma unroll
+      for (uint32_t j = 0; j < 8u; ++j) {
+        const float sw = __shfl(ws_my, (int)(hlf * 8u + j), 32);
+        acc[j] = fmaf(grp[j], sw * xs, acc[j]);
+      }
+      __syncthreads();
+    }
+
+    if (fc < nt) {
+#pragma unroll
+      for (uint32_t j = 0; j < 8u; ++j) {
+        const uint32_t r = row0 + hlf * 8u + j;
+        if (r < rows) {
+          if (out_token_major)
+            y[(size_t)fc * tm_stride + r] = acc[j];
+          else
+            y[(size_t)r * y_stride + fc] = acc[j];
+        }
+      }
+    }
+  }
+}
+
+bool lmhead_fp8_g128_wmma_hip(const uint8_t* fp8_data, const uint16_t* fp8_scales_bf16,
+                              const float* x_tm, float* y, uint32_t rows, uint32_t cols,
+                              uint32_t nt, uint32_t out_col_stride, int out_token_major,
+                              void* stream) {
+  if (!fp8_data || !fp8_scales_bf16 || !x_tm || !y || !rows || (cols % 128u) != 0u || !nt ||
+      nt > 16u)
+    return false;
+  const uint32_t blocks = aff::safe_grid_blocks(
+      std::min<uint32_t>(2048u, (rows + 127u) / 128u), 8u);
+  const bool nt_load = aff::dense_nt_load_enabled() ||
+                       (((uint64_t)rows * cols > (48ull << 20)) && lmhead_nt_enabled());
+  if (nt_load) {
+    AFF_BLAUNCH((lmhead_fp8_g128_wmma_kernel<true>), dim3(blocks), dim3(256u), 0,
+                (hipStream_t)stream, fp8_data, fp8_scales_bf16, x_tm, y, rows, cols, nt,
+                out_col_stride, out_token_major);
+  } else {
+    AFF_BLAUNCH((lmhead_fp8_g128_wmma_kernel<false>), dim3(blocks), dim3(256u), 0,
+                (hipStream_t)stream, fp8_data, fp8_scales_bf16, x_tm, y, rows, cols, nt,
+                out_col_stride, out_token_major);
+  }
+  return true;
+}
+
 void build_bf16x12_esc_host(const uint16_t* bf16_rows, uint32_t nrows, uint32_t cols,
                             std::vector<uint32_t>& esc_off, std::vector<uint16_t>& esc_col,
                             std::vector<uint16_t>& esc_val) {

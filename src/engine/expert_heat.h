@@ -154,6 +154,10 @@ public:
   // const — the list is consumed, so the engine cannot issue the same transfer twice in one tick.
   void note_missing(uint32_t layer, const uint32_t* experts, uint32_t n);
   bool pick_demand(uint32_t* promote, uint32_t* demote);
+  // Preload helper for predictive hints (e.g. DSpark draft lookahead): given a pooled `idx`,
+  // chooses the coldest unbusy, unprotected VRAM victim not in `protect_list[0..n_protect-1]`.
+  bool pick_hint(uint32_t idx, uint32_t* demote, const uint32_t* protect_list = nullptr,
+                 uint32_t n_protect = 0) const;
 
   float heat(uint32_t idx) const { return heat_[idx]; }
 

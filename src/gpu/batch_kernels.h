@@ -555,6 +555,10 @@ bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_sca
                                 const float* x_tm, float* y, uint32_t rows, uint32_t cols,
                                 uint32_t nt, uint32_t out_col_stride, int out_token_major,
                                 void* stream);
+bool lmhead_fp8_g128_wmma_hip(const uint8_t* fp8_data, const uint16_t* fp8_scales_bf16,
+                              const float* x_tm, float* y, uint32_t rows, uint32_t cols,
+                              uint32_t nt, uint32_t out_col_stride, int out_token_major,
+                              void* stream);
 
 // Lossless 12.25-bit bf16x12 (32-elem K-block SoA + host CSR escapes) packing and bit-identical
 // decode kernels.

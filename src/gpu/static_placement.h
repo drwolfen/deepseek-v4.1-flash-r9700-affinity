@@ -130,6 +130,7 @@ struct PlacementEngineStats {
   uint64_t ssd_staged = 0;
   // W3-2b: GPU bonus_slab D2D promotion/demotion counters.
   uint64_t bonus_d2d_promotes = 0, bonus_d2d_demotes = 0, bonus_d2d_bytes = 0;
+  uint64_t preload_hints = 0, preload_issued = 0;
 };
 
 // Runtime toggle (`AFF_BONUS_D2D`, default OFF unless "1") for GPU bonus_slab D2D promote/evict.
@@ -247,6 +248,8 @@ public:
   // are each an error, not a quieter mode.
   bool placement_engine_init(HostExpertPool* pool, const PlacementEngineConfig& cfg,
                              std::string* err);
+  // Preload hint from predictive draft lookahead (e.g., DSpark hash-routed layers).
+  void hint_preload(uint32_t layer, const uint32_t* experts, uint32_t n, void* const* streams);
   // The exit banner: what moved, what it cost, and the per-layer residency histogram — which is the
   // one number that says whether the engine did the thing it exists for. Static placement ranks all
   // 11008 experts globally by the container's profile, and that leaves layers with wildly different

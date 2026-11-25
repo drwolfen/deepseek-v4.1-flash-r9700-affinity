@@ -3659,6 +3659,55 @@ void StaticPlacement::engine_report() const {
   aff::ui::err("  resident experts a layer (of %u): at load min %u max %u sd %.1f"
               " -> now min %u max %u sd %.1f\n",
               n_expert_, lo0, hi0, sd0, lo1, hi1, sd1);
+  if (estats_.preload_hints > 0) {
+    aff::ui::err("  dspark preload hints: %llu missing, %llu issued\n",
+                 (unsigned long long)estats_.preload_hints,
+                 (unsigned long long)estats_.preload_issued);
+  }
+}
+
+void StaticPlacement::hint_preload(uint32_t layer, const uint32_t* experts, uint32_t n,
+                                   void* const* streams) {
+  if (!enabled_ || !engine_on_ || !pool_mut_ || !experts || !n || !streams || layer >= n_layer_)
+    return;
+  Impl& I = *impl_;
+  engine_retire(streams);
+
+  static thread_local std::vector<uint32_t> protect_idx, missing_idx;
+  protect_idx.clear();
+  missing_idx.clear();
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t e = experts[i];
+    if (e >= n_expert_) continue;
+    const uint32_t idx = (uint32_t)layer * n_expert_ + e;
+    if (std::find(protect_idx.begin(), protect_idx.end(), idx) != protect_idx.end()) continue;
+    protect_idx.push_back(idx);
+    if (device_of_[idx] < 0 && pool_mut_->slot_of(layer, e) >= 0) missing_idx.push_back(idx);
+  }
+  estats_.preload_hints += (uint64_t)missing_idx.size();
+  if (missing_idx.empty()) return;
+
+  const uint32_t max_moves = [] {
+    const char* v = std::getenv("AFF_DSPARK_PRELOAD_MAX");
+    if (!v || !*v) return 4u;
+    const int m = std::atoi(v);
+    return m > 1 ? (uint32_t)m : 1u;
+  }();
+  const uint32_t cap = std::min<uint32_t>(max_moves, shadow_slots_ > 0u ? shadow_slots_ : 4u);
+
+  // Force ensure_ev_layer() inside engine_issue() to record a fresh compute-stream event.
+  I.gate_tick = UINT64_MAX;
+  uint32_t issued = 0u;
+  for (uint32_t up : missing_idx) {
+    if (issued >= cap) break;
+    if (I.free_slab.empty() || (!pool_full_ && I.free_pool.empty())) break;
+    uint32_t down = 0u;
+    if (!heat_.pick_hint(up, &down, protect_idx.data(), (uint32_t)protect_idx.size())) continue;
+    if (!engine_issue(up, /*promote=*/true, streams)) break;
+    (void)engine_issue(down, /*promote=*/false, streams);
+    ++issued;
+    ++estats_.preload_issued;
+  }
 }
 
 

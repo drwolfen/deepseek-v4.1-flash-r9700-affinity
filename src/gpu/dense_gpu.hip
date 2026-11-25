@@ -957,6 +957,24 @@ inline uint32_t lmhead_fp8_max_t_cfg() {
   return t > 16 ? 16u : (uint32_t)t;
 }
 
+inline bool draft_kv_fp8_wmma_enabled() {
+  const char* v = std::getenv("AFF_DRAFT_KV_FP8_WMMA");
+  return v && *v && std::strcmp(v, "0") != 0;
+}
+
+inline bool lmhead_wmma_enabled() {
+  const char* v = std::getenv("AFF_LMHEAD_WMMA");
+  return v && *v && std::strcmp(v, "0") != 0;
+}
+
+inline uint32_t lmhead_wmma_min_t_cfg() {
+  const char* v = std::getenv("AFF_LMHEAD_WMMA_MIN_T");
+  if (!v || !*v) return 2u;
+  const int t = std::atoi(v);
+  if (t <= 1) return 1u;
+  return t > 16 ? 16u : (uint32_t)t;
+}
+
 inline float* b_qtm_qscales(uint16_t* b_qtm, uint32_t nh, uint32_t width, uint32_t nb) {
   const size_t q8_bytes = (size_t)nh * width * nb;
   const size_t aligned = (q8_bytes + 15u) & ~size_t(15u);
@@ -971,6 +989,11 @@ static bool launch_fp8_g128_head(const uint8_t* fp8, const uint16_t* sc, const f
   for (uint32_t t0 = 0u; t0 < nt; t0 += max_t) {
     const uint32_t chunk = std::min<uint32_t>(max_t, nt - t0);
     float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
+    if (lmhead_wmma_enabled() && chunk >= lmhead_wmma_min_t_cfg()) {
+      if (lmhead_fp8_g128_wmma_hip(fp8, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols,
+                                   chunk, out_ld, out_tm, st))
+        continue;
+    }
     if (!matvec_fp8_g128_multix_hip(fp8, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols,
                                     chunk, out_ld, out_tm, st))
       return false;
@@ -9121,8 +9144,18 @@ bool DenseGpu::draft_kv(uint32_t layer, int32_t kv, int32_t kvnorm, uint32_t n, 
     // matrix core at half rate on operands that are already fp8. W8A8 here is flat on ms a cycle and
     // it MOVES THE EMITTED TEXT — acceptance rose sharply but the speculative output stopped
     // matching the non-speculative one, which it had matched exactly. A draft that changes what the
-    // target emits is not drafting.
-    batch_gemm_ent(d, kv, D.b_dm, D.b_u, width, hidden);
+    // target emits is not drafting. Kept opt-in via AFF_DRAFT_KV_FP8_WMMA=1 for A/B testing.
+    bool used_q8 = false;
+    if (draft_kv_fp8_wmma_enabled() && q8_ok(kv, hidden)) {
+      // PITFALL: D.b_dm is overwritten per draft stage; clear D.q8_src so quant_act never reuses a stale stage's E4M3.
+      D.q8_src = nullptr;
+      if (quant_act(d, D.b_dm, (uint32_t)hidden)) {
+        batch_gemm_ent_q8(d, kv, D.b_u, width, hidden);
+        D.q8_src = nullptr;
+        used_q8 = true;
+      }
+    }
+    if (!used_q8) batch_gemm_ent(d, kv, D.b_dm, D.b_u, width, hidden);
     if (defer_bkvn) {
       b_kvn_src_[d] = D.b_u;
       b_kvn_w_[d] = D.vec[kvnorm];

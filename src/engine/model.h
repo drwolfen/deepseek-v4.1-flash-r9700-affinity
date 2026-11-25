@@ -889,6 +889,11 @@ public:
   // StaticPlacement::device_dispatch.
   using DeviceDispatchPred = bool (*)(void* ctx, uint32_t layer);
   void set_device_dispatch_pred(DeviceDispatchPred fn, void* ctx) { ddp_ = fn; ddp_ctx_ = ctx; }
+  using ExpertPreloadHint = void (*)(void* ctx, uint32_t layer, const uint32_t* experts, uint32_t n);
+  void set_expert_preload_hint(ExpertPreloadHint fn, void* ctx) {
+    preload_hint_ = fn;
+    preload_ctx_ = ctx;
+  }
   // True when the override is armed, so the caller can say so once at startup rather than let a
   // benchmark number be quietly incomparable.
   static bool force_resident_routing();
@@ -1079,6 +1084,8 @@ private:
   void* ddp_ctx_ = nullptr;
   ResidentPred res_ = nullptr;
   void* res_ctx_ = nullptr;
+  ExpertPreloadHint preload_hint_ = nullptr;
+  void* preload_ctx_ = nullptr;
   DenseOps  dops_{};
   BatchOps  bops_{};
   DraftOps  drops_{};

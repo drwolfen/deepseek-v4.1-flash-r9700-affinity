@@ -259,6 +259,148 @@ int check_flash_longctx_nt_parity() {
   return 0;
 }
 
+uint8_t host_e4m3_enc_sw(float f) {
+  uint32_t fu = 0u;
+  std::memcpy(&fu, &f, sizeof(fu));
+  const uint32_t sign = (fu >> 24) & 0x80u;
+  float a = std::fabs(f);
+  if (!(a > 0.0f)) return (uint8_t)sign;
+  if (a > 448.0f) a = 448.0f;
+  if (a >= 0x1p-6f) {
+    uint32_t u = 0u;
+    std::memcpy(&u, &a, sizeof(u));
+    int e = (int)((u >> 23) & 0xFFu) - 127;
+    uint32_t mm = (u & 0x7FFFFFu) >> 20;
+    const uint32_t rem = u & 0xFFFFFu, half = 1u << 19;
+    if (rem > half || (rem == half && (mm & 1u))) {
+      if (++mm == 8u) { mm = 0u; ++e; }
+    }
+    if (e > 8) { e = 8; mm = 7u; }
+    return (uint8_t)(sign | ((uint32_t)(e + 7) << 3) | mm);
+  }
+  uint32_t mm = (uint32_t)std::rintf(a * 512.0f);
+  if (mm >= 8u) return (uint8_t)(sign | 0x08u);
+  return (uint8_t)(sign | mm);
+}
+
+int check_lmhead_wmma_parity() {
+  const uint32_t rows = 300u, cols = 512u;
+  const uint32_t n_groups = cols / 128u;
+  std::vector<uint8_t> h_w((size_t)rows * cols);
+  std::vector<uint16_t> h_s((size_t)rows * n_groups);
+  uint32_t rng = 424242u;
+  for (size_t i = 0; i < h_w.size(); ++i) {
+    rng = rng * 1664525u + 1013904223u;
+    uint8_t b = (uint8_t)(rng >> 24);
+    if ((b & 0x7Fu) == 0x7Fu) b = 0x38u;
+    h_w[i] = b;
+  }
+  for (size_t i = 0; i < h_s.size(); ++i) {
+    rng = rng * 1664525u + 1013904223u;
+    h_s[i] = aff::float_to_bf16(0.03f + 0.002f * (float)((rng >> 16) & 31u));
+  }
+
+  uint8_t* d_w = nullptr;
+  uint16_t* d_s = nullptr;
+  if (hipMalloc(&d_w, h_w.size()) != hipSuccess ||
+      hipMalloc(&d_s, h_s.size() * sizeof(uint16_t)) != hipSuccess) {
+    std::fprintf(stderr, "FAIL: check_lmhead_wmma_parity hipMalloc W/S\n");
+    return 1;
+  }
+  (void)hipMemcpy(d_w, h_w.data(), h_w.size(), hipMemcpyHostToDevice);
+  (void)hipMemcpy(d_s, h_s.data(), h_s.size() * sizeof(uint16_t), hipMemcpyHostToDevice);
+
+  const uint32_t nts[4] = {1u, 6u, 8u, 16u};
+  double worst_cos = 1.0, worst_rel = 0.0, worst_q_abs = 0.0;
+  for (uint32_t nt : nts) {
+    std::vector<float> h_x((size_t)nt * cols);
+    for (size_t i = 0; i < h_x.size(); ++i) {
+      rng = rng * 1664525u + 1013904223u;
+      h_x[i] = ((float)(int32_t)(rng >> 8) - (float)(1 << 23)) * 1e-6f;
+    }
+
+    // Host exact reference matching per-128 E4M3 quantization of x_tm.
+    std::vector<float> h_ref((size_t)nt * rows, 0.0f);
+    for (uint32_t t = 0; t < nt; ++t) {
+      for (uint32_t g = 0; g < n_groups; ++g) {
+        const float* xg = h_x.data() + (size_t)t * cols + (size_t)g * 128u;
+        float amax = 0.0f;
+        for (uint32_t k = 0; k < 128u; ++k) amax = std::fmax(amax, std::fabs(xg[k]));
+        const float xs = (amax > 0.0f) ? (amax * (1.0f / 448.0f)) : 0.0f;
+        const float inv = (xs > 0.0f) ? (1.0f / xs) : 0.0f;
+        float xq[128];
+        for (uint32_t k = 0; k < 128u; ++k) {
+          float v = xg[k] * inv;
+          if (v > 448.0f) v = 448.0f;
+          if (v < -448.0f) v = -448.0f;
+          xq[k] = aff::fp8_e4m3_to_float(host_e4m3_enc_sw(v));
+        }
+        for (uint32_t r = 0; r < rows; ++r) {
+          const float sw = aff::bf16_to_float(h_s[(size_t)r * n_groups + g]);
+          const uint8_t* wr = h_w.data() + (size_t)r * cols + (size_t)g * 128u;
+          float dot = 0.0f;
+          for (uint32_t k = 0; k < 128u; ++k) dot += aff::fp8_e4m3_to_float(wr[k]) * xq[k];
+          h_ref[(size_t)t * rows + r] += dot * (sw * xs);
+        }
+      }
+    }
+
+    float *d_x = nullptr, *d_mv = nullptr, *d_wmma = nullptr;
+    (void)hipMalloc(&d_x, h_x.size() * sizeof(float));
+    (void)hipMalloc(&d_mv, (size_t)nt * rows * sizeof(float));
+    (void)hipMalloc(&d_wmma, (size_t)nt * rows * sizeof(float));
+    (void)hipMemcpy(d_x, h_x.data(), h_x.size() * sizeof(float), hipMemcpyHostToDevice);
+
+    for (int out_tm : {1, 0}) {
+      const uint32_t out_ld = out_tm ? rows : nt;
+      (void)hipMemset(d_mv, 0, (size_t)nt * rows * sizeof(float));
+      (void)hipMemset(d_wmma, 0, (size_t)nt * rows * sizeof(float));
+      if (!aff::matvec_fp8_g128_multix_hip(d_w, d_s, d_x, d_mv, rows, cols, nt, out_ld, out_tm, nullptr) ||
+          !aff::lmhead_fp8_g128_wmma_hip(d_w, d_s, d_x, d_wmma, rows, cols, nt, out_ld, out_tm, nullptr)) {
+        std::fprintf(stderr, "FAIL: check_lmhead_wmma_parity launch nt=%u tm=%d\n", nt, out_tm);
+        return 1;
+      }
+      (void)hipDeviceSynchronize();
+      std::vector<float> h_mv((size_t)nt * rows), h_wmma((size_t)nt * rows);
+      (void)hipMemcpy(h_mv.data(), d_mv, h_mv.size() * sizeof(float), hipMemcpyDeviceToHost);
+      (void)hipMemcpy(h_wmma.data(), d_wmma, h_wmma.size() * sizeof(float), hipMemcpyDeviceToHost);
+
+      for (uint32_t t = 0; t < nt; ++t) {
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (uint32_t r = 0; r < rows; ++r) {
+          const size_t idx = out_tm ? ((size_t)t * rows + r) : ((size_t)r * nt + t);
+          const double ref_q = (double)h_ref[(size_t)t * rows + r];
+          const double mv = (double)h_mv[idx];
+          const double wm = (double)h_wmma[idx];
+          worst_q_abs = std::fmax(worst_q_abs, std::fabs(wm - ref_q));
+          dot += mv * wm;
+          na += mv * mv;
+          nb += wm * wm;
+          const double denom = std::fmax(std::fabs(mv), 1.0);
+          worst_rel = std::fmax(worst_rel, std::fabs(wm - mv) / denom);
+        }
+        const double cos_sim = dot / std::sqrt(na * nb + 1e-30);
+        worst_cos = std::fmin(worst_cos, cos_sim);
+        if (cos_sim < 0.998) {
+          std::fprintf(stderr, "FAIL: lmhead_wmma nt=%u tm=%d t=%u cos=%g\n",
+                       nt, out_tm, t, cos_sim);
+          return 1;
+        }
+      }
+      if (worst_q_abs > 2e-3 || worst_rel > 0.06) {
+        std::fprintf(stderr, "FAIL: lmhead_wmma nt=%u tm=%d q_abs=%g rel=%g\n",
+                     nt, out_tm, worst_q_abs, worst_rel);
+        return 1;
+      }
+    }
+    (void)hipFree(d_x); (void)hipFree(d_mv); (void)hipFree(d_wmma);
+  }
+  (void)hipFree(d_w); (void)hipFree(d_s);
+  std::printf("PASS: check_lmhead_wmma_parity (worst_cos=%.6f worst_rel=%.4f worst_q_abs=%g)\n",
+              worst_cos, worst_rel, worst_q_abs);
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -271,6 +413,7 @@ int main() {
   if (check_gemm_swizzle_and_tail_parity() != 0) return 1;
   if (check_indexer_nt_store_parity() != 0) return 1;
   if (check_flash_longctx_nt_parity() != 0) return 1;
+  if (check_lmhead_wmma_parity() != 0) return 1;
   std::printf("PASS: all v511 kernel tests passed.\n");
   return 0;
 }
