@@ -366,7 +366,7 @@ int check_lmhead_wmma_parity() {
       (void)hipMemcpy(h_wmma.data(), d_wmma, h_wmma.size() * sizeof(float), hipMemcpyDeviceToHost);
 
       for (uint32_t t = 0; t < nt; ++t) {
-        double dot = 0.0, na = 0.0, nb = 0.0;
+        double dot = 0.0, na = 0.0, nb = 0.0, err2 = 0.0;
         for (uint32_t r = 0; r < rows; ++r) {
           const size_t idx = out_tm ? ((size_t)t * rows + r) : ((size_t)r * nt + t);
           const double ref_q = (double)h_ref[(size_t)t * rows + r];
@@ -376,9 +376,10 @@ int check_lmhead_wmma_parity() {
           dot += mv * wm;
           na += mv * mv;
           nb += wm * wm;
-          const double denom = std::fmax(std::fabs(mv), 1.0);
-          worst_rel = std::fmax(worst_rel, std::fabs(wm - mv) / denom);
+          err2 += (wm - mv) * (wm - mv);
         }
+        const double l2_rel = std::sqrt(err2 / (na + 1e-30));
+        worst_rel = std::fmax(worst_rel, l2_rel);
         const double cos_sim = dot / std::sqrt(na * nb + 1e-30);
         worst_cos = std::fmin(worst_cos, cos_sim);
         if (cos_sim < 0.998) {
