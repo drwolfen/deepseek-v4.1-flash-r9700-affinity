@@ -6,6 +6,36 @@ versions follow [Semantic Versioning](https://semver.org/).
 The engine serves DeepSeek-V4.1-Flash-1017 (`.aff`, 2.875 bpw FP4 experts, DSpark draft, Engram)
 on 2× Radeon AI PRO R9700 (`gfx1201`). Numbers below are from that box unless stated.
 
+## [5.10.0] — 2026-11-25 — "/btw KV Verification, Storage Format & Radiance v2.2 Audit, DSpark Placement & +12 Experts (`3,946`, `57.91 tok/s` `l16k tg2`, `133.72 ms/blk`)"
+
+Verifies the ephemeral `/btw` KV cache audit, evaluates all 5 storage tiers against `StillDeadcode/radiance` `v2.2` (`b6b8751c`) and `IQ8R` / `IQR-V4`, reclaims **`+72 MiB/card`** (`prefill arena` `654 -> 592`, `compressor+indexer` `112 -> 102`), expands GPU-resident MoE coverage by **`+12` experts (`3,934 -> 3,946`)**, and speeds up paired FAST-regime decode (`54.80 -> 57.91 tok/s` `l16k tg2`) and DSpark (`141.97 -> 133.72 ms/blk`).
+
+### Added
+- **Wave 1 (`058a7cb`): `/btw` KV & Engram Split-Gate Optimizations (`+12` Experts)**:
+  - `AFF_ENGRAM_SPLIT_GATE=1` (`src/gpu/engram_gpu.hip`, `tests/test_engram_split_gate.hip`): `engram_gate_partial_tok_kernel` and `engram_gate_apply_tok_kernel` cut **40–45 MiB/tile** Engram P2P traffic.
+  - `AFF_DRAFT_PROJ_FIXED_AR=1` (`src/gpu/tp_allreduce.hip`, `src/gpu/dense_gpu.hip`): fixed-shape DSpark projection all-reduce path.
+  - `AFF_LAZY_BKV=1`, `AFF_KV_ALIGN_COMMIT=1`, `AFF_KV_SKIP_DEAD_NCOMP=1`, `AFF_ALIAS_BG=1`, `AFF_ALIAS_BDX=1`, `AFF_SKIP_SINGLE_ARENA=1` (`src/gpu/dense_gpu.hip`): lands lazy KV chunks, aligned commits, dead `n_comp` skip, and disjoint `b_g`/`b_dx` aliasing (`prefill arena` `654 -> 592 MiB/card`, **`+12` experts to `3,946`**).
+  - `AFF_POOL_MLOCK` (`src/engine/host_pool.cpp:254`): opt-in host-pool `mlock` toggle (locked default OFF `=0` in `e0ac5c3`).
+- **Wave 2 (`84e4a3d`): Radiance `v2.2`-Inspired Indexer, KV & Flash Kernels**:
+  - `AFF_FUSE_IDX_Q=1` (`idx_rope_qat_quant_kernel`), `AFF_IDX_TOPK_V2=1` (`idx_block_max_b8_kernel` + 11-bit radix top-k), `AFF_IDX_CAND_MULTITOK=1`, `AFF_IDX_FULL_BQ=1` (`src/gpu/indexer_gpu.hip`, `src/gpu/dense_gpu.hip`), reducing `compressor+indexer` (`112 -> 102 MiB/card`).
+  - `AFF_KV_COMMIT_COALESCED=1` (`kv_norm_commit_fp8r_coalesced_kernel`) and `AFF_FLASH_SPLIT_V2=1` (`src/gpu/attention_gpu.hip`, `src/gpu/dense_gpu.hip`, `src/gpu/attn_flash.hip`), verified by `tests/test_v510_kernels.hip`.
+- **Wave 3 (`479a9ea`): DSpark Placement Control, Pruning & Noise Cache**:
+  - `--dspark-vram-experts N` (`tools/affinity.cpp`): opt-in DSpark routed expert VRAM cap (`384/384` default retained after sweep).
+  - `AFF_DRAFT_ADAPTIVE_Q1=1`, `AFF_MARKOV_EXACT_PRUNE=1` (`markov_w2_norm_*` + `markov_step_pruned_*`), and `AFF_DRAFT_NOISE_CACHE=1` (`batch_hc_seed_draft_bf16_kernel`) across `src/engine/model.{h,cpp}`, `src/gpu/dense_gpu.{h,hip}`, and `src/gpu/batch_kernels.{h,hip}`.
+- **Wave 4 (`ec6c830`): Prefix-Cache Double-Buffered Pipeline & FastDiv**:
+  - `AFF_PCACHE_PIPELINE=1` (`src/engine/prefix_cache.cpp`): double-buffered `gather[0..1]` restore with exact `payload_bytes` delta checkpoint reads.
+  - `aff::FastDivU32` (`src/gpu/hip_common.h`) in `swiglu_all_kernel` (`src/gpu/batch_kernels.{h,hip}`) and opt-in `AFF_FUSE_WOA_Q8` (`batch_gemm_fp8_grouped_b32_q8_hip`, locked default OFF `=0` in `e0ac5c3`).
+
+### Changed / Fixed / Ablated
+- **Multi-GPU `HipDeviceGuard` & `b_g` Fix (`179aef6`, `edd3428`)**: added RAII `HipDeviceGuard` in `ensure_by`, `ensure_b_kv`, and `ensure_btm` plus `b_g` hoisting (`src/gpu/dense_gpu.hip`) with regression check in `tests/test_gpu_ports.hip`.
+- **Locked Default Profile (`e0ac5c3`)**: paired FAST ablation (`fast_w123_pipe` vs `fast_rc2_all_on`, plus single-wave bisect `w1..w4`) showed `AFF_POOL_MLOCK` (`140.93 ms/blk`) and `AFF_FUSE_WOA_Q8` (`141.52 ms/blk`) were flat/negative; both default OFF (`=0`) while `AFF_PCACHE_PIPELINE=1` and Waves 1–3 remain ON (`=1`).
+- **Radiance `v2.2` (`IQ8R` / `IQR-V4`) & DSpark Offload Decision**: kept `2.875-bpw` `.aff` routed experts + native FP8 E4M3 linear/KV formats (avoiding ~28% residency loss and `fwht128` WMMA replacement) and kept `384/384` all-VRAM DSpark default (`50.42 / 57.91 tok/s` `l4k/l16k tg2` vs `41.37–44.33 / 41.96–45.24 tok/s` when streamed).
+
+### Performance & Verification
+- **Paired FAST Matrix (`--default-effort 60`, `fast_w123_pipe` vs `fast_v590_ctrl`)**: **`3,946`** live experts (`+12`), **`57.91 tok/s`** `l16k tg2` (`+5.68%` vs `54.80`), **`50.42 tok/s`** `l4k tg2` (`+2.15%` vs `49.36`), **`133.72 ms/blk`** 4-prompt DSpark (`-8.25 ms/blk`, **`73.98%`** acc vs `71.61%`), `537.4 / 627.4 / 1,313.5` `p4k/l4k/l16k pp1`, `23.57 tok/s` `step_c` (`kfd=3.33 s`).
+- **Verification**: `18/18` offline `ctest` (`12.21 s`), **`7/7` container GPU unit binaries**, `31,392` `gfx1201` ELF kernels (`new_spills_or_scratch=0`, `flash2_budget_violations=0`, `30` `buffer_load_b96`), `func_pass=true`, `dry_3_of_3=true`, `probe_all_pass=true`, `pcache fp=0x733de762fee543e6`, `N0=100%`, `0` `hipError`. Live `:8000` cutover (`--default-effort 75`) healthy at `3,946` experts (`[357, 354] MiB` load / `[341, 330] MiB` post-smoke), `391` smoke (`3.17 s`), Tdarr `GhpNI7D` `nodePaused=False`.
+- Report: [v5.10.0 KV Storage, Radiance v2.2 & DSpark Evaluation Report](docs/v5.10.0-kv-radiance22-dspark-benchmark.md).
+
 ## [5.9.0] — 2026-11-25 — "gfx1201 Transfer/VRAM Optimization & `code_edit` Recovery (+121 experts to 3,934, 46.43 tok/s `code_edit`, 23.16 tok/s 4p DSpark)"
 
 Wave 12 release (`e41f0c5`). Audits all PCIe Gen3 ×16, peer, GDDR6, and L0/L1/L2/MALL/LDS transfer paths (`model-moonmath-1017.aff` entropy `7.996 bits/byte`, `0.41%` zeros -> zero-copy UVA stays undefeated over wire compression while VRAM reclamation drives PCIe traffic down), reclaims `~518–520 MiB/card` to add **`+121` live GPU-resident MoE experts (`3,813 -> 3,934`: `3,864` shared + `70` Card-1 bonus `425.5 MiB`)** at `[355, 356]` MiB free VRAM (`prefill arena` `908/910 -> 654/654 MiB`, `compressor+indexer` `218 -> 112 MiB`, `dense` `4,398/4,238 -> 4,254/4,094 MiB`, `draft dense` `362/356 -> 324/318 MiB`), reverses the `v5.8.0` `code_edit` regression (**`46.43 tok/s` `tg2`**, `+3.06%` vs `v5.8.0` `45.05`, `+1.95%` vs `v5.7.0` `45.54`, **`95.1%` acc / `10.24 tok/blk` / `25` blk**), lifts **`step_c` to `23.16 tok/s` (`+3.30%`)**, and sets a new strided **`l64k pp2` record at `2,716.2 tok/s` (`+2.11%`)**. Preserves `-ffp-contract=off` (`33/33`), `29,585` audited ELF kernels (`0` new scratch/VGPR spills, `0` flash2 budget violations), and `pcache` fingerprint `0x733de762fee543e6`.
