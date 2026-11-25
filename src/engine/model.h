@@ -602,6 +602,9 @@ public:
                   uint32_t n_hc) = nullptr;
     bool (*begin_bf16)(void* ctx, uint32_t n_live, uint32_t pos0, const uint16_t* emb_bf16,
                        uint32_t n_embd, uint32_t n_hc) = nullptr;
+    bool (*begin_draft_bf16)(void* ctx, uint32_t n_live, uint32_t pos0,
+                             const uint16_t* row0_bf16, const uint16_t* noise_bf16,
+                             uint32_t noise_tok, uint32_t n_embd, uint32_t n_hc) = nullptr;
     // control + reduce + rms_norm for every token. `norm_host`, when non-null, receives the result
     // token-major — the router's top-k, the compressor and the expert dispatch all read it there.
     bool (*hc_pre)(void* ctx, int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,

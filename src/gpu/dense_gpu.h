@@ -630,6 +630,9 @@ private:
                        uint32_t n_hc);
   bool     batch_begin_bf16(uint32_t n_live, uint32_t pos0, const uint16_t* emb_bf16,
                             uint32_t n_embd, uint32_t n_hc);
+  bool     batch_begin_draft_bf16(uint32_t n_live, uint32_t pos0, const uint16_t* row0_bf16,
+                                  const uint16_t* noise_bf16, uint32_t noise_tok, uint32_t n_embd,
+                                  uint32_t n_hc);
   bool     batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,
                         uint32_t n_hc, uint32_t iters, float hc_eps, float rms_eps,
                         float* norm_host);

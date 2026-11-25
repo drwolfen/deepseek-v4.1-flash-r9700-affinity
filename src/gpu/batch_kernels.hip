@@ -3911,6 +3911,26 @@ __global__ void batch_hc_seed_bf16_kernel(const uint16_t* __restrict__ emb,
   for (uint32_t h = 0; h < n_hc; ++h) hc[((size_t)h * n_embd + d) * nb + b] = v;
 }
 
+__global__ void batch_hc_seed_draft_bf16_kernel(
+    const uint16_t* __restrict__ row0_bf16, const uint16_t* __restrict__ noise_bf16,
+    uint16_t* __restrict__ hc, float* __restrict__ pre_prev, uint32_t n_embd, uint32_t n_hc,
+    uint32_t n_live, uint32_t nb) {
+  const uint64_t hc_total = (uint64_t)n_embd * nb;
+  const uint64_t pre_total = pre_prev ? (uint64_t)n_hc * nb : 0ull;
+  const uint64_t total = hc_total > pre_total ? hc_total : pre_total;
+  for (uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+       t += (uint64_t)gridDim.x * blockDim.x) {
+    if (t < hc_total) {
+      const uint32_t b = (uint32_t)(t % nb), d = (uint32_t)(t / nb);
+      const uint16_t v = (b == 0u) ? row0_bf16[d] : ((b < n_live) ? noise_bf16[d] : 0u);
+      for (uint32_t h = 0; h < n_hc; ++h) hc[((size_t)h * n_embd + d) * nb + b] = v;
+    }
+    if (pre_prev && t < pre_total) {
+      pre_prev[t] = (t < nb) ? 1.0f : 0.0f;
+    }
+  }
+}
+
 
 // The same gather out of a bf16 dim-major buffer — the hyper-connection lanes, which the host reads
 // one token at a time at the end of a chunk.
@@ -4015,6 +4035,81 @@ __device__ __forceinline__ uint64_t markov_key(float v, uint32_t row) {
   return ((uint64_t)u << 32) | (uint64_t)(~row);       // ~row: bigger key = smaller row
 }
 
+template <int CACHE_MODE>
+__device__ __forceinline__ float markov_bf16_dot_wave(
+    const uint16_t* __restrict__ w2, [[maybe_unused]] aff::gfx12_rsrc_t rsrc_w2,
+    const float* __restrict__ s_e, uint32_t w2_row, uint32_t rank, uint32_t lane) {
+  const uint16_t* row = w2 + (size_t)w2_row * rank;
+  const uint32_t roff = (uint32_t)((size_t)w2_row * rank * sizeof(uint16_t));
+  float acc = 0.0f;
+  for (uint32_t i = lane * 8; i < rank; i += kWave * 8) {
+    aff::aff_u32x4 v;
+    if constexpr (CACHE_MODE == 2) {
+      v = aff::buf_load_u32x4<aff::kGfx12ThNtRt>(rsrc_w2, roff + i * 2u);
+    } else {
+      const uint4 v4 = aff::load_uint4_nt<(CACHE_MODE == 1)>(row + i);
+      v = aff::aff_u32x4{v4.x, v4.y, v4.z, v4.w};
+    }
+    const uint32_t w[4] = {v[0], v[1], v[2], v[3]};
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      acc = fmaf(__uint_as_float(w[j] << 16), s_e[i + j * 2], acc);
+      acc = fmaf(__uint_as_float(w[j] & 0xffff0000u), s_e[i + j * 2 + 1], acc);
+    }
+  }
+  return aff::wave_reduce_add_dpp(acc);
+}
+
+template <int CACHE_MODE>
+__device__ __forceinline__ float markov_fp8_g128_dot_wave(
+    const uint8_t* __restrict__ w2_fp8, const uint16_t* __restrict__ w2_scales,
+    [[maybe_unused]] aff::gfx12_rsrc_t rsrc_w2, [[maybe_unused]] aff::gfx12_rsrc_t rsrc_sc,
+    const float* __restrict__ s_e, uint32_t r, uint32_t rank, uint32_t sc_cols, uint32_t lane) {
+  const uint8_t* wrow = w2_fp8 + (size_t)r * rank;
+  const uint16_t* srow = w2_scales + (size_t)r * sc_cols;
+  const uint32_t woff = (uint32_t)((size_t)r * rank);
+  const uint32_t soff = (uint32_t)((size_t)r * sc_cols * sizeof(uint16_t));
+  float acc = 0.0f;
+  if ((rank & 255u) == 0u) {
+    for (uint32_t g = 0u; g < sc_cols; g += 2u) {
+      const uint32_t sg = g + (lane >> 4);
+      const float sc = wmma::bf16_to_f32(
+          (CACHE_MODE == 2) ? aff::buf_load_u16<aff::kGfx12ThNtHt>(rsrc_sc, soff + sg * 2u)
+                            : aff::load_nt<(CACHE_MODE == 1)>(&srow[sg]));
+      const uint32_t c = g * 128u + lane * 8u;
+      const uint2 pk2 = (CACHE_MODE == 2)
+                            ? aff::buf_load_u32x2<aff::kGfx12ThNtRt>(rsrc_w2, woff + c)
+                            : aff::load_uint2_nt<(CACHE_MODE == 1)>(wrow + c);
+      const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(pk2.x);
+      const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(pk2.x);
+      const aff::aff_f32x2 d45 = aff::e4m3_decode_pk<false>(pk2.y);
+      const aff::aff_f32x2 d67 = aff::e4m3_decode_pk<true>(pk2.y);
+      const float dot =
+          ((d01.x * s_e[c] + d01.y * s_e[c + 1u]) +
+           (d23.x * s_e[c + 2u] + d23.y * s_e[c + 3u])) +
+          ((d45.x * s_e[c + 4u] + d45.y * s_e[c + 5u]) +
+           (d67.x * s_e[c + 6u] + d67.y * s_e[c + 7u]));
+      acc = fmaf(dot, sc, acc);
+    }
+  } else {
+    for (uint32_t g = 0u; g < sc_cols; ++g) {
+      const float sc = wmma::bf16_to_f32(
+          (CACHE_MODE == 2) ? aff::buf_load_u16<aff::kGfx12ThNtHt>(rsrc_sc, soff + g * 2u)
+                            : aff::load_nt<(CACHE_MODE == 1)>(&srow[g]));
+      const uint32_t c = g * 128u + lane * 4u;
+      const uint32_t pk = (CACHE_MODE == 2)
+                              ? aff::buf_load_u32<aff::kGfx12ThNtRt>(rsrc_w2, woff + c)
+                              : aff::load_nt<(CACHE_MODE == 1)>((const uint32_t*)(wrow + c));
+      const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(pk);
+      const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(pk);
+      const float dot = (d01.x * s_e[c] + d01.y * s_e[c + 1u]) +
+                        (d23.x * s_e[c + 2u] + d23.y * s_e[c + 3u]);
+      acc = fmaf(dot, sc, acc);
+    }
+  }
+  return aff::wave_reduce_add_dpp(acc);
+}
+
 template <int CACHE_MODE = 1>
 __global__ __launch_bounds__(kMarkovThr) void markov_step_kernel(
     const uint16_t* __restrict__ w1, const uint16_t* __restrict__ w2,
@@ -4038,25 +4133,7 @@ __global__ __launch_bounds__(kMarkovThr) void markov_step_kernel(
   const aff::gfx12_rsrc_t rsrc_w2 = aff::make_gfx12_rsrc(w2);
   uint64_t wave_best = 0ull;
   for (uint32_t r = blockIdx.x * kWaves + wave; r < rows; r += gridDim.x * kWaves) {
-    const uint16_t* row = w2 + (size_t)(w2_row0 + r) * rank;
-    const uint32_t roff = (uint32_t)((size_t)(w2_row0 + r) * rank * sizeof(uint16_t));
-    float acc = 0.0f;
-    for (uint32_t i = lane * 8; i < rank; i += kWave * 8) {
-      aff::aff_u32x4 v;
-      if constexpr (CACHE_MODE == 2) {
-        v = aff::buf_load_u32x4<aff::kGfx12ThNtRt>(rsrc_w2, roff + i * 2u);
-      } else {
-        const uint4 v4 = aff::load_uint4_nt<(CACHE_MODE == 1)>(row + i);
-        v = aff::aff_u32x4{v4.x, v4.y, v4.z, v4.w};
-      }
-      const uint32_t w[4] = {v[0], v[1], v[2], v[3]};
-#pragma unroll
-      for (uint32_t j = 0; j < 4; ++j) {
-        acc = fmaf(__uint_as_float(w[j] << 16), s_e[i + j * 2], acc);
-        acc = fmaf(__uint_as_float(w[j] & 0xffff0000u), s_e[i + j * 2 + 1], acc);
-      }
-    }
-    acc = aff::wave_reduce_add_dpp(acc);
+    const float acc = markov_bf16_dot_wave<CACHE_MODE>(w2, rsrc_w2, s_e, w2_row0 + r, rank, lane);
     if (!lane) {
       const uint64_t k = markov_key(logits[(size_t)r * l_rs + (size_t)col * l_cs] + acc, row0 + r);
       if (k > wave_best) wave_best = k;
@@ -4113,49 +4190,9 @@ __global__ __launch_bounds__(kMarkovThr) void markov_step_fp8_g128_kernel(
   const uint32_t sc_cols = rank >> 7;
   uint64_t wave_best = 0ull;
   for (uint32_t r = blockIdx.x * kWaves + wave; r < rows; r += gridDim.x * kWaves) {
-    const uint8_t* wrow = w2_fp8 + (size_t)r * rank;
-    const uint16_t* srow = w2_scales + (size_t)r * sc_cols;
-    const uint32_t woff = (uint32_t)((size_t)r * rank);
-    const uint32_t soff = (uint32_t)((size_t)r * sc_cols * sizeof(uint16_t));
-    float acc = 0.0f;
-    if ((rank & 255u) == 0u) {
-      for (uint32_t g = 0u; g < sc_cols; g += 2u) {
-        const uint32_t sg = g + (lane >> 4);
-        const float sc = wmma::bf16_to_f32(
-            (CACHE_MODE == 2) ? aff::buf_load_u16<aff::kGfx12ThNtHt>(rsrc_sc, soff + sg * 2u)
-                              : aff::load_nt<(CACHE_MODE == 1)>(&srow[sg]));
-        const uint32_t c = g * 128u + lane * 8u;
-        const uint2 pk2 = (CACHE_MODE == 2)
-                              ? aff::buf_load_u32x2<aff::kGfx12ThNtRt>(rsrc_w2, woff + c)
-                              : aff::load_uint2_nt<(CACHE_MODE == 1)>(wrow + c);
-        const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(pk2.x);
-        const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(pk2.x);
-        const aff::aff_f32x2 d45 = aff::e4m3_decode_pk<false>(pk2.y);
-        const aff::aff_f32x2 d67 = aff::e4m3_decode_pk<true>(pk2.y);
-        const float dot =
-            ((d01.x * s_e[c] + d01.y * s_e[c + 1u]) +
-             (d23.x * s_e[c + 2u] + d23.y * s_e[c + 3u])) +
-            ((d45.x * s_e[c + 4u] + d45.y * s_e[c + 5u]) +
-             (d67.x * s_e[c + 6u] + d67.y * s_e[c + 7u]));
-        acc = fmaf(dot, sc, acc);
-      }
-    } else {
-      for (uint32_t g = 0u; g < sc_cols; ++g) {
-        const float sc = wmma::bf16_to_f32(
-            (CACHE_MODE == 2) ? aff::buf_load_u16<aff::kGfx12ThNtHt>(rsrc_sc, soff + g * 2u)
-                              : aff::load_nt<(CACHE_MODE == 1)>(&srow[g]));
-        const uint32_t c = g * 128u + lane * 4u;
-        const uint32_t pk = (CACHE_MODE == 2)
-                                ? aff::buf_load_u32<aff::kGfx12ThNtRt>(rsrc_w2, woff + c)
-                                : aff::load_nt<(CACHE_MODE == 1)>((const uint32_t*)(wrow + c));
-        const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(pk);
-        const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(pk);
-        const float dot = (d01.x * s_e[c] + d01.y * s_e[c + 1u]) +
-                          (d23.x * s_e[c + 2u] + d23.y * s_e[c + 3u]);
-        acc = fmaf(dot, sc, acc);
-      }
-    }
-    acc = aff::wave_reduce_add_dpp(acc);
+    const float acc =
+        markov_fp8_g128_dot_wave<CACHE_MODE>(w2_fp8, w2_scales, rsrc_w2, rsrc_sc, s_e, r, rank,
+                                             sc_cols, lane);
     if (!lane) {
       const uint64_t k = markov_key(logits[(size_t)r * l_rs + (size_t)col * l_cs] + acc, row0 + r);
       if (k > wave_best) wave_best = k;
@@ -4164,6 +4201,179 @@ __global__ __launch_bounds__(kMarkovThr) void markov_step_fp8_g128_kernel(
   if (!lane && wave_best) atomicMax(&s_best, (unsigned long long)wave_best);
   aff::lds_barrier();
   if (!threadIdx.x && s_best) atomicMax(best, s_best);
+}
+
+__global__ __launch_bounds__(kMarkovThr) void markov_w2_norm_bf16_kernel(
+    const uint16_t* __restrict__ w2, float* __restrict__ out_norm, uint32_t rows, uint32_t rank) {
+  const uint32_t lane = threadIdx.x & (kWave - 1u), wave = threadIdx.x / kWave;
+  constexpr uint32_t kWaves = kMarkovThr / kWave;
+  const uint32_t r = blockIdx.x * kWaves + wave;
+  if (r >= rows) return;
+  const uint16_t* row = w2 + (size_t)r * rank;
+  float acc = 0.0f;
+  for (uint32_t i = lane * 8u; i < rank; i += kWave * 8u) {
+    const uint4 v4 = *(const uint4*)(row + i);
+    const uint32_t w[4] = {v4.x, v4.y, v4.z, v4.w};
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      const float x0 = __uint_as_float(w[j] << 16);
+      const float x1 = __uint_as_float(w[j] & 0xffff0000u);
+      acc = fmaf(x0, x0, acc);
+      acc = fmaf(x1, x1, acc);
+    }
+  }
+  acc = aff::wave_reduce_add_dpp(acc);
+  if (!lane) out_norm[r] = sqrtf(acc) * 1.001f;
+}
+
+__global__ __launch_bounds__(kMarkovThr) void markov_w2_norm_fp8_g128_kernel(
+    const uint8_t* __restrict__ w2_fp8, const uint16_t* __restrict__ w2_scales,
+    float* __restrict__ out_norm, uint32_t rows, uint32_t rank) {
+  const uint32_t lane = threadIdx.x & (kWave - 1u), wave = threadIdx.x / kWave;
+  constexpr uint32_t kWaves = kMarkovThr / kWave;
+  const uint32_t r = blockIdx.x * kWaves + wave;
+  if (r >= rows) return;
+  const uint32_t sc_cols = rank >> 7;
+  const uint8_t* wrow = w2_fp8 + (size_t)r * rank;
+  const uint16_t* srow = w2_scales + (size_t)r * sc_cols;
+  float acc = 0.0f;
+  if ((rank & 255u) == 0u) {
+    for (uint32_t g = 0u; g < sc_cols; g += 2u) {
+      const float sc = wmma::bf16_to_f32(srow[g + (lane >> 4)]);
+      const uint32_t c = g * 128u + lane * 8u;
+      const uint2 pk2 = *(const uint2*)(wrow + c);
+      const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(pk2.x);
+      const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(pk2.x);
+      const aff::aff_f32x2 d45 = aff::e4m3_decode_pk<false>(pk2.y);
+      const aff::aff_f32x2 d67 = aff::e4m3_decode_pk<true>(pk2.y);
+      const float lsq = ((d01.x * d01.x + d01.y * d01.y) + (d23.x * d23.x + d23.y * d23.y)) +
+                        ((d45.x * d45.x + d45.y * d45.y) + (d67.x * d67.x + d67.y * d67.y));
+      acc = fmaf(lsq, sc * sc, acc);
+    }
+  } else {
+    for (uint32_t g = 0u; g < sc_cols; ++g) {
+      const float sc = wmma::bf16_to_f32(srow[g]);
+      const uint32_t c = g * 128u + lane * 4u;
+      const uint32_t pk = *(const uint32_t*)(wrow + c);
+      const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(pk);
+      const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(pk);
+      const float lsq = (d01.x * d01.x + d01.y * d01.y) + (d23.x * d23.x + d23.y * d23.y);
+      acc = fmaf(lsq, sc * sc, acc);
+    }
+  }
+  acc = aff::wave_reduce_add_dpp(acc);
+  if (!lane) out_norm[r] = sqrtf(acc) * 1.001f;
+}
+
+template <typename DotFn>
+__device__ __forceinline__ void markov_step_pruned_body(
+    const uint16_t* __restrict__ w1, const float* __restrict__ w2_norm,
+    const uint32_t* __restrict__ ids, const float* __restrict__ logits,
+    const float* __restrict__ amx, unsigned long long* __restrict__ best, uint32_t rows,
+    uint32_t row0, uint32_t rank, uint32_t nb, uint32_t col, uint32_t l_rs, uint32_t l_cs,
+    DotFn&& dot_fn) {
+  constexpr uint32_t kWaves = kMarkovThr / kWave;
+  __shared__ float s_e[kMarkovRankMax];
+  __shared__ float s_ew[kWaves];
+  __shared__ float s_enorm;
+  __shared__ float s_seed_val;
+  __shared__ unsigned long long s_seed_key;
+  __shared__ unsigned long long s_best;
+
+  const uint32_t tid = threadIdx.x;
+  const uint32_t lane = tid & (kWave - 1u), wave = tid / kWave;
+  const uint32_t token = ids[col];
+  float e_sq = 0.0f;
+  for (uint32_t i = tid; i < rank; i += kMarkovThr) {
+    const float ev = wmma::bf16_to_f32(w1[(size_t)token * rank + i]);
+    s_e[i] = ev;
+    e_sq = fmaf(ev, ev, e_sq);
+  }
+  e_sq = aff::wave_reduce_add_dpp(e_sq);
+  if (!lane) s_ew[wave] = e_sq;
+  aff::lds_barrier();
+
+  const uint32_t raw_top = (uint32_t)amx[(size_t)nb + col];
+  const uint32_t r_top = (raw_top >= row0 && (raw_top - row0) < rows) ? (raw_top - row0) : 0u;
+  if (wave == 0u) {
+    if (!lane) {
+      float esum = 0.0f;
+#pragma unroll
+      for (uint32_t w = 0u; w < kWaves; ++w) esum += s_ew[w];
+      s_enorm = sqrtf(esum) * 1.001f;
+    }
+    const float dot_top = dot_fn(s_e, r_top, lane);
+    if (!lane) {
+      const float sv = logits[(size_t)r_top * l_rs + (size_t)col * l_cs] + dot_top;
+      const uint64_t sk = markov_key(sv, row0 + r_top);
+      s_seed_val = sv;
+      s_seed_key = sk;
+      s_best = (blockIdx.x == 0u) ? (unsigned long long)sk : 0ull;
+    }
+  }
+  aff::lds_barrier();
+
+  const float e_norm = s_enorm;
+  const uint64_t seed_key = s_seed_key;
+  float best_val = s_seed_val;
+  uint64_t wave_best = 0ull;
+  const uint32_t r_step = gridDim.x * kWaves * 32u;
+  for (uint32_t r_base = (blockIdx.x * kWaves + wave) * 32u; r_base < rows; r_base += r_step) {
+    const uint32_t r = r_base + lane;
+    const bool pass =
+        (r < rows) &&
+        !(logits[(size_t)r * l_rs + (size_t)col * l_cs] + fmaf(w2_norm[r], e_norm, 1e-6f) <
+          best_val);
+    uint32_t mask = (uint32_t)__ballot(pass);
+    while (mask) {
+      const uint32_t b = (uint32_t)__ffs((int)mask) - 1u;
+      mask &= mask - 1u;
+      const uint32_t rh = r_base + b;
+      const float acc = dot_fn(s_e, rh, lane);
+      if (!lane) {
+        const float tot = logits[(size_t)rh * l_rs + (size_t)col * l_cs] + acc;
+        const uint64_t k = markov_key(tot, row0 + rh);
+        if (k >= seed_key && k > wave_best) wave_best = k;
+        if (tot > best_val) best_val = tot;
+      }
+      best_val = __shfl(best_val, 0, 32);
+    }
+  }
+  if (!lane && wave_best) atomicMax(&s_best, (unsigned long long)wave_best);
+  aff::lds_barrier();
+  if (!tid && s_best) atomicMax(best, s_best);
+}
+
+template <int CACHE_MODE = 1>
+__global__ __launch_bounds__(kMarkovThr) void markov_step_pruned_kernel(
+    const uint16_t* __restrict__ w1, const uint16_t* __restrict__ w2,
+    const float* __restrict__ w2_norm, const uint32_t* __restrict__ ids,
+    const float* __restrict__ logits, const float* __restrict__ amx,
+    unsigned long long* __restrict__ best, uint32_t rows, uint32_t row0, uint32_t rank,
+    uint32_t nb, uint32_t col, uint32_t l_rs, uint32_t l_cs) {
+  const aff::gfx12_rsrc_t rsrc_w2 = aff::make_gfx12_rsrc(w2);
+  markov_step_pruned_body(w1, w2_norm, ids, logits, amx, best, rows, row0, rank, nb, col, l_rs,
+                          l_cs, [&](const float* s_e, uint32_t r, uint32_t lane) {
+                            return markov_bf16_dot_wave<CACHE_MODE>(w2, rsrc_w2, s_e, r, rank, lane);
+                          });
+}
+
+template <int CACHE_MODE = 1>
+__global__ __launch_bounds__(kMarkovThr) void markov_step_pruned_fp8_g128_kernel(
+    const uint16_t* __restrict__ w1, const uint8_t* __restrict__ w2_fp8,
+    const uint16_t* __restrict__ w2_scales, const float* __restrict__ w2_norm,
+    const uint32_t* __restrict__ ids, const float* __restrict__ logits,
+    const float* __restrict__ amx, unsigned long long* __restrict__ best, uint32_t rows,
+    uint32_t row0, uint32_t rank, uint32_t nb, uint32_t col, uint32_t l_rs, uint32_t l_cs) {
+  const aff::gfx12_rsrc_t rsrc_w2 = aff::make_gfx12_rsrc(w2_fp8);
+  const aff::gfx12_rsrc_t rsrc_sc = aff::make_gfx12_rsrc(w2_scales);
+  const uint32_t sc_cols = rank >> 7;
+  markov_step_pruned_body(w1, w2_norm, ids, logits, amx, best, rows, row0, rank, nb, col, l_rs,
+                          l_cs, [&](const float* s_e, uint32_t r, uint32_t lane) {
+                            return markov_fp8_g128_dot_wave<CACHE_MODE>(w2_fp8, w2_scales, rsrc_w2,
+                                                                        rsrc_sc, s_e, r, rank,
+                                                                        sc_cols, lane);
+                          });
 }
 
 __global__ __launch_bounds__(32) void markov_combine_p2p_kernel(
@@ -5613,6 +5823,19 @@ void batch_hc_seed_bf16_hip(const uint16_t* emb_bf16, uint16_t* hc, uint32_t n_e
               dim3(thr), 0, (hipStream_t)stream, emb_bf16, hc, n_embd, n_hc, n_live, nb);
 }
 
+void batch_hc_seed_draft_bf16_hip(const uint16_t* row0_bf16, const uint16_t* noise_bf16,
+                                  uint16_t* hc, float* pre_prev, uint32_t n_embd, uint32_t n_hc,
+                                  uint32_t n_live, uint32_t nb, void* stream) {
+  const uint64_t hc_total = (uint64_t)n_embd * nb;
+  const uint64_t pre_total = pre_prev ? (uint64_t)n_hc * nb : 0ull;
+  const uint64_t total = std::max(hc_total, pre_total);
+  const uint32_t thr = 256;
+  AFF_BLAUNCH(batch_hc_seed_draft_bf16_kernel,
+              dim3(aff::safe_grid_blocks((uint32_t)((total + thr - 1) / thr), thr >> 5)),
+              dim3(thr), 0, (hipStream_t)stream, row0_bf16, noise_bf16, hc, pre_prev, n_embd, n_hc,
+              n_live, nb);
+}
+
 // ---- the router's top-k ------------------------------------------------------------------------
 //
 // One block per token, one thread per expert. Six rounds of a block-wide argmax rather than a sort:
@@ -5918,6 +6141,99 @@ void markov_step_fp8_g128_hip(const uint16_t* w1, const uint8_t* w2_fp8,
     AFF_BLAUNCH(markov_step_fp8_g128_kernel<0>, m_grid, dim3(kMarkovThr), 0,
                 (hipStream_t)stream, w1, w2_fp8, w2_scales, ids, logits, b64, rows, row0, rank,
                 col, l_rs, l_cs);
+  }
+}
+
+void markov_w2_norm_bf16_hip(const uint16_t* w2, float* out_norm, uint32_t rows, uint32_t rank,
+                             void* stream) {
+  if (!rows || !w2 || !out_norm || (rank % 256u) != 0u) return;
+  constexpr uint32_t kWaves = kMarkovThr / kWave;
+  const dim3 grid((rows + kWaves - 1u) / kWaves);
+  AFF_BLAUNCH(markov_w2_norm_bf16_kernel, grid, dim3(kMarkovThr), 0, (hipStream_t)stream, w2,
+              out_norm, rows, rank);
+}
+
+void markov_w2_norm_fp8_g128_hip(const uint8_t* w2_fp8, const uint16_t* w2_scales,
+                                 float* out_norm, uint32_t rows, uint32_t rank, void* stream) {
+  if (!rows || !w2_fp8 || !w2_scales || !out_norm || (rank % 128u) != 0u) return;
+  constexpr uint32_t kWaves = kMarkovThr / kWave;
+  const dim3 grid((rows + kWaves - 1u) / kWaves);
+  AFF_BLAUNCH(markov_w2_norm_fp8_g128_kernel, grid, dim3(kMarkovThr), 0, (hipStream_t)stream,
+              w2_fp8, w2_scales, out_norm, rows, rank);
+}
+
+void markov_step_pruned_hip(const uint16_t* w1, const uint16_t* w2, const float* w2_norm,
+                            const uint32_t* ids, const float* logits, const float* amx,
+                            uint64_t* best, uint32_t rows, uint32_t row0, uint32_t rank,
+                            uint32_t nb, uint32_t col, void* stream,
+                            int logits_token_major, bool reset_best) {
+  if (!rows || !best || !w2_norm || !amx || rank > kMarkovRankMax || (rank % 256u) != 0u) return;
+  const uint32_t l_rs = logits_token_major ? 1u : nb;
+  const uint32_t l_cs = logits_token_major ? rows : 1u;
+  auto* b64 = (unsigned long long*)best;
+  if (reset_best) {
+    AFF_HIP_CHECK(hipMemsetAsync(b64, 0, sizeof(unsigned long long), (hipStream_t)stream));
+  }
+  constexpr uint32_t kWaves = kMarkovThr / kWave;
+  const uint32_t max_blk = (rows + kWaves * 32u - 1u) / (kWaves * 32u);
+  const dim3 m_grid(markov_persist_enabled()
+                        ? aff::safe_grid_blocks(std::min<uint32_t>(512u, max_blk), kWaves)
+                        : max_blk);
+  const bool nt_load = aff::dense_nt_load_enabled();
+  const int cache_mode =
+      nt_load ? 1
+              : ((aff::gfx12_cache_hints_enabled() &&
+                  (uint64_t)rows * rank * sizeof(uint16_t) <= 0xffffff00ull)
+                     ? 2
+                     : 0);
+  if (cache_mode == 2) {
+    AFF_BLAUNCH(markov_step_pruned_kernel<2>, m_grid, dim3(kMarkovThr), 0, (hipStream_t)stream, w1,
+                w2, w2_norm, ids, logits, amx, b64, rows, row0, rank, nb, col, l_rs, l_cs);
+  } else if (cache_mode == 1) {
+    AFF_BLAUNCH(markov_step_pruned_kernel<1>, m_grid, dim3(kMarkovThr), 0, (hipStream_t)stream, w1,
+                w2, w2_norm, ids, logits, amx, b64, rows, row0, rank, nb, col, l_rs, l_cs);
+  } else {
+    AFF_BLAUNCH(markov_step_pruned_kernel<0>, m_grid, dim3(kMarkovThr), 0, (hipStream_t)stream, w1,
+                w2, w2_norm, ids, logits, amx, b64, rows, row0, rank, nb, col, l_rs, l_cs);
+  }
+}
+
+void markov_step_pruned_fp8_g128_hip(const uint16_t* w1, const uint8_t* w2_fp8,
+                                     const uint16_t* w2_scales, const float* w2_norm,
+                                     const uint32_t* ids, const float* logits, const float* amx,
+                                     uint64_t* best, uint32_t rows, uint32_t row0, uint32_t rank,
+                                     uint32_t nb, uint32_t col, void* stream,
+                                     int logits_token_major, bool reset_best) {
+  if (!rows || !best || !w1 || !w2_fp8 || !w2_scales || !w2_norm || !ids || !logits || !amx ||
+      rank > kMarkovRankMax || (rank % 128u) != 0u)
+    return;
+  const uint32_t l_rs = logits_token_major ? 1u : nb;
+  const uint32_t l_cs = logits_token_major ? rows : 1u;
+  auto* b64 = (unsigned long long*)best;
+  if (reset_best) {
+    AFF_HIP_CHECK(hipMemsetAsync(b64, 0, sizeof(unsigned long long), (hipStream_t)stream));
+  }
+  constexpr uint32_t kWaves = kMarkovThr / kWave;
+  const uint32_t max_blk = (rows + kWaves * 32u - 1u) / (kWaves * 32u);
+  const dim3 m_grid(markov_persist_enabled()
+                        ? aff::safe_grid_blocks(std::min<uint32_t>(512u, max_blk), kWaves)
+                        : max_blk);
+  const bool nt_load = aff::dense_nt_load_enabled();
+  const int cache_mode =
+      nt_load ? 1
+              : ((aff::gfx12_cache_hints_enabled() && (uint64_t)rows * rank <= 0xffffff00ull) ? 2 : 0);
+  if (cache_mode == 2) {
+    AFF_BLAUNCH(markov_step_pruned_fp8_g128_kernel<2>, m_grid, dim3(kMarkovThr), 0,
+                (hipStream_t)stream, w1, w2_fp8, w2_scales, w2_norm, ids, logits, amx, b64, rows,
+                row0, rank, nb, col, l_rs, l_cs);
+  } else if (cache_mode == 1) {
+    AFF_BLAUNCH(markov_step_pruned_fp8_g128_kernel<1>, m_grid, dim3(kMarkovThr), 0,
+                (hipStream_t)stream, w1, w2_fp8, w2_scales, w2_norm, ids, logits, amx, b64, rows,
+                row0, rank, nb, col, l_rs, l_cs);
+  } else {
+    AFF_BLAUNCH(markov_step_pruned_fp8_g128_kernel<0>, m_grid, dim3(kMarkovThr), 0,
+                (hipStream_t)stream, w1, w2_fp8, w2_scales, w2_norm, ids, logits, amx, b64, rows,
+                row0, rank, nb, col, l_rs, l_cs);
   }
 }
 

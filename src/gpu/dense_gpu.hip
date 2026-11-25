@@ -415,6 +415,13 @@ struct DenseGpu::Impl {
     float* b_head = nullptr;
     float* b_amx = nullptr;
     uint64_t* b_mbest = nullptr;                          // the Markov step's grid-wide maximum
+    float* mk_w2_norm = nullptr;                          // cached Markov W2 row L2 norms (for pruning)
+    const void* mk_w2_src = nullptr;
+    uint32_t mk_w2_rows = 0;
+    uint32_t mk_w2_rank = 0;
+    uint16_t* b_noise_bf16 = nullptr;                     // cached DSpark noise embedding row
+    uint32_t b_noise_embd = 0;
+    uint32_t b_noise_tok = 0xFFFFFFFFu;
     // The Markov chain, entirely on the card: `b_ids` is [1 + kNarrowTok] with the block's first
     // token at 0 and each step's winner after it, `b_mpeer` the eight bytes of each other card's key,
     // `ev_mk` one event a step so the cards' steps can be ordered against each other without the
@@ -645,6 +652,11 @@ inline bool markov_w1_uva_enabled() {
 
 inline bool markov_p2p_spin_enabled() {
   const char* v = std::getenv("AFF_MARKOV_P2P_SPIN");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool markov_exact_prune_enabled() {
+  const char* v = std::getenv("AFF_MARKOV_EXACT_PRUNE");
   return !v || !*v || std::strcmp(v, "0") != 0;
 }
 
@@ -1032,9 +1044,9 @@ DenseGpu::~DenseGpu() {
       D.a_q, D.a_out, D.d_rlog,
       D.b_mix, D.b_pre, D.b_pre_prev, D.b_post, D.b_comb, D.b_cur, D.b_norm, D.b_block,
       D.b_hcp, D.b_emb, D.b_q, D.b_hinv, D.b_kv, D.b_qr, D.b_g, D.b_u, D.b_y, D.b_tm,
-      D.b_head, D.b_amx, D.b_dx, D.b_dm};
+      D.b_head, D.b_amx, D.mk_w2_norm, D.b_dx, D.b_dm};
     for (float* p : bufs) if (p) (void)hipFree(p);
-    for (uint16_t* p : {D.b_hc, D.b_hc_next, D.b_qtm}) if (p) (void)hipFree(p);
+    for (uint16_t* p : {D.b_hc, D.b_hc_next, D.b_qtm, D.b_noise_bf16}) if (p) (void)hipFree(p);
     for (float* p : D.vec) if (p) (void)hipFree(p);
     for (uint16_t* p : D.router) if (p) (void)hipFree(p);
     for (float* p : D.b_tap_s) if (p) (void)hipFree(p);
@@ -5433,6 +5445,65 @@ bool DenseGpu::batch_begin_bf16(uint32_t n_live, uint32_t pos0, const uint16_t* 
   return true;
 }
 
+bool DenseGpu::batch_begin_draft_bf16(uint32_t n_live, uint32_t pos0, const uint16_t* row0_bf16,
+                                      const uint16_t* noise_bf16, uint32_t noise_tok,
+                                      uint32_t n_embd, uint32_t n_hc) {
+  AFF_TRACE(20);
+  if (!b_cap_ || !n_live || !row0_bf16 || !noise_bf16) return false;
+  b_idx_layer_[slot_] = -1;
+  b_cand_src_[slot_] = -1;
+  b_kvn_pending_ = false;
+  const uint32_t nb = batch_round(n_live);
+  if (nb > b_cap_) {
+    aff::ui::fatal("batch_begin_draft_bf16: %u live -> stride %u exceeds the %u-token arena\n",
+                   n_live, nb, b_cap_);
+    std::abort();
+  }
+  b_nb_ = nb; b_live_ = n_live; b_pos0_ = pos0;
+  b_ar_pending_ = 0;
+  pending_pf0_ = -1;
+  pending_pf1_ = -1;
+  const size_t row0_bytes = (size_t)n_embd * sizeof(uint16_t);
+  const size_t fit_bytes =
+      (nb <= kNarrowTok) ? ((size_t)kNarrowTok * n_embd * sizeof(uint16_t)) : row0_bytes;
+  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    D.b_shexp_ev = false;
+    D.b_ar_precollapsed = false;
+    D.b_ar_npart = 0;
+    AFF_HIP_CHECK(hipSetDevice(D.id));
+    keepalive_notify_active(D.id);
+    if (!D.b_noise_bf16 || D.b_noise_embd != n_embd || D.b_noise_tok != noise_tok) {
+      if (D.b_noise_bf16 && D.b_noise_embd != n_embd) {
+        (void)hipFree(D.b_noise_bf16);
+        D.b_noise_bf16 = nullptr;
+      }
+      if (!D.b_noise_bf16) {
+        if (hipMalloc(&D.b_noise_bf16, row0_bytes) != hipSuccess) return false;
+        D.b_noise_embd = n_embd;
+      }
+      AFF_HIP_CHECK(hipMemcpyAsync(D.b_noise_bf16, noise_bf16, row0_bytes, hipMemcpyHostToDevice,
+                                   D.stream));
+      D.b_noise_tok = noise_tok;
+    }
+    StageRing& ring = (nb <= kNarrowTok) ? D.emb_dec : D.emb;
+    if (!ring.fit(fit_bytes, kRingPlaneBudget)) return false;
+    uint32_t es = 0;
+    uint8_t* const pin = ring.claim(&es);
+    AFF_BLOCK_AT(aff::BlockSite::Begin, AFF_HIP_CHECK(ring.wait(es)));
+    std::memcpy(pin, row0_bf16, row0_bytes);
+    uint16_t* const dst_bf16 = reinterpret_cast<uint16_t*>(D.b_emb);
+    AFF_HIP_CHECK(hipMemcpyAsync(dst_bf16, pin, row0_bytes, hipMemcpyHostToDevice, D.stream));
+    AFF_HIP_CHECK(ring.done(es, D.stream));
+    batch_hc_seed_draft_bf16_hip(dst_bf16, D.b_noise_bf16, D.b_hc,
+                                 shift_pre_ ? D.b_pre_prev : nullptr, n_embd, n_hc, n_live, nb,
+                                 D.stream);
+    D.q8_src = nullptr;
+    norm_q8_invalidate(D.id, D.b_norm);
+  }
+  return true;
+}
+
 bool DenseGpu::batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t n_embd,
                             uint32_t n_hc, uint32_t iters, float hc_eps, float rms_eps,
                             float* norm_host) {
@@ -9050,10 +9121,49 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
     const Impl::Dev& D = impl_->dev[active_ranks[ai]];
     if (!D.b_mk_fg || !D.b_mk_flag) have_p2p_fg = false;
   }
+  const bool want_prune = markov_exact_prune_enabled() && rank <= 1024u;
+  bool use_prune[kMaxRanks] = {};
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     if (!D.b_ids || !D.b_mpeer || !D.tok.ready()) return false;
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    if (want_prune && nr[d]) {
+      const uint64_t w2_rel_row = (W2.split == Split::Row) ? (r0[d] - W2.sh[d].row0) : r0[d];
+      const bool fp8_w2 = !W2.sh[d].data && W2.sh[d].fp8_data && W2.sh[d].fp8_scales;
+      const bool shape_ok = fp8_w2 ? ((rank % 128u) == 0u) : ((rank % 256u) == 0u);
+      const void* const w2_src =
+          fp8_w2 ? (const void*)(static_cast<const uint8_t*>(W2.sh[d].fp8_data) + w2_rel_row * rank)
+                 : (const void*)((const uint16_t*)W2.sh[d].data + w2_rel_row * rank);
+      if (shape_ok && w2_src) {
+        if (!D.mk_w2_norm || D.mk_w2_src != w2_src || D.mk_w2_rows != (uint32_t)nr[d] ||
+            D.mk_w2_rank != rank) {
+          if (D.mk_w2_norm) { (void)hipFree(D.mk_w2_norm); D.mk_w2_norm = nullptr; }
+          if (hipMalloc(&D.mk_w2_norm, (size_t)nr[d] * sizeof(float)) == hipSuccess) {
+            if (fp8_w2) {
+              markov_w2_norm_fp8_g128_hip(static_cast<const uint8_t*>(w2_src),
+                                          W2.sh[d].fp8_scales + w2_rel_row * (rank / 128u),
+                                          D.mk_w2_norm, (uint32_t)nr[d], rank, D.stream);
+            } else {
+              markov_w2_norm_bf16_hip(static_cast<const uint16_t*>(w2_src), D.mk_w2_norm,
+                                      (uint32_t)nr[d], rank, D.stream);
+            }
+            D.mk_w2_src = w2_src;
+            D.mk_w2_rows = (uint32_t)nr[d];
+            D.mk_w2_rank = rank;
+          } else {
+            D.mk_w2_norm = nullptr;
+            D.mk_w2_src = nullptr;
+            D.mk_w2_rows = 0;
+            D.mk_w2_rank = 0;
+          }
+        }
+        if (D.mk_w2_norm) {
+          batch_argmax_hip(D.b_head, D.b_amx, (uint32_t)nr[d], kNarrowTok, n, (uint32_t)r0[d],
+                           D.stream, mx ? 1 : 0);
+          use_prune[d] = true;
+        }
+      }
+    }
     // The block's first token, the one host value the chain needs. Through a ring slot, because a
     // 4-byte H2D reads its source after this call returns exactly like a 4 MiB one does.
     uint32_t ts = 0;
@@ -9075,17 +9185,34 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
       const bool reset_best = !have_p2p_fg;
       const uint64_t w2_rel_row = (W2.split == Split::Row) ? (r0[d] - W2.sh[d].row0) : r0[d];
       if (!W2.sh[d].data && W2.sh[d].fp8_data && W2.sh[d].fp8_scales) {
-        markov_step_fp8_g128_hip(
-            (const uint16_t*)W1.sh[d].data,
-            static_cast<const uint8_t*>(W2.sh[d].fp8_data) + w2_rel_row * rank,
-            W2.sh[d].fp8_scales + w2_rel_row * (rank / 128u), D.b_ids, D.b_head, best_ptr,
-            (uint32_t)nr[d], (uint32_t)r0[d], rank, kNarrowTok, i, D.stream, mx ? 1 : 0,
-            reset_best);
+        if (use_prune[d]) {
+          markov_step_pruned_fp8_g128_hip(
+              (const uint16_t*)W1.sh[d].data,
+              static_cast<const uint8_t*>(W2.sh[d].fp8_data) + w2_rel_row * rank,
+              W2.sh[d].fp8_scales + w2_rel_row * (rank / 128u), D.mk_w2_norm, D.b_ids, D.b_head,
+              D.b_amx, best_ptr, (uint32_t)nr[d], (uint32_t)r0[d], rank, kNarrowTok, i, D.stream,
+              mx ? 1 : 0, reset_best);
+        } else {
+          markov_step_fp8_g128_hip(
+              (const uint16_t*)W1.sh[d].data,
+              static_cast<const uint8_t*>(W2.sh[d].fp8_data) + w2_rel_row * rank,
+              W2.sh[d].fp8_scales + w2_rel_row * (rank / 128u), D.b_ids, D.b_head, best_ptr,
+              (uint32_t)nr[d], (uint32_t)r0[d], rank, kNarrowTok, i, D.stream, mx ? 1 : 0,
+              reset_best);
+        }
       } else {
-        markov_step_hip((const uint16_t*)W1.sh[d].data,
-                        (const uint16_t*)W2.sh[d].data + w2_rel_row * rank, D.b_ids, D.b_head,
-                        best_ptr, (uint32_t)nr[d], (uint32_t)r0[d], rank, kNarrowTok, i, D.stream,
-                        mx ? 1 : 0, reset_best, /*w2_sharded=*/1);
+        if (use_prune[d]) {
+          markov_step_pruned_hip((const uint16_t*)W1.sh[d].data,
+                                 (const uint16_t*)W2.sh[d].data + w2_rel_row * rank, D.mk_w2_norm,
+                                 D.b_ids, D.b_head, D.b_amx, best_ptr, (uint32_t)nr[d],
+                                 (uint32_t)r0[d], rank, kNarrowTok, i, D.stream, mx ? 1 : 0,
+                                 reset_best);
+        } else {
+          markov_step_hip((const uint16_t*)W1.sh[d].data,
+                          (const uint16_t*)W2.sh[d].data + w2_rel_row * rank, D.b_ids, D.b_head,
+                          best_ptr, (uint32_t)nr[d], (uint32_t)r0[d], rank, kNarrowTok, i, D.stream,
+                          mx ? 1 : 0, reset_best, /*w2_sharded=*/1);
+        }
       }
       if (!have_p2p_fg && n_active > 1u) AFF_HIP_CHECK(hipEventRecord(D.ev_mk[i], D.stream));
     }
@@ -9199,6 +9326,10 @@ Model::BatchOps DenseGpu::batch_ops() {
   o.begin_bf16 = [](void* c, uint32_t nl, uint32_t p0, const uint16_t* e, uint32_t ne,
                     uint32_t nh) {
     return static_cast<DenseGpu*>(c)->batch_begin_bf16(nl, p0, e, ne, nh);
+  };
+  o.begin_draft_bf16 = [](void* c, uint32_t nl, uint32_t p0, const uint16_t* r0,
+                          const uint16_t* nw, uint32_t nt, uint32_t ne, uint32_t nh) {
+    return static_cast<DenseGpu*>(c)->batch_begin_draft_bf16(nl, p0, r0, nw, nt, ne, nh);
   };
   o.hc_pre = [](void* c, int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint32_t ne, uint32_t nh,
                 uint32_t it, float he, float re, float* n) {

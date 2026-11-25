@@ -1,4 +1,5 @@
 #include "gpu/attention_gpu.h"
+#include "gpu/batch_kernels.h"
 #include "gpu/indexer_gpu.h"
 
 #include <hip/hip_runtime.h>
@@ -296,6 +297,177 @@ static int check_topk_and_bmax_v2() {
   return 0;
 }
 
+static uint16_t f32_to_bf16_round_test(float x) {
+  uint32_t u = 0;
+  std::memcpy(&u, &x, 4);
+  u += ((u >> 16) & 1u) + 0x7fffu;
+  return (uint16_t)(u >> 16);
+}
+
+static int check_markov_pruned() {
+  const uint32_t vocab = 256u, rows = 2048u, row0 = 64640u, nb = 8u, n = 5u;
+  std::vector<uint32_t> h_ids(n + 1u);
+  for (uint32_t i = 0; i <= n; ++i) h_ids[i] = (17u * i + 5u) % vocab;
+
+  for (uint32_t rank : {128u, 256u}) {
+    std::vector<uint16_t> h_w1((size_t)vocab * rank);
+    std::vector<uint16_t> h_w2((size_t)rows * rank);
+    std::vector<uint8_t> h_w2_f8((size_t)rows * rank);
+    const uint32_t sc_cols = rank / 128u;
+    std::vector<uint16_t> h_w2_sc((size_t)rows * sc_cols);
+
+    uint32_t s = 918273u + rank;
+    auto next_f = [&](float scale) {
+      s = s * 1664525u + 1013904223u;
+      return ((float)((int32_t)(s >> 8) - (1 << 23)) / (float)(1 << 23)) * scale;
+    };
+    for (size_t i = 0; i < h_w1.size(); ++i) h_w1[i] = f32_to_bf16_round_test(next_f(1.5f));
+    for (size_t i = 0; i < h_w2.size(); ++i) {
+      h_w2[i] = f32_to_bf16_round_test(next_f(0.4f));
+      s = s * 1664525u + 1013904223u;
+      const uint8_t sign = (uint8_t)((s >> 31) << 7);
+      const uint8_t mag = (uint8_t)(0x10u + ((s >> 20) % 0x40u));
+      h_w2_f8[i] = (uint8_t)(sign | mag);
+    }
+    for (size_t i = 0; i < h_w2_sc.size(); ++i) h_w2_sc[i] = 0x3f80u;  // 1.0f bf16
+
+    // Adversarial setup at row 777 & tie setup at row 444 vs row 1111 so non-argmax rows win.
+    for (uint32_t c = 0; c < rank; ++c) {
+      h_w1[(size_t)h_ids[2] * rank + c] = 0x3f80u;  // +1.0f all dims
+      h_w2[(size_t)777u * rank + c] = 0x4000u;      // +2.0f -> large dot boost
+      h_w2_f8[(size_t)777u * rank + c] = 0x50u;     // positive E4M3 -> large dot boost
+    }
+
+    uint16_t *d_w1 = nullptr, *d_w2 = nullptr, *d_w2_sc = nullptr;
+    uint8_t* d_w2_f8 = nullptr;
+    uint32_t* d_ids = nullptr;
+    float *d_logits = nullptr, *d_amx = nullptr, *d_norm = nullptr;
+    uint64_t *d_best_ref = nullptr, *d_best_prn = nullptr;
+    (void)hipMalloc(&d_w1, h_w1.size() * 2u);
+    (void)hipMalloc(&d_w2, h_w2.size() * 2u);
+    (void)hipMalloc(&d_w2_f8, h_w2_f8.size());
+    (void)hipMalloc(&d_w2_sc, h_w2_sc.size() * 2u);
+    (void)hipMalloc(&d_ids, h_ids.size() * 4u);
+    (void)hipMalloc(&d_logits, (size_t)rows * nb * sizeof(float));
+    (void)hipMalloc(&d_amx, (size_t)2u * nb * sizeof(float));
+    (void)hipMalloc(&d_norm, (size_t)rows * sizeof(float));
+    (void)hipMalloc(&d_best_ref, sizeof(uint64_t));
+    (void)hipMalloc(&d_best_prn, sizeof(uint64_t));
+    (void)hipMemcpy(d_w1, h_w1.data(), h_w1.size() * 2u, hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_w2, h_w2.data(), h_w2.size() * 2u, hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_w2_f8, h_w2_f8.data(), h_w2_f8.size(), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_w2_sc, h_w2_sc.data(), h_w2_sc.size() * 2u, hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_ids, h_ids.data(), h_ids.size() * 4u, hipMemcpyHostToDevice);
+
+    for (int tm : {0, 1}) {
+      std::vector<float> h_log((size_t)rows * nb);
+      for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t col = 0; col < nb; ++col) {
+          float v = next_f(5.0f) - 10.0f;
+          if (r == 1200u) v = 2.0f;  // base argmax without markov
+          if (r == 777u) v = 0.0f;   // wins after markov boost on col 2
+          const size_t idx = tm ? ((size_t)col * rows + r) : ((size_t)r * nb + col);
+          h_log[idx] = v;
+        }
+      }
+      (void)hipMemcpy(d_logits, h_log.data(), h_log.size() * sizeof(float), hipMemcpyHostToDevice);
+      aff::batch_argmax_hip(d_logits, d_amx, rows, nb, n, row0, nullptr, tm);
+
+      aff::markov_w2_norm_fp8_g128_hip(d_w2_f8, d_w2_sc, d_norm, rows, rank, nullptr);
+      for (uint32_t col = 0; col < n; ++col) {
+        aff::markov_step_fp8_g128_hip(d_w1, d_w2_f8, d_w2_sc, d_ids, d_logits, d_best_ref, rows,
+                                      row0, rank, nb, col, nullptr, tm, true);
+        aff::markov_step_pruned_fp8_g128_hip(d_w1, d_w2_f8, d_w2_sc, d_norm, d_ids, d_logits, d_amx,
+                                             d_best_prn, rows, row0, rank, nb, col, nullptr, tm,
+                                             true);
+        (void)hipDeviceSynchronize();
+        uint64_t rref = 0, rprn = 0;
+        (void)hipMemcpy(&rref, d_best_ref, sizeof(uint64_t), hipMemcpyDeviceToHost);
+        (void)hipMemcpy(&rprn, d_best_prn, sizeof(uint64_t), hipMemcpyDeviceToHost);
+        if (rref != rprn) {
+          std::fprintf(stderr, "FAIL: markov fp8 prune mismatch rank=%u tm=%d col=%u %016llx vs %016llx\n",
+                       rank, tm, col, (unsigned long long)rref, (unsigned long long)rprn);
+          return 1;
+        }
+      }
+
+      if ((rank % 256u) == 0u) {
+        aff::markov_w2_norm_bf16_hip(d_w2, d_norm, rows, rank, nullptr);
+        for (uint32_t col = 0; col < n; ++col) {
+          aff::markov_step_hip(d_w1, d_w2, d_ids, d_logits, d_best_ref, rows, row0, rank, nb, col,
+                               nullptr, tm, true, /*w2_sharded=*/1);
+          aff::markov_step_pruned_hip(d_w1, d_w2, d_norm, d_ids, d_logits, d_amx, d_best_prn, rows,
+                                      row0, rank, nb, col, nullptr, tm, true);
+          (void)hipDeviceSynchronize();
+          uint64_t rref = 0, rprn = 0;
+          (void)hipMemcpy(&rref, d_best_ref, sizeof(uint64_t), hipMemcpyDeviceToHost);
+          (void)hipMemcpy(&rprn, d_best_prn, sizeof(uint64_t), hipMemcpyDeviceToHost);
+          if (rref != rprn) {
+            std::fprintf(stderr, "FAIL: markov bf16 prune mismatch rank=%u tm=%d col=%u %016llx vs %016llx\n",
+                         rank, tm, col, (unsigned long long)rref, (unsigned long long)rprn);
+            return 1;
+          }
+        }
+      }
+    }
+    (void)hipFree(d_w1); (void)hipFree(d_w2); (void)hipFree(d_w2_f8); (void)hipFree(d_w2_sc);
+    (void)hipFree(d_ids); (void)hipFree(d_logits); (void)hipFree(d_amx); (void)hipFree(d_norm);
+    (void)hipFree(d_best_ref); (void)hipFree(d_best_prn);
+  }
+  std::printf("PASS: AFF_MARKOV_EXACT_PRUNE BF16 + FP8 g128 bit-exact oracle\n");
+  return 0;
+}
+
+static int check_draft_noise_seed() {
+  const uint32_t n_embd = 256u, n_hc = 4u, n_live = 5u, nb = 8u;
+  std::vector<uint16_t> h_row0(n_embd), h_noise(n_embd), h_full((size_t)n_live * n_embd);
+  for (uint32_t d = 0; d < n_embd; ++d) {
+    h_row0[d] = (uint16_t)(0x3c00u + (d & 0xffu));
+    h_noise[d] = (uint16_t)(0x4000u + ((d * 3u) & 0xffu));
+  }
+  std::memcpy(h_full.data(), h_row0.data(), n_embd * 2u);
+  for (uint32_t b = 1u; b < n_live; ++b)
+    std::memcpy(h_full.data() + (size_t)b * n_embd, h_noise.data(), n_embd * 2u);
+
+  uint16_t *d_full = nullptr, *d_row0 = nullptr, *d_noise = nullptr, *d_hc0 = nullptr, *d_hc1 = nullptr;
+  float* d_pre = nullptr;
+  (void)hipMalloc(&d_full, h_full.size() * 2u);
+  (void)hipMalloc(&d_row0, n_embd * 2u);
+  (void)hipMalloc(&d_noise, n_embd * 2u);
+  (void)hipMalloc(&d_hc0, (size_t)n_hc * n_embd * nb * 2u);
+  (void)hipMalloc(&d_hc1, (size_t)n_hc * n_embd * nb * 2u);
+  (void)hipMalloc(&d_pre, (size_t)n_hc * nb * sizeof(float));
+  (void)hipMemcpy(d_full, h_full.data(), h_full.size() * 2u, hipMemcpyHostToDevice);
+  (void)hipMemcpy(d_row0, h_row0.data(), n_embd * 2u, hipMemcpyHostToDevice);
+  (void)hipMemcpy(d_noise, h_noise.data(), n_embd * 2u, hipMemcpyHostToDevice);
+
+  aff::batch_hc_seed_bf16_hip(d_full, d_hc0, n_embd, n_hc, n_live, nb, nullptr);
+  aff::batch_hc_seed_draft_bf16_hip(d_row0, d_noise, d_hc1, d_pre, n_embd, n_hc, n_live, nb, nullptr);
+  (void)hipDeviceSynchronize();
+
+  std::vector<uint16_t> o0((size_t)n_hc * n_embd * nb), o1((size_t)n_hc * n_embd * nb);
+  std::vector<float> pre((size_t)n_hc * nb);
+  (void)hipMemcpy(o0.data(), d_hc0, o0.size() * 2u, hipMemcpyDeviceToHost);
+  (void)hipMemcpy(o1.data(), d_hc1, o1.size() * 2u, hipMemcpyDeviceToHost);
+  (void)hipMemcpy(pre.data(), d_pre, pre.size() * sizeof(float), hipMemcpyDeviceToHost);
+
+  (void)hipFree(d_full); (void)hipFree(d_row0); (void)hipFree(d_noise);
+  (void)hipFree(d_hc0); (void)hipFree(d_hc1); (void)hipFree(d_pre);
+
+  if (o0 != o1) {
+    std::fprintf(stderr, "FAIL: draft noise cache hc seed mismatch\n");
+    return 1;
+  }
+  for (uint32_t t = 0; t < n_hc * nb; ++t) {
+    if (pre[t] != (t < nb ? 1.0f : 0.0f)) {
+      std::fprintf(stderr, "FAIL: draft noise cache pre_prev mismatch at %u\n", t);
+      return 1;
+    }
+  }
+  std::printf("PASS: AFF_DRAFT_NOISE_CACHE seed + pre_prev bit-exact oracle\n");
+  return 0;
+}
+
 int main() {
   uint64_t sb = 0, tb = 0;
   const uint64_t hb = aff::idx_topk_scratch_bytes(16u, &sb, &tb);
@@ -312,5 +484,7 @@ int main() {
   if (check_kv_commit_coalesced()) return 1;
   if (check_cand_scores_kpt2()) return 1;
   if (check_topk_and_bmax_v2()) return 1;
+  if (check_markov_pruned()) return 1;
+  if (check_draft_noise_seed()) return 1;
   return 0;
 }

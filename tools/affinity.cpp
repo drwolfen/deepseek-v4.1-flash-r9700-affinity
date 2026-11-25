@@ -297,6 +297,7 @@ int main(int argc, char** argv) {
   // a machine's PCIe-to-residency ratio rather than of the idea, so re-measure it before assuming
   // the default is right elsewhere.
   bool dspark_ram = false;
+  uint32_t dspark_vram_experts = 0;
   uint16_t port = 8080;
   // Per card, and a CAP rather than a target: StaticPlacement::init takes min(this, free VRAM minus
   // a fixed reserve), so the default is deliberately larger than any card here and the free-VRAM
@@ -542,6 +543,7 @@ int main(int argc, char** argv) {
       else { aff::ui::err("unknown --dspark-placement '%s' (want ram or vram)\n", v.c_str());
              return 2; }
     }
+    else if (a == "--dspark-vram-experts") dspark_vram_experts = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--host-pool-reserve-mib") host_pool_reserve_mib = std::strtod(nxt(), nullptr);
     else if (a == "--gpu-headroom-mib") gpu_headroom_mib = std::strtod(nxt(), nullptr);
     else if (a == "--keepalive-us") keepalive_us = std::strtod(nxt(), nullptr);
@@ -635,6 +637,8 @@ int main(int argc, char** argv) {
         "                              the target's slab. It is a trade, not a saving: the draft\n"
         "                              reads its experts several times a block, so what it streams\n"
         "                              can cost more than the VRAM it hands back.\n"
+        "      --dspark-vram-experts N keep N draft experts in VRAM (0 = all under vram) and pool the\n"
+        "                              remainder in host RAM.\n"
         "      --gpu-mib M             cap on VRAM per card for the expert slabs. The default is\n"
         "                              larger than any card, so free VRAM is what binds; lower it\n"
         "                              only to leave room for something else on the card.\n"
@@ -1379,8 +1383,12 @@ int main(int argc, char** argv) {
     // initialise, and this is the smallest one that can. Those few experts are under a percent of
     // the draft and the pool holds the rest.
     constexpr uint32_t kMinDraftSlots = 8;
-    const double want = dspark_ram ? shard_gib * kMinDraftSlots : need;
-    draft_wants_pool = dspark_ram;
+    const uint32_t total_draft_exp = d_n_expert * n_stage;
+    const bool partial_vram = (dspark_vram_experts > 0u && dspark_vram_experts < total_draft_exp);
+    const double want = partial_vram
+        ? (shard_gib * std::max<uint32_t>(dspark_vram_experts, kMinDraftSlots) * 1.005 + 0.01)
+        : (dspark_ram ? shard_gib * kMinDraftSlots : need);
+    draft_wants_pool = dspark_ram || partial_vram;
     std::string derr;
     draft_placement.set_rank_plan(rank_plan.data(), rank_plan.size());
     draft_placement.set_route_trace_tag('S');
@@ -2429,6 +2437,8 @@ int main(int argc, char** argv) {
     // and online per-width cost EMA tracks step latency (ms) per width q.
     const char* aw_env = std::getenv("AFF_ADAPTIVE_WIDTH");
     const bool adaptive_width_on = (!aw_env || !*aw_env || std::strcmp(aw_env, "0") != 0) && kConfT <= 0.0f;
+    const char* aq1_env = std::getenv("AFF_DRAFT_ADAPTIVE_Q1");
+    const bool adaptive_q1_on = !(aq1_env && *aq1_env && std::strcmp(aq1_env, "0") == 0);
     // SuffixDecoding empirical n-gram drafting and adaptive draft depth stop.
     const int sfx_min_match = [] {
       const char* v = std::getenv("AFF_DRAFT_SUFFIX_MIN_MATCH");
@@ -2656,13 +2666,22 @@ int main(int argc, char** argv) {
                 nd = n2;
               }
             } else if (adaptive_width_on && B >= 2) {
-              // Cost-aware adaptive width selection over q = 2 .. B+1 (nd = 1 .. B).
+              // Cost-aware adaptive width selection over q = 1..max_q (or 2..max_q if AFF_DRAFT_ADAPTIVE_Q1=0).
               const uint32_t max_q = std::min<uint32_t>({B + 1u, kMaxQ - 1u, max_nd + 1u});
+              const uint32_t min_q = adaptive_q1_on ? 1u : 2u;
               float util[kMaxQ] = {};
               float best_u = -1.0f;
               uint32_t best_q = max_q;
               float survival = 1.0f;
               float exp_commits = 1.0f; // target bonus token at the accept frontier
+              if (adaptive_q1_on) {
+                const float c1_raw = (cost_samples[1] > 2u && cost_ema[1] > 1.0f)
+                    ? cost_ema[1]
+                    : (cost_ema[2] > 1.0f ? cost_ema[2] * 0.85f : std::max(cost_ema[1], 1.0f));
+                util[1] = 1.0f / std::max(c1_raw, 1.0f);
+                best_u = util[1];
+                best_q = 1u;
+              }
               for (uint32_t q = 2; q <= max_q; ++q) {
                 const uint32_t d = q - 1; // candidate index 1..B (conf[d-1])
                 float p_cond = 0.0f;
@@ -2692,7 +2711,7 @@ int main(int argc, char** argv) {
                   steps_since_probe++;
                   if (steps_since_probe >= 32) {
                     const uint32_t nbr = (best_q < max_q) ? best_q + 1 : best_q - 1;
-                    if (nbr >= 2) {
+                    if (nbr >= min_q) {
                       probe_in_flight = true;
                       probe_phase = 0;
                       probe_anchor_q = best_q;

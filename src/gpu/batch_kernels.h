@@ -376,6 +376,10 @@ void batch_hc_seed_hip(const float* emb, uint16_t* hc, uint32_t n_embd, uint32_t
 // Direct BF16 embedding seed: takes token-major BF16 rows, zeroing columns >= n_live.
 void batch_hc_seed_bf16_hip(const uint16_t* emb_bf16, uint16_t* hc, uint32_t n_embd,
                             uint32_t n_hc, uint32_t n_live, uint32_t nb, void* stream);
+// Cached-noise DSpark BF16 seed + optional one-hot pre_prev initialization.
+void batch_hc_seed_draft_bf16_hip(const uint16_t* row0_bf16, const uint16_t* noise_bf16,
+                                  uint16_t* hc, float* pre_prev, uint32_t n_embd, uint32_t n_hc,
+                                  uint32_t n_live, uint32_t nb, void* stream);
 
 // The hc lanes averaged — `h.mean(dim=2)`, which is what DSpark conditions its draft on — written
 // TOKEN-MAJOR straight into the tap plane the draft's projection reads, so the value never leaves
@@ -427,6 +431,23 @@ void markov_step_fp8_g128_hip(const uint16_t* w1, const uint8_t* w2_fp8,
                               uint32_t row0, uint32_t rank, uint32_t nb, uint32_t col,
                               void* stream, int logits_token_major = 0,
                               bool reset_best = true);
+
+// Exact Cauchy-Schwarz row L2-norm precomputation & pruned Markov argmax steps (bit-identical).
+void markov_w2_norm_bf16_hip(const uint16_t* w2, float* out_norm, uint32_t rows, uint32_t rank,
+                             void* stream);
+void markov_w2_norm_fp8_g128_hip(const uint8_t* w2_fp8, const uint16_t* w2_scales,
+                                 float* out_norm, uint32_t rows, uint32_t rank, void* stream);
+void markov_step_pruned_hip(const uint16_t* w1, const uint16_t* w2, const float* w2_norm,
+                            const uint32_t* ids, const float* logits, const float* amx,
+                            uint64_t* best, uint32_t rows, uint32_t row0, uint32_t rank,
+                            uint32_t nb, uint32_t col, void* stream,
+                            int logits_token_major = 0, bool reset_best = true);
+void markov_step_pruned_fp8_g128_hip(const uint16_t* w1, const uint8_t* w2_fp8,
+                                     const uint16_t* w2_scales, const float* w2_norm,
+                                     const uint32_t* ids, const float* logits, const float* amx,
+                                     uint64_t* best, uint32_t rows, uint32_t row0, uint32_t rank,
+                                     uint32_t nb, uint32_t col, void* stream,
+                                     int logits_token_major = 0, bool reset_best = true);
 
 // The cross-card half of one step: `own` is this card's packed key and `peers` the other cards',
 // staged contiguously; the largest wins, which is the same "higher value, then lower id" the host

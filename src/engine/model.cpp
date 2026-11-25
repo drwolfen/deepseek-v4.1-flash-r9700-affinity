@@ -2781,7 +2781,17 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
   // only row 0, the token the target just committed, is rebuilt. The buffer is a member for the
   // same reason: it is what `begin` uploads, and a caller-local one is why that upload has to drain.
   static const bool slot_debug = std::getenv("AFF_SLOT_DEBUG") != nullptr;
-  if (bops_.begin_bf16 && begin_bf16_enabled()) {
+  static const bool draft_noise_cache_on = [] {
+    const char* v = std::getenv("AFF_DRAFT_NOISE_CACHE");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  if (draft_noise_cache_on && bops_.begin_draft_bf16 && begin_bf16_enabled() && !slot_debug) {
+    const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
+    if (!bops_.begin_draft_bf16(bops_.ctx, B, P, src_emb + (size_t)first_id * E,
+                                src_emb + (size_t)cfg_.dspark_noise_token * E,
+                                cfg_.dspark_noise_token, E, HC))
+      return false;
+  } else if (bops_.begin_bf16 && begin_bf16_enabled()) {
     const uint16_t* const src_emb = embed_uva_ ? embed_uva_ : embed_;
     if (dspark_emb_bf16_.size() != (size_t)B * E) {
       dspark_emb_bf16_.resize((size_t)B * E);
