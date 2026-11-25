@@ -24,6 +24,19 @@ inline bool idx_topk_v2_enabled() {
   return !s || !*s || std::strcmp(s, "0") != 0;
 }
 
+inline bool idx_score_nt_store_enabled() {
+  const char* s = std::getenv("AFF_IDX_SCORE_NT_STORE");
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
+
+inline uint64_t idx_score_nt_threshold_bytes() {
+  const char* s = std::getenv("AFF_IDX_SCORE_NT_BYTES");
+  if (!s || !*s) return 4ull << 20;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(s, &end, 10);
+  return (end != s) ? (uint64_t)v : (4ull << 20);
+}
+
 constexpr uint32_t kD = kIdxDim;             // 128
 constexpr uint32_t kWaves = 4;
 constexpr uint32_t kThreads = kWaves * 32;   // 128
@@ -38,6 +51,7 @@ constexpr uint32_t K_VECS_PADDED = kIdxKeys + 8; // 136 floats (+8 floats/row LD
 // once into registers and reused across all 64 heads — which is what makes this worth doing as a
 // matrix op at all. Q is staged in LDS a head-group at a time so all four waves read it once,
 // rather than each wave pulling its own copy from global.
+template <bool NT_STORE = false>
 __global__ __launch_bounds__(kThreads) void indexer_kernel(
     const uint8_t* __restrict__ q8, const float* __restrict__ qs, const uint8_t* __restrict__ k8,
     const float* __restrict__ ks, const float* __restrict__ hw, float* __restrict__ out,
@@ -161,7 +175,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
     const uint32_t t = t0 + tt;
     const uint32_t key = blockIdx.y * kIdxKeys + kk;
     if (t < nb && key < n_keys) {
-      out[(size_t)t * n_keys + key] = s_lds.score[tt][kk];
+      aff::store_nt<NT_STORE>(&out[(size_t)t * n_keys + key], s_lds.score[tt][kk]);
     }
   }
 }
@@ -192,7 +206,7 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
 // enough to accumulate index_topk compressed rows, so every other hash must come back unchanged.
 constexpr uint32_t kIdxDecHeads = 64;
 
-template <bool MultiTok, uint32_t MaxHeads = kIdxDecHeads>
+template <bool MultiTok, uint32_t MaxHeads = kIdxDecHeads, bool NT_STORE = false>
 __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
     const uint8_t* __restrict__ q8, const float* __restrict__ qs, const uint8_t* __restrict__ k8,
     const float* __restrict__ ks, const float* __restrict__ hw, float* __restrict__ out,
@@ -274,7 +288,9 @@ __global__ __launch_bounds__(kThreads) void indexer_dec_kernel(
         sum += s_w[buf][mt + hlf * 8u + (uint32_t)j] * fmaxf(acc[j], 0.0f);
     }
     sum += dpp_xor_lane<16u>(sum);               // the wave's other eight heads a tile
-    if (hlf == 0u && live_key) out[(size_t)tok * n_keys + key] = sum * qs_b * kscale;
+    if (hlf == 0u && live_key) {
+      aff::store_nt<NT_STORE>(&out[(size_t)tok * n_keys + key], sum * qs_b * kscale);
+    }
     if constexpr (MultiTok) {
       if (tok + 1u < tok_end) lds_barrier();
     }
@@ -2102,6 +2118,8 @@ void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, c
                         const float* hw, float* out, uint32_t nb, uint32_t n_keys,
                         uint32_t n_head, void* stream) {
   if (!nb || !n_keys || !n_head) return;
+  const bool nt_store = idx_score_nt_store_enabled() &&
+                        ((uint64_t)nb * n_keys * sizeof(float) > idx_score_nt_threshold_bytes());
   const uint32_t dec_max_nb = idx_narrow_max_nb();
   if (nb <= dec_max_nb && n_head <= kIdxDecHeads && (n_head % 16u) == 0u) {
     const uint32_t kpb = kWaves * 16u;                // 64 keys a block
@@ -2109,24 +2127,39 @@ void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, c
     const char* mt_env = std::getenv("AFF_IDX_DEC_MULTITOK");
     const bool dec_multitok = !(mt_env && *mt_env && std::strcmp(mt_env, "0") == 0);
     const bool use_mt = dec_multitok && nb > 1u && (!idx_cand_multitok_enabled() || gx >= 64u);
-    auto launch_dec = [&]<bool MT, uint32_t MH>() {
+    auto launch_dec = [&]<bool MT, uint32_t MH, bool NT>() {
       const dim3 g(gx, 1u, MT ? 1u : nb);
-      hipLaunchKernelGGL((indexer_dec_kernel<MT, MH>), g, dim3(kThreads), 0, (hipStream_t)stream,
+      hipLaunchKernelGGL((indexer_dec_kernel<MT, MH, NT>), g, dim3(kThreads), 0, (hipStream_t)stream,
                          q8, qs, k8, ks, hw, out, n_keys, n_head, nb);
     };
-    if (use_mt) {
-      if (n_head <= 32u) launch_dec.template operator()<true, 32u>();
-      else               launch_dec.template operator()<true, kIdxDecHeads>();
+    if (nt_store) {
+      if (use_mt) {
+        if (n_head <= 32u) launch_dec.template operator()<true, 32u, true>();
+        else               launch_dec.template operator()<true, kIdxDecHeads, true>();
+      } else {
+        if (n_head <= 32u) launch_dec.template operator()<false, 32u, true>();
+        else               launch_dec.template operator()<false, kIdxDecHeads, true>();
+      }
     } else {
-      if (n_head <= 32u) launch_dec.template operator()<false, 32u>();
-      else               launch_dec.template operator()<false, kIdxDecHeads>();
+      if (use_mt) {
+        if (n_head <= 32u) launch_dec.template operator()<true, 32u, false>();
+        else               launch_dec.template operator()<true, kIdxDecHeads, false>();
+      } else {
+        if (n_head <= 32u) launch_dec.template operator()<false, 32u, false>();
+        else               launch_dec.template operator()<false, kIdxDecHeads, false>();
+      }
     }
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }
   const dim3 g((nb + kIdxTokTile - 1) / kIdxTokTile, (n_keys + kIdxKeys - 1) / kIdxKeys);
-  hipLaunchKernelGGL(indexer_kernel, g, dim3(kThreads), 0, (hipStream_t)stream, q8, qs, k8, ks, hw,
-                     out, nb, n_keys, n_head);
+  if (nt_store) {
+    hipLaunchKernelGGL((indexer_kernel<true>), g, dim3(kThreads), 0, (hipStream_t)stream, q8, qs,
+                       k8, ks, hw, out, nb, n_keys, n_head);
+  } else {
+    hipLaunchKernelGGL((indexer_kernel<false>), g, dim3(kThreads), 0, (hipStream_t)stream, q8, qs,
+                       k8, ks, hw, out, nb, n_keys, n_head);
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 

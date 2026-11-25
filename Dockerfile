@@ -50,6 +50,7 @@ RUN cd /opt/affinity-src \
       build/test_v41_indexer \
       build/test_engram_split_gate \
       build/test_v510_kernels \
+      build/test_v511_kernels \
       build/test_cpu_dispatch
 RUN if getent passwd ubuntu >/dev/null; then userdel ubuntu; fi; if getent group ubuntu >/dev/null; then groupdel ubuntu; fi
 WORKDIR /opt

@@ -714,21 +714,22 @@ __device__ __forceinline__ void gemm_fp8_body(
     }
     aff::lds_barrier();
     if constexpr (Full && MTW == 2u) {
-      // Unconditional clamped prefetch eliminates loop-tail branch merge stalls across k-tiles.
-      const uint32_t c1 = min(c0 + FK, kend - FK);
+      const uint32_t c1 = c0 + FK;
+      if (c1 < kend) {
 #pragma unroll
-      for (uint32_t g = 0; g < kNG; ++g) {
-        const uint32_t o = c1 + g * 64;
-        pb[g] = stage8_load(bsrc + o, true);
-        if constexpr (!PS) pa[g] = stage8_load(asrc + o, true);
-      }
-      if (tid < kFolds) {
-        const uint32_t kb1 = (c1 >> 7) + tid;
-        pws = Sw[(size_t)srow * sc_cols + kb1];
-      }
-      if (tid < kFolds * FN) {
-        const uint32_t kb1 = (c1 >> 7) + sf;
-        psx = Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb1];
+        for (uint32_t g = 0; g < kNG; ++g) {
+          const uint32_t o = c1 + g * 64;
+          pb[g] = stage8_load(bsrc + o, true);
+          if constexpr (!PS) pa[g] = stage8_load(asrc + o, true);
+        }
+        if (tid < kFolds) {
+          const uint32_t kb1 = (c1 >> 7) + tid;
+          pws = Sw[(size_t)srow * sc_cols + kb1];
+        }
+        if (tid < kFolds * FN) {
+          const uint32_t kb1 = (c1 >> 7) + sf;
+          psx = Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb1];
+        }
       }
     } else {
       const uint32_t c1 = c0 + FK;
@@ -915,6 +916,14 @@ __device__ __forceinline__ void gemm_fp8_body(
   }
 }
 
+inline uint32_t gemm_swizzle_group_m() {
+  const char* s = std::getenv("AFF_GEMM_SWIZZLE");
+  if (!s || !*s) return 8u;
+  if (s[0] == '0' && s[1] == '\0') return 0u;
+  const long v = std::strtol(s, nullptr, 10);
+  return v > 0 ? (uint32_t)v : 0u;
+}
+
 template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u,
           int CACHE_MODE = 0>
 #ifdef __HIP_DEVICE_COMPILE__
@@ -925,19 +934,17 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_kernel(
     const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Sw, const uint8_t* __restrict__ Xp,
     const float* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
     unsigned int* __restrict__ Ctr, uint32_t rows, uint32_t cols, uint32_t nb, uint32_t sc_cols,
-    uint32_t x_off, uint32_t w_row_off, uint32_t x_ld, uint32_t sx_ld, int accum, uint32_t ck) {
+    uint32_t x_off, uint32_t w_row_off, uint32_t x_ld, uint32_t sx_ld, int accum, uint32_t ck,
+    uint32_t group_m = 8u) {
   uint32_t bx = blockIdx.x, by = blockIdx.y;
-  if constexpr (MTW == 2u) {
-    // Group M-bands into slabs of kGroupM across the N sweep for MALL weight reuse.
-    constexpr uint32_t kGroupM = 8u;
-    if (gridDim.x > kGroupM && gridDim.y > 1u) {
-      const uint32_t per = kGroupM * gridDim.y;
-      const uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x;
-      const uint32_t first = (lin / per) * kGroupM, rem = lin % per;
-      const uint32_t gm = min(gridDim.x - first, kGroupM);
-      bx = first + (rem % gm);
-      by = rem / gm;
-    }
+  if (group_m > 1u && gridDim.x > group_m && gridDim.y > 1u) {
+    // Group M-bands into slabs across the N sweep for MALL weight reuse (both MTW=1 and MTW=2).
+    const uint32_t per = group_m * gridDim.y;
+    const uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x;
+    const uint32_t first = (lin / per) * group_m, rem = lin % per;
+    const uint32_t gm = min(gridDim.x - first, group_m);
+    bx = first + (rem % gm);
+    by = rem / gm;
   }
   // Split-K. `ck` is a multiple of both 128 (the scale block) and FK (the staged tile), and ksplit
   // is derived FROM it at the launcher, so every slice has work and starts on a scale boundary.
@@ -1408,18 +1415,15 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_grouped_b32_kernel(
     const uint8_t* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
     unsigned int* __restrict__ Ctr, uint8_t* __restrict__ Q8, float* __restrict__ Qs, uint32_t ng,
     uint32_t rank, uint32_t cols, uint32_t nb, uint32_t sc_cols, uint32_t sx_cols,
-    uint32_t m_tiles_per_grp, uint32_t ck) {
+    uint32_t m_tiles_per_grp, uint32_t ck, uint32_t group_m = 8u) {
   uint32_t lin_bx = blockIdx.x, by = blockIdx.y;
-  if constexpr (MTW == 2u) {
-    constexpr uint32_t kGroupM = 8u;
-    if (gridDim.x > kGroupM && gridDim.y > 1u) {
-      const uint32_t per = kGroupM * gridDim.y;
-      const uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x;
-      const uint32_t first = (lin / per) * kGroupM, rem = lin % per;
-      const uint32_t gm = min(gridDim.x - first, kGroupM);
-      lin_bx = first + (rem % gm);
-      by = rem / gm;
-    }
+  if (group_m > 1u && gridDim.x > group_m && gridDim.y > 1u) {
+    const uint32_t per = group_m * gridDim.y;
+    const uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x;
+    const uint32_t first = (lin / per) * group_m, rem = lin % per;
+    const uint32_t gm = min(gridDim.x - first, group_m);
+    lin_bx = first + (rem % gm);
+    by = rem / gm;
   }
   lin_bx = __builtin_amdgcn_readfirstlane(lin_bx);
   by = __builtin_amdgcn_readfirstlane(by);
@@ -5153,12 +5157,13 @@ void batch_gemm_fp8_hip(const uint8_t* W, const uint8_t* Sw, const uint8_t* X, c
   const bool v2_ok = narrow && fp8_gemm_v2_enabled() && aff::gfx12_cache_hints_enabled() &&
                      ((uint64_t)(w_row_off + rows) * cols <= 0xffffff00ull);
   const int cache_mode = narrow ? (aff::dense_nt_load_enabled() ? 1 : (v2_ok ? 2 : 0)) : 0;
+  const uint32_t group_m = gemm_swizzle_group_m();
 // FK: a whole 256-byte cacheline a row when cols % 256 == 0, 128 for odd multiples of 128, and 64
 // for the wide prefill instantiation.
 #define AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, mtw_, cm_)                                          \
   AFF_BLAUNCH((batch_gemm_fp8_kernel<f, ps, nt_, mw_, fk_, mtw_, cm_>), grid, dim3(mw_ * kWave),   \
               0, (hipStream_t)stream, W, Sw, X, Sx, dst, final_y, ctr_buf, rows, cols, nb,         \
-              sc_cols, x_off, w_row_off, x_ld, sx_ld, accum ? 1 : 0, ck)
+              sc_cols, x_off, w_row_off, x_ld, sx_ld, accum ? 1 : 0, ck, group_m)
 #define AFF_GEMM_F8(f, ps, nt_, mw_, fk_)                                                          \
   do {                                                                                             \
     if (cache_mode == 2)      AFF_GEMM_F8_MTW(f, ps, nt_, mw_, fk_, 1u, 2);                        \
@@ -5301,10 +5306,11 @@ void batch_gemm_fp8_grouped_b32_hip(const uint8_t* W, const uint8_t* Ws, const u
                     (((uintptr_t)Sx & 7u) == 0u);
   const bool prefill_4x2 = !narrow && fp8_prefill_4x2_enabled();
   const bool nt_load = narrow && aff::dense_nt_load_enabled();
+  const uint32_t group_m = gemm_swizzle_group_m();
 #define AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, mtw_, ntl_)                                       \
   AFF_BLAUNCH((batch_gemm_fp8_grouped_b32_kernel<f, ps, nt_, mw_, fk_, mtw_, ntl_, false>), grid, \
               dim3(mw_ * kWave), 0, st, W, Ws, Xp, Sx, dst, final_y, ctr_buf, nullptr, nullptr,   \
-              ng, rank, group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck)
+              ng, rank, group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck, group_m)
 #define AFF_GEMM_GB32(f, ps, nt_, mw_, fk_)                                                        \
   do {                                                                                             \
     if (nt_load) AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, 1u, true);                                \
@@ -5393,10 +5399,11 @@ bool batch_gemm_fp8_grouped_b32_q8_hip(const uint8_t* W, const uint8_t* Ws, cons
                     (((uintptr_t)Sx & 7u) == 0u);
   const bool prefill_4x2 = !narrow && fp8_prefill_4x2_enabled();
   const bool nt_load = narrow && aff::dense_nt_load_enabled();
+  const uint32_t group_m = gemm_swizzle_group_m();
 #define AFF_GEMM_GB32Q_MTW(f, ps, nt_, mw_, fk_, mtw_, ntl_)                                       \
   AFF_BLAUNCH((batch_gemm_fp8_grouped_b32_kernel<f, ps, nt_, mw_, fk_, mtw_, ntl_, true>), grid,   \
               dim3(mw_ * kWave), 0, st, W, Ws, Xp, Sx, dst, nullptr, ctr_buf, Q8, Qs, ng, rank,    \
-              group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck)
+              group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck, group_m)
 #define AFF_GEMM_GB32Q(f, ps, fk_)                                                                 \
   do {                                                                                             \
     if (nt_load) AFF_GEMM_GB32Q_MTW(f, ps, 1u, 8u, fk_, 1u, true);                                 \
@@ -6732,7 +6739,7 @@ __global__ __launch_bounds__(kFp8G128Threads) void matvec_fp8_g128_multix_kernel
         }
         const float s = wmma::bf16_to_f32(
             kBufV2 ? aff::buf_load_u16<aff::kGfx12ThNtHt>(rsrc_sc, soff + (c >> 7) * 2u)
-                   : aff::load_nt<kLegacyNt>(&srow[c >> 7]));
+                   : srow[c >> 7]);
         const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(p4[0]);
         const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(p4[0]);
         const aff::aff_f32x2 d45 = aff::e4m3_decode_pk<false>(p4[1]);
@@ -6762,7 +6769,7 @@ __global__ __launch_bounds__(kFp8G128Threads) void matvec_fp8_g128_multix_kernel
                                : aff::load_uint2_nt<kLegacyNt>(wrow + c);
         const float s = wmma::bf16_to_f32(
             kBufV2 ? aff::buf_load_u16<aff::kGfx12ThNtHt>(rsrc_sc, soff + (c >> 7) * 2u)
-                   : aff::load_nt<kLegacyNt>(&srow[c >> 7]));
+                   : srow[c >> 7]);
         const aff::aff_f32x2 d01 = aff::e4m3_decode_pk<false>(p.x);
         const aff::aff_f32x2 d23 = aff::e4m3_decode_pk<true>(p.x);
         const aff::aff_f32x2 d45 = aff::e4m3_decode_pk<false>(p.y);
@@ -6791,6 +6798,11 @@ __global__ __launch_bounds__(kFp8G128Threads) void matvec_fp8_g128_multix_kernel
   }
 }
 
+inline bool lmhead_nt_enabled() {
+  const char* v = std::getenv("AFF_LMHEAD_NT");
+  return !v || !*v || !(v[0] == '0' && v[1] == '\0');
+}
+
 bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_scales_bf16,
                                 const float* const* x_ptrs, float* y, uint32_t rows, uint32_t cols,
                                 uint32_t T, uint32_t y_stride, bool out_token_major, void* stream) {
@@ -6811,7 +6823,7 @@ bool matvec_fp8_g128_multix_hip(const uint8_t* fp8_data, const uint16_t* fp8_sca
       nt_load ? 1
               : ((aff::gfx12_cache_hints_enabled() && bytes <= 0xffffff00ull)
                      ? (bytes > (64ull << 20) ? 3 : 2)
-                     : 0);
+                     : ((bytes > (48ull << 20) && lmhead_nt_enabled()) ? 1 : 0));
 #define AFF_FP8_G128_MX(NT_, CM_)                                                                  \
   case NT_:                                                                                        \
     AFF_BLAUNCH((matvec_fp8_g128_multix_kernel<NT_, CM_>), dim3(blocks), dim3(kFp8G128Threads),    \

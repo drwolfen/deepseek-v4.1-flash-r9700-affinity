@@ -108,10 +108,16 @@ __device__ __forceinline__ uint32_t tr_row(uint32_t l) {
 }
 __device__ __forceinline__ uint32_t tr_col(uint32_t l) { return ((l >> 2) & 1u) * 8u; }
 
+template <bool NT_KV = false>
 __device__ __forceinline__ wmma::i2v load_b_tr(const uint8_t* p) {
 #ifdef __HIP_DEVICE_COMPILE__
+  // Note: raw `asm("global_load_tr_b64 ... th:TH_LOAD_NT")` is not tracked by LLVM's
+  // SIInsertWaitcnts pass on gfx1201, so the compiler omits `s_wait_loadcnt` before `v_wmma`.
+  // Always use the compiler builtin for V; `NT_KV` still applies NT hints to K and row scales.
+  (void)NT_KV;
   return __builtin_amdgcn_global_load_tr_b64_v2i32((i2v_gp)p);
 #else
+  (void)NT_KV;
   wmma::i2v z;
   z[0] = z[1] = 0;
   return z;
@@ -150,7 +156,7 @@ __device__ __forceinline__ uint32_t pack4(float a, float b, float c, float d) {
 // faster. NT=2 also lets one K fragment feed two head tiles and one V fragment feed two
 // accumulators, so the operand-load count per mma falls from 1.0 to 0.75 (QK) and 1.125 to 0.625
 // (PV) as a side effect.
-template <uint32_t NT, bool HAS_SINK, bool HAS_MASK, bool RESOLVE_4W = true>
+template <uint32_t NT, bool HAS_SINK, bool HAS_MASK, bool RESOLVE_4W = true, bool NT_KV = false>
 __global__ __launch_bounds__(kThreads) void flash_kernel(
     const void* __restrict__ qp, const uint8_t* __restrict__ raw, const uint8_t* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const uint32_t* __restrict__ n_comp_v, uint32_t n_comp1,
@@ -303,7 +309,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
             const uint32_t cr = adm ? adm[(size_t)tk * adm_stride + (k - n_raw)] : (k - n_raw);
             p = comp + (size_t)cr * kRowB;
           }
-          r = *(const AFF_GLOBAL float*)(p + kW);
+          r = aff::load_nt<NT_KV>((const AFF_GLOBAL float*)(p + kW));
           if (HAS_MASK && k >= n_raw && !allowed[(size_t)tk * max_comp + (k - n_raw)]) r = 0.0f;
         }
         s_ptr[i] = p;
@@ -335,7 +341,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
             const uint32_t cr = adm ? adm[(size_t)tk * adm_stride + (k - n_raw)] : (k - n_raw);
             p = comp + (size_t)cr * kRowB;
           }
-          r = *(const AFF_GLOBAL float*)(p + kW);
+          r = aff::load_nt<NT_KV>((const AFF_GLOBAL float*)(p + kW));
           // `allowed[k - n_raw]` — WITHOUT the token stride — is a quiet bug. The mask is a PLANE,
           // one row of `max_comp` bytes a token, and the VALU kernel this replaced offsets by it
           // (`attention_gpu.hip`, mqa_attend_batch_kernel). Without the stride every token of a
@@ -379,7 +385,8 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     for (uint32_t nt = 0; nt < NT; ++nt) acc[nt] = wmma::acc_zero();
 #pragma unroll 4
     for (uint32_t d = 0; d < kW; d += 32) {
-      const u32x4 kk = *(const AFF_GLOBAL u32x4*)(kp + d);
+      const uint4 k4 = aff::load_uint4_nt<NT_KV>((const AFF_GLOBAL void*)(kp + d));
+      const u32x4 kk = {k4.x, k4.y, k4.z, k4.w};
       wmma::i2v a0, a1;
       a0[0] = (int)kk.x; a0[1] = (int)kk.y; a1[0] = (int)kk.z; a1[1] = (int)kk.w;
 #pragma unroll
@@ -497,7 +504,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       const uint8_t* vp = s_ptr[16u * t + kr] + co + wave * kDW;
 #pragma unroll
       for (uint32_t n = 0; n < kOT; ++n) {
-        const wmma::i2v b = load_b_tr(vp + n * 16u);   // one V fragment feeds every head tile
+        const wmma::i2v b = load_b_tr<NT_KV>(vp + n * 16u);   // one V fragment feeds every head tile
 #pragma unroll
         for (uint32_t nt = 0; nt < NT; ++nt) o[nt][n] = wmma::mma_fp8(a[nt], b, o[nt][n]);
       }
@@ -692,6 +699,19 @@ static uint32_t flash_split_slices(uint32_t n_tok, uint32_t head_tiles, uint32_t
   return s ? s : 1u;
 }
 
+inline bool flash_longctx_nt_enabled() {
+  const char* s = std::getenv("AFF_FLASH_LONGCTX_NT");
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
+
+inline uint64_t flash_nt_threshold_mib() {
+  const char* s = std::getenv("AFF_FLASH_NT_MIB");
+  if (!s || !*s) return 32ull;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(s, &end, 10);
+  return (end != s) ? (uint64_t)v : 32ull;
+}
+
 void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
                           const uint8_t* allowed, const uint32_t* n_comp_v, uint32_t n_comp1,
                           const float* sinks,
@@ -704,24 +724,9 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
   hipStream_t st = (hipStream_t)stream;
   const uint8_t* r8 = (const uint8_t*)raw;
   const uint8_t* c8 = (const uint8_t*)comp;
-  // Clamped below to what the head count can actually supply: a tile count that does not divide the
-  // heads asks for a zero-height grid, which HIP reports as "invalid configuration argument" at
-  // launch and not as anything that points here.
   uint32_t nt = flash_head_tiles();
-  // DECODE HAS ONE QUERY TOKEN, so the grid is (1, n_head / (nt*16)) — which with a card's share of
-  // the heads is exactly ONE workgroup: the whole attention sublayer on one CU, reading at a few
-  // percent of the card's bandwidth. gridDim.z is the fix; see flash_split_slices for what sets it.
-  //
-  // Splitting the HEAD tile instead — `if (n == 1) nt = 1`, two blocks rather than one — is worse at
-  // every context, and bit-identically so, which makes it a pure timing loss rather than a different
-  // answer: both blocks then walk the SAME key rows, so the bytes read double while the CU count
-  // only doubles, and the deeper the cache the more that costs. The keys are the axis to split.
   while (nt > 1u && n_head % (nt * 16u) != 0u) nt >>= 1;
   const uint32_t ntiles = n_head / (nt * 16u);
-  // The key count the split is sized against: the sliding window of the FIRST token in the launch
-  // plus the widest compressed run in it. Both are lower bounds on later tokens, and the kernel
-  // recomputes its own cut from its own count anyway, so an underestimate costs a slightly coarse
-  // grid and nothing else.
   const uint32_t raw_avail0 = (pos0 >= raw_floor) ? (pos0 - raw_floor + 1u) : 0u;
   const uint32_t nraw0 = (raw_avail0 < sliding) ? raw_avail0 : sliding;
   const uint32_t nkeys = nraw0 + (n_comp_v ? n_comp_hint : n_comp1);
@@ -733,24 +738,36 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
     const char* v = std::getenv("AFF_FLASH_4WAVE_RESOLVE");
     return !v || !*v || !(v[0] == '0' && v[1] == '\0');
   }();
+  const bool nt_kv = flash_longctx_nt_enabled() &&
+                     ((uint64_t)nkeys * kRowB > (flash_nt_threshold_mib() << 20));
   const dim3 g(n, ntiles, nsp), b(kThreads);
-#define AFF_LAUNCH(T, S, M, R4)                                                                  \
-  hipLaunchKernelGGL((flash_kernel<T, S, M, R4>), g, b, 0, st, q, r8, c8, allowed, n_comp_v,     \
-                     n_comp1, sinks, out, b0, pos0, sliding, ring, max_comp, n_head, scale,      \
+#define AFF_LAUNCH(T, S, M, R4, NK)                                                                \
+  hipLaunchKernelGGL((flash_kernel<T, S, M, R4, NK>), g, b, 0, st, q, r8, c8, allowed, n_comp_v,   \
+                     n_comp1, sinks, out, b0, pos0, sliding, ring, max_comp, n_head, scale,        \
                      q_bf16 ? 1 : 0, po, pm, ptok, adm, adm_stride, raw_floor, q_scales)
-#define AFF_PICK(T, R4)                                                \
-  do {                                                                 \
-    if (sinks && allowed)  AFF_LAUNCH(T, true, true, R4);              \
-    else if (sinks)        AFF_LAUNCH(T, true, false, R4);             \
-    else if (allowed)      AFF_LAUNCH(T, false, true, R4);             \
-    else                   AFF_LAUNCH(T, false, false, R4);            \
+#define AFF_PICK(T, R4, NK)                                                                        \
+  do {                                                                                             \
+    if (sinks && allowed)  AFF_LAUNCH(T, true, true, R4, NK);                                      \
+    else if (sinks)        AFF_LAUNCH(T, true, false, R4, NK);                                     \
+    else if (allowed)      AFF_LAUNCH(T, false, true, R4, NK);                                     \
+    else                   AFF_LAUNCH(T, false, false, R4, NK);                                    \
   } while (0)
-  if (resolve_4w) {
-    if (nt == 2u) AFF_PICK(2u, true);
-    else          AFF_PICK(1u, true);
+  if (nt_kv) {
+    if (resolve_4w) {
+      if (nt == 2u) AFF_PICK(2u, true, true);
+      else          AFF_PICK(1u, true, true);
+    } else {
+      if (nt == 2u) AFF_PICK(2u, false, true);
+      else          AFF_PICK(1u, false, true);
+    }
   } else {
-    if (nt == 2u) AFF_PICK(2u, false);
-    else          AFF_PICK(1u, false);
+    if (resolve_4w) {
+      if (nt == 2u) AFF_PICK(2u, true, false);
+      else          AFF_PICK(1u, true, false);
+    } else {
+      if (nt == 2u) AFF_PICK(2u, false, false);
+      else          AFF_PICK(1u, false, false);
+    }
   }
 #undef AFF_PICK
 #undef AFF_LAUNCH

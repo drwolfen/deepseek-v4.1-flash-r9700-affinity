@@ -561,6 +561,17 @@ __device__ __forceinline__ uint2 load_uint2_nt(
   return make_uint2(v[0], v[1]);
 }
 #endif
+
+template <bool NT_STORE, typename T>
+__device__ __forceinline__ void store_nt(T* p, T v) {
+#ifdef __HIP_DEVICE_COMPILE__
+  if constexpr (NT_STORE) {
+    __builtin_nontemporal_store(v, p);
+    return;
+  }
+#endif
+  *p = v;
+}
 #endif
 
 // Host-cached gate for non-temporal loads on dense/GEMV decode weight/scale streams (default OFF
