@@ -1,5 +1,5 @@
 [Unit]
-Description=Affinity Server (DeepSeek-V4.1-Flash-1017 MoonMath, 512k ctx, Dual R9700 ROCm 10.1 v5.8.0)
+Description=Affinity Server (DeepSeek-V4.1-Flash-1017 MoonMath, 512k ctx, Dual R9700 ROCm 10.1 v5.9.0)
 After=network.target
 
 [Service]
@@ -37,7 +37,7 @@ ExecStart=/usr/bin/docker run --name deepseek-affinity \
     -e AFF_PCACHE_DELTA=1 \
     -p 8000:8000 \
     -v /models:/models \
-    deepseek-affinity:v5.8.0 \
+    deepseek-affinity:v5.9.0 \
     -m /models/DeepSeek-V4.1-Flash-1017-MoonMath-aff/model-moonmath-1017.aff \
     --tokenizer /models/LLM-Models/DeepSeek-V4.1-Flash-1017-MoonMath-FP8/tokenizer.json \
     --host 0.0.0.0 --port 8000 \
