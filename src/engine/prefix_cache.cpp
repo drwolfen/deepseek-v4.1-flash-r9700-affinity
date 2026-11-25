@@ -189,10 +189,10 @@ struct PrefixCache::Impl {
   uint32_t             in_flight = 0;
   bool                 stop = false;
 
-  // Restore staging: `gblocks` slot images plus one gather buffer, so a batch of blocks reaches the
-  // cards as one transfer per region instead of one per region per block.
+  // Restore staging: `gblocks` slot images plus double-buffered gather arenas, so a batch of
+  // blocks reaches the cards as one transfer per region while the next batch reads from SSD.
   std::vector<uint8_t*> rbuf;
-  uint8_t*             gather = nullptr;
+  uint8_t*             gather[2] = {nullptr, nullptr};
   uint64_t             gather_bytes = 0;
   uint32_t             gblocks = 0;
   uint8_t*             ckbuf = nullptr;
@@ -215,7 +215,8 @@ struct PrefixCache::Impl {
     unpin_all();
     for (uint8_t* p : stage) std::free(p);
     for (uint8_t* p : rbuf) std::free(p);
-    std::free(gather);
+    std::free(gather[0]);
+    std::free(gather[1]);
     std::free(ckbuf);
     std::free(hdr_buf);
     if (blk_fd >= 0) ::close(blk_fd);
@@ -365,7 +366,7 @@ bool PrefixCache::open(const Options& o, const std::vector<KvRegion>& regions, c
   // Whole-batch gather arena: `gblocks * blk_payload_` so every (region, saved_rank) slice in a
   // batch stays disjoint when async H2D loads enqueue across all regions before one sync_all.
   impl_->gather_bytes = round_up((uint64_t)impl_->gblocks * blk_payload_, kAlign);
-  if (posix_memalign((void**)&impl_->gather, kAlign, (size_t)impl_->gather_bytes) ||
+  if (posix_memalign((void**)&impl_->gather[0], kAlign, (size_t)impl_->gather_bytes) ||
       posix_memalign((void**)&impl_->ckbuf, kAlign, (size_t)ck_slot_) ||
       posix_memalign((void**)&impl_->hdr_buf, kAlign, (size_t)impl_->hdr_bytes)) {
     if (err) *err = "cannot allocate the prefix cache gather arena";
@@ -376,6 +377,13 @@ bool PrefixCache::open(const Options& o, const std::vector<KvRegion>& regions, c
   const bool batch_env = !bio || !*bio || std::strcmp(bio, "0") != 0;
   impl_->use_async_save = batch_env && io_.save_async && io_.sync_all;
   impl_->use_async_load = batch_env && io_.load_async && io_.sync_all;
+  const char* penv = std::getenv("AFF_PCACHE_PIPELINE");
+  const bool pipe_on = (!penv || !*penv || std::strcmp(penv, "0") != 0) && impl_->use_async_load;
+  if (pipe_on && impl_->gather_bytes) {
+    if (posix_memalign((void**)&impl_->gather[1], kAlign, (size_t)impl_->gather_bytes) != 0) {
+      impl_->gather[1] = nullptr;
+    }
+  }
   if (batch_env && io_.pin_host) {
     impl_->unpin_host = io_.unpin_host;
     impl_->unpin_ctx = io_.ctx;
@@ -384,7 +392,8 @@ bool PrefixCache::open(const Options& o, const std::vector<KvRegion>& regions, c
         impl_->pinned_ptrs.push_back(p);
     };
     for (uint32_t i = 0; i < qd; ++i) try_pin(impl_->stage[i], ck_slot_);
-    try_pin(impl_->gather, impl_->gather_bytes);
+    try_pin(impl_->gather[0], impl_->gather_bytes);
+    if (impl_->gather[1]) try_pin(impl_->gather[1], impl_->gather_bytes);
     try_pin(impl_->ckbuf, ck_slot_);
     if (!impl_->rbuf.empty()) try_pin(impl_->rbuf[0], blk_slot_);
   }
@@ -731,8 +740,15 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
   // Every block this restore read, so the eviction order can be set once at the end and deep-end
   // first — see the note in publish(). Touching them as they are read does it the other way round.
   std::vector<uint32_t> used(nfull, kNil);
+  const bool dbl_buf = (impl_->gather[1] != nullptr) && impl_->use_async_load;
+  bool slot_in_flight[2] = {false, false};
+  auto sync_in_flight = [&]() -> bool {
+    if (!slot_in_flight[0] && !slot_in_flight[1]) return true;
+    slot_in_flight[0] = slot_in_flight[1] = false;
+    return io_.sync_all(io_.ctx);
+  };
   // ---- the full blocks, a batch at a time -------------------------------------------------------
-  for (uint32_t b0 = 0; b0 < nfull; b0 += impl_->gblocks) {
+  for (uint32_t b0 = 0, bi = 0; b0 < nfull; b0 += impl_->gblocks, ++bi) {
     const uint32_t g = std::min(impl_->gblocks, nfull - b0);
     if (par_restore && g >= 2) {
       enum class ReadStatus : uint8_t { Ok = 0, Vanished = 1, ReadErr = 2, VerifyErr = 3 };
@@ -768,14 +784,17 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
       for (uint32_t i = 0; i < g; ++i) {
         const BlockReadRes& r = res[i];
         if (r.status == ReadStatus::Vanished) {
+          (void)sync_in_flight();
           if (err) *err = "prefix cache: a block vanished between lookup and restore";
           return false;
         }
         if (r.status == ReadStatus::ReadErr) {
+          (void)sync_in_flight();
           if (err) *err = std::string("prefix cache: block read failed: ") + std::strerror(r.err_no);
           return false;
         }
         if (r.status == ReadStatus::VerifyErr) {
+          (void)sync_in_flight();
           ++st_.verify_misses;
           drop(r.slot, false);          // or this prefix reports a hit and prefills from scratch forever
           if (err) *err = "prefix cache: a block failed verification";
@@ -787,8 +806,13 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     } else {
       for (uint32_t i = 0; i < g; ++i) {
         const int32_t s = find(keys.data() + (size_t)(b0 + i) * 32);
-        if (s < 0) { if (err) *err = "prefix cache: a block vanished between lookup and restore"; return false; }
+        if (s < 0) {
+          (void)sync_in_flight();
+          if (err) *err = "prefix cache: a block vanished between lookup and restore";
+          return false;
+        }
         if (!read_exact(impl_->blk_fd, impl_->rbuf[i], blk_slot_, (uint64_t)s * blk_slot_)) {
+          (void)sync_in_flight();
           if (err) *err = std::string("prefix cache: block read failed: ") + std::strerror(errno);
           return false;
         }
@@ -798,6 +822,7 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
         // serving one conversation another's context.
         if (h->magic != kBlockMagic || h->fingerprint != fp_ || h->n_tokens != B ||
             std::memcmp(tok, ids + (size_t)(b0 + i) * B, (size_t)B * sizeof(uint32_t))) {
+          (void)sync_in_flight();
           ++st_.verify_misses;
           drop(s, false);          // or this prefix reports a hit and prefills from scratch forever
           if (err) *err = "prefix cache: a block failed verification";
@@ -807,9 +832,15 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
         used[b0 + i] = (uint32_t)s;
       }
     }
+    const uint32_t buf_idx = dbl_buf ? (bi & 1u) : 0u;
+    if (slot_in_flight[buf_idx] && !sync_in_flight()) {
+      if (err) *err = "prefix cache: async restore sync failed";
+      return false;
+    }
+    uint8_t* const gbuf = impl_->gather[buf_idx];
     // Region by region across the whole batch, so the cards see one transfer per region rather than
     // one per region per block. At a 1M restore that is the difference between ten thousand
-    // transfers and ten million. Each region owns a disjoint slice of `impl_->gather` so async
+    // transfers and ten million. Each region owns a disjoint slice of `gbuf` so async
     // loads across all regions and ranks can share a single sync_all per batch.
     const uint64_t total_copies = (uint64_t)app_.size() * kSavedRanks * g;
     if (par_restore && (uint64_t)g * blk_payload_ >= (256ull << 10) && total_copies >= 2) {
@@ -820,7 +851,7 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
           const uint32_t src_rk = (uint32_t)(rem / g);
           const uint32_t i = (uint32_t)(rem % g);
           const RegionGatherMeta& m = reg_meta[ri];
-          uint8_t* dst = impl_->gather + (uint64_t)g * m.off +
+          uint8_t* dst = gbuf + (uint64_t)g * m.off +
                          (uint64_t)src_rk * g * m.seg + (uint64_t)i * m.seg;
           const uint8_t* src = impl_->rbuf[i] + hdr + m.off + (uint64_t)src_rk * m.seg;
           std::memcpy(dst, src, (size_t)m.seg);
@@ -829,7 +860,7 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     } else {
       for (uint32_t ri = 0; ri < app_.size(); ++ri) {
         const RegionGatherMeta& m = reg_meta[ri];
-        uint8_t* dst_ri = impl_->gather + (uint64_t)g * m.off;
+        uint8_t* dst_ri = gbuf + (uint64_t)g * m.off;
         // The batch's rows for this region, contiguous: the slots hold one block each and the cards
         // want one run across all of them.
         for (uint32_t src_rk = 0; src_rk < kSavedRanks; ++src_rk) {
@@ -844,7 +875,7 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     for (uint32_t ri = 0; ri < app_.size(); ++ri) {
       const KvRegion& r = app_[ri];
       const RegionGatherMeta& m = reg_meta[ri];
-      const uint8_t* dst_ri = impl_->gather + (uint64_t)g * m.off;
+      const uint8_t* dst_ri = gbuf + (uint64_t)g * m.off;
       for (uint32_t rk = 0; rk < opt_.ranks; ++rk) {
         const uint32_t src_rk = rk < kSavedRanks ? rk : 0;
         const uint8_t* src_ptr = dst_ri + (uint64_t)src_rk * g * m.seg;
@@ -854,17 +885,26 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
             : io_.load(io_.ctx, r.part, r.layer, rk, (uint64_t)b0 * m.rpb,
                        (uint64_t)g * m.rpb, src_ptr);
         if (!ok) {
-          if (batch_async_queued) (void)io_.sync_all(io_.ctx);
+          if (batch_async_queued || slot_in_flight[0] || slot_in_flight[1]) {
+            (void)io_.sync_all(io_.ctx);
+            slot_in_flight[0] = slot_in_flight[1] = false;
+          }
           if (err) *err = "prefix cache: the engine refused a restored block";
           return false;
         }
         if (impl_->use_async_load) batch_async_queued = true;
       }
     }
-    if (batch_async_queued && !io_.sync_all(io_.ctx)) {
+    if (dbl_buf) {
+      if (batch_async_queued) slot_in_flight[buf_idx] = true;
+    } else if (batch_async_queued && !io_.sync_all(io_.ctx)) {
       if (err) *err = "prefix cache: async restore sync failed";
       return false;
     }
+  }
+  if (!sync_in_flight()) {
+    if (err) *err = "prefix cache: async restore sync failed";
+    return false;
   }
 
   // ---- the checkpoint: the rings, and whatever the partial block has emitted ---------------------
@@ -876,7 +916,7 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     if (err) *err = "prefix cache: the checkpoint vanished between lookup and restore";
     return false;
   }
-  if (!read_exact(impl_->ck_fd, impl_->ckbuf, ck_slot_, (uint64_t)cs * ck_slot_)) {
+  if (!read_exact(impl_->ck_fd, impl_->ckbuf, impl_->hdr_bytes, (uint64_t)cs * ck_slot_)) {
     if (err) *err = std::string("prefix cache: checkpoint read failed: ") + std::strerror(errno);
     return false;
   }
@@ -889,7 +929,16 @@ bool PrefixCache::restore(const uint32_t* ids, uint32_t n_restore, std::string* 
     if (err) *err = "prefix cache: the checkpoint failed verification";
     return false;
   }
-  st_.bytes_read += ck_slot_;
+  const uint64_t payload_rd = (h->payload_bytes > 0u)
+      ? std::min(ck_slot_ - impl_->hdr_bytes, round_up(h->payload_bytes, kAlign))
+      : (ck_slot_ - impl_->hdr_bytes);
+  if (payload_rd &&
+      !read_exact(impl_->ck_fd, impl_->ckbuf + impl_->hdr_bytes, payload_rd,
+                  (uint64_t)cs * ck_slot_ + impl_->hdr_bytes)) {
+    if (err) *err = std::string("prefix cache: checkpoint read failed: ") + std::strerror(errno);
+    return false;
+  }
+  st_.bytes_read += impl_->hdr_bytes + payload_rd;
   bool ckpt_async_queued = false;
   auto load_ckpt = [&](const KvRegion& r, uint32_t rk, uint64_t row0, uint64_t nrows,
                        const uint8_t* src, const char* err_msg) -> bool {

@@ -192,6 +192,12 @@ void batch_gemm_fp8_grouped_b32_hip(const uint8_t* W, const uint8_t* Ws, const u
                                     const uint8_t* Sx, float* Y, uint32_t ng, uint32_t rank,
                                     uint32_t group_dim, uint32_t nb, void* stream,
                                     bool preshuffled = true);
+// Fused grouped W8A8 FP8 WMMA directly to per-(token, 128-row) E4M3 activations (`Q8`/`Qs`),
+// skipping intermediate FP32 `woa_buf` write and standalone `batch_quant_fp8_hip`.
+bool batch_gemm_fp8_grouped_b32_q8_hip(const uint8_t* W, const uint8_t* Ws, const uint8_t* Xp,
+                                       const uint8_t* Sx, uint8_t* Q8, float* Qs, uint32_t ng,
+                                       uint32_t rank, uint32_t group_dim, uint32_t nb,
+                                       void* stream, bool preshuffled = true);
 
 // Pre-allocates the per-device Split-K scratch buffer (plus its 4 KiB arrival counter header) on
 // the current device for `stream`, eliminating mid-run hipMalloc + hipDeviceSynchronize pauses.

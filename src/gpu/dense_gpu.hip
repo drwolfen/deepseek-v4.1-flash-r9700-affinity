@@ -660,6 +660,11 @@ inline bool markov_exact_prune_enabled() {
   return !v || !*v || std::strcmp(v, "0") != 0;
 }
 
+inline bool fuse_woa_q8_enabled() {
+  const char* v = std::getenv("AFF_FUSE_WOA_Q8");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
 inline bool head_sample_bf16_enabled() {
   const char* v = std::getenv("AFF_HEAD_SAMPLE_BF16");
   return !v || !*v || std::strcmp(v, "0") != 0;
@@ -7240,6 +7245,7 @@ bool DenseGpu::batch_attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_
         A.quant == AFF_FP8_E4M3 && A.sh[d].scales != nullptr && (group_dim % 128u) == 0u &&
         (rank % 16u) == 0u && nq == (uint64_t)a_hpr_ * width && D.b_heads &&
         qtm_bytes >= sc_off + sc_bytes;
+    bool did_fused_woa_q8 = false;
     if (use_fp8_woa) {
       uint8_t* const q8 = reinterpret_cast<uint8_t*>(D.b_heads);
       uint8_t* const sc = q8 + sc_off;
@@ -7249,7 +7255,15 @@ bool DenseGpu::batch_attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_
                                          rope, -1.0f, b_nb_, D.stream))
           return false;
       }
-      {
+      if (fuse_woa_q8_enabled() && q8_ok(hwb, B.sh[d].ncols) &&
+          B.sh[d].ncols == (uint64_t)ng * rank && !xrank_trace_enabled() &&
+          q_slot(d, (uint32_t)B.sh[d].ncols)) {
+        AFF_TRACE(43);
+        did_fused_woa_q8 = batch_gemm_fp8_grouped_b32_q8_hip(
+            (const uint8_t*)A.sh[d].data, (const uint8_t*)A.sh[d].scales, q8, sc, D.q8, D.qs, ng,
+            (uint32_t)rank, group_dim, b_nb_, D.stream, A.sh[d].ps);
+      }
+      if (!did_fused_woa_q8) {
         AFF_TRACE(43);
         batch_gemm_fp8_grouped_b32_hip((const uint8_t*)A.sh[d].data,
                                        (const uint8_t*)A.sh[d].scales, q8, sc, woa_buf, ng,
@@ -7286,15 +7300,24 @@ bool DenseGpu::batch_attn_out(int32_t hwa, int32_t hwb, uint32_t n_head, uint32_
     }
     // Row-split, so no single card's value is comparable between two rank counts — but the SUM over
     // cards is, because it is the same 64 heads either way, only dealt differently.
-    xrank_trace((uint32_t)d, "woa", woa_buf, (size_t)ng * rank * b_nb_ * sizeof(float), D.stream);
+    if (!did_fused_woa_q8)
+      xrank_trace((uint32_t)d, "woa", woa_buf, (size_t)ng * rank * b_nb_ * sizeof(float), D.stream);
     // Straight into the block: the attention sublayer's block is written, not accumulated, and
     // what lands here is this card's PARTIAL for block_reduce to finish.
     {
       AFF_TRACE(44);
-      if (q8_ok(hwb, B.sh[d].ncols) && quant_act(d, woa_buf, (uint32_t)B.sh[d].ncols))
+      if (did_fused_woa_q8) {
+        D.q8_src = nullptr;
+        D.q8_act = D.q8;
+        D.qs_act = D.qs;
+        D.q_active_dim = (uint32_t)B.sh[d].ncols;
+        norm_q8_invalidate(D.id, D.b_norm);
         batch_gemm_ent_q8(d, hwb, D.b_block, hidden, B.sh[d].ncols);
-      else
+      } else if (q8_ok(hwb, B.sh[d].ncols) && quant_act(d, woa_buf, (uint32_t)B.sh[d].ncols)) {
+        batch_gemm_ent_q8(d, hwb, D.b_block, hidden, B.sh[d].ncols);
+      } else {
         batch_gemm_ent(d, hwb, woa_buf, D.b_block, hidden, B.sh[d].ncols);
+      }
     }
     // This card's partial, BEFORE the crossing. With `attn_red` it brackets the all-reduce, which is
     // the only thing between two sublayers that both cards touch. See gpu/digest.h.

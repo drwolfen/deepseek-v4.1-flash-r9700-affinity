@@ -974,13 +974,14 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_multi_kernel(
 // Grouped W8A8 FP8 WMMA with per-32 UE8M0 activation scales (`Sx`: [ng][nb][group_dim >> 5])
 // folded every 2 K=16 WMMA steps (`b32 = 0 .. FK/32 - 1`) and 128x128 UE8M0 weight scales (`Ws`).
 template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u,
-          bool NT_LOAD = false>
+          bool NT_LOAD = false, bool Q8Out = false>
 __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
     const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Ws, const uint8_t* __restrict__ Xp,
     const uint8_t* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
-    unsigned int* __restrict__ Ctr, uint32_t rank, uint32_t cols, uint32_t nb, uint32_t sc_cols,
-    uint32_t sx_cols, uint32_t w_row_off, uint32_t bx, uint32_t by, uint32_t kbeg, uint32_t kend,
-    uint32_t ws_rows, uint32_t tile_id) {
+    unsigned int* __restrict__ Ctr, uint8_t* __restrict__ Q8, float* __restrict__ Qs,
+    uint32_t rank, uint32_t cols, uint32_t nb, uint32_t sc_cols, uint32_t sx_cols,
+    uint32_t w_row_off, uint32_t bx, uint32_t by, uint32_t kbeg, uint32_t kend,
+    uint32_t ws_rows, uint32_t tile_id, uint32_t total_rows) {
   static_assert(MTW == 1u || (NT == 8u && MW == 8u && FK == 64u),
                 "4x2 prefill wave layout applies only to 8x8x64");
   constexpr bool kNtLoad = NT_LOAD && (NT == 1u);
@@ -990,6 +991,7 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
   constexpr uint32_t kNWTiles = (MTW == 2u) ? 4u : NT;
   constexpr uint32_t FN = kNWaves * kNWTiles * 16u;
   constexpr uint32_t FM = kMWaves * kMWTiles * 16u;
+  static_assert(!Q8Out || FM == 128u, "Q8Out requires 128-row workgroup M tile");
   constexpr uint32_t kNG = FK / 64u;
   constexpr uint32_t kFolds32 = FK / 32u;
   constexpr uint32_t kFolds128 = (FK + 127u) / 128u;
@@ -997,8 +999,15 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
   static_assert(kFolds32 == 2u || kFolds32 == 4u || kFolds32 == 8u,
                 "kFolds32 must be 2, 4, or 8");
 
-  alignas(16) __shared__ uint8_t s_b[FN * (FK + 8u)];
-  alignas(16) __shared__ uint8_t s_a[PS ? 1 : FM * (FK + 8u)];
+  alignas(16) __shared__ union {
+    struct {
+      uint8_t b[FN * (FK + 8u)];
+      uint8_t a[PS ? 1u : FM * (FK + 8u)];
+    } g;
+    float qt[Q8Out ? 128u : 1u][Q8Out ? 17u : 1u];
+  } lds;
+  uint8_t* const s_b = lds.g.b;
+  uint8_t* const s_a = lds.g.a;
   __shared__ uint32_t s_ws[Full ? 1 : 2][kFolds128];
   alignas(8) __shared__ uint8_t s_sx[FN][kFolds32];
 
@@ -1221,6 +1230,79 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
   }
 
   const bool split_active = (ws_rows != 0u);
+  auto quant_qt_strip = [&](uint32_t col_blk, uint32_t n_cols) __attribute__((always_inline)) {
+    if constexpr (Q8Out) {
+      const uint32_t kb = (w_row_off + m0) >> 7;
+      const uint32_t nkb = total_rows >> 7;
+      const uint32_t wt = tid >> 4;
+      const uint32_t rk = tid & 15u;
+      float vals[8];
+      float mm = 0.0f;
+      if (wt < n_cols) {
+#pragma unroll
+        for (uint32_t u = 0u; u < 8u; ++u) {
+          const float v = lds.qt[rk * 8u + u][wt];
+          vals[u] = v;
+          mm = fmaxf(mm, fabsf(v));
+        }
+      }
+      mm = fmaxf(mm, __shfl_xor(mm, 8, 32));
+      mm = fmaxf(mm, __shfl_xor(mm, 4, 32));
+      mm = fmaxf(mm, __shfl_xor(mm, 2, 32));
+      mm = fmaxf(mm, __shfl_xor(mm, 1, 32));
+      if (wt < n_cols) {
+        const float scale = (mm > 0.0f) ? (mm * (1.0f / 448.0f)) : 1.0f;
+        if (rk == 0u) Qs[(size_t)(col_blk + wt) * nkb + kb] = scale;
+        const float inv = 1.0f / scale;
+        int pk0 = 0, pk1 = 0;
+        pk0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+            fminf(fmaxf(vals[0] * inv, -448.0f), 448.0f),
+            fminf(fmaxf(vals[1] * inv, -448.0f), 448.0f), pk0, false);
+        pk0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+            fminf(fmaxf(vals[2] * inv, -448.0f), 448.0f),
+            fminf(fmaxf(vals[3] * inv, -448.0f), 448.0f), pk0, true);
+        pk1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+            fminf(fmaxf(vals[4] * inv, -448.0f), 448.0f),
+            fminf(fmaxf(vals[5] * inv, -448.0f), 448.0f), pk1, false);
+        pk1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+            fminf(fmaxf(vals[6] * inv, -448.0f), 448.0f),
+            fminf(fmaxf(vals[7] * inv, -448.0f), 448.0f), pk1, true);
+        *(uint2*)(Q8 + (size_t)(col_blk + wt) * total_rows + (size_t)kb * 128u + rk * 8u) =
+            make_uint2((uint32_t)pk0, (uint32_t)pk1);
+      }
+    }
+  };
+
+  if constexpr (Q8Out) {
+    if (!split_active) {
+      aff::lds_barrier();
+      const uint32_t c = wmma::frag_c(lane);
+      for (uint32_t tok_blk = 0u; tok_blk < FN; tok_blk += 16u) {
+        const uint32_t col_blk = n0 + tok_blk;
+        if (!Full && col_blk >= nb) break;
+        const uint32_t n_cols = min(16u, nb - col_blk);
+        if (tok_blk > 0u) aff::lds_barrier();
+#pragma unroll
+        for (uint32_t i = 0u; i < kMWTiles; ++i)
+#pragma unroll
+          for (uint32_t j = 0u; j < kNWTiles; ++j) {
+            const uint32_t gc = wn + j * 16u;
+            if (gc >= tok_blk && gc < tok_blk + 16u) {
+              const uint32_t cloc = (gc - tok_blk) + c;
+              const uint32_t rb = wm + i * 16u;
+#pragma unroll
+              for (uint32_t t = 0u; t < 8u; ++t) {
+                lds.qt[rb + wmma::acc_row(lane, t)][cloc] = out[i][j][t];
+              }
+            }
+          }
+        aff::lds_barrier();
+        quant_qt_strip(col_blk, n_cols);
+      }
+      return;
+    }
+  }
+
   float* const dst_y = split_active ? (Y + (size_t)blockIdx.z * ws_rows * nb) : Y;
   const uint32_t c = wmma::frag_c(lane);
 #pragma unroll
@@ -1268,23 +1350,46 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
           const size_t plane = (size_t)ws_rows * nb;
           const uint32_t ksplit = gridDim.z;
           const uint32_t total_el = (rhi - rlo) * ncols;
-          for (uint32_t idx = tid; idx < total_el; idx += MW * kWave) {
-            const uint32_t r = rlo + idx / ncols;
-            const uint32_t col = clo + idx % ncols;
-            const size_t o = (size_t)r * nb + col;
-            const float* __restrict__ p = Y + o;
-            constexpr uint32_t U = 8;
-            float acc = 0.0f;
-            uint32_t z = 0;
-            for (; z + U <= ksplit; z += U) {
-              float v[U];
+          if constexpr (Q8Out) {
+            for (uint32_t idx = tid; idx < total_el; idx += MW * kWave) {
+              const uint32_t r_loc = idx / ncols;
+              const uint32_t col_loc = idx % ncols;
+              const size_t o = (size_t)(rlo + r_loc) * nb + (clo + col_loc);
+              const float* __restrict__ p = Y + o;
+              constexpr uint32_t U = 8;
+              float acc = 0.0f;
+              uint32_t z = 0;
+              for (; z + U <= ksplit; z += U) {
+                float v[U];
 #pragma unroll
-              for (uint32_t u = 0; u < U; ++u) v[u] = p[(size_t)(z + u) * plane];
+                for (uint32_t u = 0; u < U; ++u) v[u] = p[(size_t)(z + u) * plane];
 #pragma unroll
-              for (uint32_t u = 0; u < U; ++u) acc += v[u];
+                for (uint32_t u = 0; u < U; ++u) acc += v[u];
+              }
+              for (; z < ksplit; ++z) acc += p[(size_t)z * plane];
+              lds.qt[r_loc][col_loc] = acc;
             }
-            for (; z < ksplit; ++z) acc += p[(size_t)z * plane];
-            FinalY[o] = acc;
+            aff::lds_barrier();
+            quant_qt_strip(clo, ncols);
+          } else {
+            for (uint32_t idx = tid; idx < total_el; idx += MW * kWave) {
+              const uint32_t r = rlo + idx / ncols;
+              const uint32_t col = clo + idx % ncols;
+              const size_t o = (size_t)r * nb + col;
+              const float* __restrict__ p = Y + o;
+              constexpr uint32_t U = 8;
+              float acc = 0.0f;
+              uint32_t z = 0;
+              for (; z + U <= ksplit; z += U) {
+                float v[U];
+#pragma unroll
+                for (uint32_t u = 0; u < U; ++u) v[u] = p[(size_t)(z + u) * plane];
+#pragma unroll
+                for (uint32_t u = 0; u < U; ++u) acc += v[u];
+              }
+              for (; z < ksplit; ++z) acc += p[(size_t)z * plane];
+              FinalY[o] = acc;
+            }
           }
         }
       }
@@ -1293,7 +1398,7 @@ __device__ __forceinline__ void gemm_fp8_grouped_b32_body(
 }
 
 template <bool Full, bool PS, uint32_t NT, uint32_t MW, uint32_t FK, uint32_t MTW = 1u,
-          bool NT_LOAD = false>
+          bool NT_LOAD = false, bool Q8Out = false>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((NT == 8u && MW == 8u && FK == 64u) ? 8 : 1,
                                    (NT == 8u && MW == 8u && FK == 64u) ? 8 : 16)))
@@ -1301,8 +1406,9 @@ __attribute__((amdgpu_waves_per_eu((NT == 8u && MW == 8u && FK == 64u) ? 8 : 1,
 __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_grouped_b32_kernel(
     const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Ws, const uint8_t* __restrict__ Xp,
     const uint8_t* __restrict__ Sx, float* __restrict__ Y, float* __restrict__ FinalY,
-    unsigned int* __restrict__ Ctr, uint32_t ng, uint32_t rank, uint32_t cols, uint32_t nb,
-    uint32_t sc_cols, uint32_t sx_cols, uint32_t m_tiles_per_grp, uint32_t ck) {
+    unsigned int* __restrict__ Ctr, uint8_t* __restrict__ Q8, float* __restrict__ Qs, uint32_t ng,
+    uint32_t rank, uint32_t cols, uint32_t nb, uint32_t sc_cols, uint32_t sx_cols,
+    uint32_t m_tiles_per_grp, uint32_t ck) {
   uint32_t lin_bx = blockIdx.x, by = blockIdx.y;
   if constexpr (MTW == 2u) {
     constexpr uint32_t kGroupM = 8u;
@@ -1324,10 +1430,11 @@ __global__ __launch_bounds__(MW * kWave) void batch_gemm_fp8_grouped_b32_kernel(
   const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
   const uint32_t ws_rows = ck ? (ng * rank) : 0u;
   const uint32_t tile_id = by * gridDim.x + lin_bx;
-  gemm_fp8_grouped_b32_body<Full, PS, NT, MW, FK, MTW, NT_LOAD>(
+  gemm_fp8_grouped_b32_body<Full, PS, NT, MW, FK, MTW, NT_LOAD, Q8Out>(
       Wp, Ws, Xp + (size_t)g * nb * cols, Sx + (size_t)g * nb * sx_cols,
-      Y + (size_t)g * rank * nb, FinalY ? (FinalY + (size_t)g * rank * nb) : nullptr, Ctr, rank,
-      cols, nb, sc_cols, sx_cols, w_row_off, bx_g, by, kbeg, kend, ws_rows, tile_id);
+      Y ? (Y + (size_t)g * rank * nb) : nullptr, FinalY ? (FinalY + (size_t)g * rank * nb) : nullptr,
+      Ctr, Q8, Qs, rank, cols, nb, sc_cols, sx_cols, w_row_off, bx_g, by, kbeg, kend, ws_rows,
+      tile_id, ng * rank);
 }
 
 // `Full` = every dimension is an exact multiple of its tile, which every dense tensor in this model
@@ -5195,9 +5302,9 @@ void batch_gemm_fp8_grouped_b32_hip(const uint8_t* W, const uint8_t* Ws, const u
   const bool prefill_4x2 = !narrow && fp8_prefill_4x2_enabled();
   const bool nt_load = narrow && aff::dense_nt_load_enabled();
 #define AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, mtw_, ntl_)                                       \
-  AFF_BLAUNCH((batch_gemm_fp8_grouped_b32_kernel<f, ps, nt_, mw_, fk_, mtw_, ntl_>), grid,        \
-              dim3(mw_ * kWave), 0, st, W, Ws, Xp, Sx, dst, final_y, ctr_buf, ng, rank,           \
-              group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck)
+  AFF_BLAUNCH((batch_gemm_fp8_grouped_b32_kernel<f, ps, nt_, mw_, fk_, mtw_, ntl_, false>), grid, \
+              dim3(mw_ * kWave), 0, st, W, Ws, Xp, Sx, dst, final_y, ctr_buf, nullptr, nullptr,   \
+              ng, rank, group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck)
 #define AFF_GEMM_GB32(f, ps, nt_, mw_, fk_)                                                        \
   do {                                                                                             \
     if (nt_load) AFF_GEMM_GB32_MTW(f, ps, nt_, mw_, fk_, 1u, true);                                \
@@ -5231,6 +5338,94 @@ void batch_gemm_fp8_grouped_b32_hip(const uint8_t* W, const uint8_t* Ws, const u
     AFF_BLAUNCH(splitk_reduce_kernel, dim3((uint32_t)((n + 255u) / 256u)), dim3(256), 0, st, ws, Y,
                 total_rows, nb, ksplit);
   }
+}
+
+bool batch_gemm_fp8_grouped_b32_q8_hip(const uint8_t* W, const uint8_t* Ws, const uint8_t* Xp,
+                                       const uint8_t* Sx, uint8_t* Q8, float* Qs, uint32_t ng,
+                                       uint32_t rank, uint32_t group_dim, uint32_t nb,
+                                       void* stream, bool preshuffled) {
+  if (!ng || !rank || !group_dim || !nb || !Q8 || !Qs) return false;
+  if (quant_hadamard_enabled() || (rank % 128u) != 0u || (group_dim % 64u) != 0u) return false;
+  if (preshuffled && ((rank % 16u) != 0u || (group_dim % 16u) != 0u)) return false;
+  const hipStream_t st = (hipStream_t)stream;
+  const uint32_t sc_cols = (group_dim + 127u) / 128u;
+  const uint32_t sx_cols = group_dim >> 5;
+  const bool n128 = fp8_narrow128_enabled();
+  const bool narrow = (nb <= wmma::kN);
+  const uint32_t fk_sel = narrow ? (((group_dim % kFKNarrowWide) == 0u)
+                                        ? kFKNarrowWide
+                                        : ((n128 && (group_dim % kFKNarrow) == 0u) ? kFKNarrow
+                                                                                   : kFK))
+                                 : kFK;
+  const uint32_t nt = narrow ? 1u : kFNTiles;
+  const uint32_t fn = nt * 16u;
+  const uint32_t mw = narrow ? 8u : kFWaves;
+  const uint32_t fm = mw * kFMTiles * 16u;
+  const uint32_t m_tiles_per_grp = rank / fm;
+  const uint32_t gx = ng * m_tiles_per_grp;
+  const uint32_t gy = (nb + fn - 1u) / fn;
+  const uint32_t total_rows = ng * rank;
+  uint32_t ksplit = 1u;
+  float* ws = nullptr;
+  unsigned int* ctr_buf = nullptr;
+  if (narrow && gx * gy * mw < kSplitTarget && group_dim >= 512u) {
+    if (!fp8_split_inline_enabled() || gx * gy > kSplitCtrFloats) return false;
+    const uint32_t want = (kSplitTarget + gx * gy * mw - 1u) / (gx * gy * mw);
+    const uint32_t kq = (fk_sel == kFKNarrowWide) ? kFKNarrowWide : 128u;
+    uint32_t ckw = ((group_dim / want) + kq - 1u) / kq * kq;
+    if (ckw < kq) ckw = kq;
+    uint32_t k2 = (group_dim + ckw - 1u) / ckw;
+    if (k2 > kSplitThinCap && (uint64_t)total_rows * nb < 8192u) k2 = kSplitThinCap;
+    if (k2 > 1u) {
+      ws = splitk_buf_with_ctr((size_t)k2 * total_rows * nb, &ctr_buf, st);
+      if (!ws || !ctr_buf) return false;
+      ksplit = k2;
+    }
+  }
+  const uint32_t kq = narrow ? ((fk_sel == kFKNarrowWide) ? kFKNarrowWide : 128u) : 128u;
+  uint32_t ck = ksplit > 1u ? ((group_dim + ksplit - 1u) / ksplit + kq - 1u) / kq * kq : 0u;
+  if (ck) ksplit = (group_dim + ck - 1u) / ck;
+  if (ksplit < 2u) { ck = 0u; ksplit = 1u; ws = nullptr; ctr_buf = nullptr; }
+  const dim3 grid(gx, gy, ksplit);
+  float* const dst = ksplit > 1u ? ws : nullptr;
+  const bool full = (rank % fm == 0u) && (rank % 128u == 0u) && (nb % fn == 0u) &&
+                    (group_dim % 128u == 0u) && (group_dim % fk_sel == 0u) &&
+                    (((uintptr_t)Sx & 7u) == 0u);
+  const bool prefill_4x2 = !narrow && fp8_prefill_4x2_enabled();
+  const bool nt_load = narrow && aff::dense_nt_load_enabled();
+#define AFF_GEMM_GB32Q_MTW(f, ps, nt_, mw_, fk_, mtw_, ntl_)                                       \
+  AFF_BLAUNCH((batch_gemm_fp8_grouped_b32_kernel<f, ps, nt_, mw_, fk_, mtw_, ntl_, true>), grid,   \
+              dim3(mw_ * kWave), 0, st, W, Ws, Xp, Sx, dst, nullptr, ctr_buf, Q8, Qs, ng, rank,    \
+              group_dim, nb, sc_cols, sx_cols, m_tiles_per_grp, ck)
+#define AFF_GEMM_GB32Q(f, ps, fk_)                                                                 \
+  do {                                                                                             \
+    if (nt_load) AFF_GEMM_GB32Q_MTW(f, ps, 1u, 8u, fk_, 1u, true);                                 \
+    else         AFF_GEMM_GB32Q_MTW(f, ps, 1u, 8u, fk_, 1u, false);                                \
+  } while (0)
+#define AFF_GEMM_GB32Q_MODE(f, ps)                                                                 \
+  do {                                                                                             \
+    if (!narrow) {                                                                                 \
+      if (prefill_4x2) AFF_GEMM_GB32Q_MTW(f, ps, kFNTiles, kFWaves, kFK, 2u, false);               \
+      else             AFF_GEMM_GB32Q_MTW(f, ps, kFNTiles, kFWaves, kFK, 1u, false);               \
+    } else if (fk_sel == kFKNarrowWide) {                                                          \
+      AFF_GEMM_GB32Q(f, ps, kFKNarrowWide);                                                        \
+    } else if (fk_sel == kFKNarrow) {                                                              \
+      AFF_GEMM_GB32Q(f, ps, kFKNarrow);                                                            \
+    } else {                                                                                       \
+      AFF_GEMM_GB32Q(f, ps, kFK);                                                                  \
+    }                                                                                              \
+  } while (0)
+  if (preshuffled) {
+    if (full) AFF_GEMM_GB32Q_MODE(true, true);
+    else      AFF_GEMM_GB32Q_MODE(false, true);
+  } else {
+    if (full) AFF_GEMM_GB32Q_MODE(true, false);
+    else      AFF_GEMM_GB32Q_MODE(false, false);
+  }
+#undef AFF_GEMM_GB32Q_MODE
+#undef AFF_GEMM_GB32Q
+#undef AFF_GEMM_GB32Q_MTW
+  return true;
 }
 
 bool batch_splitk_reserve_hip(size_t peak_floats, void* stream) {

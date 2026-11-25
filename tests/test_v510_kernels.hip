@@ -1,5 +1,6 @@
 #include "gpu/attention_gpu.h"
 #include "gpu/batch_kernels.h"
+#include "gpu/hip_common.h"
 #include "gpu/indexer_gpu.h"
 
 #include <hip/hip_runtime.h>
@@ -468,11 +469,145 @@ static int check_draft_noise_seed() {
   return 0;
 }
 
+static int check_fast_div_u32() {
+  const uint32_t divs[] = {1u, 2u, 3u, 7u, 128u, 1024u, 1536u, 2048u, 3072u,
+                           0x80000001u, 0xFFFFFFFFu};
+  for (uint32_t d : divs) {
+    const aff::FastDivU32 fd = aff::make_fast_div_u32(d);
+    auto verify_one = [&](uint32_t n) {
+      uint32_t rem = 0;
+      const uint32_t q = aff::fast_div_u32(n, fd, &rem);
+      return q == (n / d) && rem == (n % d);
+    };
+    const uint32_t edge[] = {0u, 1u, 2u, d - 1u, d, d + 1u, 0x7FFFFFFFu, 0x80000000u,
+                             0xFFFFFFFEu, 0xFFFFFFFFu};
+    for (uint32_t n : edge) {
+      if (!verify_one(n)) {
+        std::fprintf(stderr, "FAIL: FastDivU32 mismatch d=%u n=%u\n", d, n);
+        return 1;
+      }
+    }
+    uint32_t s = 1234567u ^ d;
+    for (uint32_t it = 0; it < 256u; ++it) {
+      s = s * 1664525u + 1013904223u;
+      if (!verify_one(s)) {
+        std::fprintf(stderr, "FAIL: FastDivU32 random mismatch d=%u n=%u\n", d, s);
+        return 1;
+      }
+      if (d <= 0x00FFFFFFu) {
+        const uint32_t k = (s % 4096u) * d;
+        for (int delta : {-1, 0, 1}) {
+          const uint32_t n = (uint32_t)((int64_t)k + delta);
+          if (!verify_one(n)) {
+            std::fprintf(stderr, "FAIL: FastDivU32 mul boundary mismatch d=%u n=%u\n", d, n);
+            return 1;
+          }
+        }
+      }
+    }
+  }
+  std::printf("PASS: FastDivU32 exact unsigned reciprocal checks\n");
+  return 0;
+}
+
+static int check_fuse_woa_q8() {
+  const uint32_t ng = 4u, rank = 256u, group_dim = 1024u;
+  const uint32_t total_rows = ng * rank;
+  const uint32_t sc_cols = group_dim / 128u;
+  const uint32_t sx_cols = group_dim / 32u;
+  const uint32_t ws_rows = total_rows;
+
+  std::vector<uint8_t> h_w((size_t)total_rows * group_dim);
+  std::vector<uint8_t> h_ws((size_t)((total_rows + 127u) / 128u) * sc_cols);
+  uint32_t s = 424242u;
+  for (size_t i = 0; i < h_w.size(); ++i) {
+    s = s * 1664525u + 1013904223u;
+    const uint8_t sign = (uint8_t)((s >> 31) << 7);
+    const uint8_t mag = (uint8_t)(0x10u + ((s >> 20) % 0x48u));
+    h_w[i] = (uint8_t)(sign | mag);
+  }
+  for (size_t i = 0; i < h_ws.size(); ++i) {
+    s = s * 1664525u + 1013904223u;
+    h_ws[i] = (uint8_t)(0x7du + ((s >> 24) % 5u));
+  }
+
+  uint8_t *d_w = nullptr, *d_w_ps = nullptr, *d_ws = nullptr;
+  (void)hipMalloc(&d_w, h_w.size());
+  (void)hipMalloc(&d_w_ps, h_w.size());
+  (void)hipMalloc(&d_ws, h_ws.size());
+  (void)hipMemcpy(d_w, h_w.data(), h_w.size(), hipMemcpyHostToDevice);
+  (void)hipMemcpy(d_ws, h_ws.data(), h_ws.size(), hipMemcpyHostToDevice);
+  aff::preshuffle_fp8_hip(d_w, d_w_ps, total_rows, group_dim, nullptr);
+
+  struct Case { uint32_t nb; bool ps; };
+  const Case cases[] = {{8u, true}, {128u, true}, {128u, false}};
+  for (const Case& cs : cases) {
+    const uint32_t nb = cs.nb;
+    std::vector<uint8_t> h_x((size_t)ng * nb * group_dim);
+    std::vector<uint8_t> h_sx((size_t)ng * nb * sx_cols);
+    for (size_t i = 0; i < h_x.size(); ++i) {
+      s = s * 1664525u + 1013904223u;
+      const uint8_t sign = (uint8_t)((s >> 31) << 7);
+      const uint8_t mag = (uint8_t)(0x08u + ((s >> 19) % 0x4cu));
+      h_x[i] = (uint8_t)(sign | mag);
+    }
+    for (size_t i = 0; i < h_sx.size(); ++i) {
+      s = s * 1664525u + 1013904223u;
+      h_sx[i] = (uint8_t)(0x7cu + ((s >> 23) % 6u));
+    }
+    uint8_t *d_x = nullptr, *d_sx = nullptr, *d_q8_ref = nullptr, *d_q8_fus = nullptr;
+    float *d_y = nullptr, *d_qs_ref = nullptr, *d_qs_fus = nullptr;
+    (void)hipMalloc(&d_x, h_x.size());
+    (void)hipMalloc(&d_sx, h_sx.size());
+    (void)hipMalloc(&d_y, (size_t)ws_rows * nb * sizeof(float));
+    (void)hipMalloc(&d_q8_ref, (size_t)nb * total_rows);
+    (void)hipMalloc(&d_q8_fus, (size_t)nb * total_rows);
+    (void)hipMalloc(&d_qs_ref, (size_t)nb * (total_rows / 128u) * sizeof(float));
+    (void)hipMalloc(&d_qs_fus, (size_t)nb * (total_rows / 128u) * sizeof(float));
+    (void)hipMemcpy(d_x, h_x.data(), h_x.size(), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_sx, h_sx.data(), h_sx.size(), hipMemcpyHostToDevice);
+
+    const uint8_t* Wp = cs.ps ? d_w_ps : d_w;
+    aff::batch_gemm_fp8_grouped_b32_hip(Wp, d_ws, d_x, d_sx, d_y, ng, rank, group_dim, nb, nullptr,
+                                        cs.ps);
+    aff::batch_quant_fp8_hip(d_y, d_q8_ref, d_qs_ref, total_rows, nb, 0u, nullptr);
+    const bool ok = aff::batch_gemm_fp8_grouped_b32_q8_hip(Wp, d_ws, d_x, d_sx, d_q8_fus, d_qs_fus,
+                                                          ng, rank, group_dim, nb, nullptr, cs.ps);
+    (void)hipDeviceSynchronize();
+    if (!ok) {
+      std::fprintf(stderr, "FAIL: fuse_woa_q8 refused nb=%u ps=%d\n", nb, (int)cs.ps);
+      return 1;
+    }
+
+    std::vector<uint8_t> q8_ref((size_t)nb * total_rows), q8_fus((size_t)nb * total_rows);
+    std::vector<float> qs_ref((size_t)nb * (total_rows / 128u));
+    std::vector<float> qs_fus((size_t)nb * (total_rows / 128u));
+    (void)hipMemcpy(q8_ref.data(), d_q8_ref, q8_ref.size(), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(q8_fus.data(), d_q8_fus, q8_fus.size(), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(qs_ref.data(), d_qs_ref, qs_ref.size() * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(qs_fus.data(), d_qs_fus, qs_fus.size() * sizeof(float), hipMemcpyDeviceToHost);
+
+    (void)hipFree(d_x); (void)hipFree(d_sx); (void)hipFree(d_y);
+    (void)hipFree(d_q8_ref); (void)hipFree(d_q8_fus);
+    (void)hipFree(d_qs_ref); (void)hipFree(d_qs_fus);
+
+    if (q8_ref != q8_fus ||
+        std::memcmp(qs_ref.data(), qs_fus.data(), qs_ref.size() * sizeof(float)) != 0) {
+      std::fprintf(stderr, "FAIL: AFF_FUSE_WOA_Q8 bit mismatch nb=%u ps=%d\n", nb, (int)cs.ps);
+      return 1;
+    }
+  }
+  (void)hipFree(d_w); (void)hipFree(d_w_ps); (void)hipFree(d_ws);
+  std::printf("PASS: AFF_FUSE_WOA_Q8 (nb=8 split-k + nb=128 PS/non-PS) bit-exact oracle\n");
+  return 0;
+}
+
 int main() {
   uint64_t sb = 0, tb = 0;
   const uint64_t hb = aff::idx_topk_scratch_bytes(16u, &sb, &tb);
   if (hb != 16ull * 2048u * 4u || sb != 16ull * 16u || tb != 16ull * 1025u * 4u) return 1;
   if (aff::kv_row_bytes(aff::KvDtype::FP8R, 512u, 64u) != 528ull) return 1;
+  if (check_fast_div_u32()) return 1;
 
   int dev_count = 0;
   hipError_t err = hipGetDeviceCount(&dev_count);
@@ -486,5 +621,6 @@ int main() {
   if (check_topk_and_bmax_v2()) return 1;
   if (check_markov_pruned()) return 1;
   if (check_draft_noise_seed()) return 1;
+  if (check_fuse_woa_q8()) return 1;
   return 0;
 }

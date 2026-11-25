@@ -704,9 +704,9 @@ void test_prefix_cache_batched_pinned_io() {
   std::string err;
   aff::PrefixCache cache;
   CHECK(cache.open(opt, regions, io, 0x733de762fee253e6ull, &err));
-  // Expected pins: stage[0..2] (3) + gather (1) + ckbuf (1) + rbuf[0] (1) = 6
-  CHECK(sim.pin_calls == 6);
-  CHECK(sim.pinned.size() == 6);
+  // Expected pins: stage[0..2] (3) + gather[0..1] (2) + ckbuf (1) + rbuf[0] (1) = 7
+  CHECK(sim.pin_calls == 7);
+  CHECK(sim.pinned.size() == 7);
 
   std::vector<uint32_t> ids(total_tokens);
   for (uint32_t i = 0; i < total_tokens; ++i) ids[i] = 7000 + i * 5;
@@ -762,7 +762,7 @@ void test_prefix_cache_batched_pinned_io() {
   }
 
   cache.close();
-  CHECK(sim.unpin_calls == 6);
+  CHECK(sim.unpin_calls == 7);
   CHECK(sim.pinned.empty());
   rm_rf(cache_dir);
 
@@ -778,7 +778,7 @@ void test_prefix_cache_batched_pinned_io() {
   opt.dir = fb_dir;
   aff::PrefixCache cache_fb;
   CHECK(cache_fb.open(opt, regs_fb, io_fb, 0x733de762fee253e6ull, &err));
-  CHECK(sim_fb.pin_calls == 6);
+  CHECK(sim_fb.pin_calls == 7);
   CHECK(sim_fb.pinned.empty());
   CHECK(cache_fb.publish(ids.data(), pos1, &err));
   cache_fb.drain();

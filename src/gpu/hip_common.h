@@ -29,6 +29,7 @@
 #include "ui/log.h"
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -345,6 +346,51 @@ __device__ __forceinline__ float wave_reduce_max_dpp(float v) {
   v = fmaxf(v, dpp_xor_lane<2u>(v));
   v = fmaxf(v, dpp_xor_lane<1u>(v));
   return v;
+}
+
+template <typename T>
+__host__ __device__ __forceinline__ const T* wave_uniform_ptr(const T* p) {
+#ifdef __HIP_DEVICE_COMPILE__
+  const uintptr_t u = (uintptr_t)p;
+  const uint32_t lo = __builtin_amdgcn_readfirstlane((uint32_t)(u & 0xffffffffull));
+  const uint32_t hi = __builtin_amdgcn_readfirstlane((uint32_t)(u >> 32));
+  return (const T*)(((uintptr_t)hi << 32) | (uintptr_t)lo);
+#else
+  return p;
+#endif
+}
+
+template <typename T>
+__host__ __device__ __forceinline__ T* wave_uniform_ptr(T* p) {
+  return const_cast<T*>(wave_uniform_ptr(const_cast<const T*>(p)));
+}
+
+// Hacker's Delight 10-9 exact unsigned integer division for all divisors d >= 1.
+struct FastDivU32 {
+  uint32_t d;
+  uint32_t m;
+  uint32_t sh1;
+  uint32_t sh2;
+};
+
+inline FastDivU32 make_fast_div_u32(uint32_t d) {
+  if (d <= 1u) return FastDivU32{1u, 1u, 0u, 0u};
+  const uint32_t l = 32u - (uint32_t)__builtin_clz(d - 1u);
+  const uint64_t rem = (1ULL << l) - (uint64_t)d;
+  const uint32_t m = (uint32_t)(((1ULL << 32) * rem) / (uint64_t)d + 1ULL);
+  return FastDivU32{d, m, 1u, l - 1u};
+}
+
+__host__ __device__ __forceinline__ uint32_t fast_div_u32(uint32_t n, FastDivU32 fd,
+                                                          uint32_t* rem = nullptr) {
+#ifdef __HIP_DEVICE_COMPILE__
+  const uint32_t t = __umulhi(n, fd.m);
+#else
+  const uint32_t t = (uint32_t)(((uint64_t)n * (uint64_t)fd.m) >> 32);
+#endif
+  const uint32_t q = (t + ((n - t) >> fd.sh1)) >> fd.sh2;
+  if (rem) *rem = n - q * fd.d;
+  return q;
 }
 
 using aff_u32x4 = uint32_t __attribute__((ext_vector_type(4)));

@@ -110,11 +110,12 @@ __device__ inline float wave_reduce_add(float v) {
 // [expert][gate|up][inter], so gate for expert k sits at 2*k*inter and up at (2*k+1)*inter — a
 // single flat index maps onto it, and n_experts launches collapse to one.
 __global__ void swiglu_all_kernel(float* __restrict__ scratch, uint32_t n_experts,
-                                  uint32_t inter, float limit) {
+                                  uint32_t inter, aff::FastDivU32 inter_fd, float limit) {
   const uint32_t total = n_experts * inter;
   for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < total;
        t += gridDim.x * blockDim.x) {
-    const uint32_t k = t / inter, i = t % inter;
+    uint32_t i = 0u;
+    const uint32_t k = aff::fast_div_u32(t, inter_fd, &i);
     float* g = scratch + (size_t)(2 * k) * inter + i;
     const float* u = scratch + (size_t)(2 * k + 1) * inter + i;
     float gv = *g, uv = *u;
@@ -3276,8 +3277,9 @@ void expert_ffn_hip(const DeviceExpert* experts, const float* weights, uint32_t 
     const uint32_t threads = 256;
     const uint32_t total = n_experts * inter;
     const uint32_t blocks = (total + threads - 1) / threads;
+    const aff::FastDivU32 inter_fd = aff::make_fast_div_u32(inter);
     hipLaunchKernelGGL(swiglu_all_kernel, dim3(blocks), dim3(threads), 0, st,
-                       scratch, n_experts, inter, swiglu_limit);
+                       scratch, n_experts, inter, inter_fd, swiglu_limit);
     AFF_HIP_CHECK(hipGetLastError());
   }
   std::vector<DeviceMatrix> downs(n_experts);
