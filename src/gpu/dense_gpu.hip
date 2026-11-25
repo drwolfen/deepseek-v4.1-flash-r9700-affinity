@@ -7580,7 +7580,6 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
   if (!b_nb_ || hg < 0 || hu < 0 || hd < 0) return false;
   (void)inter;
   AFF_TRACE(29);
-  if (hidden > b_qr_cap_) return false;
   const Entry& G = ent_[hg]; const Entry& U = ent_[hu]; const Entry& W = ent_[hd];
   if (G.split != Split::Row || U.split != Split::Row || W.split != Split::Col) return false;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
@@ -7709,6 +7708,8 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
       if (!ensure_by(li)) return false;
       float* const tmp = (hidden <= b_qr_cap_) ? D.b_qr :
                          ((hidden <= b_g_cap_) ? D.b_g : D.b_q);
+      if (!tmp) return false;
+      if (tmp == D.b_q && (size_t)hidden * b_nb_ > D.b_q_floats) return false;
       batch_swiglu_hip(D.b_g, yu, D.b_y, li, b_nb_, limit, D.stream);
       batch_gemm_ent(d, hd, D.b_y, tmp, hidden, li);
       batch_hc_add_hip(D.b_block, tmp, hidden * b_nb_, D.stream);
