@@ -9,10 +9,37 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# ON by default because this is a build-from-source project and the CPU kernels are gated on
-# __AVX512F__ — without -march=native they silently fall back to scalar. The resulting binary runs
-# only on CPUs at least as capable as the build host; turn this OFF to produce a portable one.
-option(AFF_NATIVE "Build for the host CPU (-march=native)" ON)
+# Runtime CPU ISA dispatch selects Scalar/AVX1/AVX2/AVX512/AVX512VBMI per kernel, so the
+# baseline binary defaults to AVX1 (`AFF_CPU_ARCH=avx`) for broad x86_64 compatibility without
+# sacrificing peak performance on modern hosts. Set `portable` for baseline SSE2 x86_64 or
+# `native` for `-march=native`.
+option(AFF_NATIVE "Deprecated alias: force AFF_CPU_ARCH=native when ON" OFF)
+set(AFF_CPU_ARCH "avx" CACHE STRING "Baseline CPU ISA: portable (x86-64 SSE2), avx (AVX1), native (-march=native)")
+set_property(CACHE AFF_CPU_ARCH PROPERTY STRINGS portable avx native)
+if(AFF_NATIVE)
+  set(AFF_CPU_ARCH "native")
+endif()
+
+set(AFF_CXX_ARCH_FLAGS "")
+set(AFF_RUST_CPU_FLAG "")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
+  if(AFF_CPU_ARCH STREQUAL "portable")
+    set(AFF_CXX_ARCH_FLAGS -march=x86-64 -mno-avx -mno-avx2 -mno-fma -mno-f16c -mno-avx512f)
+    set(AFF_RUST_CPU_FLAG -C target-cpu=x86-64)
+  elseif(AFF_CPU_ARCH STREQUAL "avx")
+    set(AFF_CXX_ARCH_FLAGS -mavx -mno-avx2 -mno-fma -mno-f16c -mno-avx512f)
+    set(AFF_RUST_CPU_FLAG -C target-feature=+avx)
+  elseif(AFF_CPU_ARCH STREQUAL "native")
+    set(AFF_CXX_ARCH_FLAGS -march=native)
+    set(AFF_RUST_CPU_FLAG -C target-cpu=native)
+  else()
+    message(FATAL_ERROR "Invalid AFF_CPU_ARCH='${AFF_CPU_ARCH}'; expected portable, avx, or native")
+  endif()
+endif()
+foreach(f IN LISTS AFF_CXX_ARCH_FLAGS)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:${f}>)
+endforeach()
+message(STATUS "CPU baseline ISA mode: ${AFF_CPU_ARCH}")
 
 # ---- build stamp ------------------------------------------------------------------------------
 #
@@ -164,6 +191,7 @@ add_library(aff_format STATIC
   src/server/server.cpp
   src/engine/model.cpp
   src/engine/engram.cpp
+  src/engine/cpu_dispatch.cpp
   src/vision/image_decode.cpp
   src/vision/vit.cpp
 )
@@ -171,9 +199,6 @@ target_include_directories(aff_format PUBLIC src src/vision)
 find_package(Threads REQUIRED)
 target_link_libraries(aff_format PUBLIC Threads::Threads aff_ui)
 target_compile_options(aff_format PRIVATE -Wall -Wextra -Wno-unused-parameter)
-if(AFF_NATIVE)
-  target_compile_options(aff_format PRIVATE -march=native)
-endif()
 # Cross-rank/host-device bitwise determinism: never let the compiler fuse multiplies
 # differently between build units.
 target_compile_options(aff_format PRIVATE -ffp-contract=off)
@@ -183,10 +208,6 @@ if(AFF_RUST AND EXISTS "${CMAKE_SOURCE_DIR}/src/rust_accel/lib.rs")
   find_program(AFF_RUSTC rustc HINTS /usr/bin /root/.cargo/bin $ENV{HOME}/.cargo/bin)
   if(AFF_RUSTC)
     set(AFF_RUST_LIB "${CMAKE_BINARY_DIR}/libaff_rust_accel.a")
-    set(AFF_RUST_CPU_FLAG "")
-    if(AFF_NATIVE)
-      set(AFF_RUST_CPU_FLAG -C target-cpu=native)
-    endif()
     add_custom_command(
       OUTPUT "${AFF_RUST_LIB}"
       COMMAND "${AFF_RUSTC}" --edition=2021 --crate-type=staticlib
@@ -281,6 +302,7 @@ if(AFF_HAVE_TESTS)
   aff_cpu_test(test_hadamard_block32 hadamard_block32)
   aff_cpu_test(test_thinking_budget thinking_budget)
   aff_cpu_test(test_suffix_draft suffix_draft)
+  aff_cpu_test(test_cpu_dispatch cpu_dispatch)
 endif()
 
 if(AFF_HIP)

@@ -1,5 +1,6 @@
 #include "engine/engram.h"
 
+#include "engine/cpu_dispatch.h"
 #include "engine/threadpool.h"
 #include "quant/source_dtypes.h"
 
@@ -16,7 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if AFF_CPU_X86
 #include <immintrin.h>
 #endif
 
@@ -336,6 +337,141 @@ void EngramTables::gather(uint32_t layer, const int64_t* ids, float* out) const 
   }
 }
 
+namespace {
+
+void gather_mxfp8_scalar(const uint8_t* mw, const uint8_t* ms, uint64_t mrows, const int64_t* ids,
+                         uint32_t n_cols, uint32_t dim, uint32_t nsc, uint8_t* w_base,
+                         uint8_t* s_base) noexcept {
+#if AFF_CPU_X86
+  constexpr uint32_t kPrefetchAhead = 16u;
+  auto prefetch_col = [&](uint32_t k) {
+    const int64_t pid = ids[k];
+    if (pid >= 0 && (uint64_t)pid < mrows) {
+      const char* pw = reinterpret_cast<const char*>(mw + (size_t)pid * dim);
+      for (uint32_t off = 0; off < dim; off += 64u) _mm_prefetch(pw + off, _MM_HINT_T0);
+      const char* ps = reinterpret_cast<const char*>(ms + (size_t)pid * nsc);
+      for (uint32_t off = 0; off < nsc; off += 64u) _mm_prefetch(ps + off, _MM_HINT_T0);
+    }
+  };
+  const uint32_t prime_n = (kPrefetchAhead < n_cols) ? kPrefetchAhead : n_cols;
+  for (uint32_t k = 0; k < prime_n; ++k) prefetch_col(k);
+#endif
+  for (uint32_t col = 0; col < n_cols; ++col) {
+#if AFF_CPU_X86
+    if (col + kPrefetchAhead < n_cols) prefetch_col(col + kPrefetchAhead);
+#endif
+    uint8_t* const w_dst = w_base + (size_t)col * dim;
+    uint8_t* const s_dst = s_base + (size_t)col * nsc;
+    const int64_t id = ids[col];
+    if (id < 0 || (uint64_t)id >= mrows) {
+      std::memset(w_dst, 0x00, dim);
+      std::memset(s_dst, 0xFF, nsc);
+      continue;
+    }
+    const uint8_t* const w_src = mw + (size_t)id * dim;
+    const uint8_t* const s_src = ms + (size_t)id * nsc;
+    std::memcpy(w_dst, w_src, dim);
+    if (nsc == 8u) {
+      uint64_t sv;
+      std::memcpy(&sv, s_src, 8);
+      std::memcpy(s_dst, &sv, 8);
+    } else {
+      std::memcpy(s_dst, s_src, nsc);
+    }
+  }
+}
+
+#if AFF_CPU_X86
+AFF_TARGET_AVX1 void gather_mxfp8_avx1(const uint8_t* mw, const uint8_t* ms, uint64_t mrows,
+                                       const int64_t* ids, uint32_t n_cols, uint32_t dim,
+                                       uint32_t nsc, uint8_t* w_base, uint8_t* s_base) noexcept {
+  constexpr uint32_t kPrefetchAhead = 16u;
+  auto prefetch_col = [&](uint32_t k) {
+    const int64_t pid = ids[k];
+    if (pid >= 0 && (uint64_t)pid < mrows) {
+      const char* pw = reinterpret_cast<const char*>(mw + (size_t)pid * dim);
+      for (uint32_t off = 0; off < dim; off += 64u) _mm_prefetch(pw + off, _MM_HINT_T0);
+      const char* ps = reinterpret_cast<const char*>(ms + (size_t)pid * nsc);
+      for (uint32_t off = 0; off < nsc; off += 64u) _mm_prefetch(ps + off, _MM_HINT_T0);
+    }
+  };
+  const uint32_t prime_n = (kPrefetchAhead < n_cols) ? kPrefetchAhead : n_cols;
+  for (uint32_t k = 0; k < prime_n; ++k) prefetch_col(k);
+  const __m256 vzero = _mm256_setzero_ps();
+  for (uint32_t col = 0; col < n_cols; ++col) {
+    if (col + kPrefetchAhead < n_cols) prefetch_col(col + kPrefetchAhead);
+    uint8_t* const w_dst = w_base + (size_t)col * dim;
+    uint8_t* const s_dst = s_base + (size_t)col * nsc;
+    const int64_t id = ids[col];
+    if (id < 0 || (uint64_t)id >= mrows) {
+      for (uint32_t off = 0; off < dim; off += 32u)
+        _mm256_storeu_ps(reinterpret_cast<float*>(w_dst + off), vzero);
+      std::memset(s_dst, 0xFF, nsc);
+      continue;
+    }
+    const uint8_t* const w_src = mw + (size_t)id * dim;
+    const uint8_t* const s_src = ms + (size_t)id * nsc;
+    for (uint32_t off = 0; off < dim; off += 32u) {
+      const __m256 v = _mm256_loadu_ps(reinterpret_cast<const float*>(w_src + off));
+      _mm256_storeu_ps(reinterpret_cast<float*>(w_dst + off), v);
+    }
+    if (nsc == 8u) {
+      uint64_t sv;
+      std::memcpy(&sv, s_src, 8);
+      std::memcpy(s_dst, &sv, 8);
+    } else {
+      std::memcpy(s_dst, s_src, nsc);
+    }
+  }
+}
+
+AFF_TARGET_AVX2 void gather_mxfp8_avx2(const uint8_t* mw, const uint8_t* ms, uint64_t mrows,
+                                       const int64_t* ids, uint32_t n_cols, uint32_t dim,
+                                       uint32_t nsc, uint8_t* w_base, uint8_t* s_base) noexcept {
+  constexpr uint32_t kPrefetchAhead = 16u;
+  auto prefetch_col = [&](uint32_t k) {
+    const int64_t pid = ids[k];
+    if (pid >= 0 && (uint64_t)pid < mrows) {
+      const char* pw = reinterpret_cast<const char*>(mw + (size_t)pid * dim);
+      for (uint32_t off = 0; off < dim; off += 64u) _mm_prefetch(pw + off, _MM_HINT_T0);
+      const char* ps = reinterpret_cast<const char*>(ms + (size_t)pid * nsc);
+      for (uint32_t off = 0; off < nsc; off += 64u) _mm_prefetch(ps + off, _MM_HINT_T0);
+    }
+  };
+  const uint32_t prime_n = (kPrefetchAhead < n_cols) ? kPrefetchAhead : n_cols;
+  for (uint32_t k = 0; k < prime_n; ++k) prefetch_col(k);
+  const __m256i vzero = _mm256_setzero_si256();
+  for (uint32_t col = 0; col < n_cols; ++col) {
+    if (col + kPrefetchAhead < n_cols) prefetch_col(col + kPrefetchAhead);
+    uint8_t* const w_dst = w_base + (size_t)col * dim;
+    uint8_t* const s_dst = s_base + (size_t)col * nsc;
+    const int64_t id = ids[col];
+    if (id < 0 || (uint64_t)id >= mrows) {
+      for (uint32_t off = 0; off < dim; off += 32u)
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(w_dst + off), vzero);
+      std::memset(s_dst, 0xFF, nsc);
+      continue;
+    }
+    const uint8_t* const w_src = mw + (size_t)id * dim;
+    const uint8_t* const s_src = ms + (size_t)id * nsc;
+    // 256-bit AVX2 copy only (no 512-bit ZMM instructions) to avoid Skylake-SP License L2 downclock.
+    for (uint32_t off = 0; off < dim; off += 32u) {
+      const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w_src + off));
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(w_dst + off), v);
+    }
+    if (nsc == 8u) {
+      uint64_t sv;
+      std::memcpy(&sv, s_src, 8);
+      std::memcpy(s_dst, &sv, 8);
+    } else {
+      std::memcpy(s_dst, s_src, nsc);
+    }
+  }
+}
+#endif
+
+}  // namespace
+
 void EngramTables::gather_mxfp8(uint32_t layer, const int64_t* ids, uint8_t* dst) const {
   if (!c_ || layer >= m_.size() || !dst || c_->head_dim % 32u != 0u) return;
   const EngramConsts& c = *c_;
@@ -349,59 +485,18 @@ void EngramTables::gather_mxfp8(uint32_t layer, const int64_t* ids, uint8_t* dst
     std::memset(s_base, 0xFF, (size_t)c.n_cols * nsc);
     return;
   }
-#if defined(__x86_64__) || defined(_M_X64)
-  constexpr uint32_t kPrefetchAhead = 16u;
-  auto prefetch_col = [&](uint32_t k) {
-    const int64_t pid = ids[k];
-    if (pid >= 0 && (uint64_t)pid < m.rows) {
-      const char* pw = reinterpret_cast<const char*>(m.w + (size_t)pid * dim);
-      for (uint32_t off = 0; off < dim; off += 64u) _mm_prefetch(pw + off, _MM_HINT_T0);
-      const char* ps = reinterpret_cast<const char*>(m.s + (size_t)pid * nsc);
-      for (uint32_t off = 0; off < nsc; off += 64u) _mm_prefetch(ps + off, _MM_HINT_T0);
-    }
-  };
-  const uint32_t prime_n = std::min(kPrefetchAhead, c.n_cols);
-  for (uint32_t k = 0; k < prime_n; ++k) prefetch_col(k);
-#endif
-#ifdef __AVX2__
-  const __m256i vzero = _mm256_setzero_si256();
-#endif
-  for (uint32_t col = 0; col < c.n_cols; ++col) {
-#if defined(__x86_64__) || defined(_M_X64)
-    if (col + kPrefetchAhead < c.n_cols) prefetch_col(col + kPrefetchAhead);
-#endif
-    uint8_t* const w_dst = w_base + (size_t)col * dim;
-    uint8_t* const s_dst = s_base + (size_t)col * nsc;
-    const int64_t id = ids[col];
-    if (id < 0 || (uint64_t)id >= m.rows) {
-#ifdef __AVX2__
-      for (uint32_t off = 0; off < dim; off += 32u)
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(w_dst + off), vzero);
-#else
-      std::memset(w_dst, 0x00, dim);
-#endif
-      std::memset(s_dst, 0xFF, nsc);
-      continue;
-    }
-    const uint8_t* const w_src = m.w + (size_t)id * dim;
-    const uint8_t* const s_src = m.s + (size_t)id * nsc;
-#ifdef __AVX2__
-    // 256-bit AVX2 copy only (no 512-bit ZMM instructions) to avoid Skylake-SP License L2 downclock.
-    for (uint32_t off = 0; off < dim; off += 32u) {
-      const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w_src + off));
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(w_dst + off), v);
-    }
-#else
-    std::memcpy(w_dst, w_src, dim);
-#endif
-    if (nsc == 8u) {
-      uint64_t sv;
-      std::memcpy(&sv, s_src, 8);
-      std::memcpy(s_dst, &sv, 8);
-    } else {
-      std::memcpy(s_dst, s_src, nsc);
-    }
+#if AFF_CPU_X86
+  const CpuIsa isa = active_cpu_isa();
+  if (isa >= CpuIsa::Avx2) {
+    gather_mxfp8_avx2(m.w, m.s, m.rows, ids, c.n_cols, dim, nsc, w_base, s_base);
+    return;
   }
+  if (isa == CpuIsa::Avx1) {
+    gather_mxfp8_avx1(m.w, m.s, m.rows, ids, c.n_cols, dim, nsc, w_base, s_base);
+    return;
+  }
+#endif
+  gather_mxfp8_scalar(m.w, m.s, m.rows, ids, c.n_cols, dim, nsc, w_base, s_base);
 }
 
 }  // namespace aff

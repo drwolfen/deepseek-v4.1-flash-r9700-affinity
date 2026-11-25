@@ -1,7 +1,8 @@
 #include "ops.h"
+#include "engine/cpu_dispatch.h"
 #include "threadpool.h"
 #include "quant/source_dtypes.h"
-#if defined(__AVX512F__)
+#if AFF_CPU_X86
 #include <immintrin.h>
 #endif
 #include <vector>
@@ -13,7 +14,7 @@
 #include <cstring>
 #include <numeric>
 
-// After <immintrin.h>: the variants are written directly in AVX-512 intrinsics.
+// After <immintrin.h> and "engine/cpu_dispatch.h": variants use runtime-dispatched targets.
 #include "matvec_bf16.inc"
 #include "matvec_fp8.inc"
 

@@ -1,3 +1,4 @@
+#include "engine/cpu_dispatch.h"
 #include "engine/engram.h"
 #include "engine/expert_heat.h"
 #include "engine/expert_kernel.h"
@@ -383,10 +384,10 @@ void test_engram_barrett_and_push_parity() {
 
 void test_expert_kernel_v2_parity() {
   const int saved_var = cpu_kernel_variant();
-#if defined(__AVX512F__) && !defined(__AVX512VBMI__)
-  // Skylake-SP (AVX512F without VBMI) must default to dual-accumulator v2 (2), not v4/v1 fallback.
-  CHECK(saved_var == 2);
-#endif
+  if (active_cpu_isa() == CpuIsa::Avx512) {
+    // Skylake-SP (AVX512F without VBMI) must default to dual-accumulator v2 (2), not v4/v1 fallback.
+    CHECK(saved_var == 2);
+  }
 
   const QuantSpec spec = expert_quant_spec(AFF_Q2P875);
   Codebook cb;

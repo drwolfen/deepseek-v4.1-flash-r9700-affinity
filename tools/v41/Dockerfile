@@ -9,7 +9,7 @@ FROM kyuz0/vllm-therock-gfx1201:rocm7.14.0-torch2.11.0-vllm0.27.1
 ARG SDK=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel
 COPY affinity /opt/affinity-src
 RUN cd /opt/affinity-src \
- && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAFF_HIP=ON -DAFF_GPU_ARCH=gfx1201 -DAFF_NATIVE=ON \
+ && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAFF_HIP=ON -DAFF_GPU_ARCH=gfx1201 -DAFF_CPU_ARCH=avx \
       -DAFF_HIPCC=$SDK/bin/hipcc -DCMAKE_CXX_COMPILER=g++ \
  && cmake --build build -j \
  && ls -l build/affinity build/aff-info build/aff-gpucheck build/aff-quantize \

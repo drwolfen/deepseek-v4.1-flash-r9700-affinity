@@ -35,7 +35,8 @@
 #include <thread>
 #include <utility>
 
-#if defined(__x86_64__)
+#include "engine/cpu_dispatch.h"
+#if AFF_CPU_X86
 #include <immintrin.h>
 #endif
 #ifdef __linux__
@@ -282,64 +283,162 @@ const char* bind_layer_common(const Binder& b, const ModelConfig& cfg, const Mod
 // it moves a row across the selection boundary — and whether it does depends on how contested the
 // selection is. A narrow selection is bit-identical end to end; a wide, contested one does swap
 // rows. So the check that matters is end-to-end continuation agreement, not the scores.
+namespace {
+
+#if AFF_CPU_X86
+AFF_TARGET_AVX1 void indexer_scores_range_avx1(const float* __restrict q,
+                                               const float* __restrict w,
+                                               const float* __restrict K, uint32_t n_head,
+                                               uint32_t head_dim, uint64_t lo, uint64_t hi,
+                                               float* __restrict out) noexcept {
+  const uint32_t nv = head_dim / 8u;
+  const __m128 vzero = _mm_setzero_ps();
+  for (uint64_t c = lo; c < hi; ++c) {
+    const float* __restrict k = K + (size_t)c * head_dim;
+    __m128 acc = _mm_setzero_ps();
+    for (uint32_t h = 0; h < n_head; h += 4u) {
+      const float* q0 = q + (size_t)(h + 0u) * head_dim;
+      const float* q1 = q + (size_t)(h + 1u) * head_dim;
+      const float* q2 = q + (size_t)(h + 2u) * head_dim;
+      const float* q3 = q + (size_t)(h + 3u) * head_dim;
+      __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+      __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+      for (uint32_t v = 0; v < nv; ++v) {
+        const __m256 kv = _mm256_loadu_ps(k + v * 8u);
+        a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_loadu_ps(q0 + v * 8u), kv));
+        a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_loadu_ps(q1 + v * 8u), kv));
+        a2 = _mm256_add_ps(a2, _mm256_mul_ps(_mm256_loadu_ps(q2 + v * 8u), kv));
+        a3 = _mm256_add_ps(a3, _mm256_mul_ps(_mm256_loadu_ps(q3 + v * 8u), kv));
+      }
+      const __m128 s0 = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0, 1));
+      const __m128 s1 = _mm_add_ps(_mm256_castps256_ps128(a1), _mm256_extractf128_ps(a1, 1));
+      const __m128 s2 = _mm_add_ps(_mm256_castps256_ps128(a2), _mm256_extractf128_ps(a2, 1));
+      const __m128 s3 = _mm_add_ps(_mm256_castps256_ps128(a3), _mm256_extractf128_ps(a3, 1));
+      const __m128 t0 = _mm_unpacklo_ps(s0, s1), t1 = _mm_unpackhi_ps(s0, s1);
+      const __m128 t2 = _mm_unpacklo_ps(s2, s3), t3 = _mm_unpackhi_ps(s2, s3);
+      const __m128 d = _mm_add_ps(_mm_add_ps(_mm_movelh_ps(t0, t2), _mm_movehl_ps(t2, t0)),
+                                  _mm_add_ps(_mm_movelh_ps(t1, t3), _mm_movehl_ps(t3, t1)));
+      acc = _mm_add_ps(acc, _mm_mul_ps(_mm_max_ps(d, vzero), _mm_loadu_ps(w + h)));
+    }
+    alignas(16) float lanes[4];
+    _mm_store_ps(lanes, acc);
+    out[c] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+  }
+}
+
+AFF_TARGET_AVX2 void indexer_scores_range_avx2(const float* __restrict q,
+                                               const float* __restrict w,
+                                               const float* __restrict K, uint32_t n_head,
+                                               uint32_t head_dim, uint64_t lo, uint64_t hi,
+                                               float* __restrict out) noexcept {
+  const uint32_t nv = head_dim / 8u;
+  const __m128 vzero = _mm_setzero_ps();
+  for (uint64_t c = lo; c < hi; ++c) {
+    const float* __restrict k = K + (size_t)c * head_dim;
+    __m128 acc = _mm_setzero_ps();
+    for (uint32_t h = 0; h < n_head; h += 4u) {
+      const float* q0 = q + (size_t)(h + 0u) * head_dim;
+      const float* q1 = q + (size_t)(h + 1u) * head_dim;
+      const float* q2 = q + (size_t)(h + 2u) * head_dim;
+      const float* q3 = q + (size_t)(h + 3u) * head_dim;
+      __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+      __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+      for (uint32_t v = 0; v < nv; ++v) {
+        const __m256 kv = _mm256_loadu_ps(k + v * 8u);
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + v * 8u), kv, a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + v * 8u), kv, a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(q2 + v * 8u), kv, a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(q3 + v * 8u), kv, a3);
+      }
+      const __m128 s0 = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0, 1));
+      const __m128 s1 = _mm_add_ps(_mm256_castps256_ps128(a1), _mm256_extractf128_ps(a1, 1));
+      const __m128 s2 = _mm_add_ps(_mm256_castps256_ps128(a2), _mm256_extractf128_ps(a2, 1));
+      const __m128 s3 = _mm_add_ps(_mm256_castps256_ps128(a3), _mm256_extractf128_ps(a3, 1));
+      const __m128 t0 = _mm_unpacklo_ps(s0, s1), t1 = _mm_unpackhi_ps(s0, s1);
+      const __m128 t2 = _mm_unpacklo_ps(s2, s3), t3 = _mm_unpackhi_ps(s2, s3);
+      const __m128 d = _mm_add_ps(_mm_add_ps(_mm_movelh_ps(t0, t2), _mm_movehl_ps(t2, t0)),
+                                  _mm_add_ps(_mm_movelh_ps(t1, t3), _mm_movehl_ps(t3, t1)));
+      acc = _mm_add_ps(acc, _mm_mul_ps(_mm_max_ps(d, vzero), _mm_loadu_ps(w + h)));
+    }
+    alignas(16) float lanes[4];
+    _mm_store_ps(lanes, acc);
+    out[c] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+  }
+}
+
+AFF_TARGET_AVX512 void indexer_scores_range_avx512(const float* __restrict q,
+                                                   const float* __restrict w,
+                                                   const float* __restrict K, uint32_t n_head,
+                                                   uint32_t head_dim, uint64_t lo, uint64_t hi,
+                                                   float* __restrict out) noexcept {
+  const uint32_t nv = head_dim / 16u;
+  const __m128 vzero = _mm_setzero_ps();
+  for (uint64_t c = lo; c < hi; ++c) {
+    const float* __restrict k = K + (size_t)c * head_dim;
+    __m128 acc = _mm_setzero_ps();
+    for (uint32_t h = 0; h < n_head; h += 4u) {
+      const float* q0 = q + (size_t)(h + 0u) * head_dim;
+      const float* q1 = q + (size_t)(h + 1u) * head_dim;
+      const float* q2 = q + (size_t)(h + 2u) * head_dim;
+      const float* q3 = q + (size_t)(h + 3u) * head_dim;
+      __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+      __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+      for (uint32_t v = 0; v < nv; ++v) {
+        const __m512 kv = _mm512_loadu_ps(k + v * 16u);
+        a0 = _mm512_fmadd_ps(_mm512_loadu_ps(q0 + v * 16u), kv, a0);
+        a1 = _mm512_fmadd_ps(_mm512_loadu_ps(q1 + v * 16u), kv, a1);
+        a2 = _mm512_fmadd_ps(_mm512_loadu_ps(q2 + v * 16u), kv, a2);
+        a3 = _mm512_fmadd_ps(_mm512_loadu_ps(q3 + v * 16u), kv, a3);
+      }
+      const __m128 s0 = _mm_add_ps(_mm_add_ps(_mm512_extractf32x4_ps(a0, 0),
+                                              _mm512_extractf32x4_ps(a0, 1)),
+                                   _mm_add_ps(_mm512_extractf32x4_ps(a0, 2),
+                                              _mm512_extractf32x4_ps(a0, 3)));
+      const __m128 s1 = _mm_add_ps(_mm_add_ps(_mm512_extractf32x4_ps(a1, 0),
+                                              _mm512_extractf32x4_ps(a1, 1)),
+                                   _mm_add_ps(_mm512_extractf32x4_ps(a1, 2),
+                                              _mm512_extractf32x4_ps(a1, 3)));
+      const __m128 s2 = _mm_add_ps(_mm_add_ps(_mm512_extractf32x4_ps(a2, 0),
+                                              _mm512_extractf32x4_ps(a2, 1)),
+                                   _mm_add_ps(_mm512_extractf32x4_ps(a2, 2),
+                                              _mm512_extractf32x4_ps(a2, 3)));
+      const __m128 s3 = _mm_add_ps(_mm_add_ps(_mm512_extractf32x4_ps(a3, 0),
+                                              _mm512_extractf32x4_ps(a3, 1)),
+                                   _mm_add_ps(_mm512_extractf32x4_ps(a3, 2),
+                                              _mm512_extractf32x4_ps(a3, 3)));
+      const __m128 t0 = _mm_unpacklo_ps(s0, s1), t1 = _mm_unpackhi_ps(s0, s1);
+      const __m128 t2 = _mm_unpacklo_ps(s2, s3), t3 = _mm_unpackhi_ps(s2, s3);
+      const __m128 d = _mm_add_ps(_mm_add_ps(_mm_movelh_ps(t0, t2), _mm_movehl_ps(t2, t0)),
+                                  _mm_add_ps(_mm_movelh_ps(t1, t3), _mm_movehl_ps(t3, t1)));
+      acc = _mm_add_ps(acc, _mm_mul_ps(_mm_max_ps(d, vzero), _mm_loadu_ps(w + h)));
+    }
+    alignas(16) float lanes[4];
+    _mm_store_ps(lanes, acc);
+    out[c] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+  }
+}
+#endif
+
+}  // namespace
+
 inline void indexer_scores(const float* __restrict q, const float* __restrict w,
                            const float* __restrict K, uint32_t n_head, uint32_t head_dim,
                            uint32_t n, float* __restrict out) {
-#if defined(__AVX512F__)
-  if ((head_dim % 16) == 0 && (n_head % 4) == 0) {
-    // A row is n_head*head_dim/16 = 512 FMAs here, so a few dozen rows already outweigh what a
-    // parallel region costs to open and close; below that it runs serially. The caller only reaches
-    // this once n_comp passes index_topk, so a short-context token pays nothing here.
+#if AFF_CPU_X86
+  const CpuIsa isa = active_cpu_isa();
+  using RangeFn = void (*)(const float*, const float*, const float*, uint32_t, uint32_t,
+                           uint64_t, uint64_t, float*) noexcept;
+  RangeFn fn = nullptr;
+  if (isa >= CpuIsa::Avx512 && (head_dim % 16u) == 0u && (n_head % 4u) == 0u) {
+    fn = &indexer_scores_range_avx512;
+  } else if (isa == CpuIsa::Avx2 && (head_dim % 8u) == 0u && (n_head % 4u) == 0u) {
+    fn = &indexer_scores_range_avx2;
+  } else if (isa >= CpuIsa::Avx1 && (head_dim % 8u) == 0u && (n_head % 4u) == 0u) {
+    fn = &indexer_scores_range_avx1;
+  }
+  if (fn) {
     parallel_for(n, 64, [&](uint64_t lo, uint64_t hi) {
-      const uint32_t nv = head_dim / 16;
-      for (uint64_t c = lo; c < hi; ++c) {
-        const float* __restrict k = K + (size_t)c * head_dim;
-        __m128 acc = _mm_setzero_ps();
-        for (uint32_t h = 0; h < n_head; h += 4) {
-          const float* q0 = q + (size_t)(h + 0) * head_dim;
-          const float* q1 = q + (size_t)(h + 1) * head_dim;
-          const float* q2 = q + (size_t)(h + 2) * head_dim;
-          const float* q3 = q + (size_t)(h + 3) * head_dim;
-          __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
-          __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
-          for (uint32_t v = 0; v < nv; ++v) {
-            const __m512 kv = _mm512_loadu_ps(k + v * 16);
-            a0 = _mm512_fmadd_ps(_mm512_loadu_ps(q0 + v * 16), kv, a0);
-            a1 = _mm512_fmadd_ps(_mm512_loadu_ps(q1 + v * 16), kv, a1);
-            a2 = _mm512_fmadd_ps(_mm512_loadu_ps(q2 + v * 16), kv, a2);
-            a3 = _mm512_fmadd_ps(_mm512_loadu_ps(q3 + v * 16), kv, a3);
-          }
-          // Four lane-sums into lanes 0..3 of one vector: pairwise adds down to 128-bit lanes,
-          // then a 4x4 transpose of what is left.
-          const __m128 s0 = _mm_add_ps(_mm_add_ps(_mm512_extractf32x4_ps(a0, 0),
-                                                  _mm512_extractf32x4_ps(a0, 1)),
-                                       _mm_add_ps(_mm512_extractf32x4_ps(a0, 2),
-                                                  _mm512_extractf32x4_ps(a0, 3)));
-          const __m128 s1 = _mm_add_ps(_mm_add_ps(_mm512_extractf32x4_ps(a1, 0),
-                                                  _mm512_extractf32x4_ps(a1, 1)),
-                                       _mm_add_ps(_mm512_extractf32x4_ps(a1, 2),
-                                                  _mm512_extractf32x4_ps(a1, 3)));
-          const __m128 s2 = _mm_add_ps(_mm_add_ps(_mm512_extractf32x4_ps(a2, 0),
-                                                  _mm512_extractf32x4_ps(a2, 1)),
-                                       _mm_add_ps(_mm512_extractf32x4_ps(a2, 2),
-                                                  _mm512_extractf32x4_ps(a2, 3)));
-          const __m128 s3 = _mm_add_ps(_mm_add_ps(_mm512_extractf32x4_ps(a3, 0),
-                                                  _mm512_extractf32x4_ps(a3, 1)),
-                                       _mm_add_ps(_mm512_extractf32x4_ps(a3, 2),
-                                                  _mm512_extractf32x4_ps(a3, 3)));
-          __m128 t0 = _mm_unpacklo_ps(s0, s1), t1 = _mm_unpackhi_ps(s0, s1);
-          __m128 t2 = _mm_unpacklo_ps(s2, s3), t3 = _mm_unpackhi_ps(s2, s3);
-          const __m128 d = _mm_add_ps(_mm_add_ps(_mm_movelh_ps(t0, t2), _mm_movehl_ps(t2, t0)),
-                                      _mm_add_ps(_mm_movelh_ps(t1, t3), _mm_movehl_ps(t3, t1)));
-          // relu, then weight. max() rather than a branch: the scalar version took 64 data-dependent
-          // and thoroughly unpredictable branches per row, which was its own cost on top of the
-          // arithmetic. Adding an exact zero for a rejected head is the same sum.
-          acc = _mm_add_ps(acc, _mm_mul_ps(_mm_max_ps(d, _mm_setzero_ps()), _mm_loadu_ps(w + h)));
-        }
-        alignas(16) float lanes[4];
-        _mm_store_ps(lanes, acc);
-        out[c] = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
-      }
+      fn(q, w, K, n_head, head_dim, lo, hi, out);
     });
     return;
   }

@@ -1,8 +1,11 @@
 #include "vit.h"
+#include "engine/cpu_dispatch.h"
 #include "engine/threadpool.h"
 #include "quant/source_dtypes.h"
 
+#if AFF_CPU_X86
 #include <immintrin.h>
+#endif
 
 #include <cmath>
 #include <cstring>
@@ -23,7 +26,42 @@ static inline float gelu(float x) {
   return 0.5f * x * (1.0f + std::erff(x * 0.7071067811865475f));
 }
 
-static inline float dot_f32(const float* a, const float* b, uint32_t n) {
+static float dot_f32_scalar(const float* a, const float* b, uint32_t n) noexcept {
+  float s = 0.0f;
+  for (uint32_t i = 0; i < n; ++i) s += a[i] * b[i];
+  return s;
+}
+
+#if AFF_CPU_X86
+AFF_TARGET_AVX1 static float dot_f32_avx1(const float* a, const float* b, uint32_t n) noexcept {
+  __m256 acc = _mm256_setzero_ps();
+  uint32_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+  }
+  const __m128 h4 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+  const __m128 h2 = _mm_add_ps(h4, _mm_movehl_ps(h4, h4));
+  const __m128 h1 = _mm_add_ss(h2, _mm_shuffle_ps(h2, h2, 1));
+  float s = _mm_cvtss_f32(h1);
+  for (; i < n; ++i) s += a[i] * b[i];
+  return s;
+}
+
+AFF_TARGET_AVX2 static float dot_f32_avx2(const float* a, const float* b, uint32_t n) noexcept {
+  __m256 acc = _mm256_setzero_ps();
+  uint32_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+  }
+  const __m128 h4 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+  const __m128 h2 = _mm_add_ps(h4, _mm_movehl_ps(h4, h4));
+  const __m128 h1 = _mm_add_ss(h2, _mm_shuffle_ps(h2, h2, 1));
+  float s = _mm_cvtss_f32(h1);
+  for (; i < n; ++i) s += a[i] * b[i];
+  return s;
+}
+
+AFF_TARGET_AVX512 static float dot_f32_avx512(const float* a, const float* b, uint32_t n) noexcept {
   __m512 acc = _mm512_setzero_ps();
   uint32_t i = 0;
   for (; i + 16 <= n; i += 16)
@@ -32,44 +70,237 @@ static inline float dot_f32(const float* a, const float* b, uint32_t n) {
   for (; i < n; ++i) s += a[i] * b[i];
   return s;
 }
+#endif
+
+static inline float (*pick_dot_f32() noexcept)(const float*, const float*, uint32_t) noexcept {
+#if AFF_CPU_X86
+  const CpuIsa isa = active_cpu_isa();
+  if (isa >= CpuIsa::Avx512) return &dot_f32_avx512;
+  if (isa == CpuIsa::Avx2)   return &dot_f32_avx2;
+  if (isa == CpuIsa::Avx1)   return &dot_f32_avx1;
+#endif
+  return &dot_f32_scalar;
+}
+
+static void gemm_nt_range_scalar(const uint16_t* W, const float* X, uint32_t N, uint32_t R,
+                                 uint32_t C, float* out, uint64_t rb0, uint64_t rb1) noexcept {
+  constexpr uint32_t RB = 8;
+  for (uint64_t rb = rb0; rb < rb1; ++rb) {
+    const uint32_t r0 = (uint32_t)rb * RB;
+    const uint32_t nr = (R - r0 < RB) ? (R - r0) : RB;
+    for (uint32_t k = 0; k < N; ++k) {
+      const float* xk = X + (size_t)k * C;
+      float acc[RB];
+      for (uint32_t r = 0; r < nr; ++r) acc[r] = 0.0f;
+      for (uint32_t c = 0; c < C; ++c) {
+        const float xv = xk[c];
+        for (uint32_t r = 0; r < nr; ++r) {
+          acc[r] += bf16_to_float(W[(size_t)(r0 + r) * C + c]) * xv;
+        }
+      }
+      float* ok = out + (size_t)k * R + r0;
+      for (uint32_t r = 0; r < nr; ++r) ok[r] = acc[r];
+    }
+  }
+}
+
+#if AFF_CPU_X86
+AFF_TARGET_AVX1 static void gemm_nt_range_avx1(const uint16_t* W, const float* X, uint32_t N,
+                                               uint32_t R, uint32_t C, float* out, uint64_t rb0,
+                                               uint64_t rb1) noexcept {
+  constexpr uint32_t RB = 8;
+  const __m128i zero = _mm_setzero_si128();
+  for (uint64_t rb = rb0; rb < rb1; ++rb) {
+    const uint32_t r0 = (uint32_t)rb * RB;
+    const uint32_t nr = (R - r0 < RB) ? (R - r0) : RB;
+    __m256 acc[RB];
+    for (uint32_t k = 0; k < N; ++k) {
+      const float* xk = X + (size_t)k * C;
+      for (uint32_t r = 0; r < nr; ++r) acc[r] = _mm256_setzero_ps();
+      uint32_t c = 0;
+      for (; c + 8 <= C; c += 8) {
+        const __m256 xv = _mm256_loadu_ps(xk + c);
+        for (uint32_t r = 0; r < nr; ++r) {
+          const uint16_t* wr = W + (size_t)(r0 + r) * C + c;
+          const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(wr));
+          const __m128 lo = _mm_castsi128_ps(_mm_unpacklo_epi16(zero, h));
+          const __m128 hi = _mm_castsi128_ps(_mm_unpackhi_epi16(zero, h));
+          const __m256 wv = _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
+          acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(wv, xv));
+        }
+      }
+      float* ok = out + (size_t)k * R + r0;
+      for (uint32_t r = 0; r < nr; ++r) {
+        const __m128 h4 = _mm_add_ps(_mm256_castps256_ps128(acc[r]),
+                                     _mm256_extractf128_ps(acc[r], 1));
+        const __m128 h2 = _mm_add_ps(h4, _mm_movehl_ps(h4, h4));
+        const __m128 h1 = _mm_add_ss(h2, _mm_shuffle_ps(h2, h2, 1));
+        float s = _mm_cvtss_f32(h1);
+        const uint16_t* wr = W + (size_t)(r0 + r) * C;
+        for (uint32_t cc = c; cc < C; ++cc) s += bf16_to_float(wr[cc]) * xk[cc];
+        ok[r] = s;
+      }
+    }
+  }
+}
+
+AFF_TARGET_AVX2 static void gemm_nt_range_avx2(const uint16_t* W, const float* X, uint32_t N,
+                                               uint32_t R, uint32_t C, float* out, uint64_t rb0,
+                                               uint64_t rb1) noexcept {
+  constexpr uint32_t RB = 8;
+  for (uint64_t rb = rb0; rb < rb1; ++rb) {
+    const uint32_t r0 = (uint32_t)rb * RB;
+    const uint32_t nr = (R - r0 < RB) ? (R - r0) : RB;
+    __m256 acc[RB];
+    for (uint32_t k = 0; k < N; ++k) {
+      const float* xk = X + (size_t)k * C;
+      for (uint32_t r = 0; r < nr; ++r) acc[r] = _mm256_setzero_ps();
+      uint32_t c = 0;
+      for (; c + 8 <= C; c += 8) {
+        const __m256 xv = _mm256_loadu_ps(xk + c);
+        for (uint32_t r = 0; r < nr; ++r) {
+          const uint16_t* wr = W + (size_t)(r0 + r) * C + c;
+          const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(wr));
+          const __m256 wv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+          acc[r] = _mm256_fmadd_ps(wv, xv, acc[r]);
+        }
+      }
+      float* ok = out + (size_t)k * R + r0;
+      for (uint32_t r = 0; r < nr; ++r) {
+        const __m128 h4 = _mm_add_ps(_mm256_castps256_ps128(acc[r]),
+                                     _mm256_extractf128_ps(acc[r], 1));
+        const __m128 h2 = _mm_add_ps(h4, _mm_movehl_ps(h4, h4));
+        const __m128 h1 = _mm_add_ss(h2, _mm_shuffle_ps(h2, h2, 1));
+        float s = _mm_cvtss_f32(h1);
+        const uint16_t* wr = W + (size_t)(r0 + r) * C;
+        for (uint32_t cc = c; cc < C; ++cc) s += bf16_to_float(wr[cc]) * xk[cc];
+        ok[r] = s;
+      }
+    }
+  }
+}
+
+AFF_TARGET_AVX512 static void gemm_nt_range_avx512(const uint16_t* W, const float* X, uint32_t N,
+                                                   uint32_t R, uint32_t C, float* out, uint64_t rb0,
+                                                   uint64_t rb1) noexcept {
+  constexpr uint32_t RB = 8;
+  for (uint64_t rb = rb0; rb < rb1; ++rb) {
+    const uint32_t r0 = (uint32_t)rb * RB;
+    const uint32_t nr = (R - r0 < RB) ? (R - r0) : RB;
+    __m512 acc[RB];
+    for (uint32_t k = 0; k < N; ++k) {
+      const float* xk = X + (size_t)k * C;
+      for (uint32_t r = 0; r < nr; ++r) acc[r] = _mm512_setzero_ps();
+      uint32_t c = 0;
+      for (; c + 16 <= C; c += 16) {
+        const __m512 xv = _mm512_loadu_ps(xk + c);
+        for (uint32_t r = 0; r < nr; ++r) {
+          const uint16_t* wr = W + (size_t)(r0 + r) * C + c;
+          const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wr));
+          const __m512 wv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
+          acc[r] = _mm512_fmadd_ps(wv, xv, acc[r]);
+        }
+      }
+      float* ok = out + (size_t)k * R + r0;
+      for (uint32_t r = 0; r < nr; ++r) {
+        float s = _mm512_reduce_add_ps(acc[r]);
+        const uint16_t* wr = W + (size_t)(r0 + r) * C;
+        for (uint32_t cc = c; cc < C; ++cc) s += bf16_to_float(wr[cc]) * xk[cc];
+        ok[r] = s;
+      }
+    }
+  }
+}
+#endif
 
 // out[k*R + r] = dot(W_row_r, X_row_k); W is [R,C] bf16, X is [N,C] f32, out is [N,R] f32.
-//
-// Weight-stationary and row-blocked: a block of RB weight rows is streamed through L1 and reused
-// across every token, so W is read from DRAM once. The per-token matvec this replaces read every
-// weight row once PER TOKEN, which bounds the whole ViT on weight bandwidth for a large image.
 static void gemm_nt(const uint16_t* W, const float* X, uint32_t N, uint32_t R, uint32_t C,
                     float* out) {
   constexpr uint32_t RB = 8;
   const uint32_t nrb = (R + RB - 1) / RB;
+  using RangeFn = void (*)(const uint16_t*, const float*, uint32_t, uint32_t, uint32_t, float*,
+                           uint64_t, uint64_t) noexcept;
+  RangeFn fn = &gemm_nt_range_scalar;
+#if AFF_CPU_X86
+  const CpuIsa isa = active_cpu_isa();
+  if (isa >= CpuIsa::Avx512) fn = &gemm_nt_range_avx512;
+  else if (isa == CpuIsa::Avx2) fn = &gemm_nt_range_avx2;
+  else if (isa == CpuIsa::Avx1) fn = &gemm_nt_range_avx1;
+#endif
   parallel_for(nrb, 1, [&](uint64_t rb0, uint64_t rb1) {
-    for (uint64_t rb = rb0; rb < rb1; ++rb) {
-      const uint32_t r0 = (uint32_t)rb * RB;
-      const uint32_t nr = std::min<uint32_t>(RB, R - r0);
-      __m512 acc[RB];
-      for (uint32_t k = 0; k < N; ++k) {
-        const float* xk = X + (size_t)k * C;
-        for (uint32_t r = 0; r < nr; ++r) acc[r] = _mm512_setzero_ps();
-        uint32_t c = 0;
-        for (; c + 16 <= C; c += 16) {
-          const __m512 xv = _mm512_loadu_ps(xk + c);
-          for (uint32_t r = 0; r < nr; ++r) {
-            const uint16_t* wr = W + (size_t)(r0 + r) * C + c;
-            const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wr));
-            const __m512 wv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
-            acc[r] = _mm512_fmadd_ps(wv, xv, acc[r]);
-          }
-        }
-        float* ok = out + (size_t)k * R + r0;
-        for (uint32_t r = 0; r < nr; ++r) {
-          float s = _mm512_reduce_add_ps(acc[r]);
-          const uint16_t* wr = W + (size_t)(r0 + r) * C;
-          for (uint32_t cc = c; cc < C; ++cc) s += bf16_val(wr[cc]) * xk[cc];
-          ok[r] = s;
-        }
-      }
-    }
+    fn(W, X, N, R, C, out, rb0, rb1);
   });
+}
+
+static void weighted_v_accum_scalar(const float* row, float inv_sum, const float* V_base,
+                                    uint32_t D, uint32_t N, uint32_t HD, float* ao) noexcept {
+  for (uint32_t j = 0; j < N; ++j) {
+    const float p = row[j] * inv_sum;
+    const float* vj = V_base + (size_t)j * D;
+    for (uint32_t c = 0; c < HD; ++c) ao[c] += p * vj[c];
+  }
+}
+
+#if AFF_CPU_X86
+AFF_TARGET_AVX1 static void weighted_v_accum_avx1(const float* row, float inv_sum,
+                                                  const float* V_base, uint32_t D, uint32_t N,
+                                                  uint32_t HD, float* ao) noexcept {
+  for (uint32_t j = 0; j < N; ++j) {
+    const float ps = row[j] * inv_sum;
+    const __m256 pv = _mm256_broadcast_ss(&ps);
+    const float* vj = V_base + (size_t)j * D;
+    uint32_t c = 0;
+    for (; c + 8 <= HD; c += 8) {
+      const __m256 a = _mm256_add_ps(_mm256_loadu_ps(ao + c), _mm256_mul_ps(pv, _mm256_loadu_ps(vj + c)));
+      _mm256_storeu_ps(ao + c, a);
+    }
+    for (; c < HD; ++c) ao[c] += ps * vj[c];
+  }
+}
+
+AFF_TARGET_AVX2 static void weighted_v_accum_avx2(const float* row, float inv_sum,
+                                                  const float* V_base, uint32_t D, uint32_t N,
+                                                  uint32_t HD, float* ao) noexcept {
+  for (uint32_t j = 0; j < N; ++j) {
+    const float ps = row[j] * inv_sum;
+    const __m256 pv = _mm256_set1_ps(ps);
+    const float* vj = V_base + (size_t)j * D;
+    uint32_t c = 0;
+    for (; c + 8 <= HD; c += 8) {
+      const __m256 a = _mm256_fmadd_ps(pv, _mm256_loadu_ps(vj + c), _mm256_loadu_ps(ao + c));
+      _mm256_storeu_ps(ao + c, a);
+    }
+    for (; c < HD; ++c) ao[c] += ps * vj[c];
+  }
+}
+
+AFF_TARGET_AVX512 static void weighted_v_accum_avx512(const float* row, float inv_sum,
+                                                      const float* V_base, uint32_t D, uint32_t N,
+                                                      uint32_t HD, float* ao) noexcept {
+  for (uint32_t j = 0; j < N; ++j) {
+    const float ps = row[j] * inv_sum;
+    const __m512 pv = _mm512_set1_ps(ps);
+    const float* vj = V_base + (size_t)j * D;
+    uint32_t c = 0;
+    for (; c + 16 <= HD; c += 16) {
+      __m512 a = _mm512_loadu_ps(ao + c);
+      a = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + c), a);
+      _mm512_storeu_ps(ao + c, a);
+    }
+    for (; c < HD; ++c) ao[c] += ps * vj[c];
+  }
+}
+#endif
+
+static inline void (*pick_weighted_v_accum() noexcept)(
+    const float*, float, const float*, uint32_t, uint32_t, uint32_t, float*) noexcept {
+#if AFF_CPU_X86
+  const CpuIsa isa = active_cpu_isa();
+  if (isa >= CpuIsa::Avx512) return &weighted_v_accum_avx512;
+  if (isa == CpuIsa::Avx2)   return &weighted_v_accum_avx2;
+  if (isa == CpuIsa::Avx1)   return &weighted_v_accum_avx1;
+#endif
+  return &weighted_v_accum_scalar;
 }
 
 bool ViT::load(const std::string& model_dir, std::string* err) {
@@ -287,6 +518,8 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
     const float attn_scale = 1.0f / std::sqrt((float)HD);
     constexpr uint32_t BQ = 32;
     const uint32_t n_block = (N + BQ - 1) / BQ;
+    const auto dot_fn = pick_dot_f32();
+    const auto vacc_fn = pick_weighted_v_accum();
     // One task per (query-block, head): a grid of BQ x N scores fits L2, and splitting by head as
     // well as block keeps the pool busy at small N (n_block alone is 23 tasks at 729 patches).
     parallel_for((uint64_t)n_block * NH, 1, [&](uint64_t t0, uint64_t t1) {
@@ -301,7 +534,7 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
           const float* kj = K.data() + (size_t)j * D + hoff;
           for (uint32_t r = 0; r < qn; ++r)
             S[(size_t)r * N + j] =
-                dot_f32(Q.data() + (size_t)(qb + r) * D + hoff, kj, HD) * attn_scale;
+                dot_fn(Q.data() + (size_t)(qb + r) * D + hoff, kj, HD) * attn_scale;
         }
         for (uint32_t r = 0; r < qn; ++r) {
           float* row = S.data() + (size_t)r * N;
@@ -312,15 +545,7 @@ bool ViT::forward(const DecodedImage& img, std::vector<float>* out_embeddings,
           const float inv_sum = 1.0f / s;
           float* ao = acc.data() + (size_t)r * HD;
           std::memset(ao, 0, (size_t)HD * sizeof(float));
-          for (uint32_t j = 0; j < N; ++j) {
-            const __m512 pv = _mm512_set1_ps(row[j] * inv_sum);
-            const float* vj = V.data() + (size_t)j * D + hoff;
-            for (uint32_t c = 0; c < HD; c += 16) {
-              __m512 a = _mm512_loadu_ps(ao + c);
-              a = _mm512_fmadd_ps(pv, _mm512_loadu_ps(vj + c), a);
-              _mm512_storeu_ps(ao + c, a);
-            }
-          }
+          vacc_fn(row, inv_sum, V.data() + hoff, D, N, HD, ao);
           std::memcpy(Attn_out.data() + (size_t)(qb + r) * D + hoff, ao,
                       (size_t)HD * sizeof(float));
         }

@@ -15,7 +15,7 @@ RUN cd /opt/affinity-src \
       -DGPU_TARGETS=gfx1201 \
       -DAFF_VERSION=${AFF_VERSION} \
       -DAFF_GIT_SHA=${AFF_GIT_SHA} \
-      -DAFF_NATIVE=ON \
+      -DAFF_CPU_ARCH=avx \
       -DAFF_HIPCC=/opt/rocm/bin/hipcc \
       -DCMAKE_CXX_COMPILER=g++ \
  && cmake --build build -j "$JOBS" \
@@ -49,7 +49,8 @@ RUN cd /opt/affinity-src \
       build/test_wave2_kernels \
       build/test_v41_indexer \
       build/test_engram_split_gate \
-      build/test_v510_kernels
+      build/test_v510_kernels \
+      build/test_cpu_dispatch
 RUN if getent passwd ubuntu >/dev/null; then userdel ubuntu; fi; if getent group ubuntu >/dev/null; then groupdel ubuntu; fi
 WORKDIR /opt
 ENTRYPOINT ["/opt/affinity-src/build/affinity"]

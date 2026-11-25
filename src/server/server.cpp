@@ -17,7 +17,8 @@
 #include <cstring>
 #include <ctime>
 #include <thread>
-#ifdef __AVX2__
+#include "engine/cpu_dispatch.h"
+#if AFF_CPU_X86
 #include <immintrin.h>
 #endif
 
@@ -349,9 +350,9 @@ std::string sanitize_utf8(const std::string& s) {
   return o;
 }
 
-#ifdef __AVX2__
+#if AFF_CPU_X86
 // Scans clean 7-bit ASCII [0x20, 0x7F] excluding '"' and '\\' in 32-byte YMM chunks (no 512-bit ZMM).
-static inline size_t avx2_scan_clean_ascii(const char* p, size_t i, size_t n) {
+AFF_TARGET_AVX2 static size_t scan_clean_ascii_avx2(const char* p, size_t i, size_t n) {
   const __m256i v_1f = _mm256_set1_epi8(0x1F);
   const __m256i v_quote = _mm256_set1_epi8('"');
   const __m256i v_bslash = _mm256_set1_epi8('\\');
@@ -375,18 +376,21 @@ static inline size_t avx2_scan_clean_ascii(const char* p, size_t i, size_t n) {
 std::string json_escape(const std::string& s) {
   const size_t n = s.size();
   size_t i = 0;
-#ifdef __AVX2__
-  i = avx2_scan_clean_ascii(s.data(), 0, n);
-  if (i == n) return s;
+#if AFF_CPU_X86
+  const bool use_avx2 = (active_cpu_isa() >= CpuIsa::Avx2);
+  if (use_avx2) {
+    i = scan_clean_ascii_avx2(s.data(), 0, n);
+    if (i == n) return s;
+  }
 #endif
   std::string o;
   o.reserve(n + 16);
   if (i > 0) o.append(s.data(), i);
   while (i < n) {
-#ifdef __AVX2__
-    if (i + 32 <= n) {
+#if AFF_CPU_X86
+    if (use_avx2 && i + 32 <= n) {
       const size_t start = i;
-      i = avx2_scan_clean_ascii(s.data(), i, n);
+      i = scan_clean_ascii_avx2(s.data(), i, n);
       if (i > start) {
         o.append(s.data() + start, i - start);
         if (i >= n) break;

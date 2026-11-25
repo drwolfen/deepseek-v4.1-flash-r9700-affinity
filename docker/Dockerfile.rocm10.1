@@ -14,7 +14,7 @@ RUN cd /opt/affinity-src \
       -DGPU_TARGETS=gfx1201 \
       -DAFF_VERSION=${AFF_VERSION} \
       -DAFF_GIT_SHA=${AFF_GIT_SHA} \
-      -DAFF_NATIVE=ON \
+      -DAFF_CPU_ARCH=avx \
       -DAFF_HIPCC=/opt/rocm/bin/hipcc \
       -DCMAKE_CXX_COMPILER=g++ \
  && cmake --build build -j "$JOBS" \

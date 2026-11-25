@@ -1,6 +1,7 @@
 #include "blockquant.h"
+#include "engine/cpu_dispatch.h"
 
-#if defined(__AVX512F__)
+#if AFF_CPU_X86
 #include <immintrin.h>
 #endif
 #include "source_dtypes.h"
@@ -100,47 +101,163 @@ inline double code_dist(const float* x, const float* e, uint32_t pair, double wa
 // float, not double: this is an argmin/min over candidates, and the accumulated block error only
 // has to ORDER candidates correctly. The chosen scale and code are identical either way.
 // ---------------------------------------------------------------------------------------------
-#if defined(__AVX512F__)
-struct CbPlanes {                  // per variant: 32 lo values and 32 hi values, as 2x16 lanes
-  __m512 lo0, lo1, hi0, hi1;
+struct CbPlanesData {
+  alignas(64) float lo[32];
+  alignas(64) float hi[32];
 };
 
-inline void build_planes(const Codebook& cb, std::vector<CbPlanes>* out) {
+inline void build_planes_data(const Codebook& cb, std::vector<CbPlanesData>* out) {
   out->resize(cb.variants);
   for (uint32_t v = 0; v < cb.variants; ++v) {
-    alignas(64) float L[32], H[32];
-    for (uint32_t j = 0; j < 32; ++j) { L[j] = cb.entry(v, j)[0]; H[j] = cb.entry(v, j)[1]; }
-    (*out)[v].lo0 = _mm512_load_ps(L);
-    (*out)[v].lo1 = _mm512_load_ps(L + 16);
-    (*out)[v].hi0 = _mm512_load_ps(H);
-    (*out)[v].hi1 = _mm512_load_ps(H + 16);
+    for (uint32_t j = 0; j < 32u; ++j) {
+      (*out)[v].lo[j] = cb.entry(v, j)[0];
+      (*out)[v].hi[j] = cb.entry(v, j)[1];
+    }
   }
 }
 
-// Smallest weighted squared distance from (t0,t1) to any of the 32 entries.
-inline float min_dist_x32(const CbPlanes& p, float t0, float t1, float wa, float wb) {
-  const __m512 v0 = _mm512_set1_ps(t0), v1 = _mm512_set1_ps(t1);
-  const __m512  va = _mm512_set1_ps(wa), vb = _mm512_set1_ps(wb);
-  const __m512 d0 = _mm512_sub_ps(p.lo0, v0), d1 = _mm512_sub_ps(p.lo1, v0);
-  const __m512 e0 = _mm512_sub_ps(p.hi0, v1), e1 = _mm512_sub_ps(p.hi1, v1);
-  const __m512 s0 = _mm512_fmadd_ps(_mm512_mul_ps(d0, d0), va, _mm512_mul_ps(_mm512_mul_ps(e0, e0), vb));
-  const __m512 s1 = _mm512_fmadd_ps(_mm512_mul_ps(d1, d1), va, _mm512_mul_ps(_mm512_mul_ps(e1, e1), vb));
-  return _mm512_reduce_min_ps(_mm512_min_ps(s0, s1));
+static float score_block_x32_scalar(const CbPlanesData& p, const float* blk, uint32_t block_sz,
+                                    uint64_t b, float sg, const float* col_imp) noexcept {
+  double acc = 0.0;
+  for (uint32_t i = 0; i < 8u; ++i) {
+    const float t0 = blk[i * 2u] * sg;
+    const float t1 = blk[i * 2u + 1u] * sg;
+    const uint64_t c0 = b * block_sz + i * 2u;
+    const float wa = col_imp ? col_imp[c0] : 1.0f;
+    const float wb = col_imp ? col_imp[c0 + 1u] : wa;
+    float best = 1e30f;
+    for (uint32_t j = 0; j < 32u; ++j) {
+      const float d = p.lo[j] - t0;
+      const float e = p.hi[j] - t1;
+      const float s = wa * d * d + wb * e * e;
+      if (s < best) best = s;
+    }
+    acc += (double)best;
+  }
+  return (float)acc;
 }
 
-// Same, but returns the winning index — needed once per pair at encode time, not in the search.
-inline uint32_t argmin_x32(const CbPlanes& p, float t0, float t1, float wa, float wb) {
-  const __m512 v0 = _mm512_set1_ps(t0), v1 = _mm512_set1_ps(t1);
-  const __m512 va = _mm512_set1_ps(wa), vb = _mm512_set1_ps(wb);
-  const __m512 d0 = _mm512_sub_ps(p.lo0, v0), d1 = _mm512_sub_ps(p.lo1, v0);
-  const __m512 e0 = _mm512_sub_ps(p.hi0, v1), e1 = _mm512_sub_ps(p.hi1, v1);
-  const __m512 s0 = _mm512_fmadd_ps(_mm512_mul_ps(d0, d0), va, _mm512_mul_ps(_mm512_mul_ps(e0, e0), vb));
-  const __m512 s1 = _mm512_fmadd_ps(_mm512_mul_ps(d1, d1), va, _mm512_mul_ps(_mm512_mul_ps(e1, e1), vb));
-  const float m0 = _mm512_reduce_min_ps(s0), m1 = _mm512_reduce_min_ps(s1);
-  if (m0 <= m1) return (uint32_t)__builtin_ctz(_mm512_cmp_ps_mask(s0, _mm512_set1_ps(m0), _CMP_EQ_OQ));
-  return 16u + (uint32_t)__builtin_ctz(_mm512_cmp_ps_mask(s1, _mm512_set1_ps(m1), _CMP_EQ_OQ));
+#if AFF_CPU_X86
+AFF_TARGET_AVX1 static float score_block_x32_avx1(const CbPlanesData& p, const float* blk,
+                                                  uint32_t block_sz, uint64_t b, float sg,
+                                                  const float* col_imp) noexcept {
+  const __m256 lo0 = _mm256_load_ps(p.lo + 0);
+  const __m256 lo1 = _mm256_load_ps(p.lo + 8);
+  const __m256 lo2 = _mm256_load_ps(p.lo + 16);
+  const __m256 lo3 = _mm256_load_ps(p.lo + 24);
+  const __m256 hi0 = _mm256_load_ps(p.hi + 0);
+  const __m256 hi1 = _mm256_load_ps(p.hi + 8);
+  const __m256 hi2 = _mm256_load_ps(p.hi + 16);
+  const __m256 hi3 = _mm256_load_ps(p.hi + 24);
+  float acc = 0.0f;
+  for (uint32_t i = 0; i < 8u; ++i) {
+    const float t0 = blk[i * 2u] * sg;
+    const float t1 = blk[i * 2u + 1u] * sg;
+    const uint64_t c0 = b * block_sz + i * 2u;
+    const float wa = col_imp ? col_imp[c0] : 1.0f;
+    const float wb = col_imp ? col_imp[c0 + 1u] : wa;
+    const __m256 v0 = _mm256_broadcast_ss(&t0), v1 = _mm256_broadcast_ss(&t1);
+    const __m256 va = _mm256_broadcast_ss(&wa), vb = _mm256_broadcast_ss(&wb);
+    const __m256 d0 = _mm256_sub_ps(lo0, v0), e0 = _mm256_sub_ps(hi0, v1);
+    const __m256 d1 = _mm256_sub_ps(lo1, v0), e1 = _mm256_sub_ps(hi1, v1);
+    const __m256 d2 = _mm256_sub_ps(lo2, v0), e2 = _mm256_sub_ps(hi2, v1);
+    const __m256 d3 = _mm256_sub_ps(lo3, v0), e3 = _mm256_sub_ps(hi3, v1);
+    const __m256 s0 = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(d0, d0), va),
+                                    _mm256_mul_ps(_mm256_mul_ps(e0, e0), vb));
+    const __m256 s1 = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(d1, d1), va),
+                                    _mm256_mul_ps(_mm256_mul_ps(e1, e1), vb));
+    const __m256 s2 = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(d2, d2), va),
+                                    _mm256_mul_ps(_mm256_mul_ps(e2, e2), vb));
+    const __m256 s3 = _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(d3, d3), va),
+                                    _mm256_mul_ps(_mm256_mul_ps(e3, e3), vb));
+    const __m256 m8 = _mm256_min_ps(_mm256_min_ps(s0, s1), _mm256_min_ps(s2, s3));
+    const __m128 m4 = _mm_min_ps(_mm256_castps256_ps128(m8), _mm256_extractf128_ps(m8, 1));
+    const __m128 m2 = _mm_min_ps(m4, _mm_movehl_ps(m4, m4));
+    const __m128 m1 = _mm_min_ss(m2, _mm_shuffle_ps(m2, m2, 1));
+    acc += _mm_cvtss_f32(m1);
+  }
+  return acc;
+}
+
+AFF_TARGET_AVX2 static float score_block_x32_avx2(const CbPlanesData& p, const float* blk,
+                                                  uint32_t block_sz, uint64_t b, float sg,
+                                                  const float* col_imp) noexcept {
+  const __m256 lo0 = _mm256_load_ps(p.lo + 0);
+  const __m256 lo1 = _mm256_load_ps(p.lo + 8);
+  const __m256 lo2 = _mm256_load_ps(p.lo + 16);
+  const __m256 lo3 = _mm256_load_ps(p.lo + 24);
+  const __m256 hi0 = _mm256_load_ps(p.hi + 0);
+  const __m256 hi1 = _mm256_load_ps(p.hi + 8);
+  const __m256 hi2 = _mm256_load_ps(p.hi + 16);
+  const __m256 hi3 = _mm256_load_ps(p.hi + 24);
+  float acc = 0.0f;
+  for (uint32_t i = 0; i < 8u; ++i) {
+    const float t0 = blk[i * 2u] * sg;
+    const float t1 = blk[i * 2u + 1u] * sg;
+    const uint64_t c0 = b * block_sz + i * 2u;
+    const float wa = col_imp ? col_imp[c0] : 1.0f;
+    const float wb = col_imp ? col_imp[c0 + 1u] : wa;
+    const __m256 v0 = _mm256_set1_ps(t0), v1 = _mm256_set1_ps(t1);
+    const __m256 va = _mm256_set1_ps(wa), vb = _mm256_set1_ps(wb);
+    const __m256 d0 = _mm256_sub_ps(lo0, v0), e0 = _mm256_sub_ps(hi0, v1);
+    const __m256 d1 = _mm256_sub_ps(lo1, v0), e1 = _mm256_sub_ps(hi1, v1);
+    const __m256 d2 = _mm256_sub_ps(lo2, v0), e2 = _mm256_sub_ps(hi2, v1);
+    const __m256 d3 = _mm256_sub_ps(lo3, v0), e3 = _mm256_sub_ps(hi3, v1);
+    const __m256 s0 = _mm256_fmadd_ps(_mm256_mul_ps(d0, d0), va,
+                                      _mm256_mul_ps(_mm256_mul_ps(e0, e0), vb));
+    const __m256 s1 = _mm256_fmadd_ps(_mm256_mul_ps(d1, d1), va,
+                                      _mm256_mul_ps(_mm256_mul_ps(e1, e1), vb));
+    const __m256 s2 = _mm256_fmadd_ps(_mm256_mul_ps(d2, d2), va,
+                                      _mm256_mul_ps(_mm256_mul_ps(e2, e2), vb));
+    const __m256 s3 = _mm256_fmadd_ps(_mm256_mul_ps(d3, d3), va,
+                                      _mm256_mul_ps(_mm256_mul_ps(e3, e3), vb));
+    const __m256 m8 = _mm256_min_ps(_mm256_min_ps(s0, s1), _mm256_min_ps(s2, s3));
+    const __m128 m4 = _mm_min_ps(_mm256_castps256_ps128(m8), _mm256_extractf128_ps(m8, 1));
+    const __m128 m2 = _mm_min_ps(m4, _mm_movehl_ps(m4, m4));
+    const __m128 m1 = _mm_min_ss(m2, _mm_shuffle_ps(m2, m2, 1));
+    acc += _mm_cvtss_f32(m1);
+  }
+  return acc;
+}
+
+AFF_TARGET_AVX512 static float score_block_x32_avx512(const CbPlanesData& p, const float* blk,
+                                                      uint32_t block_sz, uint64_t b, float sg,
+                                                      const float* col_imp) noexcept {
+  const __m512 lo0 = _mm512_load_ps(p.lo);
+  const __m512 lo1 = _mm512_load_ps(p.lo + 16);
+  const __m512 hi0 = _mm512_load_ps(p.hi);
+  const __m512 hi1 = _mm512_load_ps(p.hi + 16);
+  float acc = 0.0f;
+  for (uint32_t i = 0; i < 8u; ++i) {
+    const float t0 = blk[i * 2u] * sg;
+    const float t1 = blk[i * 2u + 1u] * sg;
+    const uint64_t c0 = b * block_sz + i * 2u;
+    const float wa = col_imp ? col_imp[c0] : 1.0f;
+    const float wb = col_imp ? col_imp[c0 + 1u] : wa;
+    const __m512 v0 = _mm512_set1_ps(t0), v1 = _mm512_set1_ps(t1);
+    const __m512 va = _mm512_set1_ps(wa), vb = _mm512_set1_ps(wb);
+    const __m512 d0 = _mm512_sub_ps(lo0, v0), d1 = _mm512_sub_ps(lo1, v0);
+    const __m512 e0 = _mm512_sub_ps(hi0, v1), e1 = _mm512_sub_ps(hi1, v1);
+    const __m512 s0 = _mm512_fmadd_ps(_mm512_mul_ps(d0, d0), va,
+                                      _mm512_mul_ps(_mm512_mul_ps(e0, e0), vb));
+    const __m512 s1 = _mm512_fmadd_ps(_mm512_mul_ps(d1, d1), va,
+                                      _mm512_mul_ps(_mm512_mul_ps(e1, e1), vb));
+    acc += _mm512_reduce_min_ps(_mm512_min_ps(s0, s1));
+  }
+  return acc;
 }
 #endif
+
+static inline float (*pick_score_block_x32() noexcept)(
+    const CbPlanesData&, const float*, uint32_t, uint64_t, float, const float*) noexcept {
+#if AFF_CPU_X86
+  const CpuIsa isa = active_cpu_isa();
+  if (isa >= CpuIsa::Avx512) return &score_block_x32_avx512;
+  if (isa == CpuIsa::Avx2)   return &score_block_x32_avx2;
+  if (isa == CpuIsa::Avx1)   return &score_block_x32_avx1;
+#endif
+  return &score_block_x32_scalar;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Wide codes (pair >= 4)
@@ -632,14 +749,14 @@ bool quantize_matrix(const float* w, uint64_t rows, uint64_t cols,
 
   uint64_t used_alt = 0, nblocks_total = 0;
 
-#if defined(__AVX512F__)
   // The fast path covers the pair-2 32-entry formats only; everything else, the shipped 4-wide one
   // included, keeps the scalar code. So a container's bytes do not depend on the host CPU, and
   // correctness never depends on the vectorisation.
-  const bool simd = g_use_simd && (pair == 2 && cb.k == 32 && items_per_block == 8);
-  std::vector<CbPlanes> planes;
-  if (simd) build_planes(cb, &planes);
-#endif
+  const bool simd = g_use_simd && (active_cpu_isa() >= CpuIsa::Avx1) &&
+                    (pair == 2 && cb.k == 32 && items_per_block == 8);
+  std::vector<CbPlanesData> planes;
+  if (simd) build_planes_data(cb, &planes);
+  const auto score_blk = pick_score_block_x32();
 
   for (uint64_t r = 0; r < rows; ++r) {
     const float* row = w + r * cols;
@@ -714,18 +831,10 @@ bool quantize_matrix(const float* w, uint64_t rows, uint64_t cols,
               const float sg = (g & 1u) ? -inv : inv;
               const uint32_t rh = (g & 2u) ? pair / 2u : 0u;
               double e = 0;
-#if defined(__AVX512F__)
             if (simd) {
-              float acc = 0.0f;
-              for (uint64_t i = 0; i < 8; ++i) {
-                const uint64_t c0 = b * spec.block + i * 2;
-                const float wa = col_importance ? col_importance[c0] : 1.0f;
-                const float wb = col_importance ? col_importance[c0 + 1] : wa;
-                acc += min_dist_x32(planes[v], blk[i * 2] * sg, blk[i * 2 + 1] * sg, wa, wb);
-              }
+              const float acc = score_blk(planes[v], blk, spec.block, b, sg, col_importance);
               e = (double)acc * (double)bs * (double)bs;
             } else
-#endif
             if (pair >= 4) {
               // ONE importance weight for the whole tuple — it scales the tuple's error and cannot
               // reorder the codes within it, so the nearest entry is the unweighted one and the
