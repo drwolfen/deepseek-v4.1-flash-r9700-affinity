@@ -527,11 +527,12 @@ inline bool dense_nt_load_enabled() {
   return on;
 }
 
-// Host-cached gate for gfx1201 two-level V# buffer cache hints (`TH_LOAD_NT_RT`/`TH_LOAD_NT_HT`).
+// Host-cached gate for gfx1201 two-level V# buffer cache hints (`TH_LOAD_NT_RT`/`TH_LOAD_NT_HT`;
+// default OFF after Wave 5b ablation, opt-in via `AFF_GFX12_CACHE_HINTS=1`).
 inline bool gfx12_cache_hints_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("AFF_GFX12_CACHE_HINTS");
-    return !s || !*s || !(s[0] == '0' && s[1] == '\0');
+    return s && *s && !(s[0] == '0' && s[1] == '\0');
   }();
   return on;
 }

@@ -4645,7 +4645,7 @@ inline bool fp8_split_inline_enabled() {
 inline bool fp8_gemm_v2_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("AFF_FP8_GEMM_V2");
-    return !s || !*s || std::strcmp(s, "0") != 0;
+    return s && *s && std::strcmp(s, "0") != 0;
   }();
   return on;
 }

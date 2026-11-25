@@ -2578,7 +2578,7 @@ void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n
 inline bool tp_ar_fixed_tok_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("AFF_TP_AR_FIXED_TOK");
-    return !s || !*s || !(s[0] == '0' && s[1] == '\0');
+    return s && *s && !(s[0] == '0' && s[1] == '\0');
   }();
   return on;
 }

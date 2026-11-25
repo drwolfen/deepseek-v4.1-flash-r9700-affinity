@@ -3589,7 +3589,7 @@ uint32_t expert_recon_tiles() {
 inline bool expert_decode_v2_enabled() {
   static const bool on = [] {
     const char* s = std::getenv("AFF_EXPERT_DECODE_V2");
-    return !s || !*s || !(s[0] == '0' && s[1] == '\0');
+    return s && *s && !(s[0] == '0' && s[1] == '\0');
   }();
   return on;
 }

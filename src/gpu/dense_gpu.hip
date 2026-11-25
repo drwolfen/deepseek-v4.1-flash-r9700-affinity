@@ -6264,7 +6264,7 @@ bool DenseGpu::engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool
                                            P.e_out + (size_t)r0[p] * nt, P.id,
                                            (size_t)nr[p] * nt * sizeof(float), D.stream));
         }
-        if (off + tile < n) AFF_HIP_CHECK(hipEventRecord(D.ev_eng_done, D.stream));
+        AFF_HIP_CHECK(hipEventRecord(D.ev_eng_done, D.stream));
       }
     }
     for (size_t d = 0; d < R; ++d) {
@@ -6276,6 +6276,16 @@ bool DenseGpu::engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool
       // selects slice tokens [off, off+nt) without changing the column stride.
       engram_gate_hip(hc, batched, D.e_out, D.vec[qk_vec], n_embd, n_hc, nt, hc_stride, eps,
                       D.stream);
+    }
+  }
+  if (row_sharded) {
+    for (size_t d = 0; d < R; ++d) {
+      if (!nr[d]) continue;
+      Impl::Dev& D = impl_->dev[d];
+      AFF_HIP_CHECK(hipSetDevice(D.id));
+      for (size_t p = 0; p < R; ++p) {
+        if (p != d) AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, impl_->dev[p].ev_eng_done, 0));
+      }
     }
   }
   ++st_.calls;
@@ -8081,10 +8091,10 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     const uint64_t r0 = r0_band[d], nr = nr_band[d];
     covered += nr;
     if (!nr) continue;
-    // When pack_tm is active, fp8/w4 matvec kernels can write token-major directly:
-    // rank 0 lands straight in D0.b_q at stride `vocab` (skipping head_unpack_tm_kernel), and
-    // peers when !hs_bf16 land straight in `peer_src[d]` (skipping head_pack_tm_kernel).
-    const bool tm_direct = pack_tm && (use_fp8 || use_w4) && (!hs_bf16 || d == 0u);
+    // When pack_tm is active, fp8/w4 matvec kernels can write token-major directly on rank 0:
+    // rank 0 lands straight in D0.b_q at stride `vocab` (skipping head_unpack_tm_kernel), while
+    // peers stage through peer_src[d] and head_unpack_tm_kernel{_bf16}.
+    const bool tm_direct = pack_tm && (use_fp8 || use_w4) && (d == 0u);
     if (d == 0u) r0_tm_direct = tm_direct;
     float* const band_dst =
         tm_direct ? (d == 0u ? (D0.b_q + r0) : peer_src[d]) : (D.b_head + (size_t)r0 * b_nb_);

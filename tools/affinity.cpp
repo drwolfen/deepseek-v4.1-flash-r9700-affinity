@@ -2455,10 +2455,10 @@ int main(int argc, char** argv) {
     }();
     const uint32_t sfx_burst_max = [sfx_max] {
       const char* v = std::getenv("AFF_DRAFT_SUFFIX_BURST_MAX");
-      if (!v || !*v) return (uint32_t)std::max<uint32_t>(sfx_max, aff::kSpecTok - 1u);
+      if (!v || !*v) return sfx_max;
       char* end = nullptr;
       const long x = std::strtol(v, &end, 10);
-      if (end == v) return (uint32_t)std::max<uint32_t>(sfx_max, aff::kSpecTok - 1u);
+      if (end == v) return sfx_max;
       return (uint32_t)std::clamp<long>(x, (long)sfx_max, (long)(aff::kSpecTok - 1u));
     }();
     const float sfx_min_expect = [] {
