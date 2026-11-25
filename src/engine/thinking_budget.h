@@ -13,7 +13,7 @@ namespace aff {
 // close_token_ids replace the next emitted tokens in order so reusable KV
 // state sees the replacement.
 struct BudgetHook {
-  // The sequence the budget injects (e.g. "\n</think>\n\n"). Empty disables the hook.
+  // The sequence the budget injects (e.g. "</think>\n\n"). Empty disables the hook.
   std::vector<int32_t> close_token_ids;
   // How the model itself ends thinking, e.g. "</think>". A natural close
   // is recognized only by this marker, never by close_token_ids.

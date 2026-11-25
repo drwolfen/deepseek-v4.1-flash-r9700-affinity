@@ -550,6 +550,128 @@ void test_short_mantra_loop_and_short_novelty() {
   std::printf("PASS: test_short_mantra_loop_and_short_novelty\n");
 }
 
+void test_forced_close_prefix_cache_bpe_invariance() {
+  char tmpl[] = "/tmp/aff_tb_ckpt_tok_XXXXXX";
+  int fd = ::mkstemp(tmpl);
+  REQUIRE(fd >= 0);
+  ::close(fd);
+  const std::string tok_path(tmpl);
+  {
+    FILE* f = std::fopen(tok_path.c_str(), "wb");
+    REQUIRE(f != nullptr);
+    std::string j = R"({"model":{"vocab":{)";
+    uint32_t next_id = 10;
+    for (int ch = 33; ch <= 126; ++ch) {
+      if (ch == '"' || ch == '\\') continue;
+      char s[2] = {(char)ch, 0};
+      j += "\"" + std::string(s) + "\":" + std::to_string(next_id++) + ",";
+    }
+    j += R"("\"":198,"\\":199,"\u0120":200,"\u010a":201,"\u010a\u010a":271,".\u010a":603})";
+    j += R"(,"merges":["\u010a \u010a",". \u010a"]},)";
+    j += R"("added_tokens":[)";
+    j += R"({"id":0,"content":"<｜begin▁of▁sentence｜>"},)";
+    j += R"({"id":1,"content":"<｜end▁of▁sentence｜>"},)";
+    j += R"({"id":128803,"content":"<｜User｜>"},)";
+    j += R"({"id":128804,"content":"<｜Assistant｜>"},)";
+    j += R"({"id":128805,"content":"<｜System｜>"},)";
+    j += R"({"id":128821,"content":"<think>"},)";
+    j += R"({"id":128822,"content":"</think>"},)";
+    j += R"({"id":128825,"content":"｜DSML｜"})";
+    j += R"(]})";
+    std::fwrite(j.data(), 1, j.size(), f);
+    std::fclose(f);
+  }
+
+  Tokenizer tok;
+  std::string err;
+  REQUIRE(tok.load(tok_path, &err));
+  std::remove(tok_path.c_str());
+
+  // (a) Forced-close sequence starts directly with </think> (128822), followed by \n\n (271).
+  const std::vector<uint32_t> close_ids = tok.encode(std::string(kThinkEnd) + "\n\n", false);
+  REQUIRE((close_ids == std::vector<uint32_t>{128822, 271}));
+
+  // (b) ThinkingBudget cuts on hard_limit with 128822, queues 271, and settles after 271.
+  BudgetHook h;
+  for (uint32_t id : close_ids) h.close_token_ids.push_back((int32_t)id);
+  h.marker_token_ids = {128822};
+  h.hard_limit_remaining = 4;
+  ThinkingBudget b(&h, 12);
+  for (int i = 0; i < 8; ++i) {
+    auto d = b.apply(100 + i);
+    REQUIRE(!d.cut);
+    REQUIRE(!b.force_closed());
+  }
+  auto d_cut = b.apply(999);
+  REQUIRE(d_cut.cut);
+  REQUIRE(d_cut.token == 128822);
+  REQUIRE(b.force_closed());
+  REQUIRE(b.injecting());
+  REQUIRE(b.pending_close_tokens() == 1);
+  REQUIRE(b.pending_close_token(0) == 271);
+  auto d_tail = b.apply(271);
+  REQUIRE(!d_tail.cut);
+  REQUIRE(d_tail.token == 271);
+  REQUIRE(!b.injecting());
+  REQUIRE(b.settled());
+
+  // (c) Turn-1 forced close -> parse_completion -> Turn-2 encode_messages keeps identical prefix
+  //     tokens up to </think> without trailing '.' + '\n' BPE merge.
+  ChatMsg sys_m;
+  sys_m.role = "system";
+  sys_m.content = "Check weather.";
+
+  ChatMsg usr_m;
+  usr_m.role = "user";
+  usr_m.content = "Zurich weather?";
+  usr_m.tools.push_back(ToolDef{
+      R"({"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}})"});
+
+  EncodeOpts eo;
+  eo.v41 = true;
+  eo.thinking_mode = ThinkingMode::Thinking;
+  eo.effort_budget = 75;
+
+  const std::string t1_prompt = encode_messages({sys_m, usr_m}, eo);
+  std::vector<uint32_t> t1_toks = tok.encode(t1_prompt, false);
+  const std::string t1_thought = "2 plus 2 equals 4.";
+  const std::vector<uint32_t> thought_toks = tok.encode(t1_thought, false);
+  t1_toks.insert(t1_toks.end(), thought_toks.begin(), thought_toks.end());
+  const size_t ckpt_len = t1_toks.size();  // Pre-</think> checkpoint length.
+  t1_toks.insert(t1_toks.end(), close_ids.begin(), close_ids.end());
+
+  const std::string dsml =
+      "<｜DSML｜ calls>\n"
+      "<｜DSML｜ invoke name=\"get_weather\">\n"
+      "<｜DSML｜ parameter name=\"location\" string=\"true\">Zurich</｜DSML｜ parameter>\n"
+      "</｜DSML｜ invoke>\n"
+      "</｜DSML｜ calls>";
+  const ParsedMessage pm =
+      parse_completion(t1_thought + "</think>\n\n" + dsml + kEosStr, ThinkingMode::Thinking);
+  REQUIRE(pm.ok);
+  REQUIRE(pm.reasoning_content == t1_thought);
+  REQUIRE(pm.tool_calls.size() == 1);
+
+  ChatMsg asst_m;
+  asst_m.role = "assistant";
+  asst_m.content = pm.content;
+  asst_m.reasoning_content = pm.reasoning_content;
+  asst_m.tool_calls = pm.tool_calls;
+
+  ChatMsg tool_m;
+  tool_m.role = "tool";
+  tool_m.content = R"({"location":"Zurich"})";
+
+  const std::string t2_prompt = encode_messages({sys_m, usr_m, asst_m, tool_m}, eo);
+  const std::vector<uint32_t> t2_toks = tok.encode(t2_prompt, false);
+  REQUIRE(t2_toks.size() > ckpt_len + 2);
+  for (size_t i = 0; i < ckpt_len; ++i) {
+    REQUIRE(t2_toks[i] == t1_toks[i]);
+  }
+  REQUIRE(t2_toks[ckpt_len] == 128822);
+  std::printf("PASS: test_forced_close_prefix_cache_bpe_invariance\n");
+}
+
 }  // namespace
 
 int main() {
@@ -560,6 +682,7 @@ int main() {
   test_suppress_final_think_and_prefix_invariance();
   test_full_vocab_freeze_short_loop_low_novelty_and_clean_trace();
   test_short_mantra_loop_and_short_novelty();
+  test_forced_close_prefix_cache_bpe_invariance();
   std::printf("ALL thinking_budget tests passed\n");
   return 0;
 }

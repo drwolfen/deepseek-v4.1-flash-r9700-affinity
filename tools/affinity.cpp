@@ -1094,7 +1094,11 @@ int main(int argc, char** argv) {
   if (tok.vocab_size()) {
     for (uint32_t id : tok.encode(kThinkEnd, false))
       think_marker_ids.push_back((int32_t)id);
-    for (uint32_t id : tok.encode(std::string("\n") + kThinkEnd + "\n\n", false))
+    // Omit any leading '\n' before "</think>": appending a newline to reasoning_content merges with
+    // preceding '.', ',', ':', ')', or '\n' under Turn-2 BPE re-tokenization and invalidates the
+    // prefix-cache checkpoint. "</think>" is an added_token split before BPE and closes at st.pos
+    // immediately before itself, matching natural think-close checkpoint alignment.
+    for (uint32_t id : tok.encode(std::string(kThinkEnd) + "\n\n", false))
       think_close_ids.push_back((int32_t)id);
     if (tok.eos() >= 0) dry_exempt_ids.push_back((uint32_t)tok.eos());
     for (int32_t mid : think_marker_ids)
