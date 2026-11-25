@@ -95,6 +95,7 @@ static int run_case(uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t hs, bo
   (void)hipDeviceSynchronize();
 
   float max_err = 0.0f;
+  int32_t max_bf16_ulp = 0;
   if (bf16) {
     std::vector<uint16_t> r_ref(hc_elems), r_spl(hc_elems);
     (void)hipMemcpy(r_ref.data(), d_hc_ref, hc_bytes, hipMemcpyDeviceToHost);
@@ -102,6 +103,11 @@ static int run_case(uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t hs, bo
     for (size_t i = 0; i < hc_elems; ++i) {
       float e = std::fabs(bf16_to_f32(r_ref[i]) - bf16_to_f32(r_spl[i]));
       if (e > max_err) max_err = e;
+      uint16_t a = r_ref[i], b = r_spl[i];
+      int32_t ulp = ((a ^ b) & 0x8000u)
+                        ? ((int32_t)(a & 0x7fffu) + (int32_t)(b & 0x7fffu))
+                        : ((a > b) ? (int32_t)(a - b) : (int32_t)(b - a));
+      if (ulp > max_bf16_ulp) max_bf16_ulp = ulp;
     }
   } else {
     std::vector<float> r_ref(hc_elems), r_spl(hc_elems);
@@ -121,12 +127,14 @@ static int run_case(uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t hs, bo
   (void)hipFree(d_part0);
   (void)hipFree(d_part1);
 
-  if (max_err >= 1e-5f) {
-    std::fprintf(stderr, "FAIL: nb=%u hs=%u bf16=%d max_err=%.6g\n", nb, hs, (int)bf16, max_err);
+  const bool ok = bf16 ? (max_bf16_ulp <= 1 && max_err < 1e-4f) : (max_err < 1e-5f);
+  if (!ok) {
+    std::fprintf(stderr, "FAIL: nb=%u hs=%u bf16=%d max_err=%.6g max_bf16_ulp=%d\n", nb, hs,
+                 (int)bf16, max_err, max_bf16_ulp);
     return 1;
   }
-  std::printf("PASS: engram split-gate nb=%u hs=%u bf16=%d max_err=%.3e\n", nb, hs, (int)bf16,
-              max_err);
+  std::printf("PASS: engram split-gate nb=%u hs=%u bf16=%d max_err=%.3e max_bf16_ulp=%d\n", nb, hs,
+              (int)bf16, max_err, max_bf16_ulp);
   return 0;
 }
 

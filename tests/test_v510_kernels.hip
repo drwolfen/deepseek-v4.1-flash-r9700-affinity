@@ -143,6 +143,7 @@ static int check_cand_scores_kpt2() {
   (void)hipMalloc(&d_cids, h_cids.size() * sizeof(uint16_t));
   (void)hipMalloc(&d_cn, nb * sizeof(uint32_t)); (void)hipMalloc(&d_nk, nb * sizeof(uint32_t));
   (void)hipMalloc(&d_out0, out_bytes); (void)hipMalloc(&d_out1, out_bytes);
+  (void)hipMemset(d_out0, 0, out_bytes); (void)hipMemset(d_out1, 0, out_bytes);
   (void)hipMemcpy(d_q8, h_q8.data(), h_q8.size(), hipMemcpyHostToDevice);
   (void)hipMemcpy(d_k8, h_k8.data(), h_k8.size(), hipMemcpyHostToDevice);
   (void)hipMemcpy(d_qs, h_qs.data(), nb * sizeof(float), hipMemcpyHostToDevice);
@@ -168,6 +169,16 @@ static int check_cand_scores_kpt2() {
   (void)hipFree(d_out0); (void)hipFree(d_out1);
 
   if (std::memcmp(o0.data(), o1.data(), out_bytes) != 0) {
+    for (uint32_t t = 0; t < nb; ++t) {
+      for (uint32_t u = 0; u < out_stride; ++u) {
+        const size_t idx = (size_t)t * out_stride + u;
+        if (std::memcmp(&o0[idx], &o1[idx], sizeof(float)) != 0) {
+          std::fprintf(stderr, "FAIL: indexer_scores_cand KPT2 mismatch at tok=%u u=%u o0=%.6g o1=%.6g\n",
+                       t, u, o0[idx], o1[idx]);
+          return 1;
+        }
+      }
+    }
     std::fprintf(stderr, "FAIL: indexer_scores_cand KPT2 mismatch\n");
     return 1;
   }
@@ -204,6 +215,14 @@ static int check_topk_and_bmax_v2() {
   (void)hipMalloc(&d_adm1, (size_t)nb * k * sizeof(uint32_t));
   (void)hipMalloc(&d_an0, nb * sizeof(uint32_t));
   (void)hipMalloc(&d_an1, nb * sizeof(uint32_t));
+  (void)hipMemset(d_bsc0, 0, (size_t)nb * bstride * sizeof(float));
+  (void)hipMemset(d_bsc1, 0, (size_t)nb * bstride * sizeof(float));
+  (void)hipMemset(d_m0, 0, (size_t)nb * mstride);
+  (void)hipMemset(d_m1, 0, (size_t)nb * mstride);
+  (void)hipMemset(d_adm0, 0, (size_t)nb * k * sizeof(uint32_t));
+  (void)hipMemset(d_adm1, 0, (size_t)nb * k * sizeof(uint32_t));
+  (void)hipMemset(d_an0, 0, nb * sizeof(uint32_t));
+  (void)hipMemset(d_an1, 0, nb * sizeof(uint32_t));
   (void)hipMemcpy(d_sc, h_sc.data(), h_sc.size() * sizeof(float), hipMemcpyHostToDevice);
   (void)hipMemcpy(d_nk, h_nk.data(), nb * sizeof(uint32_t), hipMemcpyHostToDevice);
 
@@ -222,6 +241,12 @@ static int check_topk_and_bmax_v2() {
   sp.tok_cap = 16u;
 
   for (int use_sp = 0; use_sp <= 1; ++use_sp) {
+    (void)hipMemset(d_m0, 0, (size_t)nb * mstride);
+    (void)hipMemset(d_m1, 0, (size_t)nb * mstride);
+    (void)hipMemset(d_adm0, 0, (size_t)nb * k * sizeof(uint32_t));
+    (void)hipMemset(d_adm1, 0, (size_t)nb * k * sizeof(uint32_t));
+    (void)hipMemset(d_an0, 0, nb * sizeof(uint32_t));
+    (void)hipMemset(d_an1, 0, nb * sizeof(uint32_t));
     const aff::TopkScratch* spp = use_sp ? &sp : nullptr;
     setenv("AFF_IDX_TOPK_V2", "0", 1);
     aff::idx_topk_mask_hip(d_sc, d_m0, d_nk, nb, sstride, mstride, n_keys, k, nullptr, spp, d_adm0, d_an0, k);
@@ -257,6 +282,12 @@ static int check_topk_and_bmax_v2() {
     (void)hipMemcpy(d_cids, h_cids.data(), h_cids.size() * sizeof(uint16_t), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_cn, h_cn.data(), nb * sizeof(uint32_t), hipMemcpyHostToDevice);
     for (int use_sp = 0; use_sp <= 1; ++use_sp) {
+      (void)hipMemset(d_m0, 0, (size_t)nb * mstride);
+      (void)hipMemset(d_m1, 0, (size_t)nb * mstride);
+      (void)hipMemset(d_adm0, 0, (size_t)nb * k * sizeof(uint32_t));
+      (void)hipMemset(d_adm1, 0, (size_t)nb * k * sizeof(uint32_t));
+      (void)hipMemset(d_an0, 0, nb * sizeof(uint32_t));
+      (void)hipMemset(d_an1, 0, nb * sizeof(uint32_t));
       const aff::TopkScratch* spp = use_sp ? &sp : nullptr;
       setenv("AFF_IDX_TOPK_V2", "0", 1);
       aff::idx_topk_mask_cand_hip(d_sc, d_m0, d_cids, d_cn, nb, c_sstride, cs, cb, max_b, mstride,
@@ -438,6 +469,9 @@ static int check_draft_noise_seed() {
   (void)hipMalloc(&d_hc0, (size_t)n_hc * n_embd * nb * 2u);
   (void)hipMalloc(&d_hc1, (size_t)n_hc * n_embd * nb * 2u);
   (void)hipMalloc(&d_pre, (size_t)n_hc * nb * sizeof(float));
+  (void)hipMemset(d_hc0, 0, (size_t)n_hc * n_embd * nb * 2u);
+  (void)hipMemset(d_hc1, 0, (size_t)n_hc * n_embd * nb * 2u);
+  (void)hipMemset(d_pre, 0, (size_t)n_hc * nb * sizeof(float));
   (void)hipMemcpy(d_full, h_full.data(), h_full.size() * 2u, hipMemcpyHostToDevice);
   (void)hipMemcpy(d_row0, h_row0.data(), n_embd * 2u, hipMemcpyHostToDevice);
   (void)hipMemcpy(d_noise, h_noise.data(), n_embd * 2u, hipMemcpyHostToDevice);
@@ -564,6 +598,11 @@ static int check_fuse_woa_q8() {
     (void)hipMalloc(&d_q8_fus, (size_t)nb * total_rows);
     (void)hipMalloc(&d_qs_ref, (size_t)nb * (total_rows / 128u) * sizeof(float));
     (void)hipMalloc(&d_qs_fus, (size_t)nb * (total_rows / 128u) * sizeof(float));
+    (void)hipMemset(d_y, 0, (size_t)ws_rows * nb * sizeof(float));
+    (void)hipMemset(d_q8_ref, 0, (size_t)nb * total_rows);
+    (void)hipMemset(d_q8_fus, 0, (size_t)nb * total_rows);
+    (void)hipMemset(d_qs_ref, 0, (size_t)nb * (total_rows / 128u) * sizeof(float));
+    (void)hipMemset(d_qs_fus, 0, (size_t)nb * (total_rows / 128u) * sizeof(float));
     (void)hipMemcpy(d_x, h_x.data(), h_x.size(), hipMemcpyHostToDevice);
     (void)hipMemcpy(d_sx, h_sx.data(), h_sx.size(), hipMemcpyHostToDevice);
 
