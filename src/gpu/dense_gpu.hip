@@ -4973,7 +4973,16 @@ bool DenseGpu::draft_init(uint32_t n_embd, uint32_t tap_in, uint32_t vocab, uint
 //
 // Every helper below is capacity-guarded and idempotent, so calling them here with the widest
 // arguments the run can present makes every later call a no-op rather than a resize.
+namespace {
+struct HipDeviceGuard {
+  int prev = -1;
+  HipDeviceGuard() { (void)hipGetDevice(&prev); }
+  ~HipDeviceGuard() { if (prev >= 0) (void)hipSetDevice(prev); }
+};
+}  // namespace
+
 bool DenseGpu::ensure_by(uint32_t need_rows, std::string* err) {
+  HipDeviceGuard dev_guard;
   const uint32_t nb = b_cap_ ? b_cap_ : b_nb_;
   if (!nb) return false;
   if (need_rows <= b_y_cap_) return true;
@@ -5002,6 +5011,7 @@ bool DenseGpu::ensure_by(uint32_t need_rows, std::string* err) {
 }
 
 bool DenseGpu::ensure_b_kv(uint32_t width, std::string* err) {
+  HipDeviceGuard dev_guard;
   const uint32_t nb = b_cap_ ? b_cap_ : b_nb_;
   if (!nb || !width) return false;
   if (width <= b_kv_width_ &&
@@ -5026,6 +5036,7 @@ bool DenseGpu::ensure_b_kv(uint32_t width, std::string* err) {
 }
 
 bool DenseGpu::ensure_btm(uint32_t need_rows, std::string* err) {
+  HipDeviceGuard dev_guard;
   const uint32_t nb = b_cap_ ? b_cap_ : b_nb_;
   if (!nb) return false;
   if (!need_rows || need_rows <= b_tm_cap_) return true;
@@ -5651,7 +5662,13 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
     // and wkv is hoisted above the q chain to make that possible, which is free because nothing in
     // the q chain feeds it.
     bool q8;
-    float* ykv = D.b_u;                 // where wkv landed: b_u unfused, inside b_g when fused
+    const uint64_t g_lim =
+        (D.b_g && D.b_qr > D.b_g && D.b_qr < D.b_g + (size_t)b_g_cap_ * b_cap_)
+            ? 2048ull
+            : (uint64_t)b_g_cap_;
+    float* const kv_dst =
+        ((uint64_t)qr + width <= g_lim) ? (D.b_g + (size_t)qr * b_nb_) : D.b_u;
+    float* ykv = kv_dst;                // where wkv landed: in b_g when room remains, else b_u
     {
       AFF_TRACE(39);
       q8 = q8_ok(qa, hidden) && q8_ok(kv, hidden) && q8_ok(qb, qr) &&
@@ -5663,10 +5680,6 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
         // One layout flag for the group. Both are fp8 with the same K, so the load-time preshuffle
         // took both or neither; a mixed group would silently read one in the wrong order, so it
         // refuses the fusion and each goes on its own.
-        const uint64_t g_lim =
-            (D.b_g && D.b_qr > D.b_g && D.b_qr < D.b_g + (size_t)b_g_cap_ * b_cap_)
-                ? 2048ull
-                : (uint64_t)b_g_cap_;
         if (A.sh[d].ps == K.sh[d].ps &&
             (uint64_t)qr + width <= g_lim &&
             batch_gemm_fp8_multi_hip(bj, 2, D.q8, D.qs, (uint32_t)hidden, b_nb_, D.q_dim,
@@ -5674,11 +5687,11 @@ bool DenseGpu::batch_attn_qkv(int32_t qa, int32_t qb, int32_t qnorm, int32_t kv,
           ykv = D.b_g + (size_t)qr * b_nb_;
         } else {
           batch_gemm_ent_q8(d, qa, D.b_g, qr, hidden);
-          batch_gemm_ent_q8(d, kv, D.b_u, width, hidden);
+          batch_gemm_ent_q8(d, kv, kv_dst, width, hidden);
         }
       } else {
         batch_gemm_ent(d, qa, D.b_norm, D.b_g, qr, hidden);
-        batch_gemm_ent(d, kv, D.b_norm, D.b_u, width, hidden);
+        batch_gemm_ent(d, kv, D.b_norm, kv_dst, width, hidden);
       }
     }
     {

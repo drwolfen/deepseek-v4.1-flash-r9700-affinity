@@ -2931,6 +2931,26 @@ int main() {
     std::printf("PASS: W2-7 moe_plan_hip sparse ActRing + act_dev_head parity\n");
   }
 
+  // 24. 2-GPU regression: lazy ensure_b_kv inside per-device loops must preserve active HIP device
+  {
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) == hipSuccess && nd >= 2) {
+      DenseGpu dg;
+      std::string dg_err;
+      assert(dg.init(64, 64, &dg_err, 2));
+      uint32_t comp_rows[1] = {16};
+      assert(dg.attn_init(1, 32, 512, 64, 64, comp_rows, KvDtype::FP8R, 64, 64, &dg_err));
+      assert(dg.batch_init(16, 128, 4, 32, 512, 128, 128, 64, &dg_err));
+      Model::BatchOps bops = dg.batch_ops();
+      std::vector<float> emb(4u * 128u, 0.1f);
+      assert(bops.begin(bops.ctx, 4u, 0u, emb.data(), 128u, 4u));
+      assert(bops.kv_commit(bops.ctx, 0u, 0u, 4u, 0u, 512u, 64u));
+      assert(dg.kv_sync_all());
+      assert(hipGetLastError() == hipSuccess);
+      std::printf("PASS: 2-GPU lazy ensure_b_kv preserves active HIP device\n");
+    }
+  }
+
   std::printf("PASS: test_gpu_ports on gfx1201\n");
   return 0;
 }
