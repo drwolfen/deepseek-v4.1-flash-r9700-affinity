@@ -444,6 +444,8 @@ private:
 
   struct Impl;
   static bool ensure_single_arena(Impl& I, size_t d);
+  bool        ensure_single_attn(size_t d);
+  bool        ensure_shexp_stream(size_t d);
   Impl* impl_ = nullptr;
   std::vector<Entry> ent_;
   void upload_sink(uint32_t layer);

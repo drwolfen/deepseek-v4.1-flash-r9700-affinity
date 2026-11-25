@@ -2198,6 +2198,11 @@ static inline int tp_ar_fixed_blk_cfg() {
   return b > kTpMaxBlocks ? kTpMaxBlocks : b;
 }
 
+static inline bool tp_draft_proj_fixed_ar_enabled() {
+  const char* v = std::getenv("AFF_DRAFT_PROJ_FIXED_AR");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
 static inline size_t tp_ar_prefetch_max_bytes() {
   const char* v = std::getenv("AFF_PREFETCH_MB");
   if (!v || !*v) return (size_t)8u << 20;
@@ -2543,7 +2548,16 @@ void tp_all_reduce(TpContext& ctx, float* const* in, float* const* out, size_t n
     // Block count from the payload. Small messages want ONE block: their cost is the handshake,
     // and extra blocks add flag traffic without adding transfer.
     int nb = (int)((n4 + kTpWordsPerBlock - 1) / kTpWordsPerBlock);
-    nb = std::max(1, std::min(nb, kTpMaxBlocks));
+    const int fixed_blk = tp_ar_fixed_blk_cfg();
+    if (np == 1u && fixed_blk > 0 && tp_draft_proj_fixed_ar_enabled() &&
+        tp_ar_reg_form_enabled() && n4 >= kTpWordsPerBlock &&
+        (size_t)n4 <= (size_t)fixed_blk * (size_t)nt * 8u) {
+      // Pin draft-size crossings to AFF_AR_FIXED_BLK (32) so tp_sync_on_grid_change never stalls
+      // both cards dropping 32 -> 15 -> 32 around DSpark draft_proj.
+      nb = fixed_blk;
+    } else {
+      nb = std::max(1, std::min(nb, kTpMaxBlocks));
+    }
     tp_sync_on_grid_change(ctx, nb);
     switch (np) {
       case 1: tp_launch_exact<1>(ctx, in_p, out_p, n4, nb, nt, slot4, peer4); break;

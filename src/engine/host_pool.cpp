@@ -249,6 +249,25 @@ bool HostExpertPool::init(const AffReader* aff, uint64_t budget_bytes, Wanted wa
   // the expert path is COMPUTE-bound, far from memory per core, so a TLB miss it never waits on
   // cannot cost anything. The hint stays only because it is free where it is.
   (void)::madvise(base_, alloc_bytes_, MADV_HUGEPAGE);
+#ifdef __linux__
+  const char* const mlock_env = std::getenv("AFF_POOL_MLOCK");
+  const bool pool_mlock = !mlock_env || !*mlock_env || std::strcmp(mlock_env, "0") != 0;
+  if (pool_mlock) {
+#ifndef MLOCK_ONFAULT
+#define MLOCK_ONFAULT 1u
+#endif
+    int ml_rc = -1;
+#ifdef SYS_mlock2
+    ml_rc = (int)::syscall(SYS_mlock2, base_, alloc_bytes_, MLOCK_ONFAULT);
+#else
+    ml_rc = ::mlock(base_, alloc_bytes_);
+#endif
+    if (ml_rc != 0) {
+      aff::ui::err("host pool: mlock2(ONFAULT) failed for %.1f GiB (errno=%d: %s) — continuing unlocked\n",
+                   (double)alloc_bytes_ / (1 << 30), errno, std::strerror(errno));
+    }
+  }
+#endif
   if (thp_first) {
     const auto tp0 = std::chrono::steady_clock::now();
 #ifndef MADV_POPULATE_WRITE

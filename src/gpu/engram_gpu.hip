@@ -289,6 +289,208 @@ void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, ui
   AFF_HIP_CHECK(hipGetLastError());
 }
 
+template <bool BF16>
+__global__ __launch_bounds__(kEngThreads) void engram_gate_partial_tok_kernel(
+    const void* __restrict__ hc, const float* __restrict__ kv, const float* __restrict__ w,
+    float* __restrict__ part_out, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t hs,
+    uint32_t row_lo, uint32_t row_hi) {
+  const uint32_t t = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t lane = tid & 31u;
+  const uint32_t wave = tid >> 5;
+  if (t >= nb || n_hc > kEngMaxHc) return;
+
+  __shared__ float s_sh[kEngMaxHc][kEngWaves];
+  __shared__ float s_sk[kEngMaxHc][kEngWaves];
+  __shared__ float s_dot[kEngMaxHc][kEngWaves];
+
+  const uint32_t key_hi = row_hi < n_hc * n_embd ? row_hi : n_hc * n_embd;
+  for (uint32_t c = 0; c < n_hc; ++c) {
+    const uint32_t b_lo = c * n_embd;
+    const uint32_t b_hi = b_lo + n_embd;
+    const uint32_t lo = (row_lo > b_lo) ? (row_lo - b_lo) : 0u;
+    const uint32_t hi = (key_hi < b_hi) ? (key_hi > b_lo ? key_hi - b_lo : 0u) : n_embd;
+    float sh = 0.0f, sk = 0.0f, dot = 0.0f;
+    for (uint32_t i = lo + tid; i < hi; i += kEngThreads) {
+      const float h = ld_hc(hc, ((size_t)b_lo + i) * hs + t, BF16);
+      const float k = kv[((size_t)b_lo + i) * nb + t];
+      sh = fmaf(h, h, sh);
+      sk = fmaf(k, k, sk);
+      dot = fmaf(h * w[b_lo + i], k, dot);
+    }
+    sh = aff::wave_reduce_add_dpp(sh);
+    sk = aff::wave_reduce_add_dpp(sk);
+    dot = aff::wave_reduce_add_dpp(dot);
+    if (lane == 0u) {
+      s_sh[c][wave] = sh;
+      s_sk[c][wave] = sk;
+      s_dot[c][wave] = dot;
+    }
+  }
+  aff::lds_barrier();
+
+  if (tid < n_hc) {
+    float fsh = 0.0f, fsk = 0.0f, fdot = 0.0f;
+#pragma unroll
+    for (uint32_t wp = 0; wp < kEngWaves; ++wp) {
+      fsh += s_sh[tid][wp];
+      fsk += s_sk[tid][wp];
+      fdot += s_dot[tid][wp];
+    }
+    part_out[(size_t)tid * nb + t] = fsh;
+    part_out[((size_t)n_hc + tid) * nb + t] = fsk;
+    part_out[((size_t)2u * n_hc + tid) * nb + t] = fdot;
+  }
+}
+
+template <bool BF16>
+__global__ void engram_gate_partial_kernel(
+    const void* __restrict__ hc, const float* __restrict__ kv, const float* __restrict__ w,
+    float* __restrict__ part_out, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t hs,
+    uint32_t row_lo, uint32_t row_hi) {
+  const uint32_t c = blockIdx.x;
+  const uint32_t t = blockIdx.y * blockDim.x + threadIdx.x;
+  if (t >= nb || c >= n_hc) return;
+
+  const uint32_t key_hi = row_hi < n_hc * n_embd ? row_hi : n_hc * n_embd;
+  const uint32_t b_lo = c * n_embd;
+  const uint32_t b_hi = b_lo + n_embd;
+  const uint32_t lo = (row_lo > b_lo) ? (row_lo - b_lo) : 0u;
+  const uint32_t hi = (key_hi < b_hi) ? (key_hi > b_lo ? key_hi - b_lo : 0u) : n_embd;
+
+  float sh = 0.0f, sk = 0.0f, dot = 0.0f;
+  for (uint32_t i = lo; i < hi; ++i) {
+    const float h = ld_hc(hc, ((size_t)b_lo + i) * hs + t, BF16);
+    const float k = kv[((size_t)b_lo + i) * nb + t];
+    sh = fmaf(h, h, sh);
+    sk = fmaf(k, k, sk);
+    dot = fmaf(h * w[b_lo + i], k, dot);
+  }
+  part_out[(size_t)c * nb + t] = sh;
+  part_out[((size_t)n_hc + c) * nb + t] = sk;
+  part_out[((size_t)2u * n_hc + c) * nb + t] = dot;
+}
+
+template <bool BF16>
+__global__ __launch_bounds__(kEngThreads) void engram_gate_apply_tok_kernel(
+    void* __restrict__ hc, const float* __restrict__ kv, const float* __restrict__ part_a,
+    const float* __restrict__ part_b, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t hs,
+    float eps) {
+  const uint32_t t = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  if (t >= nb || n_hc > kEngMaxHc) return;
+
+  __shared__ float s_gate[kEngMaxHc];
+  if (tid < n_hc) {
+    const float fsh = part_a[(size_t)tid * nb + t] + part_b[(size_t)tid * nb + t];
+    const float fsk = part_a[((size_t)n_hc + tid) * nb + t] +
+                      part_b[((size_t)n_hc + tid) * nb + t];
+    const float fdot = part_a[((size_t)2u * n_hc + tid) * nb + t] +
+                       part_b[((size_t)2u * n_hc + tid) * nb + t];
+    const float rstd = rsqrtf(fsh / (float)n_embd + eps) * rsqrtf(fsk / (float)n_embd + eps);
+    const float d = fdot * rstd * rsqrtf((float)n_embd);
+    const float s = copysignf(sqrtf(fmaxf(fabsf(d), 1e-6f)), d);
+    s_gate[tid] = 1.0f / (1.0f + __expf(-s));
+  }
+  aff::lds_barrier();
+
+  const size_t vband = (size_t)n_hc * n_embd;
+  for (uint32_t i = tid; i < n_embd; i += kEngThreads) {
+    const float val = kv[(vband + i) * nb + t];
+    for (uint32_t c = 0; c < n_hc; ++c) {
+      const size_t off = ((size_t)c * n_embd + i) * hs + t;
+      st_hc(hc, off, ld_hc(hc, off, BF16) + s_gate[c] * val, BF16);
+    }
+  }
+}
+
+template <bool BF16>
+__global__ void engram_gate_apply_kernel(
+    void* __restrict__ hc, const float* __restrict__ kv, const float* __restrict__ part_a,
+    const float* __restrict__ part_b, uint32_t n_embd, uint32_t n_hc, uint32_t nb, uint32_t hs,
+    float eps) {
+  const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= nb || n_hc > kEngMaxHc) return;
+
+  float gate[kEngMaxHc];
+  for (uint32_t c = 0; c < n_hc; ++c) {
+    const float fsh = part_a[(size_t)c * nb + t] + part_b[(size_t)c * nb + t];
+    const float fsk = part_a[((size_t)n_hc + c) * nb + t] +
+                      part_b[((size_t)n_hc + c) * nb + t];
+    const float fdot = part_a[((size_t)2u * n_hc + c) * nb + t] +
+                       part_b[((size_t)2u * n_hc + c) * nb + t];
+    const float rstd = rsqrtf(fsh / (float)n_embd + eps) * rsqrtf(fsk / (float)n_embd + eps);
+    const float d = fdot * rstd * rsqrtf((float)n_embd);
+    const float s = copysignf(sqrtf(fmaxf(fabsf(d), 1e-6f)), d);
+    gate[c] = 1.0f / (1.0f + __expf(-s));
+  }
+
+  const size_t vband = (size_t)n_hc * n_embd;
+  for (uint32_t i = 0; i < n_embd; ++i) {
+    const float val = kv[(vband + i) * nb + t];
+    for (uint32_t c = 0; c < n_hc; ++c) {
+      const size_t off = ((size_t)c * n_embd + i) * hs + t;
+      st_hc(hc, off, ld_hc(hc, off, BF16) + gate[c] * val, BF16);
+    }
+  }
+}
+
+void engram_gate_partial_hip(const void* hc, bool hc_bf16, const float* kv, const float* w,
+                             float* part_out, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
+                             uint32_t hc_stride, uint32_t row_lo, uint32_t row_hi, void* stream) {
+  if (!hc || !kv || !w || !part_out || !n_embd || !n_hc || !nb || hc_stride < nb ||
+      n_hc > kEngMaxHc)
+    return;
+  if (nb <= 64u) {
+    const dim3 g(nb), b(kEngThreads);
+    if (hc_bf16)
+      hipLaunchKernelGGL(engram_gate_partial_tok_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv,
+                         w, part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
+    else
+      hipLaunchKernelGGL(engram_gate_partial_tok_kernel<false>, g, b, 0, (hipStream_t)stream, hc,
+                         kv, w, part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
+    AFF_HIP_CHECK(hipGetLastError());
+    return;
+  }
+  const uint32_t thr = 256u;
+  const dim3 g(n_hc, (nb + thr - 1u) / thr), b(thr);
+  if (hc_bf16)
+    hipLaunchKernelGGL(engram_gate_partial_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv, w,
+                       part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
+  else
+    hipLaunchKernelGGL(engram_gate_partial_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv, w,
+                       part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
+  AFF_HIP_CHECK(hipGetLastError());
+}
+
+void engram_gate_apply_hip(void* hc, bool hc_bf16, const float* kv, const float* part_a,
+                           const float* part_b, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
+                           uint32_t hc_stride, float eps, void* stream) {
+  if (!hc || !kv || !part_a || !part_b || !n_embd || !n_hc || !nb || hc_stride < nb ||
+      n_hc > kEngMaxHc)
+    return;
+  if (nb <= 64u) {
+    const dim3 g(nb), b(kEngThreads);
+    if (hc_bf16)
+      hipLaunchKernelGGL(engram_gate_apply_tok_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv,
+                         part_a, part_b, n_embd, n_hc, nb, hc_stride, eps);
+    else
+      hipLaunchKernelGGL(engram_gate_apply_tok_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv,
+                         part_a, part_b, n_embd, n_hc, nb, hc_stride, eps);
+    AFF_HIP_CHECK(hipGetLastError());
+    return;
+  }
+  const uint32_t thr = 256u;
+  const dim3 g((nb + thr - 1u) / thr), b(thr);
+  if (hc_bf16)
+    hipLaunchKernelGGL(engram_gate_apply_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv,
+                       part_a, part_b, n_embd, n_hc, nb, hc_stride, eps);
+  else
+    hipLaunchKernelGGL(engram_gate_apply_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv,
+                       part_a, part_b, n_embd, n_hc, nb, hc_stride, eps);
+  AFF_HIP_CHECK(hipGetLastError());
+}
+
 bool engram_mxfp8_requant_fp8_hip(const uint8_t* raw_mxfp8, uint8_t* out_q8, float* out_scales,
                                   uint32_t nt, uint32_t in_dim, hipStream_t stream) {
   if ((in_dim % 128u) != 0u) return false;

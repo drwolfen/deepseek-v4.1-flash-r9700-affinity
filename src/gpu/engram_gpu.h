@@ -35,6 +35,17 @@ namespace aff {
 void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, uint32_t n_embd,
                      uint32_t n_hc, uint32_t nb, uint32_t hc_stride, float eps, void* stream);
 
+// Split Row-sharded Engram gate across TP ranks without gathering all key bands over PCIe:
+// each rank sums its local key rows [row_lo, row_hi) into `part_out` ([3*n_hc][nb]), peers swap
+// only `part_out` + value rows, then apply_hip folds `part_a + part_b` and adds value * gate.
+void engram_gate_partial_hip(const void* hc, bool hc_bf16, const float* kv, const float* w,
+                             float* part_out, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
+                             uint32_t hc_stride, uint32_t row_lo, uint32_t row_hi, void* stream);
+
+void engram_gate_apply_hip(void* hc, bool hc_bf16, const float* kv, const float* part_a,
+                           const float* part_b, uint32_t n_embd, uint32_t n_hc, uint32_t nb,
+                           uint32_t hc_stride, float eps, void* stream);
+
 // Requantizes host-gathered raw MXFP8 tokens (`[nt][in_dim B E4M3 | (in_dim/32) B E8M0]`,
 // stride `in_dim + in_dim / 32`) into token-major per-128-K-block FP8 E4M3 (`out_q8`:
 // `[nt][in_dim]`) and F32 block scales (`out_scales`: `[nt][in_dim / 128]`), matching
