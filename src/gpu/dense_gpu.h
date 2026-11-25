@@ -536,7 +536,7 @@ private:
   // The context a_comp_rows_ was sized for, and how much of it is backed at load. The gap between
   // them is address space that costs nothing until the sequence reaches it — which is 962 expert
   // slots at the shipped --kv-size, worth 19% of decode. See gpu/vmem.h.
-  uint64_t a_max_pos_ = 0, a_init_pos_ = 0;
+  uint64_t a_max_pos_ = 0, a_init_pos_ = 0, a_backed_init_ = 0;
   std::atomic<uint64_t> kv_pos_{0}, kv_backed_{0}, kv_margin_{0};
   std::atomic<bool> kv_grow_run_{false};
   std::thread kv_grow_;

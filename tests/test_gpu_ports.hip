@@ -2951,6 +2951,75 @@ int main() {
     }
   }
 
+  // 25. 2-GPU regression: AFF_DENSE_WEIGHT_SLAB + AFF_ROUTER_RANK=1 mirrors sel/wt identically
+  {
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) == hipSuccess && nd >= 2) {
+      auto run_router_rank = [&](const char* rank_env, std::vector<uint32_t>* sel0_out,
+                                 std::vector<uint32_t>* sel1_out, std::vector<float>* wt0_out,
+                                 std::vector<float>* wt1_out) {
+        setenv("AFF_ROUTER_RANK", rank_env, 1);
+        setenv("AFF_DENSE_WEIGHT_SLAB", "1", 1);
+        DenseGpu dg;
+        std::string err;
+        assert(dg.init(256, 128, &err, 2));
+        uint32_t comp_rows[1] = {16};
+        assert(dg.attn_init(1, 32, 512, 64, 64, comp_rows, KvDtype::FP8R, 64, 64, &err));
+        assert(dg.batch_init(16, 128, 1, 32, 512, 128, 128, 64, &err));
+        Model::DenseOps dops = dg.ops();
+        Model::BatchOps bops = dg.batch_ops();
+        // Pack small BF16 matrices into the 2 MiB slab pool before registering routers.
+        std::vector<uint16_t> dense_w(256u * 128u, 0x3c00u);
+        for (int m = 0; m < 4; ++m) {
+          assert(dops.reg(dops.ctx, "blk.0.attn_kv", dense_w.data(), nullptr, AFF_BF16, 256u, 128u) >= 0);
+        }
+        std::vector<uint16_t> w_t(384u * 128u);
+        for (size_t i = 0; i < w_t.size(); ++i)
+          w_t[i] = f32_to_bf16_cpu(0.05f * std::sin((float)(i % 997u) * 0.19f));
+        std::vector<float> bias(384u, 0.0f);
+        for (uint32_t e = 0; e < 384u; ++e) bias[e] = 0.002f * (float)((e * 11u) % 23u);
+        const int32_t rh = dops.reg_router(dops.ctx, w_t.data(), bias.data(), 384u, 128u);
+        assert(rh == 0);
+        const uint32_t live = 4u;
+        std::vector<float> emb(live * 128u);
+        for (size_t i = 0; i < emb.size(); ++i)
+          emb[i] = 0.25f + 0.1f * std::cos((float)i * 0.17f);
+        assert(bops.begin(bops.ctx, live, 0u, emb.data(), 128u, 1u));
+        assert(bops.hc_pre(bops.ctx, -1, -1, -1, -1, 128u, 1u, 1u, 1e-6f, 1e-6f, nullptr));
+        assert(bops.router_topk(bops.ctx, rh, 384u, 128u, 6u, bias.data(), nullptr, 1, 1.0f,
+                                nullptr, nullptr, nullptr));
+        const DenseGpu::RouteDev r0 = dg.route_dev(0);
+        const DenseGpu::RouteDev r1 = dg.route_dev(1);
+        assert(r0.sel && r0.wt && r1.sel && r1.wt && r0.ready && r1.ready && r0.ready == r1.ready);
+        sel0_out->resize(live * 6u);
+        sel1_out->resize(live * 6u);
+        wt0_out->resize(live * 6u);
+        wt1_out->resize(live * 6u);
+        dg.sync_devices();
+        assert(hipSetDevice(0) == hipSuccess);
+        assert(hipMemcpy(sel0_out->data(), r0.sel, live * 6u * sizeof(uint32_t),
+                         hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(wt0_out->data(), r0.wt, live * 6u * sizeof(float),
+                         hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipSetDevice(1) == hipSuccess);
+        assert(hipMemcpy(sel1_out->data(), r1.sel, live * 6u * sizeof(uint32_t),
+                         hipMemcpyDeviceToHost) == hipSuccess);
+        assert(hipMemcpy(wt1_out->data(), r1.wt, live * 6u * sizeof(float),
+                         hipMemcpyDeviceToHost) == hipSuccess);
+        assert(*sel0_out == *sel1_out && *wt0_out == *wt1_out);
+        assert(hipSetDevice(0) == hipSuccess);
+      };
+      std::vector<uint32_t> s0_r0, s1_r0, s0_r1, s1_r1;
+      std::vector<float> w0_r0, w1_r0, w0_r1, w1_r1;
+      run_router_rank("0", &s0_r0, &s1_r0, &w0_r0, &w1_r0);
+      run_router_rank("1", &s0_r1, &s1_r1, &w0_r1, &w1_r1);
+      assert(s0_r0 == s0_r1 && w0_r0 == w0_r1);
+      unsetenv("AFF_ROUTER_RANK");
+      unsetenv("AFF_DENSE_WEIGHT_SLAB");
+      std::printf("PASS: 2-GPU AFF_DENSE_WEIGHT_SLAB + AFF_ROUTER_RANK=1 mirror parity\n");
+    }
+  }
+
   std::printf("PASS: test_gpu_ports on gfx1201\n");
   return 0;
 }
