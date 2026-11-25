@@ -251,7 +251,7 @@ bool HostExpertPool::init(const AffReader* aff, uint64_t budget_bytes, Wanted wa
   (void)::madvise(base_, alloc_bytes_, MADV_HUGEPAGE);
 #ifdef __linux__
   const char* const mlock_env = std::getenv("AFF_POOL_MLOCK");
-  const bool pool_mlock = !mlock_env || !*mlock_env || std::strcmp(mlock_env, "0") != 0;
+  const bool pool_mlock = mlock_env && *mlock_env && std::strcmp(mlock_env, "0") != 0;
   if (pool_mlock) {
 #ifndef MLOCK_ONFAULT
 #define MLOCK_ONFAULT 1u

@@ -2,7 +2,7 @@ ARG BASE_IMAGE=docker.io/rocm/dev-ubuntu-24.04:10.1.0-full
 FROM ${BASE_IMAGE}
 ARG JOBS=16
 ARG AFF_GIT_SHA=unknown
-ARG AFF_VERSION=v5.9.0
+ARG AFF_VERSION=v5.10.0
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build git bash sudo passwd python3 procps iproute2 curl ca-certificates rustc && rm -rf /var/lib/apt/lists/*
 COPY . /opt/affinity-src
 RUN ln -s /opt/affinity-src /opt/affinity
@@ -47,7 +47,9 @@ RUN cd /opt/affinity-src \
       build/test_thinking_budget \
       build/test_suffix_draft \
       build/test_wave2_kernels \
-      build/test_v41_indexer
+      build/test_v41_indexer \
+      build/test_engram_split_gate \
+      build/test_v510_kernels
 RUN if getent passwd ubuntu >/dev/null; then userdel ubuntu; fi; if getent group ubuntu >/dev/null; then groupdel ubuntu; fi
 WORKDIR /opt
 ENTRYPOINT ["/opt/affinity-src/build/affinity"]

@@ -662,7 +662,7 @@ inline bool markov_exact_prune_enabled() {
 
 inline bool fuse_woa_q8_enabled() {
   const char* v = std::getenv("AFF_FUSE_WOA_Q8");
-  return !v || !*v || std::strcmp(v, "0") != 0;
+  return v && *v && std::strcmp(v, "0") != 0;
 }
 
 inline bool head_sample_bf16_enabled() {
