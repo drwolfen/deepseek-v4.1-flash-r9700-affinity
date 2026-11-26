@@ -52,6 +52,17 @@ constexpr uint64_t kRowAlign = 128;
 
 // yarn_ramp_d and rope_pair: gpu/device_math.h, one definition for every caller on device.
 
+template <typename T>
+__global__ void slice_tail_pack_kernel(const T* __restrict__ src, T* __restrict__ dst,
+                                       uint32_t rows, uint32_t old_nb, uint32_t new_nb,
+                                       uint32_t off, uint32_t keep) {
+  const uint32_t row = blockIdx.y;
+  const uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows || col >= new_nb) return;
+  dst[(size_t)row * new_nb + col] =
+      (col < keep) ? src[(size_t)row * old_nb + off + col] : T(0);
+}
+
 __global__ void rope_tail_kernel(float* __restrict__ x, uint32_t n_head, uint32_t head_dim,
                                  uint32_t n_rot, uint32_t pos, float freq_scale, float theta_scale,
                                  float ext_factor, float lo, float hi, float sin_sign) {
@@ -206,10 +217,17 @@ struct StageRing {
   // per-call one.
   bool fit(size_t bytes_per_slot, size_t budget_bytes) {
     if (!bytes_per_slot) return false;
-    if (ready() && stride >= bytes_per_slot && stride <= 4 * bytes_per_slot) return true;
+    if (ready() && stride >= bytes_per_slot &&
+        (stride <= (2u << 20) || stride <= 4 * bytes_per_slot))
+      return true;
     // Every outstanding transfer is reading the memory about to be freed. This is the one place the
     // ring blocks by design, and it is a phase change rather than a call.
-    for (uint32_t i = 0; i < slots; ++i) if (ev[i]) (void)hipEventSynchronize(ev[i]);
+    for (uint32_t i = 0; i < slots; ++i) {
+      if (ev[i] && hipEventSynchronize(ev[i]) != hipSuccess) {
+        if (hipDeviceSynchronize() != hipSuccess) return false;
+        break;
+      }
+    }
     free();
     size_t n = budget_bytes / bytes_per_slot;
     if (n < 1) n = 1;
@@ -477,7 +495,9 @@ struct DenseGpu::Impl {
     // for, and borrowing it would tie one lane's capacity to another's.
     float* e_in = nullptr; float* e_out = nullptr; float* e_stage = nullptr;
     uint32_t e_tile = 0;
+    size_t e_in_bytes = 0, e_out_bytes = 0, e_stg_bytes = 0;
     hipEvent_t ev_eng = nullptr, ev_eng_done = nullptr;
+    hipEvent_t ev_idx = nullptr, ev_idx_read = nullptr;
     // ---- THE FOUR STAGING RINGS -----------------------------------------------------------------
     //
     // Every H2D on the hot path whose source the host rewrites. See StageRing for why each is a ring
@@ -730,7 +750,7 @@ inline bool kv_align_commit_enabled() {
 inline bool kv_skip_dead_ncomp_enabled() {
   static const bool on = [] {
     const char* v = std::getenv("AFF_KV_SKIP_DEAD_NCOMP");
-    return !v || !*v || std::strcmp(v, "0") != 0;
+    return v && *v && std::strcmp(v, "0") != 0;
   }();
   return on;
 }
@@ -753,7 +773,7 @@ inline bool alias_bdx_enabled() {
 
 inline bool idx_full_bq_enabled() {
   const char* v = std::getenv("AFF_IDX_FULL_BQ");
-  return !v || !*v || std::strcmp(v, "0") != 0;
+  return v && *v && std::strcmp(v, "0") != 0;
 }
 
 inline bool fuse_idx_q_enabled() {
@@ -764,9 +784,36 @@ inline bool fuse_idx_q_enabled() {
 inline bool flash_split_v2_enabled() {
   static const bool on = [] {
     const char* v = std::getenv("AFF_FLASH_SPLIT_V2");
-    return !v || !*v || std::strcmp(v, "0") != 0;
+    return v && *v && std::strcmp(v, "0") != 0;
   }();
   return on;
+}
+
+inline bool comp_idx_w8a8_enabled() {
+  const char* v = std::getenv("AFF_COMP_IDX_W8A8");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool idx_tp_split_enabled() {
+  const char* v = std::getenv("AFF_IDX_TP_SPLIT");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool prefill_fuse_ar_hc_enabled() {
+  const char* v = std::getenv("AFF_PREFILL_FUSE_AR_HC");
+  return !v || !*v || !(v[0] == '0' && v[1] == '\0');
+}
+
+inline bool tp_scratch_fp8_enabled() {
+  const char* v = std::getenv("AFF_TP_SCRATCH_FP8");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+inline uint32_t engram_tile_max_cfg() {
+  const char* v = std::getenv("AFF_ENGRAM_TILE_MAX");
+  if (!v || !*v) return 1408u;
+  const int t = std::atoi(v);
+  return t > 0 ? (uint32_t)t : 1u;
 }
 
 inline bool idx_topk_v2_enabled() {
@@ -1283,6 +1330,8 @@ DenseGpu::~DenseGpu() {
     if (D.ev_sd) (void)hipEventDestroy(D.ev_sd);
     if (D.ev_eng) (void)hipEventDestroy(D.ev_eng);
     if (D.ev_eng_done) (void)hipEventDestroy(D.ev_eng_done);
+    if (D.ev_idx) (void)hipEventDestroy(D.ev_idx);
+    if (D.ev_idx_read) (void)hipEventDestroy(D.ev_idx_read);
     if (D.sstream) {
       batch_splitk_release_hip(D.sstream);
       (void)hipStreamDestroy(D.sstream);
@@ -6228,8 +6277,12 @@ bool DenseGpu::batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t
       // Reads `norm`, not qr — a different activation, hence a second GEMM — and the
       // 1/sqrt(dim*heads) folds into the transpose's store, exactly as batch_compress does it.
       const Entry& ep = ent_[h_proj];
-      batch_gemm_hip(ep.quant, shard_rows(ep.sh[d], ep.quant, 0), shard_scales(ep.sh[d], 0),
-                     D.b_norm, D.b_y, n_head, (uint32_t)n_embd, b_nb_, D.stream);
+      if (comp_idx_w8a8_enabled() && q8_ok(h_proj, n_embd) && quant_act(d, D.b_norm, (uint32_t)n_embd)) {
+        batch_gemm_ent_q8(d, h_proj, D.b_y, n_head, n_embd);
+      } else {
+        batch_gemm_hip(ep.quant, shard_rows(ep.sh[d], ep.quant, 0), shard_scales(ep.sh[d], 0),
+                       D.b_norm, D.b_y, n_head, (uint32_t)n_embd, b_nb_, D.stream);
+      }
       batch_scale_transpose_hip(D.b_y, D.i_w, n_head, b_nb_, 1, scale, D.stream);
     }
   }
@@ -6358,8 +6411,18 @@ void DenseGpu::build_v41_keys(void* devp, size_t rank, const Model::CompressArgs
   const Entry& e = ent_[a.h_idx_wk];
   // Dim-major [width][n_out] in, dim-major [idx_dim][n_out] out — compress_kernel wrote the latent
   // in the layout this reads precisely so that no transpose sits between them.
-  batch_gemm_hip(e.quant, shard_rows(e.sh[rank], e.quant, 0), shard_scales(e.sh[rank], 0), D.c_lat,
-                 D.ci_ky, a.idx_dim, a.width, n_out, st);
+  if (comp_idx_w8a8_enabled() && n_out > 1u && b_cap_ >= n_out && q8_ok(a.h_idx_wk, a.width) &&
+      q_slot(rank, a.width)) {
+    D.q8_src = nullptr;
+    norm_q8_invalidate(D.id, D.b_norm);
+    batch_quant_fp8_hip(D.c_lat, D.q8, D.qs, a.width, n_out, 0u, st);
+    batch_gemm_fp8_hip((const uint8_t*)e.sh[rank].data, e.sh[rank].scales, D.q8, D.qs, D.ci_ky,
+                       a.idx_dim, a.width, n_out, 0u, 0u, st, e.sh[rank].ps, a.width,
+                       a.width / 128u);
+  } else {
+    batch_gemm_hip(e.quant, shard_rows(e.sh[rank], e.quant, 0), shard_scales(e.sh[rank], 0),
+                   D.c_lat, D.ci_ky, a.idx_dim, a.width, n_out, st);
+  }
   // Into the SAME key cache and scale plane V4's mode-1 compressor writes, in the same format, so
   // indexer_scores_hip cannot tell the two apart — which is the point.
   idx_key_rows_hip(D.ci_ky, D.ci_norm[a.layer], D.a_idx8_s[slot_][a.layer],
@@ -6476,11 +6539,19 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
     }
     if (!one || !batch_gemm_multi_hip(ent_[job[0].h].quant, bj, (uint32_t)nj, D.b_norm,
                                       (uint32_t)a.n_embd, b_nb_, false, st)) {
+      const bool w8a8_try = comp_idx_w8a8_enabled();
+      bool have_norm_q8 = false;
       off = 0;
       for (int i = 0; i < nj; ++i) {
         const Entry& e = ent_[job[i].h];
-        batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), D.b_norm,
-                       D.b_y + off * b_nb_, job[i].rows, (uint32_t)a.n_embd, b_nb_, st);
+        if (w8a8_try && q8_ok(job[i].h, a.n_embd) &&
+            (have_norm_q8 || (have_norm_q8 = quant_act(d, D.b_norm, (uint32_t)a.n_embd)))) {
+          batch_gemm_ent_q8(d, job[i].h, D.b_y + off * b_nb_, job[i].rows, a.n_embd);
+        } else {
+          batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0),
+                         D.b_norm, D.b_y + off * b_nb_, job[i].rows, (uint32_t)a.n_embd, b_nb_,
+                         st);
+        }
         off += job[i].rows;
       }
     }
@@ -6498,8 +6569,13 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
     if (a.h_iproj >= 0 && a.idx_heads) {
       if (!idx_grow(&D, b_live_, a.idx_heads, a.idx_dim)) return false;
       const Entry& e = ent_[a.h_iproj];
-      batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), D.b_norm,
-                     D.b_y, a.idx_heads, (uint32_t)a.n_embd, b_nb_, st);
+      if (comp_idx_w8a8_enabled() && q8_ok(a.h_iproj, a.n_embd) &&
+          quant_act(d, D.b_norm, (uint32_t)a.n_embd)) {
+        batch_gemm_ent_q8(d, a.h_iproj, D.b_y, a.idx_heads, a.n_embd);
+      } else {
+        batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, 0), shard_scales(e.sh[d], 0), D.b_norm,
+                       D.b_y, a.idx_heads, (uint32_t)a.n_embd, b_nb_, st);
+      }
       batch_scale_transpose_hip(D.b_y, D.i_w, a.idx_heads, b_nb_, 1, a.iscale, st);
     }
 
@@ -6559,19 +6635,38 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
 // the tile below is a real tile, not a convenience.
 static constexpr uint32_t kEngramTileMax = 512u;
 
-bool DenseGpu::engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t out_dim) {
+static void engram_buf_bytes(uint32_t tile, uint32_t in_dim, uint32_t out_dim, bool raw_mxfp8,
+                             size_t* raw_in, size_t* raw_out, size_t* raw_stg) {
+  if (raw_mxfp8) {
+    const size_t qs_off = ((size_t)tile * in_dim + 15u) & ~size_t(15u);
+    *raw_in = qs_off + (size_t)tile * ((size_t)in_dim / 128u) * sizeof(float);
+    *raw_stg = (size_t)tile * ((size_t)in_dim + (size_t)(in_dim / 32u));
+  } else {
+    *raw_in = (size_t)in_dim * tile * sizeof(float);
+    *raw_stg = (size_t)in_dim * tile * sizeof(float);
+  }
+  *raw_out = (size_t)out_dim * tile * sizeof(float);
+}
+
+bool DenseGpu::engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t out_dim,
+                           bool raw_mxfp8) {
   Impl::Dev& D = *(Impl::Dev*)devp;
   if (!D.ev_eng) AFF_HIP_CHECK(hipEventCreateWithFlags(&D.ev_eng, hipEventDisableTiming));
   if (!D.ev_eng_done) AFF_HIP_CHECK(hipEventCreateWithFlags(&D.ev_eng_done, hipEventDisableTiming));
-  if (D.e_tile >= tile && D.e_in) return true;
+  size_t raw_in = 0, raw_out = 0, raw_stg = 0;
+  engram_buf_bytes(tile, in_dim, out_dim, raw_mxfp8, &raw_in, &raw_out, &raw_stg);
+  if (D.e_tile >= tile && D.e_in && D.e_in_bytes >= raw_in && D.e_out_bytes >= raw_out &&
+      D.e_stg_bytes >= raw_stg)
+    return true;
   for (void** p : {(void**)&D.e_in, (void**)&D.e_out, (void**)&D.e_stage}) {
     if (*p && !D.is_bq_alias(*p)) (void)hipFree(*p);
     *p = nullptr;
   }
   D.e_tile = 0u;
-  const size_t b_in = align256((size_t)in_dim * tile * sizeof(float));
-  const size_t b_out = align256((size_t)out_dim * tile * sizeof(float));
-  const size_t b_stg = align256((size_t)in_dim * tile * sizeof(float));
+  D.e_in_bytes = D.e_out_bytes = D.e_stg_bytes = 0u;
+  const size_t b_in = align256(raw_in);
+  const size_t b_out = align256(raw_out);
+  const size_t b_stg = align256(raw_stg);
   const size_t usable_bq =
       (D.b_q && D.b_q_floats) ? ((D.b_q_floats * sizeof(float)) & ~size_t(255u)) : 0u;
   // Engram runs before hc_pre/attn_qkv/compress/indexer, so all other b_q sub-allocations are dead.
@@ -6581,13 +6676,16 @@ bool DenseGpu::engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t 
     D.e_out = reinterpret_cast<float*>(base + b_in);
     D.e_stage = reinterpret_cast<float*>(base + b_in + b_out);
   } else {
-    if (hipMalloc(&D.e_in, (size_t)in_dim * tile * sizeof(float)) != hipSuccess) return false;
-    if (hipMalloc(&D.e_out, (size_t)out_dim * tile * sizeof(float)) != hipSuccess) return false;
+    if (hipMalloc(&D.e_in, raw_in) != hipSuccess) return false;
+    if (hipMalloc(&D.e_out, raw_out) != hipSuccess) return false;
     // Token-major staging, because that is how the host gathers rows; a transpose lands it dim-major
     // for the GEMM. At one token the two layouts are the same and the transpose is skipped.
-    if (hipMalloc(&D.e_stage, (size_t)in_dim * tile * sizeof(float)) != hipSuccess) return false;
+    if (hipMalloc(&D.e_stage, raw_stg) != hipSuccess) return false;
   }
   D.e_tile = tile;
+  D.e_in_bytes = raw_in;
+  D.e_out_bytes = raw_out;
+  D.e_stg_bytes = raw_stg;
   return true;
 }
 
@@ -6596,7 +6694,7 @@ bool DenseGpu::engram_reserve(uint32_t tile, uint32_t in_dim, uint32_t out_dim) 
   tile = std::min(tile, kEngramTileMax);
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
-    if (!engram_grow(&impl_->dev[d], tile, in_dim, out_dim)) return false;
+    if (!engram_grow(&impl_->dev[d], tile, in_dim, out_dim, false)) return false;
   }
   return true;
 }
@@ -6615,17 +6713,36 @@ bool DenseGpu::engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool
   if (raw_mxfp8 && (!engram_fp8_enabled() || !engram_raw_h2d_enabled() ||
                     e.quant != AFF_FP8_E4M3 || (in_dim % 128u) != 0u))
     return false;
-  const uint32_t tile = std::min(n, kEngramTileMax);
+  const size_t R = impl_->dev.size();
+  uint32_t tile = std::min(n, kEngramTileMax);
+  if (raw_mxfp8) {
+    const uint32_t cand_tile = std::min(n, engram_tile_max_cfg());
+    if (cand_tile > tile && dense_arena_alias_enabled()) {
+      size_t ri = 0, ro = 0, rs = 0;
+      engram_buf_bytes(cand_tile, in_dim, (uint32_t)out_dim, true, &ri, &ro, &rs);
+      const size_t need = align256(ri) + align256(ro) + align256(rs);
+      bool all_fit = true;
+      for (size_t d = 0; d < R; ++d) {
+        const Impl::Dev& D = impl_->dev[d];
+        const size_t usable_bq =
+            (D.b_q && D.b_q_floats) ? ((D.b_q_floats * sizeof(float)) & ~size_t(255u)) : 0u;
+        if (!D.b_q || need > usable_bq) {
+          all_fit = false;
+          break;
+        }
+      }
+      if (all_fit) tile = cand_tile;
+    }
+  }
   const uint32_t hc_stride = batched ? b_nb_ : n;
   const size_t token_bytes = raw_mxfp8 ? ((size_t)in_dim + (size_t)(in_dim / 32u))
                                        : (size_t)in_dim * sizeof(float);
-  const size_t R = impl_->dev.size();
   const bool row_sharded = (e.split == Split::Row) && (R > 1u);
   uint64_t r0[kMaxRanks] = {}, nr[kMaxRanks] = {};
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    if (!engram_grow(&D, tile, in_dim, (uint32_t)out_dim)) return false;
+    if (!engram_grow(&D, tile, in_dim, (uint32_t)out_dim, raw_mxfp8)) return false;
     if (!(batched ? (void*)D.b_hc : (void*)D.d_hc)) return false;
     if (batched) {
       D.b_ar_precollapsed = false;
@@ -7193,10 +7310,42 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
   uint32_t n_mask = n_keys;
   for (uint32_t t = 0; t < n; ++t) n_mask = std::max(n_mask, n_comp[t]);
   if (n_mask > a_maxcomp_) return false;
-  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+  const size_t R = impl_->dev.size();
+  const bool gather = topk <= kAdmCap;
+  const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
+  const uint32_t nblk = cand_block_ ? (n_keys + cand_block_ - 1u) / cand_block_ : 0u;
+  bool use_gather_cand = idx_cand_gather_enabled() && cand_block_ && cand_topk_cap_ &&
+                         a.cand_source >= 0 && a.cand_topk_blocks <= cand_topk_cap_ &&
+                         (uint64_t)a.cand_topk_blocks * cand_block_ <= a_maxcomp_;
+  for (size_t d = 0; d < R && use_gather_cand; ++d) {
+    if (!impl_->dev[d].b_cand_ids || !impl_->dev[d].b_cand_n) use_gather_cand = false;
+  }
+  if (use_gather_cand) {
+    if (nblk > cand_blocks_cap_ || !idx_cand_blocks_fit_u16(nblk)) return false;
+    if ((int64_t)layer > (int64_t)a.cand_source && b_cand_src_[slot_] != (int64_t)a.cand_source)
+      return false;
+  }
+  const bool tp_split = idx_tp_split_enabled() && R == 2u && n >= 64u && gather && flash_ok &&
+                        (!cand_block_ || a.cand_source < 0 || use_gather_cand);
+  const uint32_t half = n >> 1;
+  if (b_idx_tp_read_pending_) {
+    for (size_t d = 0; d < R; ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      AFF_HIP_CHECK(hipSetDevice(D.id));
+      if (R == 2u && impl_->dev[1u - d].ev_idx_read)
+        AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, impl_->dev[1u - d].ev_idx_read, 0));
+    }
+    b_idx_tp_read_pending_ = false;
+  }
+  for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
     hipStream_t st = D.stream;
+    if (tp_split) {
+      if (!D.ev_idx) AFF_HIP_CHECK(hipEventCreateWithFlags(&D.ev_idx, hipEventDisableTiming));
+      if (!D.ev_idx_read)
+        AFF_HIP_CHECK(hipEventCreateWithFlags(&D.ev_idx_read, hipEventDisableTiming));
+    }
     if (!idx_grow(&D, n, n_head, a.dim)) return false;
     // The keys are ALREADY on device, in the form this wants: batch_compress wrote them as E4M3
     // rows with one f32 scale each when it emitted them. They used to arrive as host f32 — a
@@ -7228,16 +7377,23 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
                                    hipMemcpyHostToDevice, st));
       AFF_HIP_CHECK(D.ncomp_idxb.done(bs, st));
     }
+    const uint32_t rank_t0 = tp_split ? ((d == 0u) ? 0u : half) : 0u;
+    const uint32_t rank_n = tp_split ? ((d == 0u) ? half : (n - half)) : n;
     // RoPE, QAT, and E4M3 quantization here: i_q holds the projection's RAW output, and i_w the head
     // weights — batch_indexer_q and batch_compress wrote both, on device.
-    if (!fuse_idx_q_enabled() ||
-        !idx_rope_qat_quant_hip(D.i_q, D.i_q8, D.i_qs, n, n_head, a.n_rot, a.pos0,
+    float* const q_ptr = D.i_q + (size_t)rank_t0 * n_head * a.dim;
+    uint8_t* const q8_ptr = D.i_q8 + (size_t)rank_t0 * n_head * a.dim;
+    float* const qs_ptr = D.i_qs + rank_t0;
+    const uint32_t rank_pos0 = a.pos0 + rank_t0;
+    if (rank_n < 64u || !fuse_idx_q_enabled() ||
+        !idx_rope_qat_quant_hip(q_ptr, q8_ptr, qs_ptr, rank_n, n_head, a.n_rot, rank_pos0,
                                 a.rope.freq_scale, a.rope.theta_scale, a.rope.ext_factor, a.rope.lo,
                                 a.rope.hi, st, a.hadamard)) {
-      idx_rope_qat_hip(D.i_q, n, n_head, a.n_rot, a.pos0, a.rope.freq_scale, a.rope.theta_scale,
-                       a.rope.ext_factor, a.rope.lo, a.rope.hi, st, a.hadamard);
+      idx_rope_qat_hip(q_ptr, rank_n, n_head, a.n_rot, rank_pos0, a.rope.freq_scale,
+                       a.rope.theta_scale, a.rope.ext_factor, a.rope.lo, a.rope.hi, st,
+                       a.hadamard);
       // One scale a token over all 64 heads; the keys' own scales came with them.
-      idx_quant_rows_hip(D.i_q, D.i_q8, D.i_qs, n, n_head * a.dim, st);
+      idx_quant_rows_hip(q_ptr, q8_ptr, qs_ptr, rank_n, n_head * a.dim, st);
     }
     // Scores in TILES of `i_tile_` tokens, because the score plane is [tokens][every candidate row]
     // and the candidate count is the context. Holding a whole 1536-token chunk of it costs 1.50 GiB
@@ -7247,26 +7403,14 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
     // launches, same arithmetic, same answer as before.
     //
     // Each token's row is independent, so tiling cannot move a score or a tie.
-    const bool gather = topk <= kAdmCap;
-    const bool flash_ok = a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
     if (!(gather && flash_ok) && !D.b_allow) return false;
-    const uint32_t nblk = cand_block_ ? (n_keys + cand_block_ - 1u) / cand_block_ : 0u;
-    const bool use_gather_cand = idx_cand_gather_enabled() && cand_block_ && cand_topk_cap_ &&
-                                 a.cand_source >= 0 && D.b_cand_ids && D.b_cand_n &&
-                                 a.cand_topk_blocks <= cand_topk_cap_ &&
-                                 (uint64_t)a.cand_topk_blocks * cand_block_ <= a_maxcomp_;
-    if (use_gather_cand) {
-      if (nblk > cand_blocks_cap_ || !idx_cand_blocks_fit_u16(nblk)) return false;
-      if ((int64_t)layer > (int64_t)a.cand_source && b_cand_src_[slot_] != (int64_t)a.cand_source)
-        return false;
-    }
     uint32_t eff_tile = i_tile_;
     if (idx_dyn_tile_enabled() && D.i_sc_bytes) {
       const uint32_t eff_row_elems = (use_gather_cand && (int64_t)layer > (int64_t)a.cand_source)
                                        ? (a.cand_topk_blocks * cand_block_)
                                        : n_keys;
       const size_t row_b = (size_t)std::max<uint32_t>(1u, eff_row_elems) * sizeof(float);
-      eff_tile = (uint32_t)std::min<size_t>(n, std::max<size_t>(1u, D.i_sc_bytes / row_b));
+      eff_tile = (uint32_t)std::min<size_t>(rank_n, std::max<size_t>(1u, D.i_sc_bytes / row_b));
       if (cand_block_ && a.cand_source >= 0 &&
           ((layer == (uint32_t)a.cand_source) || (!use_gather_cand && D.b_cand))) {
         const uint32_t bsc_cap = D.i_bsc_rows ? D.i_bsc_rows : i_tile_;
@@ -7274,12 +7418,14 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
       }
       if (!(gather && flash_ok) && !b_allow_dense_ && D.b_allow_rows)
         eff_tile = std::min(eff_tile, D.b_allow_rows);
-      if (idx_full_bq_enabled() && eff_tile < n && eff_tile >= kIdxTokTile) {
+      if (idx_full_bq_enabled() && eff_tile < rank_n && eff_tile >= kIdxTokTile) {
         eff_tile &= ~(kIdxTokTile - 1u);
       }
     }
-    for (uint32_t t0 = 0; t0 < n; t0 += eff_tile) {
-      const uint32_t nt = std::min(eff_tile, n - t0);
+    for (uint32_t rel = 0; rel < rank_n; rel += eff_tile) {
+      const uint32_t t0 = rank_t0 + rel;
+      const uint32_t nt = std::min(eff_tile, rank_n - rel);
+      const TopkScratch* const sp = (nt <= D.topk.tok_cap && D.topk.ready()) ? &D.topk : nullptr;
       uint8_t* const mrow = (gather && flash_ok)
                                 ? nullptr
                                 : (D.b_allow ? (b_allow_dense_ ? D.b_allow + (size_t)t0 * a_maxcomp_
@@ -7295,13 +7441,14 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
                                 n_keys, n_head, cand_topk_cap_, cand_block_, a.cand_topk_blocks,
                                 cand_keys_stride, st);
         idx_topk_mask_cand_hip(D.i_sc, mrow, cids, cn, nt, cand_keys_stride, cand_topk_cap_,
-                               cand_block_, a.cand_topk_blocks, a_maxcomp_, n_mask, topk, st,
-                               nullptr, gather ? D.b_adm + (size_t)t0 * kAdmCap : nullptr,
+                               cand_block_, a.cand_topk_blocks, a_maxcomp_, n_mask, topk, st, sp,
+                               gather ? D.b_adm + (size_t)t0 * kAdmCap : nullptr,
                                gather ? D.b_admn + t0 : nullptr, kAdmCap);
       } else {
         indexer_scores_hip(D.i_q8 + (size_t)t0 * n_head * a.dim, D.i_qs + t0,
                            D.a_idx8_s[slot_][kl], D.a_idxs_s[slot_][kl],
-                           D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys, n_head, st);
+                           D.i_w + (size_t)t0 * n_head, D.i_sc, nt, n_keys, n_head, st,
+                           D.i_nc + t0);
         // The candidate pre-filter, per tile.
         if (cand_block_ && a.cand_source >= 0) {
           if (nblk > cand_blocks_cap_) return false;
@@ -7312,7 +7459,7 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
             if (!idx_topk_mask_cand_emit_hip(D.i_bsc, nullptr, D.i_ncb + t0, nt, cand_blocks_cap_,
                                              cand_blocks_cap_, nblk, a.cand_topk_blocks,
                                              D.b_cand_ids + (size_t)t0 * cand_topk_cap_,
-                                             D.b_cand_n + t0, cand_topk_cap_, st, nullptr))
+                                             D.b_cand_n + t0, cand_topk_cap_, st, sp))
               return false;
           } else if (D.b_cand) {
             uint8_t* cand = D.b_cand + (size_t)t0 * cand_blocks_cap_;
@@ -7332,11 +7479,37 @@ bool DenseGpu::batch_indexer(const Model::IndexArgs& a) {
         // Straight into b_allow at the CHUNK's own token indexing; batch_attend then offsets by its
         // sub-batch. The mask never leaves the card.
         idx_topk_mask_hip(D.i_sc, mrow, D.i_nc + t0, nt, n_keys,
-                          a_maxcomp_, n_mask, topk, st, nullptr,
+                          a_maxcomp_, n_mask, topk, st, sp,
                           gather ? D.b_adm + (size_t)t0 * kAdmCap : nullptr,
                           gather ? D.b_admn + t0 : nullptr, kAdmCap);
       }
     }
+    if (tp_split) AFF_HIP_CHECK(hipEventRecord(D.ev_idx, st));
+  }
+  if (tp_split) {
+    for (size_t d = 0; d < 2u; ++d) {
+      const size_t p = 1u - d;
+      Impl::Dev& D = impl_->dev[d];
+      Impl::Dev& P = impl_->dev[p];
+      const uint32_t p_t0 = (p == 0u) ? 0u : half;
+      const uint32_t p_n = (p == 0u) ? half : (n - half);
+      AFF_HIP_CHECK(hipSetDevice(D.id));
+      AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, P.ev_idx, 0));
+      AFF_HIP_CHECK(hipMemcpyPeerAsync(D.b_adm + (size_t)p_t0 * kAdmCap, D.id,
+                                       P.b_adm + (size_t)p_t0 * kAdmCap, P.id,
+                                       (size_t)p_n * kAdmCap * sizeof(uint32_t), D.stream));
+      AFF_HIP_CHECK(hipMemcpyPeerAsync(D.b_admn + p_t0, D.id, P.b_admn + p_t0, P.id,
+                                       (size_t)p_n * sizeof(uint32_t), D.stream));
+      if (use_gather_cand && layer == (uint32_t)a.cand_source) {
+        AFF_HIP_CHECK(hipMemcpyPeerAsync(D.b_cand_ids + (size_t)p_t0 * cand_topk_cap_, D.id,
+                                         P.b_cand_ids + (size_t)p_t0 * cand_topk_cap_, P.id,
+                                         (size_t)p_n * cand_topk_cap_ * sizeof(uint16_t), D.stream));
+        AFF_HIP_CHECK(hipMemcpyPeerAsync(D.b_cand_n + p_t0, D.id, P.b_cand_n + p_t0, P.id,
+                                         (size_t)p_n * sizeof(uint32_t), D.stream));
+      }
+      AFF_HIP_CHECK(hipEventRecord(D.ev_idx_read, D.stream));
+    }
+    b_idx_tp_read_pending_ = true;
   }
   if (cand_block_ && a.cand_source >= 0 && layer == (uint32_t)a.cand_source)
     b_cand_src_[slot_] = (int64_t)a.cand_source;
@@ -7968,24 +8141,34 @@ bool DenseGpu::batch_router_hash(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   // `batch_attend` had exactly this shape without a drain to save it, and the result was an
   // attention output that differed from an identical q, non-deterministically.
   const size_t nk = (size_t)b_live_ * k;
+  const bool pack_alias = route_wt_alias_enabled() && b_live_ > 0 && (nk <= UINT32_MAX);
+  float* const wt_dst = pack_alias ? reinterpret_cast<float*>(D.b_rsel + nk) : D.b_rwt;
   if (!D.rsel.ready()) return false;
   uint32_t rs = 0;
   uint8_t* const pin = D.rsel.claim(&rs);
   AFF_BLOCK_AT(aff::BlockSite::RouterHash, AFF_HIP_CHECK(D.rsel.wait(rs)));
   std::memcpy(pin, sel, nk * sizeof(uint32_t));
   std::memcpy(pin + D.r_noff, nsel, (size_t)b_live_ * sizeof(uint32_t));
-  // The copy below is the WHOLE block, so it also carries the weight region — which the host does
-  // not fill, because `router_hash_wt_hip` computes it on the card. With one staging buffer that
-  // region held stale bytes, but the SAME stale bytes every call; with a ring it would hold whatever
-  // that slot last had, and a padding slot's weight that no kernel overwrites would then differ
-  // between two runs of one binary. Zeroed rather than narrowed to two copies: it is 144 bytes at
-  // decode, and one DMA of a contiguous block is why the block is laid out contiguously.
-  std::memset(pin + D.r_woff, 0, nk * sizeof(float));
-  AFF_HIP_CHECK(hipMemcpyAsync(D.b_rsel, pin, D.r_back, hipMemcpyHostToDevice, D.stream));
+  // Preserve D.r_woff / D.r_noff layout in D.b_rsel while transferring only the live slices
+  // [0, nk) and [0, b_live_) instead of trailing gaps when b_live_ < b_cap_.
+  if (b_live_ == b_cap_) {
+    std::memset(pin + D.r_woff, 0, nk * sizeof(float));
+    AFF_HIP_CHECK(hipMemcpyAsync(D.b_rsel, pin, D.r_back, hipMemcpyHostToDevice, D.stream));
+  } else if (pack_alias) {
+    std::memset(pin + nk * sizeof(uint32_t), 0, nk * sizeof(float));
+    AFF_HIP_CHECK(hipMemcpyAsync(D.b_rsel, pin, nk * (sizeof(uint32_t) + sizeof(float)),
+                                 hipMemcpyHostToDevice, D.stream));
+    AFF_HIP_CHECK(hipMemcpyAsync(D.b_rn, pin + D.r_noff, (size_t)b_live_ * sizeof(uint32_t),
+                                 hipMemcpyHostToDevice, D.stream));
+  } else {
+    AFF_HIP_CHECK(hipMemcpyAsync(D.b_rsel, pin, nk * sizeof(uint32_t), hipMemcpyHostToDevice,
+                                 D.stream));
+    AFF_HIP_CHECK(hipMemsetAsync(wt_dst, 0, nk * sizeof(float), D.stream));
+    AFF_HIP_CHECK(hipMemcpyAsync(D.b_rn, pin + D.r_noff, (size_t)b_live_ * sizeof(uint32_t),
+                                 hipMemcpyHostToDevice, D.stream));
+  }
   AFF_HIP_CHECK(D.rsel.done(rs, D.stream));
 
-  const bool pack_alias = route_wt_alias_enabled() && b_live_ > 0 && (nk <= UINT32_MAX);
-  float* const wt_dst = pack_alias ? reinterpret_cast<float*>(D.b_rsel + nk) : D.b_rwt;
   { AFF_TRACE(33);
     batch_gemm_hip(AFF_BF16, D.router[h], nullptr, D.b_norm, D.b_y, n_expert,
                    (uint32_t)n_embd, b_nb_, D.stream); }
@@ -8331,9 +8514,27 @@ bool DenseGpu::batch_block_reduce(uint32_t n_embd) {
     const char* v = std::getenv("AFF_FUSE_BATCH_AR_HC");
     return !(v && *v && std::strcmp(v, "0") == 0);
   };
-  if (fuse_batch_ar_hc_enabled() && impl_->tp.ready && impl_->dev.size() == 2 &&
-      b_nb_ <= kNarrowTok && b_live_ > 0 && b_live_ <= b_nb_ && !xrank_trace_enabled() &&
-      ((size_t)n_embd * b_live_ * sizeof(float) <= impl_->tp.scratch_peer_bytes)) {
+  auto prefill_fuse_ar_ready = [&]() -> bool {
+    if (!prefill_fuse_ar_hc_enabled() || !tp_scratch_fp8_enabled()) return false;
+    if (!impl_->tp.ready || impl_->dev.size() != 2) return false;
+    if (b_nb_ <= kNarrowTok || (b_nb_ & 3u) != 0u || b_live_ == 0 || b_live_ > b_nb_) return false;
+    if (xrank_trace_enabled()) return false;
+    const char* m = std::getenv("AFF_TP_AR_MODE");
+    if (m && *m && std::strcmp(m, "fp8") != 0) return false;
+    if (!m || !*m) {
+      const char* c = std::getenv("AFF_TP_AR_CODED");
+      if (c && *c && std::strcmp(c, "0") != 0) return false;
+    }
+    const size_t n_total = (size_t)n_embd * b_nb_;
+    const size_t need = ((n_total + 15u) & ~size_t(15u)) +
+                        ((n_total + kTpFp8Group - 1u) / kTpFp8Group) * sizeof(float);
+    return n_total <= (size_t)INT32_MAX && n_total * sizeof(float) >= kTpFp8MinBytes &&
+           need <= impl_->tp.scratch_peer_bytes;
+  };
+  if ((fuse_batch_ar_hc_enabled() && impl_->tp.ready && impl_->dev.size() == 2 &&
+       b_nb_ <= kNarrowTok && b_live_ > 0 && b_live_ <= b_nb_ && !xrank_trace_enabled() &&
+       ((size_t)n_embd * b_live_ * sizeof(float) <= impl_->tp.scratch_peer_bytes)) ||
+      prefill_fuse_ar_ready()) {
     b_ar_pending_ = n_embd;
     return true;
   }
@@ -9600,6 +9801,106 @@ bool DenseGpu::draft_confidence(int32_t cw, int32_t h_w1, uint32_t n_embd, uint3
   std::memcpy(out_host, D.h_conf, (size_t)n * sizeof(float));
   ++st_.calls;
   return true;
+}
+
+bool DenseGpu::batch_slice_tail(uint32_t off, uint32_t keep, uint32_t n_embd, uint32_t n_hc,
+                                uint32_t n_head, uint32_t width, uint32_t qr_dim) {
+  if (!impl_ || !b_nb_ || !keep || off + keep > b_live_) return false;
+  const uint32_t old_nb = b_nb_;
+  const uint32_t new_nb = batch_round(keep);
+  if (new_nb > old_nb || new_nb > b_cap_) return false;
+  const size_t R = impl_->dev.size();
+  const uint32_t nh_r = (n_head && R) ? (n_head / (uint32_t)R) : 0u;
+  const uint32_t band_rows = std::max<uint32_t>(1u, b_y_cap_);
+  if (!ensure_by(std::min<uint32_t>(std::max<uint32_t>(n_embd, 1u), band_rows))) return false;
+  const size_t stg_bytes = (size_t)b_y_cap_ * b_cap_ * sizeof(float);
+
+  for (size_t d = 0; d < R; ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    AFF_HIP_CHECK(hipSetDevice(D.id));
+    hipStream_t st = D.stream;
+    auto pack_rows_to = [&](auto* src_buf, auto* dst_buf, uint32_t total_rows) {
+      using T = std::remove_pointer_t<decltype(src_buf)>;
+      if (!src_buf || !dst_buf || !total_rows) return;
+      T* const stg = reinterpret_cast<T*>(D.b_y);
+      const dim3 block(256);
+      const uint32_t gx = (new_nb + 255u) / 256u;
+      for (uint32_t r0 = 0; r0 < total_rows; r0 += band_rows) {
+        const uint32_t cnt = std::min(band_rows, total_rows - r0);
+        hipLaunchKernelGGL((slice_tail_pack_kernel<T>), dim3(gx, cnt), block, 0, st,
+                           src_buf + (size_t)r0 * old_nb, stg, cnt, old_nb, new_nb, off, keep);
+        AFF_HIP_CHECK(hipGetLastError());
+        AFF_HIP_CHECK(hipMemcpyAsync(dst_buf + (size_t)r0 * new_nb, stg,
+                                     (size_t)cnt * new_nb * sizeof(T), hipMemcpyDeviceToDevice, st));
+      }
+    };
+    pack_rows_to(D.b_hc, D.b_hc, n_hc * n_embd);
+    pack_rows_to(D.b_pre_prev, D.b_pre_prev, n_hc);
+    pack_rows_to(D.b_pre, D.b_pre, n_hc);
+    pack_rows_to(D.b_post, D.b_post, n_hc);
+    pack_rows_to(D.b_comb, D.b_comb, n_hc * n_hc);
+    pack_rows_to(D.b_norm, D.b_norm, n_embd);
+    if (D.b_qr && qr_dim) {
+      const uint32_t qr_rows = std::min(qr_dim, b_qr_cap_);
+      const bool qr_in_blk =
+          D.b_g && D.b_g == D.b_block && D.b_qr == D.b_block + (size_t)2048u * old_nb;
+      float* const qr_dst = qr_in_blk ? (D.b_block + (size_t)2048u * new_nb) : D.b_qr;
+      pack_rows_to(D.b_qr, qr_dst, qr_rows);
+      D.b_qr = qr_dst;
+    }
+    pack_rows_to(D.b_q, D.b_q, nh_r * width);
+    pack_rows_to(D.b_hinv, D.b_hinv, nh_r);
+    if (D.b_qtm && nh_r && width) {
+      const size_t nq_r = (size_t)nh_r * width;
+      const size_t elem_b = D.b_qtm_e4m3 ? sizeof(uint8_t) : sizeof(uint16_t);
+      const size_t live_b = (size_t)keep * nq_r * elem_b;
+      uint8_t* const qtm8 = reinterpret_cast<uint8_t*>(D.b_qtm);
+      if (off > 0u) {
+        const size_t src_off = (size_t)off * nq_r * elem_b;
+        for (size_t done = 0; done < live_b; done += stg_bytes) {
+          const size_t chunk = std::min(stg_bytes, live_b - done);
+          AFF_HIP_CHECK(hipMemcpyAsync(D.b_y, qtm8 + src_off + done, chunk,
+                                       hipMemcpyDeviceToDevice, st));
+          AFF_HIP_CHECK(hipMemcpyAsync(qtm8 + done, D.b_y, chunk, hipMemcpyDeviceToDevice, st));
+        }
+      }
+      if (new_nb > keep) {
+        AFF_HIP_CHECK(hipMemsetAsync(qtm8 + live_b, 0, (size_t)(new_nb - keep) * nq_r * elem_b, st));
+      }
+      if (D.b_qtm_e4m3) {
+        const float* const sc_src = b_qtm_qscales(D.b_qtm, nh_r, width, old_nb);
+        float* const sc_dst = b_qtm_qscales(D.b_qtm, nh_r, width, new_nb);
+        const uint32_t gx = (new_nb + 255u) / 256u;
+        for (uint32_t r0 = 0; r0 < nh_r; r0 += band_rows) {
+          const uint32_t cnt = std::min(band_rows, nh_r - r0);
+          hipLaunchKernelGGL((slice_tail_pack_kernel<float>), dim3(gx, cnt), dim3(256), 0, st,
+                             sc_src + (size_t)r0 * old_nb, D.b_y, cnt, old_nb, new_nb, off, keep);
+          AFF_HIP_CHECK(hipGetLastError());
+          AFF_HIP_CHECK(hipMemcpyAsync(sc_dst + (size_t)r0 * new_nb, D.b_y,
+                                       (size_t)cnt * new_nb * sizeof(float),
+                                       hipMemcpyDeviceToDevice, st));
+        }
+      }
+    }
+    D.q8_src = nullptr;
+    norm_q8_invalidate(D.id, D.b_norm);
+  }
+  b_live_ = keep;
+  b_nb_ = new_nb;
+  b_pos0_ += off;
+  b_kvn_pending_ = false;
+  b_ar_pending_ = 0;
+  pending_pf0_ = -1;
+  pending_pf1_ = -1;
+  b_idx_layer_[slot_] = -1;
+  b_cand_src_[slot_] = -1;
+  return true;
+}
+
+bool DenseGpu::slice_tail_cb(void* ctx, uint32_t off, uint32_t keep, uint32_t n_embd,
+                             uint32_t n_hc, uint32_t n_head, uint32_t width, uint32_t qr_dim) {
+  return static_cast<DenseGpu*>(ctx)->batch_slice_tail(off, keep, n_embd, n_hc, n_head, width,
+                                                       qr_dim);
 }
 
 Model::BatchOps DenseGpu::batch_ops() {

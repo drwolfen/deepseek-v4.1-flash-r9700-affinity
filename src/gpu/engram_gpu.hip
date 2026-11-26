@@ -441,25 +441,13 @@ void engram_gate_partial_hip(const void* hc, bool hc_bf16, const float* kv, cons
   if (!hc || !kv || !w || !part_out || !n_embd || !n_hc || !nb || hc_stride < nb ||
       n_hc > kEngMaxHc)
     return;
-  if (nb <= 64u) {
-    const dim3 g(nb), b(kEngThreads);
-    if (hc_bf16)
-      hipLaunchKernelGGL(engram_gate_partial_tok_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv,
-                         w, part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
-    else
-      hipLaunchKernelGGL(engram_gate_partial_tok_kernel<false>, g, b, 0, (hipStream_t)stream, hc,
-                         kv, w, part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
-    AFF_HIP_CHECK(hipGetLastError());
-    return;
-  }
-  const uint32_t thr = 256u;
-  const dim3 g(n_hc, (nb + thr - 1u) / thr), b(thr);
+  const dim3 g(nb), b(kEngThreads);
   if (hc_bf16)
-    hipLaunchKernelGGL(engram_gate_partial_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv, w,
-                       part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
+    hipLaunchKernelGGL(engram_gate_partial_tok_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv,
+                       w, part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
   else
-    hipLaunchKernelGGL(engram_gate_partial_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv, w,
-                       part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
+    hipLaunchKernelGGL(engram_gate_partial_tok_kernel<false>, g, b, 0, (hipStream_t)stream, hc,
+                       kv, w, part_out, n_embd, n_hc, nb, hc_stride, row_lo, row_hi);
   AFF_HIP_CHECK(hipGetLastError());
 }
 
@@ -469,24 +457,12 @@ void engram_gate_apply_hip(void* hc, bool hc_bf16, const float* kv, const float*
   if (!hc || !kv || !part_a || !part_b || !n_embd || !n_hc || !nb || hc_stride < nb ||
       n_hc > kEngMaxHc)
     return;
-  if (nb <= 64u) {
-    const dim3 g(nb), b(kEngThreads);
-    if (hc_bf16)
-      hipLaunchKernelGGL(engram_gate_apply_tok_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv,
-                         part_a, part_b, n_embd, n_hc, nb, hc_stride, eps);
-    else
-      hipLaunchKernelGGL(engram_gate_apply_tok_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv,
-                         part_a, part_b, n_embd, n_hc, nb, hc_stride, eps);
-    AFF_HIP_CHECK(hipGetLastError());
-    return;
-  }
-  const uint32_t thr = 256u;
-  const dim3 g((nb + thr - 1u) / thr), b(thr);
+  const dim3 g(nb), b(kEngThreads);
   if (hc_bf16)
-    hipLaunchKernelGGL(engram_gate_apply_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv,
+    hipLaunchKernelGGL(engram_gate_apply_tok_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv,
                        part_a, part_b, n_embd, n_hc, nb, hc_stride, eps);
   else
-    hipLaunchKernelGGL(engram_gate_apply_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv,
+    hipLaunchKernelGGL(engram_gate_apply_tok_kernel<false>, g, b, 0, (hipStream_t)stream, hc, kv,
                        part_a, part_b, n_embd, n_hc, nb, hc_stride, eps);
   AFF_HIP_CHECK(hipGetLastError());
 }

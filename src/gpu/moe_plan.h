@@ -194,6 +194,7 @@ struct MoePlanArgs {
   const uint8_t** pref_src  = nullptr;
   uint32_t        pref_cap  = 0;
   bool            hybrid_tile128 = false;
+  bool            res_tile128 = false;
 };
 
 // One workgroup. `nb_tok` is handled in groups of 64 tokens, so decode is one group and a 1408-token
@@ -253,14 +254,17 @@ constexpr uint32_t moe_plan_last_group(uint32_t nb_tok) {
 // that bucket requires (`>=1`, `>=17`, `>=33`, `>=65`) and zeros unreachable buckets rather than
 // allocating worst-case `tile_cap` uniformly across all 8 groups. Returns total tiles per plane.
 constexpr uint32_t moe_plan_bucket_caps(uint32_t nb_tok, uint32_t k, uint32_t n_expert,
-                                        bool hybrid_tile128, uint32_t cap[8]) {
+                                        bool hybrid_tile128, uint32_t cap[8],
+                                        bool res_tile128 = false) {
   for (uint32_t g = 0; g < 8u; ++g) cap[g] = 0u;
   if (!nb_tok || !k || !n_expert) return 0u;
   const uint64_t taken64 = (uint64_t)nb_tok * k;
   const uint32_t taken = taken64 > 0xffffffffull ? 0xffffffffu : (uint32_t)taken64;
   const uint32_t distinct = taken < n_expert ? taken : n_expert;
-  const uint32_t last_res = moe_plan_last_group(nb_tok);
-  const uint32_t last_hyb = (hybrid_tile128 && nb_tok > kExpertWmmaTok) ? 3u : last_res;
+  const uint32_t last_res =
+      (res_tile128 && nb_tok > kExpertWmmaTok) ? 3u : moe_plan_last_group(nb_tok);
+  const uint32_t last_hyb =
+      (hybrid_tile128 && nb_tok > kExpertWmmaTok) ? 3u : moe_plan_last_group(nb_tok);
 
   cap[0] = distinct;
   if (last_res >= 1u) {
@@ -269,8 +273,17 @@ constexpr uint32_t moe_plan_bucket_caps(uint32_t nb_tok, uint32_t k, uint32_t n_
   }
   if (last_res >= 2u) {
     const uint32_t b2a = taken / 33u;
-    const uint32_t b2b = distinct + taken / kExpertWmmaTok;
-    cap[2] = b2a < b2b ? b2a : b2b;
+    if (res_tile128) {
+      cap[2] = distinct < b2a ? distinct : b2a;
+    } else {
+      const uint32_t b2b = distinct + taken / kExpertWmmaTok;
+      cap[2] = b2a < b2b ? b2a : b2b;
+    }
+  }
+  if (last_res >= 3u) {
+    const uint32_t b3a = taken / 65u;
+    const uint32_t b3b = distinct + taken / 128u;
+    cap[3] = b3a < b3b ? b3a : b3b;
   }
 
   cap[4] = distinct;

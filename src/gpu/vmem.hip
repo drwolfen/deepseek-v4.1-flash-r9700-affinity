@@ -18,6 +18,20 @@ std::string hip_err(const std::string& what, hipError_t e) {
   return what + ": " + hipGetErrorString(e);
 }
 
+// Allocate and immediately free one 4 KiB pinned host page on the active card so KFD settles
+// deferred VM unmap / page-table invalidations before physical backing is freed or remapped.
+void dev_settle_maps(int dev) {
+  int prev_dev = -1;
+  if (dev >= 0 && hipGetDevice(&prev_dev) == hipSuccess && prev_dev != dev) {
+    (void)hipSetDevice(dev);
+  } else {
+    prev_dev = -1;
+  }
+  void* p = nullptr;
+  if (hipHostMalloc(&p, 4096, hipHostMallocDefault) == hipSuccess && p) (void)hipHostFree(p);
+  if (prev_dev >= 0) (void)hipSetDevice(prev_dev);
+}
+
 }  // namespace
 
 bool VirtualSpan::granularity_for(int dev, size_t* out, std::string* err) {
@@ -107,6 +121,7 @@ bool VirtualSpan::commit_to(size_t bytes, hipStream_t zero_on, std::string* err)
   e = hipMemSetAccess(base_, want, &access, 1);
   if (e != hipSuccess) {
     (void)hipMemUnmap(base_ + off, add);
+    dev_settle_maps(dev_);
     (void)hipMemRelease(h);
     if (err) *err = hip_err("hipMemSetAccess", e);
     return false;
@@ -123,6 +138,7 @@ bool VirtualSpan::commit_to(size_t bytes, hipStream_t zero_on, std::string* err)
   if (e == hipSuccess) e = hipStreamSynchronize(zero_on);
   if (e != hipSuccess) {
     (void)hipMemUnmap(base_ + off, add);
+    dev_settle_maps(dev_);
     (void)hipMemRelease(h);
     if (err) *err = hip_err("hipMemsetAsync", e);
     return false;
@@ -143,6 +159,7 @@ bool VirtualSpan::decommit_to(size_t bytes, std::string* err) {
     const size_t off = committed_ - sz;
     const hipError_t e = hipMemUnmap(base_ + off, sz);
     if (e != hipSuccess) { if (err) *err = hip_err("hipMemUnmap", e); return false; }
+    dev_settle_maps(dev_);
     (void)hipMemRelease(chunks_.back().first);
     chunks_.pop_back();
     committed_ = off;

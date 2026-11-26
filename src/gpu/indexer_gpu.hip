@@ -31,10 +31,10 @@ inline bool idx_score_nt_store_enabled() {
 
 inline uint64_t idx_score_nt_threshold_bytes() {
   const char* s = std::getenv("AFF_IDX_SCORE_NT_BYTES");
-  if (!s || !*s) return 4ull << 20;
+  if (!s || !*s) return 64ull << 20;
   char* end = nullptr;
   const unsigned long long v = std::strtoull(s, &end, 10);
-  return (end != s) ? (uint64_t)v : (4ull << 20);
+  return (end != s) ? (uint64_t)v : (64ull << 20);
 }
 
 constexpr uint32_t kD = kIdxDim;             // 128
@@ -55,7 +55,7 @@ template <bool NT_STORE = false>
 __global__ __launch_bounds__(kThreads) void indexer_kernel(
     const uint8_t* __restrict__ q8, const float* __restrict__ qs, const uint8_t* __restrict__ k8,
     const float* __restrict__ ks, const float* __restrict__ hw, float* __restrict__ out,
-    uint32_t nb, uint32_t n_keys, uint32_t n_head) {
+    uint32_t nb, uint32_t n_keys, uint32_t n_head, const uint32_t* __restrict__ n_comp = nullptr) {
 
   // Reuse Q staging LDS for coalesced score writeout after the head loop completes (17,920 B
   // total <= 18,432 B for >=3 WGs/WGP), separated by lds_barrier() before writing scores.
@@ -71,7 +71,14 @@ __global__ __launch_bounds__(kThreads) void indexer_kernel(
   const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5;
   const uint32_t c = lane & 15u, hlf = lane >> 4;
   const uint32_t t0 = blockIdx.x * kIdxTokTile;
-  const uint32_t kb = blockIdx.y * kIdxKeys + wave * (kKT * 16u);
+  const uint32_t blk_k0 = blockIdx.y * kIdxKeys;
+  // Block-uniform causal early return BEFORE touching LDS/barriers: all 16 tokens in this block
+  // have causal n_comp <= n_comp[min(t0 + kIdxTokTile - 1, nb - 1)].
+  if (n_comp != nullptr) {
+    const uint32_t t_hi = (t0 + kIdxTokTile - 1u < nb) ? (t0 + kIdxTokTile - 1u) : (nb - 1u);
+    if (blk_k0 >= n_comp[t_hi]) return;
+  }
+  const uint32_t kb = blk_k0 + wave * (kKT * 16u);
 
   // ---- B: the keys. Loaded once, held for the whole head loop.
   wmma::i2v bf[kKT][kD / 16u];
@@ -2116,7 +2123,7 @@ inline uint32_t idx_narrow_max_nb() {
 
 void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, const float* ks,
                         const float* hw, float* out, uint32_t nb, uint32_t n_keys,
-                        uint32_t n_head, void* stream) {
+                        uint32_t n_head, void* stream, const uint32_t* n_comp) {
   if (!nb || !n_keys || !n_head) return;
   const bool nt_store = idx_score_nt_store_enabled() &&
                         ((uint64_t)nb * n_keys * sizeof(float) > idx_score_nt_threshold_bytes());
@@ -2155,10 +2162,10 @@ void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, c
   const dim3 g((nb + kIdxTokTile - 1) / kIdxTokTile, (n_keys + kIdxKeys - 1) / kIdxKeys);
   if (nt_store) {
     hipLaunchKernelGGL((indexer_kernel<true>), g, dim3(kThreads), 0, (hipStream_t)stream, q8, qs,
-                       k8, ks, hw, out, nb, n_keys, n_head);
+                       k8, ks, hw, out, nb, n_keys, n_head, n_comp);
   } else {
     hipLaunchKernelGGL((indexer_kernel<false>), g, dim3(kThreads), 0, (hipStream_t)stream, q8, qs,
-                       k8, ks, hw, out, nb, n_keys, n_head);
+                       k8, ks, hw, out, nb, n_keys, n_head, n_comp);
   }
   AFF_HIP_CHECK(hipGetLastError());
 }
