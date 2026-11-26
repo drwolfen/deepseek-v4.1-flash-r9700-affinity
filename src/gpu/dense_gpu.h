@@ -158,6 +158,12 @@ public:
   void*  batch_shexp_event(size_t r) const;
   void   clear_batch_shexp_event(size_t r);
   uint32_t batch_nb() const { return b_nb_; }
+  // Compact live tokens [off, off + keep) -> [0, keep) across active batch buffers when prefill
+  // slices down to a narrow decode/verify tail mid-forward. Updates b_live_, b_nb_, and b_pos0_.
+  bool     batch_slice_tail(uint32_t off, uint32_t keep, uint32_t n_embd, uint32_t n_hc,
+                            uint32_t n_head, uint32_t width, uint32_t qr_dim);
+  static bool slice_tail_cb(void* ctx, uint32_t off, uint32_t keep, uint32_t n_embd,
+                            uint32_t n_hc, uint32_t n_head, uint32_t width, uint32_t qr_dim);
 
   // The router's selection as a CARD can read it, which is what a device-built dispatch needs and
   // the host path never did. `sel` and `wt` are [nb_tok][k] on rank `r`'s own memory — rank 0's own
@@ -583,6 +589,7 @@ private:
       a_cand_src_[i] = -1;  b_cand_src_[i] = -1;
       a_idx_gather_[i] = false; a_idx_topk_[i] = 0;
     }
+    b_idx_tp_read_pending_ = false;
   }
 
  private:
@@ -617,6 +624,7 @@ private:
   uint32_t b_ar_pending_ = 0;
   int32_t  pending_pf0_ = -1;
   int32_t  pending_pf1_ = -1;
+  bool     b_idx_tp_read_pending_ = false;
   size_t   n_vec_ = 0, n_router_ = 0;
   uint32_t r_max_expert_ = 0;
   void     batch_shexp_join(size_t r);
@@ -682,7 +690,8 @@ private:
   bool     engram_impl(int32_t h_wkv, int32_t qk_vec, const void* rows, bool raw_mxfp8,
                        uint32_t n, uint32_t in_dim, uint32_t n_embd, uint32_t n_hc, float eps,
                        bool batched);
-  bool     engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t out_dim);
+  bool     engram_grow(void* devp, uint32_t tile, uint32_t in_dim, uint32_t out_dim,
+                       bool raw_mxfp8 = false);
   bool     indexer_one(const Model::IndexArgs& a);
   // Tells attn_q to keep qr_norm in VRAM for indexer_one instead of copying it to the host.
   //

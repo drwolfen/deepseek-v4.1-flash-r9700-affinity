@@ -152,7 +152,10 @@ __device__ inline PlanLds plan_lds(char* raw, uint32_t n_expert, uint32_t nb_tok
   L.uniq = p; p += n_expert;
   L.tc = p; p += 8u * n_expert;
   L.run = p; p += nb_tok + 1u;
-  const uint32_t tmpn = (8u * n_expert > nb_tok + 1u) ? 8u * n_expert : nb_tok + 1u;
+  const uint32_t nw_e = (n_expert + 31u) >> 5;
+  const uint32_t nw_t = (nb_tok + 32u) >> 5;
+  const uint32_t t1 = (8u * nw_e > nw_t) ? (8u * nw_e) : nw_t;
+  const uint32_t tmpn = (n_expert > t1) ? n_expert : t1;
   L.tmp = p; p += tmpn;
   // 8-byte aligned by construction: every block above is a whole number of uint32 and the base of a
   // dynamic LDS allocation is 16-byte aligned.
@@ -321,9 +324,9 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
   aff::lds_barrier();
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) {
     const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
-    const bool hyb128 = (cls == 1u && a.hybrid_tile128);
-    const uint32_t wmax = hyb128 ? 128u : kExpertWmmaTok;
-    const uint32_t full_b = hyb128 ? 3u : 2u;
+    const bool tile128 = (cls == 0u) ? a.res_tile128 : a.hybrid_tile128;
+    const uint32_t wmax = tile128 ? 128u : kExpertWmmaTok;
+    const uint32_t full_b = tile128 ? 3u : 2u;
     const uint32_t q = c / wmax, r = c % wmax;
     // One thread owns j, so these accumulate rather than race — and they DO have to accumulate:
     // when the remainder lands in `full_b` it sits in the same row as the full tiles.
@@ -351,9 +354,9 @@ __global__ __launch_bounds__(kPlanThreads) void moe_plan_kernel(MoePlanArgs a,
   const uint32_t pstride = custom_caps ? a.plane_stride : 8u * cap;
   for (uint32_t j = threadIdx.x; j < n_uniq; j += kPlanThreads) {
     const uint32_t e = L.uniq[j], c = L.counts[e], cls = (j < n_res) ? 0u : 1u;
-    const bool hyb128 = (cls == 1u && a.hybrid_tile128);
-    const uint32_t wmax = hyb128 ? 128u : kExpertWmmaTok;
-    const uint32_t full_b = hyb128 ? 3u : 2u;
+    const bool tile128 = (cls == 0u) ? a.res_tile128 : a.hybrid_tile128;
+    const uint32_t wmax = tile128 ? 128u : kExpertWmmaTok;
+    const uint32_t full_b = tile128 ? 3u : 2u;
     const uint32_t q = c / wmax, r = c % wmax;
     const uint64_t pv = plc[e];
     uint8_t* base = (uint8_t*)(uintptr_t)(pv & ~1ull);
@@ -918,7 +921,10 @@ bool plc_publish_hip(uint64_t* plc, const PlcPatch& p, void* stream) {
 }
 
 size_t moe_plan_lds_bytes(uint32_t n_expert, uint32_t nb_tok) {
-  const uint32_t tmpn = (8u * n_expert > nb_tok + 1u) ? 8u * n_expert : nb_tok + 1u;
+  const uint32_t nw_e = (n_expert + 31u) >> 5;
+  const uint32_t nw_t = (nb_tok + 32u) >> 5;
+  const uint32_t t1 = (8u * nw_e > nw_t) ? (8u * nw_e) : nw_t;
+  const uint32_t tmpn = (n_expert > t1) ? n_expert : t1;
   return (size_t)(5u * n_expert + 8u * n_expert + nb_tok + 1u + tmpn) * sizeof(uint32_t) + 8u +
          (size_t)n_expert * sizeof(unsigned long long);
 }
@@ -976,9 +982,10 @@ bool moe_plan_hip(const MoePlanArgs& a, void* stream) {
   // this is on the dispatch path and hipGetDeviceProperties is a driver call.
   const size_t lds = moe_plan_lds_bytes(a.n_expert, a.nb_tok);
   if (lds > device_lds_per_block()) return false;
-  const uint32_t last_res = moe_plan_last_group(a.nb_tok);
+  const uint32_t last_res =
+      (a.res_tile128 && a.nb_tok > kExpertWmmaTok) ? 3u : moe_plan_last_group(a.nb_tok);
   const uint32_t last_hyb =
-      (a.hybrid_tile128 && a.nb_tok > kExpertWmmaTok) ? 3u : last_res;
+      (a.hybrid_tile128 && a.nb_tok > kExpertWmmaTok) ? 3u : moe_plan_last_group(a.nb_tok);
   hipLaunchKernelGGL(moe_plan_kernel, dim3(1), dim3(kPlanThreads), lds, (hipStream_t)stream, a,
                      last_res, last_hyb);
   return hipGetLastError() == hipSuccess;   // amdnas-fixes: an unbuilt plan must not be dispatched

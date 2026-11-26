@@ -47,7 +47,7 @@ constexpr uint32_t kIdxKeys = 128;       // keys a block
 // `n_head` must be a multiple of 8 and `n_keys` may be anything — the tail is masked on store.
 void indexer_scores_hip(const uint8_t* q8, const float* qs, const uint8_t* k8, const float* ks,
                         const float* hw, float* out, uint32_t nb, uint32_t n_keys,
-                        uint32_t n_head, void* stream);
+                        uint32_t n_head, void* stream, const uint32_t* n_comp = nullptr);
 
 // RoPE tail + the indexer's QAT (an E2M1 round trip per 32, behind an optional 128-wide Hadamard)
 // over the whole chunk's queries, in place. `q` is [n][n_head][kIdxDim] f32 and token t sits at
@@ -97,6 +97,7 @@ struct TopkScratch {
   uint32_t* state = nullptr;   // [tok_cap][4]       prefix, need, gt, arrivals
   uint32_t* tie = nullptr;     // [tok_cap][1+1024]  count, then the indices tied at the threshold
   uint32_t tok_cap = 0;
+  bool ready() const { return hist && state && tie && tok_cap > 0u; }
 };
 
 // Bytes the scratch needs for `tok` tokens: the return value is the histogram's.

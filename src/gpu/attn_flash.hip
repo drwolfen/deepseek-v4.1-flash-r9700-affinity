@@ -686,7 +686,7 @@ static uint32_t flash_split_slices(uint32_t n_tok, uint32_t head_tiles, uint32_t
   }();
   static const bool split_v2 = [] {
     const char* v = std::getenv("AFF_FLASH_SPLIT_V2");
-    return !v || !*v || std::strcmp(v, "0") != 0;
+    return v && *v && std::strcmp(v, "0") != 0;
   }();
   const uint32_t min_tiles =
       env_min_tiles ? env_min_tiles : (n_tok <= 16u ? (split_v2 ? 2u : 1u) : 4u);
@@ -738,7 +738,7 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
     const char* v = std::getenv("AFF_FLASH_4WAVE_RESOLVE");
     return !v || !*v || !(v[0] == '0' && v[1] == '\0');
   }();
-  const bool nt_kv = flash_longctx_nt_enabled() &&
+  const bool nt_kv = (n == 1u) && flash_longctx_nt_enabled() &&
                      ((uint64_t)nkeys * kRowB > (flash_nt_threshold_mib() << 20));
   const dim3 g(n, ntiles, nsp), b(kThreads);
 #define AFF_LAUNCH(T, S, M, R4, NK)                                                                \

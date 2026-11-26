@@ -71,6 +71,8 @@ inline bool mover_ev_wait_enabled() {
 }
 inline bool moe_bucket_caps_enabled() { return env_default_on("AFF_MOE_BUCKET_CAPS"); }
 inline bool hybrid_tile128_enabled() { return env_default_on("AFF_HYBRID_TILE128"); }
+inline bool res_tile128_enabled() { return env_default_on("AFF_RES_TILE128"); }
+inline bool prefill_hyb_split_enabled() { return env_default_on("AFF_PREFILL_HYB_SPLIT"); }
 } // namespace
 
 bool bonus_d2d_enabled() {
@@ -637,6 +639,9 @@ uint32_t StaticPlacement::act_drain() {
     act_tail_ = h - kActSlots;
   }
   static thread_local std::vector<uint32_t> distinct, cnts;
+#if defined(AFF_HEAT_APPEND)
+  if (ecfg_.strategy == PlacementEngineConfig::Strategy::Demand) heat_.clear_demand();
+#endif
   uint32_t took = 0;
   for (; act_tail_ < h; ++act_tail_, ++took) {
     const ActRecord& R = act_ring_->slot[act_tail_ % kActSlots];
@@ -664,7 +669,11 @@ uint32_t StaticPlacement::act_drain() {
       missing.clear();
       for (uint32_t e : distinct)
         if (device_of_[(size_t)layer * n_expert_ + e] < 0) missing.push_back(e);
+#if defined(AFF_HEAT_APPEND)
+      heat_.note_missing(layer, missing.data(), (uint32_t)missing.size(), true);
+#else
       heat_.note_missing(layer, missing.data(), (uint32_t)missing.size());
+#endif
     }
     ++act_seen_;
   }
@@ -1120,8 +1129,14 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     uint32_t n_tiles_init = 0;
     if (moe_bucket_caps_enabled()) {
       uint32_t gcap[8] = {};
-      n_tiles_init =
-          aff::moe_plan_bucket_caps(batch_tok, k, n_expert, hybrid_tile128_enabled(), gcap);
+      const bool hyb128 = hybrid_tile128_enabled();
+      const bool res128 = res_tile128_enabled() && (batch_tok >= 512u);
+      n_tiles_init = aff::moe_plan_bucket_caps(batch_tok, k, n_expert, hyb128, gcap, res128);
+      if (res128) {
+        const uint32_t n_tiles_64 =
+            aff::moe_plan_bucket_caps(batch_tok, k, n_expert, hyb128, gcap, false);
+        if (n_tiles_64 > n_tiles_init) n_tiles_init = n_tiles_64;
+      }
     } else {
       n_tiles_init = (uint32_t)std::max<uint64_t>(
           bound, 8ull * aff::moe_plan_tile_cap(batch_tok, k, n_expert));
@@ -1238,7 +1253,11 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     const bool ma = is_v41_massive_expert(n_layer, n_expert, a);
     const bool mb = is_v41_massive_expert(n_layer, n_expert, b);
     if (ma != mb) return ma > mb;
-    return prof ? (prof[a] > prof[b]) : (a < b);
+    if (prof && prof[a] != prof[b]) return prof[a] > prof[b];
+    const uint32_t ea = a % n_expert;
+    const uint32_t eb = b % n_expert;
+    if (ea != eb) return ea < eb;
+    return a < b;
   });
 
   const uint64_t n_resident = std::min<uint64_t>(total_slots, order.size());
@@ -2195,11 +2214,13 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         // that has not seen the routing cannot know where a packed class would start. `tile_cap` is
         // a function of nb_tok, k and n_expert, all of which it does know.
         const bool hybrid_tile128 = hybrid_tile128_enabled();
+        const bool res_tile128 = res_tile128_enabled() && (nb_tok >= 512u);
         const bool use_bucket_caps = moe_bucket_caps_enabled();
         uint32_t gcap[8] = {}, goff[8] = {};
         uint32_t cap = 0, plane_tiles = 0;
         if (use_bucket_caps) {
-          plane_tiles = moe_plan_bucket_caps(nb_tok, k, n_expert_, hybrid_tile128, gcap);
+          plane_tiles =
+              moe_plan_bucket_caps(nb_tok, k, n_expert_, hybrid_tile128, gcap, res_tile128);
           for (uint32_t g = 1; g < 8u; ++g) goff[g] = goff[g - 1] + gcap[g - 1];
         } else {
           cap = moe_plan_tile_cap(nb_tok, k, n_expert_);
@@ -2261,6 +2282,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         A.pref_src  = d_pref_src_[dv];
         A.pref_cap  = pref_cap_;
         A.hybrid_tile128 = hybrid_tile128;
+        A.res_tile128 = res_tile128;
         if (!moe_plan_hip(A, st)) {
           aff::ui::fatal("fatal: the plan kernel refused nb_tok %u k %u experts %u on card "
                        "%zu\n", nb_tok, k, n_expert_, dv);
@@ -2274,7 +2296,8 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
         // decode nothing is wider than nb_tok <= 16, so exactly one bucket a class is launched and
         // the layer costs the same six launches it does today. Launching all four unconditionally
         // would take that to twenty-four.
-        const uint32_t last_res = moe_plan_last_group(nb_tok);
+        const uint32_t w_res = std::min<uint32_t>(nb_tok, res_tile128 ? 128u : kExpertWmmaTok);
+        const uint32_t last_res = w_res > 64u ? 3u : moe_plan_last_group(nb_tok);
         const uint32_t w_hyb = std::min<uint32_t>(nb_tok, hybrid_tile128 ? 128u : kExpertWmmaTok);
         const uint32_t last_hyb = w_hyb > 64u ? 3u : moe_plan_last_group(nb_tok);
         const bool has_pooled =
@@ -2475,7 +2498,9 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
       //   ev_dn  the missing experts' down has landed                       (hyb  -> comp)
       // and nothing else crosses. A miss count small enough to fit under the resident chain makes
       // every one of these already-satisfied on arrival, which is the whole design.
-      const bool split = n_miss_tiles && I.hyb.size() > dv && I.hyb[dv];
+      const bool split =
+          ((nb_tok <= 16u) || prefill_hyb_split_enabled()) && n_miss_tiles && I.hyb.size() > dv &&
+          I.hyb[dv];
       hipStream_t hyb = split ? I.hyb[dv] : st;
       // This dispatch's slot in each of the four rings. Advanced once per (card, layer) so a record
       // and the wait that reads it are the same object, and no other layer touches it.
