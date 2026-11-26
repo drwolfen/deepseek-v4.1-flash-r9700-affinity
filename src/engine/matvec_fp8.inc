@@ -222,15 +222,26 @@ AFF_TARGET_AVX512 inline void matvec_fp8_rows_avx512(const uint8_t* W, const uin
 }  // namespace detail
 
 inline void matvec_fp8_rows(const uint8_t* W, const uint8_t* S, uint64_t row0, uint64_t nrows,
-                            uint64_t cols, const float* x, float* out) noexcept {
-  const float* lut = fp8_lut().v;
+                            uint64_t cols, const float* x, float* out, CpuIsa isa,
+                            const float* lut) noexcept {
 #if AFF_CPU_X86
-  const CpuIsa isa = active_cpu_isa();
   if (isa >= CpuIsa::Avx512) { detail::matvec_fp8_rows_avx512(W, S, row0, nrows, cols, x, out, lut); return; }
   if (isa == CpuIsa::Avx2)   { detail::matvec_fp8_rows_avx2(W, S, row0, nrows, cols, x, out, lut); return; }
   if (isa == CpuIsa::Avx1)   { detail::matvec_fp8_rows_avx1(W, S, row0, nrows, cols, x, out, lut); return; }
+#else
+  (void)isa;
 #endif
   detail::matvec_fp8_rows_scalar(W, S, row0, nrows, cols, x, out, lut);
+}
+
+inline void matvec_fp8_rows(const uint8_t* W, const uint8_t* S, uint64_t row0, uint64_t nrows,
+                            uint64_t cols, const float* x, float* out, CpuIsa isa) noexcept {
+  matvec_fp8_rows(W, S, row0, nrows, cols, x, out, isa, fp8_lut().v);
+}
+
+inline void matvec_fp8_rows(const uint8_t* W, const uint8_t* S, uint64_t row0, uint64_t nrows,
+                            uint64_t cols, const float* x, float* out) noexcept {
+  matvec_fp8_rows(W, S, row0, nrows, cols, x, out, active_cpu_isa(), fp8_lut().v);
 }
 
 }  // namespace aff

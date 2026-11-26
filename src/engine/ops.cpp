@@ -266,8 +266,9 @@ int  matvec_bf16_variant() { return g_mv_variant; }
 
 void matvec_bf16(const uint16_t* W, const float* x, uint64_t rows, uint64_t cols,
                  float* out) noexcept {
-  if (g_mv_variant == 1) matvec_bf16_v1(W, x, rows, cols, out);
-  else                   matvec_bf16_v2(W, x, rows, cols, out);
+  const CpuIsa isa = active_cpu_isa();
+  if (g_mv_variant == 1) matvec_bf16_v1(W, x, rows, cols, out, isa);
+  else                   matvec_bf16_v2(W, x, rows, cols, out, isa);
 }
 
 
@@ -275,8 +276,11 @@ void matvec_bf16(const uint16_t* W, const float* x, uint64_t rows, uint64_t cols
 constexpr uint64_t kMtRowThreshold = 512;
 
 void matvec_bf16_mt(const uint16_t* W, const float* x, uint64_t rows, uint64_t cols, float* out) {
+  const CpuIsa isa = active_cpu_isa();
+  const int var = g_mv_variant;
   parallel_for(rows, kMtRowThreshold, [&](uint64_t lo, uint64_t hi) {
-    matvec_bf16(W + lo * cols, x, hi - lo, cols, out + lo);
+    if (var == 1) matvec_bf16_v1(W + lo * cols, x, hi - lo, cols, out + lo, isa);
+    else          matvec_bf16_v2(W + lo * cols, x, hi - lo, cols, out + lo, isa);
   });
 }
 
@@ -285,7 +289,7 @@ void matvec_bf16_mt(const uint16_t* W, const float* x, uint64_t rows, uint64_t c
 void matvec_dense(const DenseW& w, const float* x, uint64_t rows, uint64_t cols,
                   float* out) noexcept {
   if (w.quant == AFF_FP8_E4M3)
-    matvec_fp8_rows((const uint8_t*)w.data, w.scales, 0, rows, cols, x, out);
+    matvec_fp8_rows((const uint8_t*)w.data, w.scales, 0, rows, cols, x, out, active_cpu_isa());
   else
     matvec_bf16((const uint16_t*)w.data, x, rows, cols, out);
 }
@@ -294,8 +298,10 @@ void matvec_dense_mt(const DenseW& w, const float* x, uint64_t rows, uint64_t co
   if (w.quant != AFF_FP8_E4M3) { matvec_bf16_mt((const uint16_t*)w.data, x, rows, cols, out); return; }
   // Pass the ABSOLUTE row offset, not a shifted base pointer: the scale tile is chosen by row index,
   // so a thread that started its own numbering at zero would read another tile's scale.
+  const CpuIsa isa = active_cpu_isa();
+  const float* const lut = fp8_lut().v;
   parallel_for(rows, kMtRowThreshold, [&](uint64_t lo, uint64_t hi) {
-    matvec_fp8_rows((const uint8_t*)w.data, w.scales, lo, hi - lo, cols, x, out + lo);
+    matvec_fp8_rows((const uint8_t*)w.data, w.scales, lo, hi - lo, cols, x, out + lo, isa, lut);
   });
 }
 
@@ -305,11 +311,14 @@ void matvec_dense_grouped_mt(const DenseW& w, const float* x, uint32_t n_groups,
     matvec_bf16_grouped_mt((const uint16_t*)w.data, x, n_groups, group_dim, rank, out);
     return;
   }
+  const CpuIsa isa = active_cpu_isa();
+  const float* const lut = fp8_lut().v;
   const uint64_t total = (uint64_t)n_groups * rank;
   parallel_for(total, kMtRowThreshold, [&](uint64_t lo, uint64_t hi) {
     for (uint64_t i = lo; i < hi; ++i) {
       const uint64_t g = i / rank;
-      matvec_fp8_rows((const uint8_t*)w.data, w.scales, i, 1, group_dim, x + g * group_dim, out + i);
+      matvec_fp8_rows((const uint8_t*)w.data, w.scales, i, 1, group_dim, x + g * group_dim,
+                      out + i, isa, lut);
     }
   });
 }
@@ -318,10 +327,17 @@ void matvec_bf16_grouped_mt(const uint16_t* W, const float* x, uint32_t n_groups
                             uint64_t group_dim, uint64_t rank, float* out) {
   // Parallelise over the flattened (group, row) space so 8 groups of 1024 rows still spread over
   // more than 8 workers.
+  const CpuIsa isa = active_cpu_isa();
+  const int var = g_mv_variant;
   parallel_for((uint64_t)n_groups * rank, kMtRowThreshold, [&](uint64_t lo, uint64_t hi) {
     for (uint64_t i = lo; i < hi; ++i) {
       const uint64_t g = i / rank, r = i % rank;
-      matvec_bf16(W + (g * rank + r) * group_dim, x + g * group_dim, 1, group_dim, out + i);
+      if (var == 1)
+        matvec_bf16_v1(W + (g * rank + r) * group_dim, x + g * group_dim, 1, group_dim, out + i,
+                       isa);
+      else
+        matvec_bf16_v2(W + (g * rank + r) * group_dim, x + g * group_dim, 1, group_dim, out + i,
+                       isa);
     }
   });
 }

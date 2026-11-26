@@ -28,6 +28,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 namespace aff {
 
@@ -460,6 +462,7 @@ struct DenseGpu::Impl {
     // reordering becomes a silent wrong token.
     float* b_apeer = nullptr;
     uint32_t* b_hids = nullptr;  uint32_t* h_hids = nullptr;
+    uint32_t* b_pen = nullptr;   uint32_t* h_pen = nullptr;
     hipEvent_t ev_amx = nullptr;
     StageRing tok;                                        // the block's first token, 4 bytes a slot
     // The draft's own two: transposed tap, and main_norm(main_proj(.)), which is all three stages
@@ -572,9 +575,9 @@ struct DenseGpu::Impl {
     // verified identical on 1050 dispatches.
     //
     // 64 slots: more than the 43 layers of a block, so it cannot wrap inside one, and the block
-    // boundary still has waits of its own. `route_wait` guards the wrap anyway — a host that IS 64
+    // boundary still has waits of its own. `route_wait` guards the wrap anyway — a host that IS 128
     // layers ahead is not the bottleneck, so blocking it there costs nothing.
-    static constexpr uint32_t kRouteSlots = 64;
+    static constexpr uint32_t kRouteSlots = 128;
     uint32_t* b_rsel_m = nullptr;  float* b_rwt_m = nullptr;   // owner: its own block, unringed
     void* m_ring = nullptr;                      // peer: kRouteSlots blocks
     void* ev_route[kRouteSlots] = {};            // owner: one per slot
@@ -888,6 +891,11 @@ inline bool route_wt_alias_enabled() {
 
 inline bool head_tm_fast_enabled() {
   const char* v = std::getenv("AFF_HEAD_TM_FAST");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+inline bool head_greedy_local_enabled() {
+  const char* v = std::getenv("AFF_HEAD_GREEDY_LOCAL");
   return !(v && *v && std::strcmp(v, "0") == 0);
 }
 
@@ -1407,6 +1415,8 @@ DenseGpu::~DenseGpu() {
     free_rt(D.b_apeer);
     free_rt(D.b_hids);
     if (D.h_hids) (void)hipHostFree(D.h_hids);
+    free_rt(D.b_pen);
+    if (D.h_pen) (void)hipHostFree(D.h_pen);
     D.tok.free();
     if (D.h_y) (void)hipHostFree(D.h_y);
     if (D.h_norm) (void)hipHostFree(D.h_norm);
@@ -4658,20 +4668,58 @@ bool DenseGpu::kv_sync_all() const {
   return true;
 }
 
+namespace {
+std::mutex g_pin_mu;
+std::unordered_map<void*, std::vector<void*>> g_pin_chunks;
+}  // namespace
+
 bool DenseGpu::pin_host(void* ptr, size_t bytes) {
   if (!ptr || !bytes) return false;
-  const hipError_t e = hipHostRegister(ptr, bytes, hipHostRegisterDefault);
-  if (e != hipSuccess) {
-    (void)hipGetLastError();
-    aff::ui::err("prefix cache: hipHostRegister(%zu bytes) declined (%s); using pageable host memory\n",
-                 bytes, hipGetErrorString(e));
-    return false;
+  constexpr size_t kPinChunk = (size_t)1u << 30;
+  std::vector<void*> chunks;
+  uint8_t* const base = static_cast<uint8_t*>(ptr);
+  for (size_t off = 0; off < bytes; ) {
+    uint8_t* const cptr = base + off;
+    const size_t to_gib = kPinChunk - ((uintptr_t)cptr & (kPinChunk - 1u));
+    const size_t cur = std::min(bytes - off, to_gib);
+    const hipError_t e = hipHostRegister(cptr, cur, hipHostRegisterDefault);
+    if (e != hipSuccess) {
+      (void)hipGetLastError();
+      for (void* c : chunks) {
+        if (hipHostUnregister(c) != hipSuccess) (void)hipGetLastError();
+      }
+      aff::ui::err("prefix cache: hipHostRegister(%zu bytes, chunk@%zu MiB=%zu MiB) declined (%s); "
+                   "using pageable host memory\n",
+                   bytes, off >> 20, cur >> 20, hipGetErrorString(e));
+      return false;
+    }
+    chunks.push_back(cptr);
+    off += cur;
+  }
+  if (chunks.size() > 1u) {
+    std::lock_guard<std::mutex> lk(g_pin_mu);
+    g_pin_chunks[ptr] = std::move(chunks);
   }
   return true;
 }
 
 void DenseGpu::unpin_host(void* ptr) {
   if (!ptr) return;
+  std::vector<void*> chunks;
+  {
+    std::lock_guard<std::mutex> lk(g_pin_mu);
+    auto it = g_pin_chunks.find(ptr);
+    if (it != g_pin_chunks.end()) {
+      chunks = std::move(it->second);
+      g_pin_chunks.erase(it);
+    }
+  }
+  if (!chunks.empty()) {
+    for (void* c : chunks) {
+      if (hipHostUnregister(c) != hipSuccess) (void)hipGetLastError();
+    }
+    return;
+  }
   const hipError_t e = hipHostUnregister(ptr);
   if (e != hipSuccess) (void)hipGetLastError();
 }
@@ -5197,6 +5245,8 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
                            (kMaxRanks - 1) * 2u * kNarrowTok * sizeof(float), false});
     small_items.push_back({reinterpret_cast<void**>(&D.b_hids),
                            (size_t)kNarrowTok * sizeof(uint32_t), false});
+    small_items.push_back({reinterpret_cast<void**>(&D.b_pen),
+                           (size_t)(2u * kPenaltyCap) * sizeof(uint32_t), false});
     if (!runtime_slab_alloc(D, small_items.data(), small_items.size(), "batch runtime slab", err))
       return false;
     if (emb_aliases_y) D.b_emb = D.b_y;
@@ -5288,6 +5338,9 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
     }
     if (!hip_try(hipHostMalloc(&D.h_hids, (size_t)kNarrowTok * sizeof(uint32_t),
                                hipHostMallocDefault), "block ids staging", err))
+      return false;
+    if (!hip_try(hipHostMalloc(&D.h_pen, (size_t)(2u * kPenaltyCap) * sizeof(uint32_t),
+                               hipHostMallocDefault), "block pen staging", err))
       return false;
     if (!hip_try(hipEventCreateWithFlags(&D.ev_amx, hipEventDisableTiming), "argmax event", err))
       return false;
@@ -9020,6 +9073,200 @@ bool DenseGpu::batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_tap
 // card — only the card's own band is written by the GEMM — so the gather is a peer copy into the
 // hole rather than a new allocation. It is ~1.5 MiB for a verify block, tens of microseconds, and it
 // buys a sampler that needs no cross-card step at all afterwards.
+bool DenseGpu::batch_head_local_argmax(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n,
+                                       const float* x, const uint32_t* pen_all, uint32_t n_pen,
+                                       float repeat_penalty, const uint32_t* dry_all,
+                                       uint32_t n_dry, float dry_delta, bool require_full_vocab,
+                                       bool head_sample_site, uint32_t* ids) {
+  if (!b_nb_ || !n || !ids || h < 0 || (size_t)h >= ent_.size()) return false;
+  if (n > b_live_ || b_nb_ > kNarrowTok || vocab > b_vocab_) return false;
+  const Entry& e = ent_[h];
+  if (e.split == Split::Col || e.cols != n_embd) return false;
+  const size_t R = impl_->dev.size();
+  const bool tm_fast_bf16 = head_tm_fast_enabled() && n <= 6u;
+  const bool tm_fast_fp8 = head_tm_fast_enabled() && n <= kNarrowTok;
+  const uint32_t bf16_mx_max = tm_fast_bf16 ? 6u : kMvMultiXFast;
+  const bool bf16_mx = e.quant == AFF_BF16 && n <= bf16_mx_max;
+  uint64_t r0_band[kMaxRanks] = {};
+  uint64_t band[kMaxRanks] = {};
+  uint64_t covered = 0;
+  for (size_t d = 0; d < R; ++d) {
+    row_band(e.sh[d], vocab, &r0_band[d], &band[d]);
+    covered += band[d];
+  }
+  if (require_full_vocab && covered != vocab) return false;
+  const bool has_rep = pen_all && n_pen && (repeat_penalty > 0.0f) && (repeat_penalty != 1.0f);
+  const bool has_dry = dry_all && n_dry && (dry_delta > 0.0f);
+  static auto launch_w4_head = [](const uint8_t* w4, const uint16_t* sc, const float* x_tm,
+                                  float* y, uint32_t nr_rows, uint32_t cols, uint32_t nt,
+                                  uint32_t out_ld, int out_tm, hipStream_t st) -> bool {
+    if (!w4 || !sc || (cols % 256) != 0 || !nt) return false;
+    for (uint32_t t0 = 0; t0 < nt; t0 += 8u) {
+      const uint32_t chunk = std::min<uint32_t>(8u, nt - t0);
+      float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
+      if (!matvec_w4_multix_hip(w4, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols, chunk,
+                                out_ld, out_tm, st))
+        return false;
+    }
+    return true;
+  };
+  for (size_t d = 0; d < R; ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    if (!D.b_head || !D.b_amx || !D.b_apeer || !D.b_hids || !D.h_hids || !D.ev_amx) return false;
+    if ((has_rep || has_dry) && (!D.b_pen || !D.h_pen)) return false;
+    AFF_HIP_CHECK(hipSetDevice(D.id));
+    const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
+    const bool lmhead_int4 = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
+    const bool use_fp8 = !lmhead_int4 && !e.sh[d].data && e.sh[d].fp8_data &&
+                         e.sh[d].fp8_scales && (n_embd % 256) == 0;
+    const bool use_w4 =
+        (lmhead_int4 || (!e.sh[d].data && !e.sh[d].b12_sm && !e.sh[d].fp8_data)) &&
+        e.sh[d].w4_data && e.sh[d].w4_scales && (n_embd % 256) == 0;
+    const bool use_b12 = !use_w4 && !use_fp8 && !e.sh[d].data && e.sh[d].b12_sm &&
+                         (n_embd % 256) == 0;
+    // Under AFF_HEAD_TM_FAST=1, extend direct token-major output (skipping memset+transpose) up to
+    // n <= kNarrowTok for W4/FP8 heads and n <= 6 for BF16x12/multix; batch_argmax consumes matching layout.
+    const bool mx = bf16_mx || (tm_fast_fp8 && (use_w4 || use_fp8)) || (tm_fast_bf16 && use_b12);
+    // The padding columns go through the transpose and the GEMM like any other, so the source of
+    // them has to be finite; b_emb is the arena's upload slot and nothing else reads it here.
+    if (x) {
+      if (!mx && !use_w4 && !use_fp8) {
+        AFF_HIP_CHECK(hipMemsetAsync(D.b_emb, 0, (size_t)n_embd * b_nb_ * sizeof(float),
+                                     D.stream));
+      }
+      AFF_HIP_CHECK(hipMemcpyAsync(D.b_emb, x, (size_t)n * n_embd * sizeof(float),
+                                   hipMemcpyHostToDevice, D.stream));
+      if (!mx && !use_w4 && !use_fp8)
+        batch_transpose_hip(D.b_emb, D.b_norm, (uint32_t)n_embd, b_nb_, 0, D.stream);
+    }
+    const uint64_t r0 = r0_band[d], nr = band[d];
+    if (!nr) continue;
+    if (mx) {
+      if (use_w4) {
+        const uint64_t off = r0 - e.sh[d].row0;
+        if (!launch_w4_head(e.sh[d].w4_data + off * (n_embd / 2),
+                            e.sh[d].w4_scales + off * (n_embd / 128), D.b_emb, D.b_head,
+                            (uint32_t)nr, (uint32_t)n_embd, n, (uint32_t)nr,
+                            /*out_token_major=*/1, D.stream))
+          return false;
+      } else if (use_fp8) {
+        const uint64_t off = r0 - e.sh[d].row0;
+        if (!launch_fp8_g128_head(static_cast<const uint8_t*>(e.sh[d].fp8_data) + off * n_embd,
+                                  e.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb, D.b_head,
+                                  (uint32_t)nr, (uint32_t)n_embd, n, (uint32_t)nr,
+                                  /*out_token_major=*/1, D.stream))
+          return false;
+      } else if (use_b12) {
+        const uint64_t off = r0 - e.sh[d].row0;
+        if (!matvec_bf16x12_multix_hip(
+                e.sh[d].b12_sm + off * n_embd,
+                e.sh[d].b12_exp4 + off * (n_embd / 2),
+                e.sh[d].b12_mexp + off * (n_embd / 32),
+                e.sh[d].b12_esc_off ? (e.sh[d].b12_esc_off + off) : nullptr,
+                e.sh[d].b12_esc_col, e.sh[d].b12_esc_val, D.b_emb, D.b_head, (uint32_t)nr,
+                (uint32_t)n_embd, n, (uint32_t)nr, /*out_token_major=*/1, D.stream))
+          return false;
+      } else {
+        const MvJob j{shard_rows(e.sh[d], e.quant, r0 - e.sh[d].row0), nullptr, e.quant,
+                      (uint32_t)nr, D.b_head, 1.0f};
+        if (!matvec_multix_hip(&j, 1, D.b_emb, (uint32_t)n_embd, n, (uint32_t)n_embd, D.stream))
+          return false;
+      }
+    } else {
+      if (use_w4) {
+        const uint64_t off = r0 - e.sh[d].row0;
+        if (!launch_w4_head(e.sh[d].w4_data + off * (n_embd / 2),
+                            e.sh[d].w4_scales + off * (n_embd / 128), D.b_emb, D.b_head,
+                            (uint32_t)nr, (uint32_t)n_embd, n, b_nb_, /*out_token_major=*/0,
+                            D.stream))
+          return false;
+      } else if (use_fp8) {
+        const uint64_t off = r0 - e.sh[d].row0;
+        if (!launch_fp8_g128_head(static_cast<const uint8_t*>(e.sh[d].fp8_data) + off * n_embd,
+                                  e.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb, D.b_head,
+                                  (uint32_t)nr, (uint32_t)n_embd, n, b_nb_,
+                                  /*out_token_major=*/0, D.stream))
+          return false;
+      } else if (use_b12) {
+        const uint64_t off = r0 - e.sh[d].row0;
+        batch_gemm_bf16x12_hip(e.sh[d].b12_sm, e.sh[d].b12_exp4, e.sh[d].b12_mexp,
+                               e.sh[d].b12_esc_off, e.sh[d].b12_esc_col, e.sh[d].b12_esc_val,
+                               D.b_norm, D.b_head, (uint32_t)nr, (uint32_t)n_embd, b_nb_,
+                               (uint32_t)off, D.stream);
+      } else {
+        batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, r0 - e.sh[d].row0),
+                       shard_scales(e.sh[d], r0 - e.sh[d].row0), D.b_norm, D.b_head, (uint32_t)nr,
+                       (uint32_t)n_embd, b_nb_, D.stream);
+      }
+    }
+    if (has_rep || has_dry) {
+      uint32_t d_n_pen = 0;
+      uint32_t d_n_dry = 0;
+      if (has_rep) {
+        for (uint32_t i = 0; i < n_pen; ++i) {
+          const uint32_t id = pen_all[i];
+          if (id >= r0 && id < r0 + nr) D.h_pen[d_n_pen++] = (uint32_t)(id - r0);
+        }
+      }
+      if (has_dry) {
+        for (uint32_t i = 0; i < n_dry; ++i) {
+          const uint32_t id = dry_all[i];
+          if (id >= r0 && id < r0 + nr) D.h_pen[d_n_pen + d_n_dry++] = (uint32_t)(id - r0);
+        }
+      }
+      if (d_n_pen || d_n_dry) {
+        AFF_HIP_CHECK(hipMemcpyAsync(D.b_pen, D.h_pen,
+                                     (size_t)(d_n_pen + d_n_dry) * sizeof(uint32_t),
+                                     hipMemcpyHostToDevice, D.stream));
+        const uint32_t rs = mx ? 1u : b_nb_;
+        const uint32_t cs = mx ? (uint32_t)nr : 1u;
+        if (!apply_penalties_hip(D.b_head, (uint32_t)nr, n, rs, cs,
+                                 d_n_pen ? D.b_pen : nullptr, d_n_pen, repeat_penalty,
+                                 d_n_dry ? (D.b_pen + d_n_pen) : nullptr, d_n_dry, dry_delta,
+                                 D.stream))
+          return false;
+      }
+    }
+    batch_argmax_hip(D.b_head, D.b_amx, (uint32_t)nr, b_nb_, n, (uint32_t)r0, D.stream,
+                     mx ? 1 : 0);
+    // The instant this card's plane exists. Rank 0's stream waits on rank 1's record; nothing waits
+    // on rank 0's, and it costs one event record a block to have it.
+    AFF_HIP_CHECK(hipEventRecord(D.ev_amx, D.stream));
+  }
+  // ---- THE CROSS-CARD COMBINE, ON THE CARD -----------------------------------------------------
+  {
+    size_t nband = 0;
+    for (size_t d = 0; d < R; ++d) nband += band[d] ? 1 : 0;
+    if (!nband) return false;                             // no card owns any of the vocabulary
+    Impl::Dev& D = impl_->dev[0];
+    AFF_HIP_CHECK(hipSetDevice(D.id));
+    const size_t plane = 2u * (size_t)b_nb_;
+    uint32_t staged = 0;
+    for (size_t d = 1; d < R; ++d) {
+      if (!band[d]) continue;
+      Impl::Dev& P = impl_->dev[d];
+      AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, P.ev_amx, 0));
+      AFF_HIP_CHECK(hipMemcpyPeerAsync(D.b_apeer + staged * plane, D.id, P.b_amx, P.id,
+                                       plane * sizeof(float), D.stream));
+      ++staged;
+    }
+    const float* const own = band[0] ? D.b_amx : D.b_apeer;
+    const float* const peers = band[0] ? D.b_apeer : D.b_apeer + plane;
+    const uint32_t npeer = band[0] ? staged : staged - 1;
+    batch_head_combine_hip(own, peers, npeer, D.b_hids, n, b_nb_, D.stream);
+    AFF_HIP_CHECK(hipMemcpyAsync(D.h_hids, D.b_hids, (size_t)n * sizeof(uint32_t),
+                                 hipMemcpyDeviceToHost, D.stream));
+    if (head_sample_site) {
+      AFF_DRAIN_AT(D, aff::BlockSite::HeadSample);
+    } else {
+      AFF_DRAIN_AT(D, aff::BlockSite::Head);
+    }
+    std::memcpy(ids, D.h_hids, (size_t)n * sizeof(uint32_t));
+  }
+  ++st_.calls;
+  return true;
+}
+
 bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n,
                                  const float* x, const uint32_t* query, const float* u,
                                  float temperature, float top_p, uint32_t top_k, float min_p,
@@ -9042,6 +9289,47 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
   if (e.split == Split::Col) return no("the head is Col-split; it must be Row or Rep");
   if (e.cols != n_embd) return no("the head's column count is not n_embd");
   const size_t R = impl_->dev.size();
+
+  // Deduplicate repetition window once across [0, vocab) so greedy local and full sampling apply
+  // identical penalties.
+  uint32_t pen_all[kPenaltyCap];
+  uint32_t n_pen = 0;
+  if (repeat_penalty > 0.0f && repeat_penalty != 1.0f && penalty_ids && n_penalty_ids) {
+    if (pen_seen_.size() < vocab) pen_seen_.assign((size_t)vocab, 0u);
+    if (++pen_epoch_ == 0u) {
+      std::fill(pen_seen_.begin(), pen_seen_.end(), 0u);
+      pen_epoch_ = 1u;
+    }
+    const uint32_t first = n_penalty_ids > kPenaltyCap ? n_penalty_ids - kPenaltyCap : 0;
+    for (uint32_t i = first; i < n_penalty_ids; ++i) {
+      const uint32_t id = penalty_ids[i];
+      if (id >= vocab) continue;
+      if (pen_seen_[id] == pen_epoch_) continue;
+      pen_seen_[id] = pen_epoch_;
+      pen_all[n_pen++] = id;
+    }
+  }
+  uint32_t n_dry = 0;
+  const uint32_t* dry_src = nullptr;
+  if (dry_delta > 0.0f && dry_ids && n_dry_ids) {
+    n_dry = n_dry_ids > kPenaltyCap ? kPenaltyCap : n_dry_ids;
+    dry_src = dry_ids;
+  }
+
+  if (head_greedy_local_enabled() && !(temperature > 0.0f)) {
+    uint32_t greedy_ids[kNarrowTok];
+    if (!batch_head_local_argmax(h, vocab, n_embd, n, x, pen_all, n_pen, repeat_penalty, dry_src,
+                                 n_dry, dry_delta, /*require_full_vocab=*/true,
+                                 /*head_sample_site=*/true, greedy_ids)) {
+      return no("local greedy argmax failed");
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t tok = greedy_ids[i];
+      const uint32_t q = query ? query[i] : 0xFFFFFFFFu;
+      out[i] = Model::PosDraw{tok, tok, (q == tok) ? 1.0f : 0.0f};
+    }
+    return true;
+  }
 
   // ---- THE BANDS MUST TILE THE VOCABULARY --------------------------------------------------
   //
@@ -9234,37 +9522,8 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
   auto* const d_ctrl = reinterpret_cast<SmpCtrlBuf*>(smp_ctrl_);
   std::memcpy(h_ctrl->query, query, (size_t)n * sizeof(uint32_t));
   std::memcpy(h_ctrl->u, u, (size_t)2u * n * sizeof(float));
-  // ---- the repetition window -------------------------------------------------------------------
-  //
-  // Deduplicated here rather than in the kernel: a window in which one token appears eight times
-  // would otherwise compound the penalty eight times, which is a frequency penalty by accident and
-  // a much harsher one than the caller asked for. Oldest-first, newest kept when the window is
-  // longer than the staging buffer.
-  uint32_t n_pen = 0;
-  if (repeat_penalty != 1.0f && penalty_ids && n_penalty_ids) {
-    if (pen_seen_.size() < vocab) pen_seen_.assign((size_t)vocab, 0u);
-    if (++pen_epoch_ == 0u) {
-      std::fill(pen_seen_.begin(), pen_seen_.end(), 0u);
-      pen_epoch_ = 1u;
-    }
-    const uint32_t first = n_penalty_ids > kPenaltyCap ? n_penalty_ids - kPenaltyCap : 0;
-    for (uint32_t i = first; i < n_penalty_ids; ++i) {
-      const uint32_t id = penalty_ids[i];
-      if (id >= vocab) continue;
-      if (pen_seen_[id] == pen_epoch_) continue;
-      pen_seen_[id] = pen_epoch_;
-      h_ctrl->tail[n_pen++] = id;
-    }
-  }
-  // ---- DRY ------------------------------------------------------------------------------------
-  //
-  // The host has already decided which ids continue a repeated n-gram, and deduplicated them
-  // because it collected them by scanning. All that is left is a bounded copy and a subtract.
-  uint32_t n_dry = 0;
-  if (dry_delta > 0.0f && dry_ids && n_dry_ids) {
-    n_dry = n_dry_ids > kPenaltyCap ? kPenaltyCap : n_dry_ids;
-    std::memcpy(h_ctrl->tail + n_pen, dry_ids, (size_t)n_dry * sizeof(uint32_t));
-  }
+  if (n_pen) std::memcpy(h_ctrl->tail, pen_all, (size_t)n_pen * sizeof(uint32_t));
+  if (n_dry) std::memcpy(h_ctrl->tail + n_pen, dry_src, (size_t)n_dry * sizeof(uint32_t));
   const size_t tail_off = (size_t)((const uint8_t*)h_ctrl->tail - (const uint8_t*)h_ctrl);
   const size_t ctrl_bytes = tail_off + (size_t)(n_pen + n_dry) * sizeof(uint32_t);
   AFF_HIP_CHECK(hipMemcpyAsync(smp_ctrl_, smp_h_ctrl_, ctrl_bytes, hipMemcpyHostToDevice, D0.stream));
@@ -9295,176 +9554,8 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
 // against. Same contract draft_head carries, for the same reason.
 bool DenseGpu::batch_head(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
                           uint32_t* ids) {
-  if (!b_nb_ || !n || !ids || h < 0 || (size_t)h >= ent_.size()) return false;
-  if (n > b_live_ || b_nb_ > kNarrowTok || vocab > b_vocab_) return false;
-  const Entry& e = ent_[h];
-  if (e.split == Split::Col || e.cols != n_embd) return false;
-  const size_t R = impl_->dev.size();
-  const bool tm_fast_bf16 = head_tm_fast_enabled() && n <= 6u;
-  const bool tm_fast_fp8 = head_tm_fast_enabled() && n <= kNarrowTok;
-  const uint32_t bf16_mx_max = tm_fast_bf16 ? 6u : kMvMultiXFast;
-  const bool bf16_mx = e.quant == AFF_BF16 && n <= bf16_mx_max;
-  uint64_t band[kMaxRanks] = {};                  // nr per card, for the combine below
-  static auto launch_w4_head = [](const uint8_t* w4, const uint16_t* sc, const float* x_tm,
-                                  float* y, uint32_t nr_rows, uint32_t cols, uint32_t nt,
-                                  uint32_t out_ld, int out_tm, hipStream_t st) -> bool {
-    if (!w4 || !sc || (cols % 256) != 0 || !nt) return false;
-    for (uint32_t t0 = 0; t0 < nt; t0 += 8u) {
-      const uint32_t chunk = std::min<uint32_t>(8u, nt - t0);
-      float* dst = out_tm ? (y + (size_t)t0 * out_ld) : (y + t0);
-      if (!matvec_w4_multix_hip(w4, sc, x_tm + (size_t)t0 * cols, dst, nr_rows, cols, chunk,
-                                out_ld, out_tm, st))
-        return false;
-    }
-    return true;
-  };
-  for (size_t d = 0; d < R; ++d) {
-    Impl::Dev& D = impl_->dev[d];
-    if (!D.b_head || !D.b_amx || !D.b_apeer || !D.b_hids || !D.h_hids || !D.ev_amx) return false;
-    AFF_HIP_CHECK(hipSetDevice(D.id));
-    const char* l_int4 = std::getenv("AFF_LMHEAD_INT4");
-    const bool lmhead_int4 = l_int4 && *l_int4 && std::strcmp(l_int4, "0") != 0;
-    const bool use_fp8 = !lmhead_int4 && !e.sh[d].data && e.sh[d].fp8_data &&
-                         e.sh[d].fp8_scales && (n_embd % 256) == 0;
-    const bool use_w4 =
-        (lmhead_int4 || (!e.sh[d].data && !e.sh[d].b12_sm && !e.sh[d].fp8_data)) &&
-        e.sh[d].w4_data && e.sh[d].w4_scales && (n_embd % 256) == 0;
-    const bool use_b12 = !use_w4 && !use_fp8 && !e.sh[d].data && e.sh[d].b12_sm &&
-                         (n_embd % 256) == 0;
-    // Under AFF_HEAD_TM_FAST=1, extend direct token-major output (skipping memset+transpose) up to
-    // n <= kNarrowTok for W4/FP8 heads and n <= 6 for BF16x12/multix; batch_argmax consumes matching layout.
-    const bool mx = bf16_mx || (tm_fast_fp8 && (use_w4 || use_fp8)) || (tm_fast_bf16 && use_b12);
-    // The padding columns go through the transpose and the GEMM like any other, so the source of
-    // them has to be finite; b_emb is the arena's upload slot and nothing else reads it here.
-    if (x) {
-      if (!mx && !use_w4 && !use_fp8) {
-        AFF_HIP_CHECK(hipMemsetAsync(D.b_emb, 0, (size_t)n_embd * b_nb_ * sizeof(float),
-                                     D.stream));
-      }
-      AFF_HIP_CHECK(hipMemcpyAsync(D.b_emb, x, (size_t)n * n_embd * sizeof(float),
-                                   hipMemcpyHostToDevice, D.stream));
-      if (!mx && !use_w4 && !use_fp8)
-        batch_transpose_hip(D.b_emb, D.b_norm, (uint32_t)n_embd, b_nb_, 0, D.stream);
-    }
-    uint64_t r0 = 0, nr = 0;
-    row_band(e.sh[d], vocab, &r0, &nr);
-    band[d] = nr;
-    if (!nr) continue;
-    if (mx) {
-      if (use_w4) {
-        const uint64_t off = r0 - e.sh[d].row0;
-        if (!launch_w4_head(e.sh[d].w4_data + off * (n_embd / 2),
-                            e.sh[d].w4_scales + off * (n_embd / 128), D.b_emb, D.b_head,
-                            (uint32_t)nr, (uint32_t)n_embd, n, (uint32_t)nr,
-                            /*out_token_major=*/1, D.stream))
-          return false;
-      } else if (use_fp8) {
-        const uint64_t off = r0 - e.sh[d].row0;
-        if (!launch_fp8_g128_head(static_cast<const uint8_t*>(e.sh[d].fp8_data) + off * n_embd,
-                                  e.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb, D.b_head,
-                                  (uint32_t)nr, (uint32_t)n_embd, n, (uint32_t)nr,
-                                  /*out_token_major=*/1, D.stream))
-          return false;
-      } else if (use_b12) {
-        const uint64_t off = r0 - e.sh[d].row0;
-        if (!matvec_bf16x12_multix_hip(
-                e.sh[d].b12_sm + off * n_embd,
-                e.sh[d].b12_exp4 + off * (n_embd / 2),
-                e.sh[d].b12_mexp + off * (n_embd / 32),
-                e.sh[d].b12_esc_off ? (e.sh[d].b12_esc_off + off) : nullptr,
-                e.sh[d].b12_esc_col, e.sh[d].b12_esc_val, D.b_emb, D.b_head, (uint32_t)nr,
-                (uint32_t)n_embd, n, (uint32_t)nr, /*out_token_major=*/1, D.stream))
-          return false;
-      } else {
-        const MvJob j{shard_rows(e.sh[d], e.quant, r0 - e.sh[d].row0), nullptr, e.quant,
-                      (uint32_t)nr, D.b_head, 1.0f};
-        if (!matvec_multix_hip(&j, 1, D.b_emb, (uint32_t)n_embd, n, (uint32_t)n_embd, D.stream))
-          return false;
-      }
-    } else {
-      if (use_w4) {
-        const uint64_t off = r0 - e.sh[d].row0;
-        if (!launch_w4_head(e.sh[d].w4_data + off * (n_embd / 2),
-                            e.sh[d].w4_scales + off * (n_embd / 128), D.b_emb, D.b_head,
-                            (uint32_t)nr, (uint32_t)n_embd, n, b_nb_, /*out_token_major=*/0,
-                            D.stream))
-          return false;
-      } else if (use_fp8) {
-        const uint64_t off = r0 - e.sh[d].row0;
-        if (!launch_fp8_g128_head(static_cast<const uint8_t*>(e.sh[d].fp8_data) + off * n_embd,
-                                  e.sh[d].fp8_scales + off * (n_embd / 128), D.b_emb, D.b_head,
-                                  (uint32_t)nr, (uint32_t)n_embd, n, b_nb_,
-                                  /*out_token_major=*/0, D.stream))
-          return false;
-      } else if (use_b12) {
-        const uint64_t off = r0 - e.sh[d].row0;
-        batch_gemm_bf16x12_hip(e.sh[d].b12_sm, e.sh[d].b12_exp4, e.sh[d].b12_mexp,
-                               e.sh[d].b12_esc_off, e.sh[d].b12_esc_col, e.sh[d].b12_esc_val,
-                               D.b_norm, D.b_head, (uint32_t)nr, (uint32_t)n_embd, b_nb_,
-                               (uint32_t)off, D.stream);
-      } else {
-        batch_gemm_hip(e.quant, shard_rows(e.sh[d], e.quant, r0 - e.sh[d].row0),
-                       shard_scales(e.sh[d], r0 - e.sh[d].row0), D.b_norm, D.b_head, (uint32_t)nr,
-                       (uint32_t)n_embd, b_nb_, D.stream);
-      }
-    }
-    batch_argmax_hip(D.b_head, D.b_amx, (uint32_t)nr, b_nb_, n, (uint32_t)r0, D.stream,
-                     mx ? 1 : 0);
-    // The instant this card's plane exists. Rank 0's stream waits on rank 1's record; nothing waits
-    // on rank 0's, and it costs one event record a block to have it.
-    AFF_HIP_CHECK(hipEventRecord(D.ev_amx, D.stream));
-  }
-  // ---- THE CROSS-CARD COMBINE, ON THE CARD -----------------------------------------------------
-  //
-  // The vocabulary is Row-split, so each card knows the best of its own band and nothing about the
-  // others'. Folding one (value, id) pair a position a card is the whole exchange — shipping the
-  // logits themselves would be 3.1 MB a block over PCIe for an argmax.
-  //
-  // It used to be run on the HOST, which meant a `hipStreamSynchronize` PER CARD to get the planes
-  // back: a drain a card a verify block, each waiting on that card's whole queued chain. The
-  // comparison is `higher value, then lower id`, which is one packed 64-bit max, so it is 128 bytes
-  // a card over the peer link and a kernel — and then ONE readback of the answer instead of one of
-  // every input. Exactly the shape draft_head's Markov chain already took.
-  //
-  // Bit-identity is not an argument here, it is arithmetic: the kernel applies the same comparison
-  // to the same pairs, `markov_key`'s float map is order-preserving on finite logits, and `max` is
-  // associative, so the fold is independent of how many cards there are and of their order.
-  {
-    static const bool verify_gpu_argmax = [] {
-      const char* v = std::getenv("AFF_VERIFY_GPU_ARGMAX");
-      return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    size_t nband = 0;
-    for (size_t d = 0; d < R; ++d) nband += band[d] ? 1 : 0;
-    if (!nband) return false;                             // no card owns any of the vocabulary
-    Impl::Dev& D = impl_->dev[0];
-    AFF_HIP_CHECK(hipSetDevice(D.id));
-    // A card with no band skipped its argmax, so its `b_amx` holds whatever the last call left
-    // there and must not enter the fold. Only the cards that DID write one are staged.
-    const size_t plane = 2u * (size_t)b_nb_;
-    uint32_t staged = 0;
-    for (size_t d = 1; d < R; ++d) {
-      if (!band[d]) continue;
-      Impl::Dev& P = impl_->dev[d];
-      AFF_HIP_CHECK(hipStreamWaitEvent(D.stream, P.ev_amx, 0));
-      AFF_HIP_CHECK(hipMemcpyPeerAsync(D.b_apeer + staged * plane, D.id, P.b_amx, P.id,
-                                       plane * sizeof(float), D.stream));
-      ++staged;
-    }
-    // When rank 0 has no band its own plane is meaningless, so the first staged peer stands in as
-    // the fold's seed and the rest follow it. `max` is commutative, so which one seeds it cannot
-    // change the winner.
-    const float* const own = band[0] ? D.b_amx : D.b_apeer;
-    const float* const peers = band[0] ? D.b_apeer : D.b_apeer + plane;
-    const uint32_t npeer = band[0] ? staged : staged - 1;
-    batch_head_combine_hip(own, peers, npeer, D.b_hids, n, b_nb_, D.stream);
-    AFF_HIP_CHECK(hipMemcpyAsync(D.h_hids, D.b_hids, (size_t)n * sizeof(uint32_t),
-                                 hipMemcpyDeviceToHost, D.stream));
-    AFF_DRAIN_AT(D, aff::BlockSite::Head);
-    std::memcpy(ids, D.h_hids, (size_t)n * sizeof(uint32_t));
-  }
-  ++st_.calls;
-  return true;
+  return batch_head_local_argmax(h, vocab, n_embd, n, x, nullptr, 0u, 1.0f, nullptr, 0u, 0.0f,
+                                 /*require_full_vocab=*/false, /*head_sample_site=*/false, ids);
 }
 
 // ==================================================================================================

@@ -762,6 +762,11 @@ private:
   void*    smp_h_ctrl_ = nullptr;
   void*    smp_h_out_ = nullptr;
   uint32_t smp_cap_ = 0;
+  bool     batch_head_local_argmax(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n,
+                                   const float* x, const uint32_t* pen_all, uint32_t n_pen,
+                                   float repeat_penalty, const uint32_t* dry_all, uint32_t n_dry,
+                                   float dry_delta, bool require_full_vocab, bool head_sample_site,
+                                   uint32_t* ids);
   bool     batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uint32_t n, const float* x,
                              const uint32_t* query, const float* u, float temperature, float top_p,
                              uint32_t top_k, float min_p, const uint32_t* penalty_ids,

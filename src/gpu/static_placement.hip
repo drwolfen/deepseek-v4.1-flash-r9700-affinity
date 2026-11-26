@@ -216,8 +216,15 @@ struct StaticPlacement::Impl {
   bool plan_inflight[8] = {};
   uint32_t plan_expect_total[8] = {};
   bool plan_any_inflight = false;
-
+  std::vector<void*> pool_reg_chunks;
 };
+
+static void unregister_host_chunks(std::vector<void*>& chunks) {
+  for (void* c : chunks) {
+    if (c && hipHostUnregister(c) != hipSuccess) (void)hipGetLastError();
+  }
+  chunks.clear();
+}
 
 void StaticPlacement::free_batch_arenas() {
   int prev = 0;
@@ -316,8 +323,7 @@ StaticPlacement::~StaticPlacement() {
     act_ring_ = nullptr;
     act_dev_ = nullptr;
   }
-  if (pool_registered_ && pool_ && pool_->base())
-    (void)hipHostUnregister(const_cast<uint8_t*>(pool_->base()));
+  if (impl_) unregister_host_chunks(impl_->pool_reg_chunks);
   delete impl_;
   impl_ = nullptr;
 }
@@ -613,8 +619,13 @@ void StaticPlacement::lead_gate(void* const* streams, uint32_t nb_tok, size_t R)
   const uint32_t d = ecfg_.max_lead_blocks < kLeadRing ? ecfg_.max_lead_blocks : kLeadRing - 1;
   if (blk >= d) {
     const size_t old = (size_t)((blk - d) % kLeadRing) * R;
-    for (size_t dv = 0; dv < R; ++dv)
-      if (I.lead_ev[old + dv]) (void)hipEventSynchronize(I.lead_ev[old + dv]);
+    for (size_t dv = 0; dv < R; ++dv) {
+      hipEvent_t ev = I.lead_ev[old + dv];
+      if (!ev) continue;
+      if (hipEventQuery(ev) == hipSuccess) continue;
+      (void)hipGetLastError();
+      (void)hipEventSynchronize(ev);
+    }
   }
   const size_t cur = (size_t)(blk % kLeadRing) * R;
   for (size_t dv = 0; dv < R; ++dv) {
@@ -838,7 +849,8 @@ bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
   pool_ = p;
   pool_registered_ = false;
   pool_dev_ = nullptr;
-  if (!enabled_ || !impl_ || !p || !p->enabled() || !p->base()) return false;
+  if (impl_) unregister_host_chunks(impl_->pool_reg_chunks);
+  if (!enabled_ || !impl_ || !p || !p->enabled() || !p->base() || !p->bytes()) return false;
 
   // Register the pool so the cards DMA out of it instead of through the driver's bounce buffer.
   // Registered, the cards read it at the same rate as memory allocated pinned, which is the wire
@@ -858,13 +870,24 @@ bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
   // stages later.
 
   const auto t0 = std::chrono::steady_clock::now();
-  const hipError_t err = hipHostRegister(const_cast<uint8_t*>(p->base()), p->bytes(),
-                                         hipHostRegisterDefault);
-  if (err != hipSuccess) {
-    aff::ui::err("expert streaming off: hipHostRegister(%.1f GiB) failed: %s\n",
-                 (double)p->bytes() / (1 << 30), hipGetErrorString(err));
-    return false;
+  constexpr size_t kPinChunk = (size_t)1u << 30;
+  std::vector<void*> reg_chunks;
+  for (size_t off = 0; off < p->bytes(); ) {
+    uint8_t* const cptr = const_cast<uint8_t*>(p->base()) + off;
+    const size_t to_gib = kPinChunk - ((uintptr_t)cptr & (kPinChunk - 1u));
+    const size_t cur = std::min(p->bytes() - off, to_gib);
+    const hipError_t err = hipHostRegister(cptr, cur, hipHostRegisterDefault);
+    if (err != hipSuccess) {
+      (void)hipGetLastError();
+      unregister_host_chunks(reg_chunks);
+      aff::ui::err("expert streaming off: hipHostRegister(%.1f GiB, chunk@%zu MiB=%zu MiB) failed: %s\n",
+                   (double)p->bytes() / (1 << 30), off >> 20, cur >> 20, hipGetErrorString(err));
+      return false;
+    }
+    reg_chunks.push_back(cptr);
+    off += cur;
   }
+  impl_->pool_reg_chunks = std::move(reg_chunks);
   const double reg_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
   // The hybrid stream and its four events, one set per card. Non-blocking so a miss can never be
@@ -983,10 +1006,27 @@ bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
   // and asking anyway is what makes that a checked fact — a hybrid tile carries this pointer into a
   // kernel, and an address that is merely plausible would fault or, worse, read something.
   {
-    void* dp = nullptr;
-    if (hipHostGetDevicePointer(&dp, const_cast<uint8_t*>(p->base()), 0) == hipSuccess && dp) {
-      pool_dev_ = (uint8_t*)dp;
+    void* dp0 = nullptr;
+    if (hipHostGetDevicePointer(&dp0, const_cast<uint8_t*>(p->base()), 0) == hipSuccess && dp0) {
+      uint8_t* const dev_base = (uint8_t*)dp0;
+      bool contig = true;
+      for (size_t ci = 1; ci < impl_->pool_reg_chunks.size(); ++ci) {
+        void* dpc = nullptr;
+        const size_t off = (size_t)((const uint8_t*)impl_->pool_reg_chunks[ci] - p->base());
+        if (hipHostGetDevicePointer(&dpc, impl_->pool_reg_chunks[ci], 0) != hipSuccess ||
+            (uint8_t*)dpc != dev_base + off) {
+          (void)hipGetLastError();
+          contig = false;
+          break;
+        }
+      }
+      if (contig) {
+        pool_dev_ = dev_base;
+      } else {
+        aff::ui::err("hybrid tier off: piecewise hipHostRegister device pointers non-contiguous\n");
+      }
     } else {
+      (void)hipGetLastError();
       aff::ui::err("hybrid tier off: hipHostGetDevicePointer on the pool failed\n");
     }
   }

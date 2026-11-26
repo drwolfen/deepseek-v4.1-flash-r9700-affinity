@@ -13,11 +13,150 @@
 #include <unistd.h>
 #ifdef __linux__
 #include <cerrno>
+#include <dirent.h>
 #include <sys/syscall.h>
 #endif
 
 namespace aff {
 namespace {
+
+#ifdef __linux__
+bool read_sysfs_int(const char* path, int* out) {
+  std::FILE* f = std::fopen(path, "r");
+  if (!f) return false;
+  int v = 0;
+  const bool ok = std::fscanf(f, "%d", &v) == 1;
+  std::fclose(f);
+  if (ok) *out = v;
+  return ok;
+}
+
+bool read_sysfs_token(const char* path, char* buf, size_t n) {
+  std::FILE* f = std::fopen(path, "r");
+  if (!f) return false;
+  char fmt[16];
+  std::snprintf(fmt, sizeof fmt, "%%%zus", n - 1u);
+  const bool ok = std::fscanf(f, fmt, buf) == 1;
+  std::fclose(f);
+  return ok;
+}
+
+int parse_kfd_properties(const char* path, uint64_t* simd, uint64_t* cpu, int* render_minor) {
+  std::FILE* f = std::fopen(path, "r");
+  if (!f) return 0;
+  char key[64];
+  unsigned long long val = 0;
+  int found = 0;
+  *simd = 0;
+  *cpu = 0;
+  *render_minor = -1;
+  while (std::fscanf(f, "%63s %llu", key, &val) == 2) {
+    if (std::strcmp(key, "simd_count") == 0) {
+      *simd = (uint64_t)val;
+      found = 1;
+    } else if (std::strcmp(key, "cpu_cores_count") == 0) {
+      *cpu = (uint64_t)val;
+      found = 1;
+    } else if (std::strcmp(key, "drm_render_minor") == 0) {
+      *render_minor = (int)val;
+    }
+  }
+  std::fclose(f);
+  return found;
+}
+
+// Auto-detect GPU NUMA node via KFD topology and DRM sysfs; clamps -1 -> 0.
+int detect_gpu_numa_node(const char** source_out) {
+  if (DIR* d = ::opendir("/sys/class/kfd/kfd/topology/nodes")) {
+    int best_node = -1;
+    while (struct dirent* ent = ::readdir(d)) {
+      if (ent->d_name[0] == '.') continue;
+      char prop_path[512];
+      std::snprintf(prop_path, sizeof prop_path,
+                    "/sys/class/kfd/kfd/topology/nodes/%s/properties", ent->d_name);
+      uint64_t simd = 0, cpu = 0;
+      int render_minor = -1;
+      if (!parse_kfd_properties(prop_path, &simd, &cpu, &render_minor) || simd == 0) continue;
+      if (render_minor > 0) {
+        char drm_path[256];
+        std::snprintf(drm_path, sizeof drm_path,
+                      "/sys/class/drm/renderD%d/device/numa_node", render_minor);
+        int numa = -1;
+        if (read_sysfs_int(drm_path, &numa)) {
+          ::closedir(d);
+          if (source_out) *source_out = "sysfs/kfd";
+          return numa < 0 ? 0 : numa;
+        }
+      }
+      char links_dir[512];
+      std::snprintf(links_dir, sizeof links_dir,
+                    "/sys/class/kfd/kfd/topology/nodes/%s/io_links", ent->d_name);
+      if (DIR* ld = ::opendir(links_dir)) {
+        uint64_t best_w = UINT64_MAX;
+        while (struct dirent* le = ::readdir(ld)) {
+          if (le->d_name[0] == '.') continue;
+          char lp[1024];
+          std::snprintf(lp, sizeof lp, "%s/%s/properties", links_dir, le->d_name);
+          std::FILE* lf = std::fopen(lp, "r");
+          if (!lf) continue;
+          char k[64];
+          unsigned long long v = 0, node_to = 0, weight = UINT64_MAX;
+          bool has_to = false;
+          while (std::fscanf(lf, "%63s %llu", k, &v) == 2) {
+            if (std::strcmp(k, "node_to") == 0) { node_to = v; has_to = true; }
+            else if (std::strcmp(k, "weight") == 0) { weight = v; }
+          }
+          std::fclose(lf);
+          if (!has_to || weight >= best_w) continue;
+          char tp[256];
+          std::snprintf(tp, sizeof tp, "/sys/class/kfd/kfd/topology/nodes/%llu/properties",
+                        node_to);
+          uint64_t t_simd = 0, t_cpu = 0;
+          int t_rm = -1;
+          if (parse_kfd_properties(tp, &t_simd, &t_cpu, &t_rm) && t_cpu > 0) {
+            best_w = weight;
+            best_node = (int)node_to;
+          }
+        }
+        ::closedir(ld);
+      }
+      if (best_node >= 0) break;
+    }
+    ::closedir(d);
+    if (best_node >= 0) {
+      if (source_out) *source_out = "sysfs/kfd";
+      return best_node;
+    }
+  }
+  if (DIR* d = ::opendir("/sys/class/drm")) {
+    int fallback_node = -1;
+    while (struct dirent* ent = ::readdir(d)) {
+      if (std::strncmp(ent->d_name, "card", 4) != 0) continue;
+      if (std::strchr(ent->d_name, '-') != nullptr) continue;
+      char vpath[512], npath[512], vendor[32] = {};
+      std::snprintf(vpath, sizeof vpath, "/sys/class/drm/%s/device/vendor", ent->d_name);
+      std::snprintf(npath, sizeof npath, "/sys/class/drm/%s/device/numa_node", ent->d_name);
+      int numa = -1;
+      if (!read_sysfs_int(npath, &numa)) continue;
+      const int clamped = numa < 0 ? 0 : numa;
+      if (read_sysfs_token(vpath, vendor, sizeof vendor) &&
+          std::strcmp(vendor, "0x1002") == 0) {
+        ::closedir(d);
+        if (source_out) *source_out = "sysfs/drm";
+        return clamped;
+      }
+      if (fallback_node < 0) fallback_node = clamped;
+    }
+    ::closedir(d);
+    if (fallback_node >= 0) {
+      if (source_out) *source_out = "sysfs/drm";
+      return fallback_node;
+    }
+  }
+  if (source_out) *source_out = "default";
+  return 0;
+}
+#endif
 
 // A named field of /proc/meminfo, in bytes. 0 when it cannot be read, which callers treat as
 // "unknown, do not clamp" rather than "no memory".
@@ -215,7 +354,9 @@ bool HostExpertPool::init(const AffReader* aff, uint64_t budget_bytes, Wanted wa
 #ifdef __linux__
   {
     const char* numa_env = std::getenv("AFF_POOL_NUMA_NODE");
-    const int numa_node = (numa_env && *numa_env) ? std::atoi(numa_env) : 0;
+    const bool has_env = (numa_env && *numa_env);
+    const char* numa_src = "AFF_POOL_NUMA_NODE";
+    const int numa_node = has_env ? std::atoi(numa_env) : detect_gpu_numa_node(&numa_src);
     static bool numa_logged = false;
     if (numa_node >= 0 && numa_node < 63) {
 #ifdef SYS_mbind
@@ -225,17 +366,17 @@ bool HostExpertPool::init(const AffReader* aff, uint64_t budget_bytes, Wanted wa
       if (!numa_logged) {
         numa_logged = true;
         if (rc == 0) {
-          aff::ui::err("host pool: NUMA policy MPOL_PREFERRED -> node %d (AFF_POOL_NUMA_NODE)\n",
-                       numa_node);
+          aff::ui::err("host pool: NUMA policy MPOL_PREFERRED -> node %d (%s)\n",
+                       numa_node, numa_src);
         } else {
-          aff::ui::err("host pool: NUMA mbind(node %d) skipped (%s)\n",
-                       numa_node, std::strerror(errno));
+          aff::ui::err("host pool: NUMA mbind(node %d, %s) skipped (%s)\n",
+                       numa_node, numa_src, std::strerror(errno));
         }
       }
 #endif
     } else if (!numa_logged) {
       numa_logged = true;
-      aff::ui::err("host pool: NUMA binding disabled (AFF_POOL_NUMA_NODE=%d)\n", numa_node);
+      aff::ui::err("host pool: NUMA binding disabled (%s=%d)\n", numa_src, numa_node);
     }
   }
 #endif
@@ -273,8 +414,26 @@ bool HostExpertPool::init(const AffReader* aff, uint64_t budget_bytes, Wanted wa
 #ifndef MADV_POPULATE_WRITE
 #define MADV_POPULATE_WRITE 23
 #endif
-    if (::madvise(base_, alloc_bytes_, MADV_POPULATE_WRITE) != 0) {
-      for (uint64_t o = 0; o < alloc_bytes_; o += (2u << 20)) base_[o] = 0;   // one touch a 2 MiB page
+    constexpr uint64_t kTouchStride = 2ull << 20;
+    const uint64_t n_pages = (alloc_bytes_ + kTouchStride - 1ull) / kTouchStride;
+    const uint32_t nt = (uint32_t)std::min<uint64_t>(4ull, std::max<uint64_t>(1ull, n_pages));
+    auto worker = [&](uint32_t tid) {
+      const uint64_t p0 = (n_pages * tid) / nt;
+      const uint64_t p1 = (n_pages * (tid + 1u)) / nt;
+      const uint64_t lo = p0 * kTouchStride;
+      const uint64_t hi = std::min<uint64_t>(alloc_bytes_, p1 * kTouchStride);
+      if (lo >= hi) return;
+      if (::madvise(base_ + lo, hi - lo, MADV_POPULATE_WRITE) != 0) {
+        volatile uint8_t* const vp = base_;
+        for (uint64_t o = lo; o < hi; o += kTouchStride) vp[o] = 0;   // one touch a 2 MiB page
+      }
+    };
+    if (nt <= 1u) {
+      worker(0u);
+    } else {
+      std::thread thr[4];
+      for (uint32_t t = 0; t < nt; ++t) thr[t] = std::thread(worker, t);
+      for (uint32_t t = 0; t < nt; ++t) thr[t].join();
     }
     aff::ui::err("host pool: hugepage-first populate of %.1f GiB in %.1f s (amdnas-fixes thp-first; AFF_POOL_THP=0 to disable)\n",
                  (double)alloc_bytes_ / (1 << 30),

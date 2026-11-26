@@ -9,11 +9,18 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+add_compile_options(
+  $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX,HIP>>:-O3>
+  $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX,HIP>>:-DNDEBUG>
+  $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX,HIP>>:-g0>
+)
+
 # Runtime CPU ISA dispatch selects Scalar/AVX1/AVX2/AVX512/AVX512VBMI per kernel, so the
 # baseline binary defaults to AVX1 (`AFF_CPU_ARCH=avx`) for broad x86_64 compatibility without
 # sacrificing peak performance on modern hosts. Set `portable` for baseline SSE2 x86_64 or
 # `native` for `-march=native`.
 option(AFF_NATIVE "Deprecated alias: force AFF_CPU_ARCH=native when ON" OFF)
+option(AFF_HIP_DISABLE_VOPD "Disable AMDGPU VOPD dual-issue on HIP kernels (for A/B ablation)" OFF)
 set(AFF_CPU_ARCH "avx" CACHE STRING "Baseline CPU ISA: portable (x86-64 SSE2), avx (AVX1), native (-march=native)")
 set_property(CACHE AFF_CPU_ARCH PROPERTY STRINGS portable avx native)
 if(AFF_NATIVE)
@@ -208,12 +215,16 @@ if(AFF_RUST AND EXISTS "${CMAKE_SOURCE_DIR}/src/rust_accel/lib.rs")
   find_program(AFF_RUSTC rustc HINTS /usr/bin /root/.cargo/bin $ENV{HOME}/.cargo/bin)
   if(AFF_RUSTC)
     set(AFF_RUST_LIB "${CMAKE_BINARY_DIR}/libaff_rust_accel.a")
+    set(AFF_RUST_DEP "${CMAKE_BINARY_DIR}/libaff_rust_accel.d")
     add_custom_command(
       OUTPUT "${AFF_RUST_LIB}"
+      BYPRODUCTS "${AFF_RUST_DEP}"
       COMMAND "${AFF_RUSTC}" --edition=2021 --crate-type=staticlib
               -C opt-level=3 ${AFF_RUST_CPU_FLAG} -C codegen-units=1 -C panic=abort
+              --emit=dep-info="${AFF_RUST_DEP}",link
               "${CMAKE_SOURCE_DIR}/src/rust_accel/lib.rs" -o "${AFF_RUST_LIB}"
       DEPENDS "${CMAKE_SOURCE_DIR}/src/rust_accel/lib.rs"
+      DEPFILE "${AFF_RUST_DEP}"
       COMMENT "Building Rust staticlib libaff_rust_accel.a"
     )
     add_custom_target(aff_rust_accel DEPENDS "${AFF_RUST_LIB}")
@@ -278,10 +289,15 @@ aff_tool(aff-exphash     tools/aff_exphash.cpp     aff_format)
 aff_tool(aff-predict  tools/aff_predict.cpp)
 aff_tool(aff-profile  tools/aff_profile.cpp)
 
-add_custom_target(aff-bench ALL
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/tools/v41/bench_pp_tg.py ${CMAKE_BINARY_DIR}/aff-bench
-  COMMAND chmod +x ${CMAKE_BINARY_DIR}/aff-bench
+add_custom_command(
+  OUTPUT "${CMAKE_BINARY_DIR}/aff-bench"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_SOURCE_DIR}/tools/v41/bench_pp_tg.py" "${CMAKE_BINARY_DIR}/aff-bench"
+  COMMAND chmod +x "${CMAKE_BINARY_DIR}/aff-bench"
+  DEPENDS "${CMAKE_SOURCE_DIR}/tools/v41/bench_pp_tg.py"
+  COMMENT "Staging aff-bench"
 )
+add_custom_target(aff_bench_stage ALL DEPENDS "${CMAKE_BINARY_DIR}/aff-bench")
 
 # ---- tests --------------------------------------------------------------------------------------
 if(AFF_HAVE_TESTS)
@@ -313,19 +329,25 @@ if(AFF_HIP)
                              src/gpu/attention_gpu.hip src/gpu/keepalive.hip
                              src/gpu/batch_kernels.hip src/gpu/attn_flash.hip
                              src/gpu/indexer_gpu.hip src/gpu/compressor_gpu.hip
-  src/gpu/engram_gpu.hip)
+                             src/gpu/engram_gpu.hip)
   set_source_files_properties(src/gpu/expert_kernel.hip src/gpu/tp_allreduce.hip
-                              src/gpu/moe_plan.hip src/gpu/digest.hip src/gpu/vmem.hip
+                              src/gpu/sampler_gpu.hip src/gpu/moe_plan.hip
+                              src/gpu/digest.hip src/gpu/vmem.hip
                               src/gpu/static_placement.hip src/gpu/dense_gpu.hip
                               src/gpu/attention_gpu.hip src/gpu/keepalive.hip
                               src/gpu/batch_kernels.hip src/gpu/attn_flash.hip
                               src/gpu/indexer_gpu.hip src/gpu/compressor_gpu.hip
+                              src/gpu/engram_gpu.hip
                               PROPERTIES LANGUAGE HIP)
   target_include_directories(aff_gpu PUBLIC src)
   target_link_libraries(aff_gpu PUBLIC "${AFF_HIP_RT}" aff_format)
   target_compile_options(aff_gpu PUBLIC "${AFF_HIP_INC}")
   target_link_options(aff_gpu PUBLIC "${AFF_HIP_LIBDIR}")
   target_compile_options(aff_gpu PRIVATE -ffp-contract=off)
+  if(AFF_HIP_DISABLE_VOPD)
+    target_compile_options(aff_gpu PRIVATE "SHELL:-mllvm -amdgpu-enable-vopd=false")
+    message(STATUS "HIP VOPD dual-issue disabled on aff_gpu (-mllvm -amdgpu-enable-vopd=false)")
+  endif()
 
   target_compile_definitions(aff_gpu PUBLIC AFF_WITH_HIP __HIP_PLATFORM_AMD__)
 

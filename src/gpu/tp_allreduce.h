@@ -109,10 +109,10 @@ struct TpContext {
   float* scratch[kTpMaxRanks] = {};
   // [peer][block], fine-grained. Peer p releases rank r's flag at tp_peer_slot(p, r).
   unsigned* flags[kTpMaxRanks] = {};
-  unsigned* seq[kTpMaxRanks] = {};            // device-resident per-block counters
+  unsigned* seq[kTpMaxRanks] = {};            // [0, kTpMaxBlocks) per-block seq; [kTpMaxBlocks, 2*kTpMaxBlocks) parity
   size_t max_floats = 0;                      // per sub-slot, i.e. one whole message
   size_t scratch_peer_bytes = 0;              // physical bytes allocated per [slot][peer] sub-slot
-  int last_scratch_nb = 0;                    // last gridDim.x on scratch; guards slot parity across width changes
+  int last_scratch_nb = 0;                    // last gridDim.x on scratch; fallback guard when AFF_TP_AR_PARITY=0
   bool ready = false;
 
   // ---- a SECOND, disjoint set of the same three buffers -------------------------------

@@ -6,6 +6,55 @@ const EMPTY_TARGET: u32 = u32::MAX;
 const MAX_STATS_WALK: usize = 24;
 const INLINE_CAP: usize = 4;
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn slice_eq_u32_avx2(a: &[u32], b: &[u32]) -> bool {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    if n != b.len() {
+        return false;
+    }
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let va = _mm256_loadu_si256(pa.add(i) as *const __m256i);
+        let vb = _mm256_loadu_si256(pb.add(i) as *const __m256i);
+        let eq = _mm256_cmpeq_epi32(va, vb);
+        if _mm256_movemask_epi8(eq) != -1i32 {
+            return false;
+        }
+        i += 8;
+    }
+    while i < n {
+        if *pa.add(i) != *pb.add(i) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[inline]
+fn slice_eq_u32(a: &[u32], b: &[u32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if a.len() >= 8 && std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { slice_eq_u32_avx2(a, b) };
+        }
+    }
+    a == b
+}
+
+#[inline]
+fn slice_ends_with_u32(haystack: &[u32], needle: &[u32]) -> bool {
+    haystack.len() >= needle.len() && slice_eq_u32(&haystack[haystack.len() - needle.len()..], needle)
+}
+
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct NodeStats {
     total_cnt: u32,
@@ -593,7 +642,7 @@ impl AffSam {
         }
         let min_score = min_score.max(0.0);
 
-        let (start_state, matched_len) = if self.tokens.ends_with(ctx) {
+        let (start_state, matched_len) = if slice_ends_with_u32(&self.tokens, ctx) {
             if (self.match_len as usize) < min_match
                 || self.cur_state == 0
                 || ctx.len() < min_match
@@ -883,7 +932,7 @@ pub unsafe extern "C" fn aff_sam_matches_prefix(
         return false;
     }
     let s = slice::from_raw_parts(ptr, len);
-    tokens[..len] == *s
+    slice_eq_u32(&tokens[..len], s)
 }
 
 #[cfg(test)]
@@ -1121,5 +1170,31 @@ mod tests {
         assert_eq!(prop.match_len, 4);
         assert_eq!(&out[..2], &[200, 201]);
         assert!(prop.score > 0.5 && prop.score <= 1.0);
+    }
+
+    #[test]
+    fn test_slice_eq_u32_dispatch() {
+        for n in 0..=40usize {
+            let a: Vec<u32> = (0..n as u32).map(|x| x.wrapping_mul(17) ^ 3).collect();
+            let mut b = a.clone();
+            assert!(slice_eq_u32(&a, &b));
+            for pos in 0..n {
+                b[pos] ^= 1;
+                assert!(!slice_eq_u32(&a, &b));
+                b[pos] ^= 1;
+            }
+        }
+        let sam_ptr = aff_sam_new();
+        assert!(!sam_ptr.is_null());
+        let seq: Vec<u32> = (100u32..120u32).collect();
+        unsafe {
+            aff_sam_push_slice(sam_ptr, seq.as_ptr(), seq.len());
+            assert!(aff_sam_matches_prefix(sam_ptr, seq.as_ptr(), seq.len()));
+            assert!(aff_sam_matches_prefix(sam_ptr, seq.as_ptr(), 9));
+            let mut bad = seq.clone();
+            bad[8] ^= 99;
+            assert!(!aff_sam_matches_prefix(sam_ptr, bad.as_ptr(), bad.len()));
+            aff_sam_free(sam_ptr);
+        }
     }
 }
