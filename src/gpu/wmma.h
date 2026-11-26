@@ -85,9 +85,37 @@ __device__ __forceinline__ uint16_t f32_to_bf16(float f) {
   if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu)) return (uint16_t)((u >> 16) | 0x40u);
   return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
+__device__ __forceinline__ uint32_t bf16_hi_rne(float f) {
+  const uint32_t u = __float_as_uint(f);
+  if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu)) return u | 0x400000u;
+  return u + 0x7fffu + ((u >> 16) & 1u);
+}
+// Pack two FP32 values into one BF16x2 dword using exact RNE and v_perm_b32.
+__device__ __forceinline__ uint32_t bf16x2_rne(float lo, float hi) {
+  const uint32_t ua = bf16_hi_rne(lo);
+  const uint32_t ub = bf16_hi_rne(hi);
+#ifdef __HIP_DEVICE_COMPILE__
+  return __builtin_amdgcn_perm(ub, ua, 0x07060302u);
+#else
+  return (ua >> 16) | (ub & 0xffff0000u);
+#endif
+}
 __device__ __forceinline__ float bf16_to_f32(uint16_t h) {
   return __uint_as_float((uint32_t)h << 16);
 }
+
+// Compensated Kahan FP32 accumulator for wide HC Gram / sum-of-squares reductions.
+struct KahanF32 {
+  float sum = 0.0f;
+  float comp = 0.0f;
+  __host__ __device__ __forceinline__ void add(float x) {
+    const float y = x - comp;
+    const float t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  __host__ __device__ __forceinline__ float total() const { return sum - comp; }
+};
 
 // ---- fragment indexing -------------------------------------------------------------------------
 //

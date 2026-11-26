@@ -50,6 +50,34 @@ __device__ __forceinline__ const AFF_CONST T* as_const(const T* p) {
   return (const AFF_CONST T*)p;
 }
 
+__device__ __forceinline__ const void* uniform_ptr(const void* p) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  const uint64_t u = (uint64_t)(uintptr_t)p;
+  const uint32_t lo = (uint32_t)__builtin_amdgcn_readfirstlane((int)(uint32_t)u);
+  const uint32_t hi = (uint32_t)__builtin_amdgcn_readfirstlane((int)(uint32_t)(u >> 32));
+  return (const void*)(uintptr_t)(((uint64_t)hi << 32) | lo);
+#else
+  return p;
+#endif
+}
+
+__device__ __forceinline__ void s_prefetch_data_u(const void* p, int len) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__) && __has_builtin(__builtin_amdgcn_s_prefetch_data)
+  __builtin_amdgcn_s_prefetch_data(uniform_ptr(p), len);
+#else
+  (void)p; (void)len;
+#endif
+}
+
+// Targeted LDS wait for wave-local staging without draining unrelated VMEM/scalar/store counters.
+__device__ __forceinline__ void s_wait_ds_only() {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  asm volatile("s_wait_dscnt 0x0" ::: "memory");
+#elif defined(__HIP_DEVICE_COMPILE__)
+  __builtin_amdgcn_s_waitcnt(0);
+#endif
+}
+
 // `threadIdx.x / kWave` is constant across a wave, but LLVM's divergence analysis does not know the
 // wave size and calls the quotient divergent, so everything derived from it lands in VGPRs.
 // readfirstlane asserts what is true for one instruction, after which the loop bounds and the
@@ -203,7 +231,13 @@ __global__ __launch_bounds__(kThreads) void expert_gemm_tokens_kernel(
       const uint32_t* frow = (const uint32_t*)fields + (size_t)row * field_words_row;
       for (uint32_t i = lane; i < code_words_row; i += kWave) s_code[wave][i] = crow[i];
       for (uint32_t i = lane; i < field_words_row; i += kWave) s_field[wave][i] = frow[i];
-      __builtin_amdgcn_s_waitcnt(0);
+      const uint32_t next_row = row + gridDim.x * kWavesPerBlock;
+      if (next_row < rows) {
+        const uint32_t code_bytes = code_words_row * 4u;
+        const int cl = (int)((code_bytes + 127u) >> 7);
+        s_prefetch_data_u(data + (size_t)next_row * code_bytes, cl > 31 ? 31 : cl);
+      }
+      s_wait_ds_only();
       __builtin_amdgcn_wave_barrier();
 
       const uint8_t* cb_lane = (const uint8_t*)s_code[wave] + lane * code_bytes_lane;
@@ -913,6 +947,14 @@ __global__ __launch_bounds__(kEThreads) void expert_gemm_wmma_kernel(
   // keeps the store below the loads — which is why `load_efrag` does not take its LDS pointer
   // `__restrict__`.
   for (uint32_t c0 = 0; c0 < cols; c0 += 128) {
+    if constexpr (TR) {
+      if (c0 + 128 < cols) {
+        const size_t gn = (size_t)((c0 + 128u) / kEK) * rows + m0;
+        const size_t row_bytes = (size_t)(MT * kEWaves * 16u) * (kEK / 16u * 5u);
+        const int cl = (int)((row_bytes + 127u) >> 7);
+        s_prefetch_data_u(data + gn * (kEK / 16u * 5u), cl > 31 ? 31 : (cl > 0 ? cl : 1));
+      }
+    }
     aff::lds_barrier();
     const uint32_t kb = c0 >> 7;
     float xs_cur[NT];
@@ -1119,6 +1161,89 @@ __global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_kernel(
   }
 }
 
+template <int VPL, uint32_t MASK>
+__device__ __forceinline__ void expert_fwht_xstage(float* v, uint32_t lane) {
+  const uint32_t sm = (lane & MASK) ? 0x80000000u : 0u;
+#pragma unroll
+  for (int j = 0; j < VPL; ++j) {
+    const float o = aff::dpp_xor_lane<MASK>(v[j]);
+    v[j] = __int_as_float(__float_as_int(v[j]) ^ sm) + o;
+  }
+}
+
+// Wave32 DPP Hadamard32 butterfly + direct coalesced pack: eliminates 6 LDS butterfly barriers,
+// `part`/`smax` scratch, and the second tile pass while producing bit-identical FP8 outputs.
+__global__ __launch_bounds__(kSQThreads) void expert_swiglu_quant_dpp_kernel(
+    const uint16_t* __restrict__ g, const uint16_t* __restrict__ u, const float* __restrict__ w,
+    uint8_t* __restrict__ out, float* __restrict__ scales, uint32_t dim, uint32_t total,
+    float limit) {
+  __shared__ float tile[128][kSQTok + 1];
+
+  const uint32_t tid = threadIdx.x, tt = tid & 31u, kk = tid >> 5;
+  const uint32_t wave = tid >> 5, lane = tid & 31u;
+  const uint32_t t0 = blockIdx.x * kSQTok;
+  const uint32_t sl = t0 + tt;
+  const uint32_t nkb = dim >> 7;
+  const float wv = (sl < total && w) ? w[sl] : 1.0f;
+  constexpr uint32_t kSignMask = 0x96696996u ^ 0xA53C965Au;
+
+  for (uint32_t kb = blockIdx.y; kb < nkb; kb += gridDim.y) {
+    if (kb > blockIdx.y) aff::lds_barrier();
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) {
+      const uint32_t k = kk + i * 8;
+      float v = 0.0f;
+      if (sl < total) {
+        const size_t o = (size_t)(kb * 128 + k) * total + sl;
+        float gv = bf16_to_f32_dev(g[o]), uv = bf16_to_f32_dev(u[o]);
+        if (limit > 0.0f) { gv = fminf(gv, limit); uv = fminf(limit, fmaxf(-limit, uv)); }
+        v = (gv / (1.0f + expf(-gv))) * uv * wv;
+      }
+      if ((kSignMask >> (k & 31u)) & 1u) v = -v;
+      tile[k][tt] = v;
+    }
+    aff::lds_barrier();
+
+    constexpr uint32_t kWaves = kSQThreads >> 5;
+    for (uint32_t tbase = 0u; tbase < kSQTok; tbase += kWaves) {
+      const uint32_t tok = tbase + wave;
+      const uint32_t tok_idx = t0 + tok;
+      if (tok_idx >= total) continue;
+      float v[4];
+#pragma unroll
+      for (uint32_t b32 = 0u; b32 < 4u; ++b32) v[b32] = tile[b32 * 32u + lane][tok];
+      expert_fwht_xstage<4, 1u>(v, lane);
+      expert_fwht_xstage<4, 2u>(v, lane);
+      expert_fwht_xstage<4, 4u>(v, lane);
+      expert_fwht_xstage<4, 8u>(v, lane);
+      expert_fwht_xstage<4, 16u>(v, lane);
+      float m = 0.0f;
+#pragma unroll
+      for (uint32_t b32 = 0u; b32 < 4u; ++b32) {
+        v[b32] *= 0.17677669529663689f;
+        m = fmaxf(m, fabsf(v[b32]));
+      }
+      m = aff::wave_reduce_max_dpp(m);
+      const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+      if (lane == 0u) scales[(size_t)tok_idx * nkb + kb] = sc;
+      const float inv = 1.0f / sc;
+#pragma unroll
+      for (uint32_t b32 = 0u; b32 < 4u; ++b32) {
+        const float c = fminf(fmaxf(v[b32] * inv, -448.0f), 448.0f);
+        const uint32_t q =
+            (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(c, 0.0f, 0, false) & 0xffu;
+        const uint32_t p1 = aff::dpp_xor_lane<1u>(q);
+        const uint32_t pair = ((lane & 1u) == 0u) ? (q | (p1 << 8)) : 0u;
+        const uint32_t p2 = aff::dpp_xor_lane<2u>(pair);
+        const uint32_t quad = pair | (p2 << 16);
+        if ((lane & 3u) == 0u) {
+          *(uint32_t*)(out + (size_t)tok_idx * dim + kb * 128u + b32 * 32u + lane) = quad;
+        }
+      }
+    }
+  }
+}
+
 // Coalesced decode scatter (`nb_tok <= 16`, `total <= 192`): each WG of 128 threads owns 8 dims,
 // cooperatively loads `y[d][0..total)` coalesced along `slot` into 3 KiB LDS, then reduces in exact
 // `i = a..b-1` sequential FP32 order and stores `block[d][0..nb_tok)` coalesced along `t`.
@@ -1300,7 +1425,13 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_multix_kernel(
         s_code[wave][i] = aff::load_nt<NT_LOAD>(&crow[i]);
       for (uint32_t i = lane; i < field_words_row; i += kWave)
         s_field[wave][i] = aff::load_nt<NT_LOAD>(&frow[i]);
-      __builtin_amdgcn_s_waitcnt(0);
+      if (m + 1u < n_mats) {
+        const uint32_t code_bytes = code_words_row * 4u;
+        const int cl = (int)((code_bytes + 127u) >> 7);
+        s_prefetch_data_u((const uint32_t*)(p.data[m + 1u]) + (size_t)row * code_words_row,
+                          cl > 31 ? 31 : cl);
+      }
+      s_wait_ds_only();
       __builtin_amdgcn_wave_barrier();
 
       const uint32_t nwords = bpl * 5 / 4;
@@ -1677,7 +1808,13 @@ __global__ __launch_bounds__(kThreads) void expert_gemv_kernel_v8(
         s_code[wave][i] = aff::load_nt<NT_LOAD>(&crow[i]);
       for (uint32_t i = lane; i < field_words_row; i += kWave)
         s_field[wave][i] = aff::load_nt<NT_LOAD>(&frow[i]);
-      __builtin_amdgcn_s_waitcnt(0);
+      if (m + 1u < n_mats) {
+        const uint32_t code_bytes = code_words_row * 4u;
+        const int cl = (int)((code_bytes + 127u) >> 7);
+        s_prefetch_data_u((const uint32_t*)(p.data[m + 1u]) + (size_t)row * code_words_row,
+                          cl > 31 ? 31 : cl);
+      }
+      s_wait_ds_only();
       __builtin_amdgcn_wave_barrier();
       if (rs == 0.0f) continue;
 
@@ -1758,7 +1895,7 @@ __device__ inline float gemv_row_staged(
   const uint32_t* frow = (const uint32_t*)scales + (size_t)row * field_words_row;
   for (uint32_t i = lane; i < code_words_row; i += kWave) s_code[i] = crow[i];
   for (uint32_t i = lane; i < field_words_row; i += kWave) s_field[i] = frow[i];
-  __builtin_amdgcn_s_waitcnt(0);
+  s_wait_ds_only();
   __builtin_amdgcn_wave_barrier();
   if (rs == 0.0f) return 0.0f;
 
@@ -3312,11 +3449,14 @@ void expert_swiglu_quant_hip(const uint16_t* g, const uint16_t* u, const float* 
   const uint32_t slot_blocks = (total + kSQTok - 1) / kSQTok;
   const uint32_t bands = dim >> 7;
   const uint32_t gy = bands ? std::min(bands, std::max(1u, 64u / std::max(1u, slot_blocks))) : 1u;
-  static const bool had = [] {
-    const char* s = std::getenv("AFF_HADAMARD_ROT");
-    return s && *s && *s != '0';
-  }();
-  if (had) {
+  const char* had_s = std::getenv("AFF_HADAMARD_ROT");
+  const bool had = had_s && *had_s && *had_s != '0';
+  const char* dpp_s = std::getenv("AFF_EXPERT_HAD32_DPP");
+  const bool had_dpp = !(dpp_s && dpp_s[0] == '0' && dpp_s[1] == '\0');
+  if (had && had_dpp) {
+    hipLaunchKernelGGL(expert_swiglu_quant_dpp_kernel, dim3(slot_blocks, gy), dim3(kSQThreads),
+                       0, (hipStream_t)stream, g, u, w, out, scales, dim, total, limit);
+  } else if (had) {
     hipLaunchKernelGGL((expert_swiglu_quant_kernel<true>), dim3(slot_blocks, gy),
                        dim3(kSQThreads), 0, (hipStream_t)stream, g, u, w, out, scales, dim, total,
                        limit);

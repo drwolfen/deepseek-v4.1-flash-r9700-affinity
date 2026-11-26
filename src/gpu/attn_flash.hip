@@ -86,6 +86,15 @@ constexpr uint32_t kQLd = kW + 16;           // 528
 constexpr uint32_t kPLd = kKT + 8;           // 72 = 18 dwords, and 18c mod 32 is a bijection
 
 constexpr float kNeg = -3.0e38f;
+constexpr float kLog2e = 1.4426950408889634f;
+
+__device__ __forceinline__ float flash_exp2f(float x) {
+#if defined(__gfx1201__) && __has_builtin(__builtin_amdgcn_exp2f)
+  return __builtin_amdgcn_exp2f(x);
+#else
+  return exp2f(x);
+#endif
+}
 
 typedef wmma::i2v __attribute__((address_space(1))) * i2v_gp;
 
@@ -156,7 +165,8 @@ __device__ __forceinline__ uint32_t pack4(float a, float b, float c, float d) {
 // faster. NT=2 also lets one K fragment feed two head tiles and one V fragment feed two
 // accumulators, so the operand-load count per mma falls from 1.0 to 0.75 (QK) and 1.125 to 0.625
 // (PV) as a side effect.
-template <uint32_t NT, bool HAS_SINK, bool HAS_MASK, bool RESOLVE_4W = true, bool NT_KV = false>
+template <uint32_t NT, bool HAS_SINK, bool HAS_MASK, bool RESOLVE_4W = true, bool NT_KV = false,
+          bool EXP2 = false, bool KLATE = false>
 __global__ __launch_bounds__(kThreads) void flash_kernel(
     const void* __restrict__ qp, const uint8_t* __restrict__ raw, const uint8_t* __restrict__ comp,
     const uint8_t* __restrict__ allowed, const uint32_t* __restrict__ n_comp_v, uint32_t n_comp1,
@@ -167,6 +177,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     const float* __restrict__ q_scales) {
 
   constexpr uint32_t NH = NT * 16u;                   // query heads a block
+  constexpr bool kLate = KLATE && RESOLVE_4W;
 
   __shared__ __align__(16) uint8_t s_q[NH * kQLd];   // Q, E4M3, head-major
   __shared__ __align__(16) uint8_t s_p[NH * kPLd];   // P, E4M3, head-major, key contiguous
@@ -174,14 +185,9 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
   __shared__ float s_rs[kKT];                        // their row scales; 0 marks absent or masked
   __shared__ float s_qs[NH];                         // Q dequant scale a head
   __shared__ float s_m[NH], s_l[NH];               // running max and denominator
-  __shared__ float s_red[kWaves * NH];               // cross-wave max scratch; dead before s_af
-  // `s_red` is dead after the cross-wave max reduction until the next key tile, and `s_af` is
-  // written only after the P-sum barrier and consumed before that barrier repeats, so they alias.
-  float* const s_af = s_red;
-  __shared__ float s_amax[kThreads];
-  // `s_amax` is dead after Q quantisation in the prologue, so `s_ps` aliases it at zero extra
-  // LDS cost to keep `LDS <= 21504` (6 waves/SIMD) while keeping `s_red` disjoint.
-  float* const s_ps = s_amax;
+  __shared__ float s_red[kWaves * NH];               // cross-wave max/sum scratch
+  float* const s_ps = s_red;
+  __shared__ float s_af[NH];
   __shared__ float s_scur, s_sprev;
   __shared__ int s_skip;
   __shared__ float s_wmx[kWaves];
@@ -235,7 +241,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       if (tid < 16u) {
         const uint32_t hd = sb * 16u + tid;
         s_qs[hd] = q_scales[(size_t)(b0 + tk) * n_head + (h0 + hd)];
-        s_m[hd] = sink0 ? sinks[h0 + hd] : kNeg;
+        s_m[hd] = sink0 ? (EXP2 ? sinks[h0 + hd] * kLog2e : sinks[h0 + hd]) : kNeg;
         s_l[hd] = sink0 ? 1.0f : 0.0f;
       }
       continue;
@@ -262,14 +268,13 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
         a = fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fmaxf(fabsf(v[i].z), fabsf(v[i].w)), a));
       }
     }
-    s_amax[tid] = a;
-    lds_barrier();
-    if (tid < 16u) {
-      float m = 0.0f;
-      for (uint32_t i = 0; i < kQTh; ++i) m = fmaxf(m, s_amax[tid * kQTh + i]);
-      const uint32_t hd = sb * 16u + tid;
-      s_qs[hd] = (m > 0.0f) ? m * (1.0f / 448.0f) : 1.0f;
-      s_m[hd] = sink0 ? sinks[h0 + hd] : kNeg;
+    a = fmaxf(a, dpp_xor_lane<4u>(a));
+    a = fmaxf(a, dpp_xor_lane<2u>(a));
+    a = fmaxf(a, dpp_xor_lane<1u>(a));
+    if ((tid & 7u) == 0u) {
+      const uint32_t hd = sb * 16u + (tid >> 3);
+      s_qs[hd] = (a > 0.0f) ? a * (1.0f / 448.0f) : 1.0f;
+      s_m[hd] = sink0 ? (EXP2 ? sinks[h0 + hd] * kLog2e : sinks[h0 + hd]) : kNeg;
       // The sink contributes no value vector: the denominator starts at exp(sink - sink) = 1 and
       // the numerator at zero.
       s_l[hd] = sink0 ? 1.0f : 0.0f;
@@ -291,99 +296,119 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     for (uint32_t n = 0; n < kOT; ++n) o[nt][n] = wmma::acc_zero();
 
   const uint32_t kr = tr_row(lane), co = tr_col(lane);
+  auto resolve_4w_regs = [&](uint32_t kbase, const uint8_t*& p_out, float& r_out,
+                             float& wmx_out) __attribute__((always_inline)) {
+    float r = 0.0f;
+    const uint8_t* p = raw;                          // valid fallback: absent keys get weight 0
+    if (lane < 16u) {
+      const uint32_t k = kbase + wave * 16u + lane;
+      if (k < kt_hi) {
+        if (k < n_raw) {
+          uint32_t sl = raw0 + k;
+          if (sl >= ring) sl -= ring;
+          p = raw + (size_t)sl * kRowB;
+        } else {
+          const uint32_t cr = adm ? adm[(size_t)tk * adm_stride + (k - n_raw)] : (k - n_raw);
+          p = comp + (size_t)cr * kRowB;
+        }
+        r = aff::load_nt<NT_KV>((const AFF_GLOBAL float*)(p + kW));
+        if (HAS_MASK && k >= n_raw && !allowed[(size_t)tk * max_comp + (k - n_raw)]) r = 0.0f;
+      }
+    }
+    p_out = p;
+    r_out = r;
+    float wmx = (lane < 16u) ? r : 0.0f;
+    wmx = fmaxf(wmx, dpp_xor_lane<8u>(wmx));
+    wmx = fmaxf(wmx, dpp_xor_lane<4u>(wmx));
+    wmx = fmaxf(wmx, dpp_xor_lane<2u>(wmx));
+    wmx = fmaxf(wmx, dpp_xor_lane<1u>(wmx));
+    wmx_out = wmx;
+  };
+
+  const uint8_t* late_p = raw;
+  float late_r = 0.0f;
+  if constexpr (kLate) {
+    float unused_wmx = 0.0f;
+    if (kt_lo < kt_hi) resolve_4w_regs(kt_lo, late_p, late_r, unused_wmx);
+  }
 
   for (uint32_t kt0 = kt_lo; kt0 < kt_hi; kt0 += kKT) {
-    // ---- resolve the tile's rows: 4 waves x 16 keys (RESOLVE_4W) or wave 0 alone.
-    if constexpr (RESOLVE_4W) {
-      float r = 0.0f;
+    const uint8_t* kp = nullptr;
+    if constexpr (kLate) {
       if (lane < 16u) {
         const uint32_t i = wave * 16u + lane;
-        const uint32_t k = kt0 + i;
-        const uint8_t* p = raw;                      // valid fallback: absent keys get weight 0
-        if (k < kt_hi) {
-          if (k < n_raw) {
-            uint32_t sl = raw0 + k;
-            if (sl >= ring) sl -= ring;
-            p = raw + (size_t)sl * kRowB;
-          } else {
-            const uint32_t cr = adm ? adm[(size_t)tk * adm_stride + (k - n_raw)] : (k - n_raw);
-            p = comp + (size_t)cr * kRowB;
-          }
-          r = aff::load_nt<NT_KV>((const AFF_GLOBAL float*)(p + kW));
-          if (HAS_MASK && k >= n_raw && !allowed[(size_t)tk * max_comp + (k - n_raw)]) r = 0.0f;
-        }
-        s_ptr[i] = p;
-        s_rs[i] = r;
+        s_ptr[i] = late_p;
+        s_rs[i] = late_r;
       }
-      float wmx = (lane < 16u) ? r : 0.0f;
+      float wmx = (lane < 16u) ? late_r : 0.0f;
       wmx = fmaxf(wmx, dpp_xor_lane<8u>(wmx));
       wmx = fmaxf(wmx, dpp_xor_lane<4u>(wmx));
       wmx = fmaxf(wmx, dpp_xor_lane<2u>(wmx));
       wmx = fmaxf(wmx, dpp_xor_lane<1u>(wmx));
       if (lane == 0u) s_wmx[wave] = wmx;
-    } else if (wave == 0) {
-      float rs[kKT / 32u];
-#pragma unroll
-      for (uint32_t u = 0; u < kKT / 32u; ++u) {
-        const uint32_t i = lane + u * 32u;
-        const uint32_t k = kt0 + i;
-        const uint8_t* p = raw;                      // valid fallback: absent keys get weight 0
-        float r = 0.0f;
-        if (k < kt_hi) {
-          if (k < n_raw) {
-            uint32_t sl = raw0 + k;
-            if (sl >= ring) sl -= ring;
-            p = raw + (size_t)sl * kRowB;
-          } else {
-            // GATHERED, when the indexer left a list: `n_comp` is then the number of rows it
-            // ADMITTED and this walks those rows only. Without one it is the whole compressed
-            // cache and the row index is the key's own offset, as it always was.
-            const uint32_t cr = adm ? adm[(size_t)tk * adm_stride + (k - n_raw)] : (k - n_raw);
-            p = comp + (size_t)cr * kRowB;
-          }
-          r = aff::load_nt<NT_KV>((const AFF_GLOBAL float*)(p + kW));
-          // `allowed[k - n_raw]` — WITHOUT the token stride — is a quiet bug. The mask is a PLANE,
-          // one row of `max_comp` bytes a token, and the VALU kernel this replaced offsets by it
-          // (`attention_gpu.hip`, mqa_attend_batch_kernel). Without the stride every token of a
-          // batched launch reads the FIRST token's admissions — fluent text from the wrong keys, at
-          // long-context prefill only, since decode is one token and never sees it.
-          if (HAS_MASK && k >= n_raw && !allowed[(size_t)tk * max_comp + (k - n_raw)]) r = 0.0f;
+      const uint64_t pu = (uint64_t)(uintptr_t)late_p;
+      const uint32_t plo = dpp_xor_lane<16u>((uint32_t)pu);
+      const uint32_t phi = dpp_xor_lane<16u>((uint32_t)(pu >> 32));
+      const uint8_t* kp_base =
+          hlf ? (const uint8_t*)(uintptr_t)(((uint64_t)phi << 32) | plo) : late_p;
+      kp = kp_base + hlf * 16u;
+    } else {
+      // ---- resolve the tile's rows: 4 waves x 16 keys (RESOLVE_4W) or wave 0 alone.
+      if constexpr (RESOLVE_4W) {
+        const uint8_t* p = raw;
+        float r = 0.0f, wmx = 0.0f;
+        resolve_4w_regs(kt0, p, r, wmx);
+        if (lane < 16u) {
+          const uint32_t i = wave * 16u + lane;
+          s_ptr[i] = p;
+          s_rs[i] = r;
         }
-        s_ptr[i] = p;
-        s_rs[i] = r;
-        rs[u] = r;
-      }
-      float mx = rs[0];
+        if (lane == 0u) s_wmx[wave] = wmx;
+      } else if (wave == 0) {
+        float rs[kKT / 32u];
 #pragma unroll
-      for (uint32_t u = 1; u < kKT / 32u; ++u) mx = fmaxf(mx, rs[u]);
-      mx = wave_reduce_max_dpp(mx);
-      if (lane == 0) s_scur = (mx > 0.0f) ? mx : s_sprev;
-    }
-    lds_barrier();
-    if constexpr (RESOLVE_4W) {
-      if (tid == 0u) {
-        const float tile_mx = fmaxf(fmaxf(s_wmx[0], s_wmx[1]), fmaxf(s_wmx[2], s_wmx[3]));
-        s_scur = (tile_mx > 0.0f) ? tile_mx : s_sprev;
+        for (uint32_t u = 0; u < kKT / 32u; ++u) {
+          const uint32_t i = lane + u * 32u;
+          const uint32_t k = kt0 + i;
+          const uint8_t* p = raw;                    // valid fallback: absent keys get weight 0
+          float r = 0.0f;
+          if (k < kt_hi) {
+            if (k < n_raw) {
+              uint32_t sl = raw0 + k;
+              if (sl >= ring) sl -= ring;
+              p = raw + (size_t)sl * kRowB;
+            } else {
+              const uint32_t cr = adm ? adm[(size_t)tk * adm_stride + (k - n_raw)] : (k - n_raw);
+              p = comp + (size_t)cr * kRowB;
+            }
+            r = aff::load_nt<NT_KV>((const AFF_GLOBAL float*)(p + kW));
+            if (HAS_MASK && k >= n_raw && !allowed[(size_t)tk * max_comp + (k - n_raw)]) r = 0.0f;
+          }
+          s_ptr[i] = p;
+          s_rs[i] = r;
+          rs[u] = r;
+        }
+        float mx = rs[0];
+#pragma unroll
+        for (uint32_t u = 1; u < kKT / 32u; ++u) mx = fmaxf(mx, rs[u]);
+        mx = wave_reduce_max_dpp(mx);
+        if (lane == 0) s_scur = (mx > 0.0f) ? mx : s_sprev;
       }
+      lds_barrier();
+      if constexpr (RESOLVE_4W) {
+        if (tid == 0u) {
+          const float tile_mx = fmaxf(fmaxf(s_wmx[0], s_wmx[1]), fmaxf(s_wmx[2], s_wmx[3]));
+          s_scur = (tile_mx > 0.0f) ? tile_mx : s_sprev;
+        }
+      }
+      kp = s_ptr[16u * wave + c] + hlf * 16u;
     }
 
     // ---- S^T = K . Q^T over all 512 dims. A is K (dim contiguous, plain load), B is Q from LDS.
-    // D[m][n] is S^T[key m][head n], so a lane owns ONE head and eight keys — which is what makes
-    // the softmax below a wave reduction with no block barrier.
-    //
-    // TWO mmas per 128-bit load a side, not one per 64-bit load. A K-major fp8 fragment is only
-    // 8 bytes, so the natural load leaves half the width on the table and QK spends two operand
-    // fetches per matrix op. Reading 16 bytes at `hlf * 16` and splitting it relabels K as
-    //     mma 0: dims d + 16h + 0..7      mma 1: dims d + 16h + 8..15
-    // which is a permutation of the 32-dim super-group applied IDENTICALLY to K and Q, and the
-    // product is invariant under exactly that (`wmma.h`, "the K labelling"). Both operands are read
-    // that way here, which is the condition; mixing it with an unrelabelled load is silently wrong,
-    // so neither pointer below is used anywhere else. The one K fragment feeds all NT head tiles.
-    const uint8_t* kp = s_ptr[16u * wave + c] + hlf * 16u;
     wmma::f8v acc[NT];
 #pragma unroll
     for (uint32_t nt = 0; nt < NT; ++nt) acc[nt] = wmma::acc_zero();
-#pragma unroll 4
+#pragma unroll 2
     for (uint32_t d = 0; d < kW; d += 32) {
       const uint4 k4 = aff::load_uint4_nt<NT_KV>((const AFF_GLOBAL void*)(kp + d));
       const u32x4 kk = {k4.x, k4.y, k4.z, k4.w};
@@ -399,18 +424,16 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       }
     }
 
-    // ---- online softmax. The key's row scale and the head's Q scale are both single multiplies
-    // here: one indexes the accumulator ROW (8h+j, a key), the other the COLUMN (c, a head).
-    // The eight row scales a lane needs are the same for every head tile and are wanted twice more
-    // below, so they are read once. Left inline they were 16*NT LDS reads a tile for 8 values.
+    // ---- online softmax.
     float rw[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) rw[j] = s_rs[16u * wave + hlf * 8u + (uint32_t)j];
 
     float mnew[NT], alpha[NT];
+    const float qscale = EXP2 ? (scale * kLog2e) : scale;
 #pragma unroll
     for (uint32_t nt = 0; nt < NT; ++nt) {
-      const float qs = s_qs[nt * 16u + c] * scale;
+      const float qs = s_qs[nt * 16u + c] * qscale;
       float mt = kNeg;
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
@@ -421,6 +444,12 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       if (lane < 16) s_red[wave * NH + nt * 16u + c] = mt;
     }
     lds_barrier();
+    if constexpr (kLate) {
+      if (tid == 0u) {
+        const float tile_mx = fmaxf(fmaxf(s_wmx[0], s_wmx[1]), fmaxf(s_wmx[2], s_wmx[3]));
+        s_scur = (tile_mx > 0.0f) ? tile_mx : s_sprev;
+      }
+    }
 #pragma unroll
     for (uint32_t nt = 0; nt < NT; ++nt) {
       const uint32_t hd = nt * 16u + c;
@@ -429,11 +458,14 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       for (uint32_t w = 1; w < kWaves; ++w) mtile = fmaxf(mtile, s_red[w * NH + hd]);
       const float mold = s_m[hd];
       mnew[nt] = fmaxf(mold, mtile);
-      alpha[nt] = (mold <= kNeg) ? 0.0f : __expf(mold - mnew[nt]);
+      alpha[nt] = (mold <= kNeg) ? 0.0f
+                                 : (EXP2 ? flash_exp2f(mold - mnew[nt]) : __expf(mold - mnew[nt]));
       float psum = 0.0f;
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
-        const float e = (acc[nt][j] > kNeg) ? __expf(acc[nt][j] - mnew[nt]) : 0.0f;
+        const float e = (acc[nt][j] > kNeg)
+                            ? (EXP2 ? flash_exp2f(acc[nt][j] - mnew[nt]) : __expf(acc[nt][j] - mnew[nt]))
+                            : 0.0f;
         acc[nt][j] = e;                               // acc becomes P in place
         psum += e;
       }
@@ -443,12 +475,6 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     lds_barrier();
 
     // ---- P -> E4M3, with the key's row scale folded in.
-    //
-    // O is kept in units of the tile's own scale S_cur. A row scale belongs to V, and V is the
-    // reduction operand, so it can only ride on P; but P is a softmax weight in [0,1] and
-    // multiplying it by a raw 2^-7 would push most of it into E4M3 subnormals. Dividing by S_cur
-    // holds the ratio at or below 1, and the unit change is absorbed by the rescale the online
-    // softmax already applies each tile: alpha * (S_prev / S_cur).
     const float inv_scur = flash_rcpf(s_scur);
     const float sratio = s_sprev * inv_scur;
     int skip = 1;
@@ -456,9 +482,6 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     for (uint32_t nt = 0; nt < NT; ++nt) {
       const uint32_t hd = nt * 16u + c;
       const float fac = alpha[nt] * sratio;
-      // Rescaling O is 64*NT multiplies a lane a tile — the largest non-matrix cost in the loop —
-      // and it is the identity on most tiles, because the running max stops moving after the first
-      // few and neighbouring rows share a scale. One ballot prices the check at nothing.
       if (wave == 0) {
         if (__ballot(fac == 1.0f) != 0xFFFFFFFFull) skip = 0;
         if (lane < 16) {
@@ -466,7 +489,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
 #pragma unroll
           for (uint32_t w = 1; w < kWaves; ++w) ltile += s_ps[w * NH + hd];
           s_m[hd] = mnew[nt];
-          s_l[hd] = s_l[hd] * alpha[nt] + ltile;
+          s_l[hd] = __builtin_fmaf(s_l[hd], alpha[nt], ltile);
           s_af[hd] = fac;
         }
       }
@@ -480,8 +503,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     if (wave == 0 && lane == 0) s_skip = skip;
     lds_barrier();
 
-    // ---- rescale O, then O += P . V. The accumulator row is the HEAD here, not the key, so the
-    // factor is indexed by 8h+j and the eight values are contiguous in s_af.
+    // ---- rescale O, then overlap next tile's key row resolution with O += P . V.
     if (!s_skip) {
 #pragma unroll
       for (uint32_t nt = 0; nt < NT; ++nt) {
@@ -495,7 +517,13 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
       }
     }
 
-#pragma unroll
+    if constexpr (kLate) {
+      const uint32_t kt_next = kt0 + kKT;
+      float unused_wmx = 0.0f;
+      if (kt_next < kt_hi) resolve_4w_regs(kt_next, late_p, late_r, unused_wmx);
+    }
+
+#pragma unroll 2
     for (uint32_t t = 0; t < kKT / 16u; ++t) {
       wmma::i2v a[NT];
 #pragma unroll
@@ -566,6 +594,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
 constexpr uint32_t kCT = 128;                        // threads a combine block; kW / 4 exactly
 constexpr uint32_t kMaxSlices = 64;
 
+template <bool EXP2 = false>
 __global__ __launch_bounds__(kCT) void flash_combine_kernel(
     const float* __restrict__ part_o, const float* __restrict__ part_ml, float* __restrict__ out,
     uint32_t nsp, uint32_t part_tok, uint32_t n_head, uint32_t b0) {
@@ -586,9 +615,10 @@ __global__ __launch_bounds__(kCT) void flash_combine_kernel(
     float l = 0.0f;
     for (uint32_t s = threadIdx.x; s < nsp; s += 32u) {
       const float ms = part_ml[(row + (size_t)s * plane) * 2];
-      const float w = (ms > kNeg) ? __expf(ms - m) : 0.0f;
+      const float w =
+          (ms > kNeg) ? (EXP2 ? flash_exp2f(ms - m) : __expf(ms - m)) : 0.0f;
       s_w[s] = w;
-      l += part_ml[(row + (size_t)s * plane) * 2 + 1] * w;
+      l = __builtin_fmaf(part_ml[(row + (size_t)s * plane) * 2 + 1], w, l);
     }
     l = wave_reduce_add_dpp(l);
     if (threadIdx.x == 0) s_inv = (l > 0.0f) ? 1.0f / l : 0.0f;
@@ -601,7 +631,10 @@ __global__ __launch_bounds__(kCT) void flash_combine_kernel(
     const float w = s_w[s];
     if (w == 0.0f) continue;                         // an empty slice, and at depth most are not
     const float4 v = *(const float4*)(part_o + (row + (size_t)s * plane) * kW + d);
-    acc.x += v.x * w; acc.y += v.y * w; acc.z += v.z * w; acc.w += v.w * w;
+    acc.x = __builtin_fmaf(v.x, w, acc.x);
+    acc.y = __builtin_fmaf(v.y, w, acc.y);
+    acc.z = __builtin_fmaf(v.z, w, acc.z);
+    acc.w = __builtin_fmaf(v.w, w, acc.w);
   }
   const float inv = s_inv;
   *(float4*)(out + ((size_t)(b0 + tk) * n_head + hd) * kW + d) =
@@ -712,6 +745,16 @@ inline uint64_t flash_nt_threshold_mib() {
   return (end != s) ? (uint64_t)v : 32ull;
 }
 
+static inline bool flash_exp2_enabled() {
+  const char* s = std::getenv("AFF_FLASH_EXP2");
+  return !(s && s[0] == '0' && s[1] == '\0');
+}
+
+static inline bool flash_klate_enabled() {
+  const char* s = std::getenv("AFF_FLASH_KLATE");
+  return !(s && s[0] == '0' && s[1] == '\0');
+}
+
 void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
                           const uint8_t* allowed, const uint32_t* n_comp_v, uint32_t n_comp1,
                           const float* sinks,
@@ -734,23 +777,30 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
   float* po = nsp > 1u ? split->o : nullptr;
   float* pm = nsp > 1u ? split->ml : nullptr;
   const uint32_t ptok = nsp > 1u ? split->tok_cap : 0u;
-  static const bool resolve_4w = []() -> bool {
-    const char* v = std::getenv("AFF_FLASH_4WAVE_RESOLVE");
-    return !v || !*v || !(v[0] == '0' && v[1] == '\0');
-  }();
+  const char* r4v = std::getenv("AFF_FLASH_4WAVE_RESOLVE");
+  const bool resolve_4w = !r4v || !*r4v || !(r4v[0] == '0' && r4v[1] == '\0');
+  const bool exp2 = flash_exp2_enabled();
+  const bool klate = flash_klate_enabled();
   const bool nt_kv = (n == 1u) && flash_longctx_nt_enabled() &&
                      ((uint64_t)nkeys * kRowB > (flash_nt_threshold_mib() << 20));
   const dim3 g(n, ntiles, nsp), b(kThreads);
-#define AFF_LAUNCH(T, S, M, R4, NK)                                                                \
-  hipLaunchKernelGGL((flash_kernel<T, S, M, R4, NK>), g, b, 0, st, q, r8, c8, allowed, n_comp_v,   \
-                     n_comp1, sinks, out, b0, pos0, sliding, ring, max_comp, n_head, scale,        \
-                     q_bf16 ? 1 : 0, po, pm, ptok, adm, adm_stride, raw_floor, q_scales)
+#define AFF_LAUNCH(T, S, M, R4, NK, E2, KL)                                                        \
+  hipLaunchKernelGGL((flash_kernel<T, S, M, R4, NK, E2, KL>), g, b, 0, st, q, r8, c8, allowed,     \
+                     n_comp_v, n_comp1, sinks, out, b0, pos0, sliding, ring, max_comp, n_head,     \
+                     scale, q_bf16 ? 1 : 0, po, pm, ptok, adm, adm_stride, raw_floor, q_scales)
+#define AFF_PICK_OPT(T, S, M, R4, NK)                                                              \
+  do {                                                                                             \
+    if (exp2 && klate && (R4))   AFF_LAUNCH(T, S, M, R4, NK, true, true);                          \
+    else if (exp2)               AFF_LAUNCH(T, S, M, R4, NK, true, false);                         \
+    else if (klate && (R4))      AFF_LAUNCH(T, S, M, R4, NK, false, true);                         \
+    else                         AFF_LAUNCH(T, S, M, R4, NK, false, false);                        \
+  } while (0)
 #define AFF_PICK(T, R4, NK)                                                                        \
   do {                                                                                             \
-    if (sinks && allowed)  AFF_LAUNCH(T, true, true, R4, NK);                                      \
-    else if (sinks)        AFF_LAUNCH(T, true, false, R4, NK);                                     \
-    else if (allowed)      AFF_LAUNCH(T, false, true, R4, NK);                                     \
-    else                   AFF_LAUNCH(T, false, false, R4, NK);                                    \
+    if (sinks && allowed)  AFF_PICK_OPT(T, true, true, R4, NK);                                    \
+    else if (sinks)        AFF_PICK_OPT(T, true, false, R4, NK);                                   \
+    else if (allowed)      AFF_PICK_OPT(T, false, true, R4, NK);                                   \
+    else                   AFF_PICK_OPT(T, false, false, R4, NK);                                  \
   } while (0)
   if (nt_kv) {
     if (resolve_4w) {
@@ -770,10 +820,17 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
     }
   }
 #undef AFF_PICK
+#undef AFF_PICK_OPT
 #undef AFF_LAUNCH
-  if (nsp > 1u)
-    hipLaunchKernelGGL(flash_combine_kernel, dim3(n, n_head), dim3(kCT), 0, st, po, pm, out, nsp,
-                       ptok, n_head, b0);
+  if (nsp > 1u) {
+    if (exp2) {
+      hipLaunchKernelGGL((flash_combine_kernel<true>), dim3(n, n_head), dim3(kCT), 0, st, po, pm,
+                         out, nsp, ptok, n_head, b0);
+    } else {
+      hipLaunchKernelGGL((flash_combine_kernel<false>), dim3(n, n_head), dim3(kCT), 0, st, po, pm,
+                         out, nsp, ptok, n_head, b0);
+    }
+  }
   AFF_HIP_CHECK(hipGetLastError());
 }
 

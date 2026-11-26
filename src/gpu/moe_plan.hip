@@ -62,6 +62,24 @@ __device__ inline uint32_t plan_bucket(uint32_t nt) {
 // Exclusive prefix sum over `nrow` independent rows of `n` values, laid out row-major with stride
 // `n`. Hillis-Steele: O(n log n) work, but n is at most a few thousand and the alternative is a
 // tree with twice the barriers. `tmp` must hold nrow*n.
+__device__ __forceinline__ uint32_t wave_incl_scan_u32_dpp(uint32_t x, uint32_t lane) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x111, 0xF, 0xF, true);  // row_shr:1
+  x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x112, 0xF, 0xF, true);  // row_shr:2
+  x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x114, 0xF, 0xF, true);  // row_shr:4
+  x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x118, 0xF, 0xF, true);  // row_shr:8
+  const uint32_t lo = (uint32_t)__builtin_amdgcn_readlane((int)x, 15);
+  return (lane >= 16u) ? (x + lo) : x;
+#else
+#pragma unroll
+  for (uint32_t d = 1u; d < 32u; d <<= 1) {
+    const uint32_t up = __shfl_up(x, d, 32);
+    if (lane >= d) x += up;
+  }
+  return x;
+#endif
+}
+
 template <uint32_t NWaves = 32u>
 __device__ void wg_excl_scan(uint32_t* __restrict__ a, uint32_t* __restrict__ tmp, uint32_t n,
                              uint32_t nrow) {
@@ -71,12 +89,7 @@ __device__ void wg_excl_scan(uint32_t* __restrict__ a, uint32_t* __restrict__ tm
   if (nw_row == 1u) {
     for (uint32_t r = w; r < nrow; r += NWaves) {
       const uint32_t val = (lane < n) ? a[r * n + lane] : 0u;
-      uint32_t inc = val;
-      #pragma unroll
-      for (uint32_t d = 1u; d < 32u; d <<= 1) {
-        const uint32_t up = __shfl_up(inc, d, 32);
-        if (lane >= d) inc += up;
-      }
+      const uint32_t inc = wave_incl_scan_u32_dpp(val, lane);
       if (lane < n) a[r * n + lane] = inc - val;
     }
     lds_barrier();
@@ -89,12 +102,7 @@ __device__ void wg_excl_scan(uint32_t* __restrict__ a, uint32_t* __restrict__ tm
     const uint32_t blk = chunk - r * nw_row;
     const uint32_t c = (blk << 5) + lane;
     const uint32_t val = (c < n) ? a[r * n + c] : 0u;
-    uint32_t inc = val;
-    #pragma unroll
-    for (uint32_t d = 1u; d < 32u; d <<= 1) {
-      const uint32_t up = __shfl_up(inc, d, 32);
-      if (lane >= d) inc += up;
-    }
+    const uint32_t inc = wave_incl_scan_u32_dpp(val, lane);
     if (c < n) a[r * n + c] = inc - val;
     if (lane == 31u) tmp[chunk] = inc;
   }
@@ -105,14 +113,13 @@ __device__ void wg_excl_scan(uint32_t* __restrict__ a, uint32_t* __restrict__ tm
     for (uint32_t b0 = 0u; b0 < nw_row; b0 += 32u) {
       const uint32_t idx = b0 + lane;
       const uint32_t cv = (idx < nw_row) ? tmp[r * nw_row + idx] : 0u;
-      uint32_t ci = cv;
-      #pragma unroll
-      for (uint32_t d = 1u; d < 32u; d <<= 1) {
-        const uint32_t up = __shfl_up(ci, d, 32);
-        if (lane >= d) ci += up;
-      }
+      const uint32_t ci = wave_incl_scan_u32_dpp(cv, lane);
       if (idx < nw_row) tmp[r * nw_row + idx] = base + (ci - cv);
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+      base += (uint32_t)__builtin_amdgcn_readlane((int)ci, 31);
+#else
       base += __shfl(ci, 31, 32);
+#endif
     }
   }
   lds_barrier();
@@ -680,11 +687,18 @@ __global__ __launch_bounds__(kNarrowThreads) void moe_plan_narrow_kernel(
         c[m] = v;
       }
       uint32_t inc = n;
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+      inc += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)inc, 0x111, 0xF, 0xF, true);
+      inc += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)inc, 0x112, 0xF, 0xF, true);
+      inc += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)inc, 0x114, 0xF, 0xF, true);
+      inc += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)inc, 0x118, 0xF, 0xF, true);
+#else
       #pragma unroll
       for (uint32_t d = 1u; d <= 8u; d <<= 1) {
         const uint32_t up = __shfl_up(inc, d, 32);
         if ((tid & 31u) >= d) inc += up;
       }
+#endif
       const uint32_t base = inc - n;
       a.run[tid] = base;
       if (tid + 1u == NB) a.run[NB] = inc;

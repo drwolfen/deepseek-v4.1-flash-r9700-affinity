@@ -1,9 +1,12 @@
+#include "gpu/attn_flash.h"
 #include "gpu/batch_kernels.h"
 #include "gpu/dense_gpu.h"
 #include "gpu/engram_gpu.h"
+#include "gpu/expert_kernel_hip.h"
 #include "gpu/hip_common.h"
 #include "gpu/indexer_gpu.h"
 #include "gpu/moe_plan.h"
+#include "gpu/wmma.h"
 #include "quant/source_dtypes.h"
 
 #include <hip/hip_runtime.h>
@@ -485,6 +488,510 @@ int check_moe_plan_large_tok_lds() {
   return 0;
 }
 
+__global__ void test_bf16x2_rne_kernel(const float* in_lo, const float* in_hi, uint32_t* out,
+                                       uint32_t n) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = aff::wmma::bf16x2_rne(in_lo[i], in_hi[i]);
+}
+
+int check_bf16x2_rne_parity() {
+  auto bits_to_f32 = [](uint32_t u) {
+    float f = 0.0f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+  };
+  std::vector<float> lo, hi;
+  const uint32_t specials[] = {
+      0x00000000u, 0x80000000u, 0x3f800000u, 0x3f808000u, 0x3f818000u, 0xbf808000u, 0xbf818000u,
+      0x3f807fffu, 0x3f808001u, 0x00008000u, 0x00018000u, 0x007f8000u, 0x7f7fffffu, 0xff7fffffu,
+      0x7f800000u, 0xff800000u, 0x7f800001u, 0x7fc00001u, 0xffffffffu, 0x42488000u, 0x42498000u,
+  };
+  for (uint32_t a : specials) {
+    for (uint32_t b : specials) {
+      lo.push_back(bits_to_f32(a));
+      hi.push_back(bits_to_f32(b));
+    }
+  }
+  uint32_t rng = 0x12345678u;
+  for (int i = 0; i < 4096; ++i) {
+    rng = rng * 1664525u + 1013904223u;
+    lo.push_back(bits_to_f32(rng));
+    rng = rng * 1664525u + 1013904223u;
+    hi.push_back(bits_to_f32(rng));
+  }
+  const uint32_t n = (uint32_t)lo.size();
+  float *d_lo = nullptr, *d_hi = nullptr;
+  uint32_t* d_out = nullptr;
+  assert(hipMalloc(&d_lo, n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_hi, n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_out, n * sizeof(uint32_t)) == hipSuccess);
+  assert(hipMemcpy(d_lo, lo.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_hi, hi.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+  hipLaunchKernelGGL(test_bf16x2_rne_kernel, dim3((n + 255u) / 256u), dim3(256), 0, nullptr,
+                     d_lo, d_hi, d_out, n);
+  assert(hipGetLastError() == hipSuccess);
+  assert(hipDeviceSynchronize() == hipSuccess);
+  std::vector<uint32_t> got(n);
+  assert(hipMemcpy(got.data(), d_out, n * sizeof(uint32_t), hipMemcpyDeviceToHost) == hipSuccess);
+  (void)hipFree(d_lo);
+  (void)hipFree(d_hi);
+  (void)hipFree(d_out);
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t exp =
+        (uint32_t)f32_to_bf16_cpu(lo[i]) | ((uint32_t)f32_to_bf16_cpu(hi[i]) << 16);
+    assert(got[i] == exp);
+  }
+  std::printf("PASS: bf16x2_rne bit-exact parity (n=%u)\n", n);
+  return 0;
+}
+
+int check_router_topk_v2_parity() {
+  struct Case {
+    uint32_t ne, live, nb, k;
+    int norm;
+    float scale, res_bias;
+    bool use_res, has_prot, sparse_res;
+  };
+  const Case cases[] = {
+      {256u, 8u, 16u, 8u, 1, 2.5f, 0.0f, false, false, false},
+      {256u, 8u, 8u, 8u, 1, 2.5f, 0.0f, true, false, false},
+      {256u, 4u, 8u, 8u, 1, 1.0f, 0.25f, true, false, false},
+      {256u, 4u, 8u, 8u, 1, 1.0f, 0.25f, true, true, false},
+      {256u, 2u, 4u, 8u, 0, 1.5f, 0.0f, true, false, true},
+      {384u, 4u, 8u, 8u, 1, 2.0f, 0.2f, true, false, false},
+      {512u, 4u, 8u, 8u, 1, 2.0f, 0.0f, false, false, false},
+  };
+  uint32_t rng = 777u;
+  for (const Case& c : cases) {
+    std::vector<float> logits((size_t)c.ne * c.nb), bias(c.ne);
+    std::vector<uint8_t> res(c.ne, 1u);
+    for (uint32_t e = 0; e < c.ne; ++e) {
+      rng = rng * 1664525u + 1013904223u;
+      bias[e] = 0.05f * (float)((int)(rng & 7u) - 3);
+      if (c.use_res) res[e] = (e & 1u) ? 1u : 0u;
+    }
+    if (c.sparse_res) {
+      std::fill(res.begin(), res.end(), 0u);
+      res[5] = 1u;
+      res[17] = 1u;
+      res[103] = 1u;
+    }
+    if (c.has_prot) res[12] = 3u;
+    for (size_t i = 0; i < logits.size(); ++i) {
+      rng = rng * 1664525u + 1013904223u;
+      logits[i] = 0.1f * (float)((int)(rng & 15u) - 8);
+    }
+    // Inject exact score ties across multiple expert IDs to verify lower-ID tie break.
+    for (uint32_t b = 0; b < c.live; ++b) {
+      for (uint32_t e : {3u, 19u, 64u, 133u, 255u}) {
+        if (e < c.ne) {
+          logits[(size_t)e * c.nb + b] = (e == 19u) ? -0.0f : 0.0f;
+          bias[e] = 0.25f;
+        }
+      }
+      if (c.has_prot) {
+        logits[(size_t)12u * c.nb + b] = 25.0f;
+        bias[12] = 1.0f;
+      }
+    }
+
+    float *d_log = nullptr, *d_bias = nullptr, *d_wt0 = nullptr, *d_wt1 = nullptr;
+    uint8_t* d_res = nullptr;
+    uint32_t *d_sel0 = nullptr, *d_sel1 = nullptr, *d_ns0 = nullptr, *d_ns1 = nullptr;
+    assert(hipMalloc(&d_log, logits.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_bias, bias.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_res, res.size()) == hipSuccess);
+    assert(hipMalloc(&d_sel0, (size_t)c.live * c.k * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_sel1, (size_t)c.live * c.k * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_wt0, (size_t)c.live * c.k * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_wt1, (size_t)c.live * c.k * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_ns0, c.live * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMalloc(&d_ns1, c.live * sizeof(uint32_t)) == hipSuccess);
+    assert(hipMemcpy(d_log, logits.data(), logits.size() * sizeof(float), hipMemcpyHostToDevice) ==
+           hipSuccess);
+    assert(hipMemcpy(d_bias, bias.data(), bias.size() * sizeof(float), hipMemcpyHostToDevice) ==
+           hipSuccess);
+    assert(hipMemcpy(d_res, res.data(), res.size(), hipMemcpyHostToDevice) == hipSuccess);
+
+    ::setenv("AFF_ROUTER_TOPK_V2", "0", 1);
+    aff::router_topk_hip(d_log, d_bias, c.use_res ? d_res : nullptr, d_sel0, d_wt0, d_ns0, c.ne,
+                         c.nb, c.live, c.k, c.norm, c.scale, nullptr, c.res_bias);
+    ::setenv("AFF_ROUTER_TOPK_V2", "1", 1);
+    aff::router_topk_hip(d_log, d_bias, c.use_res ? d_res : nullptr, d_sel1, d_wt1, d_ns1, c.ne,
+                         c.nb, c.live, c.k, c.norm, c.scale, nullptr, c.res_bias);
+    ::unsetenv("AFF_ROUTER_TOPK_V2");
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    std::vector<uint32_t> s0((size_t)c.live * c.k), s1((size_t)c.live * c.k), ns0(c.live),
+        ns1(c.live);
+    std::vector<float> w0((size_t)c.live * c.k), w1((size_t)c.live * c.k);
+    assert(hipMemcpy(s0.data(), d_sel0, s0.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(s1.data(), d_sel1, s1.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(w0.data(), d_wt0, w0.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(w1.data(), d_wt1, w1.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(ns0.data(), d_ns0, ns0.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(ns1.data(), d_ns1, ns1.size() * sizeof(uint32_t), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+
+    for (void* p : {(void*)d_log, (void*)d_bias, (void*)d_res, (void*)d_sel0, (void*)d_sel1,
+                    (void*)d_wt0, (void*)d_wt1, (void*)d_ns0, (void*)d_ns1})
+      (void)hipFree(p);
+
+    assert(ns0 == ns1);
+    for (uint32_t b = 0; b < c.live; ++b) {
+      for (uint32_t i = 0; i < ns0[b]; ++i) {
+        const size_t idx = (size_t)b * c.k + i;
+        assert(s0[idx] == s1[idx]);
+        assert(std::memcmp(&w0[idx], &w1[idx], sizeof(float)) == 0);
+      }
+    }
+  }
+  std::printf("PASS: router_topk_v2 bit-exact parity (ties, res_bias, prot, ne=256/384/512)\n");
+  return 0;
+}
+
+int check_mhc_mix_fast_parity() {
+  const uint32_t n_embd = 5120u, n_hc = 4u, nb_n = aff::kNarrowTok;
+  const uint32_t n_mix = 2u * n_hc + n_hc * n_hc;
+  const size_t hc_sz = (size_t)n_hc * n_embd * nb_n;
+  std::vector<uint16_t> h_hc(hc_sz);
+  std::vector<float> h_mix((size_t)n_mix * nb_n), h_scale(3u, 0.25f), h_base(n_mix, 0.1f),
+      h_nw(n_embd, 1.0f), h_pre_in((size_t)n_hc * nb_n, 0.25f);
+  uint32_t rng = 31337u;
+  for (size_t i = 0; i < hc_sz; ++i) {
+    rng = rng * 1664525u + 1013904223u;
+    h_hc[i] = f32_to_bf16_cpu((((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f) * 0.5f);
+  }
+  for (size_t i = 0; i < h_mix.size(); ++i) {
+    rng = rng * 1664525u + 1013904223u;
+    h_mix[i] = (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f) * 0.2f;
+  }
+
+  uint16_t* d_hc = nullptr;
+  float *d_mix = nullptr, *d_sc = nullptr, *d_base = nullptr, *d_nw = nullptr, *d_pin = nullptr;
+  float *d_pre0 = nullptr, *d_post0 = nullptr, *d_comb0 = nullptr, *d_cur0 = nullptr,
+        *d_norm0 = nullptr, *d_part0 = nullptr, *d_qs0 = nullptr;
+  float *d_pre1 = nullptr, *d_post1 = nullptr, *d_comb1 = nullptr, *d_cur1 = nullptr,
+        *d_norm1 = nullptr, *d_part1 = nullptr, *d_qs1 = nullptr;
+  uint8_t *d_q80 = nullptr, *d_q81 = nullptr;
+  const size_t nkb = n_embd / 128u;
+  assert(hipMalloc(&d_hc, hc_sz * sizeof(uint16_t)) == hipSuccess);
+  assert(hipMalloc(&d_mix, h_mix.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_sc, h_scale.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_base, h_base.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_nw, h_nw.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_pin, h_pre_in.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_pre0, h_pre_in.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_pre1, h_pre_in.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_post0, h_pre_in.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_post1, h_pre_in.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_comb0, (size_t)n_hc * n_hc * nb_n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_comb1, (size_t)n_hc * n_hc * nb_n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_cur0, (size_t)n_embd * nb_n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_cur1, (size_t)n_embd * nb_n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_norm0, (size_t)n_embd * nb_n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_norm1, (size_t)n_embd * nb_n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_part0, (size_t)2u * aff::kHcnChunks * nb_n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_part1, (size_t)2u * aff::kHcnChunks * nb_n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_q80, (size_t)nb_n * n_embd) == hipSuccess);
+  assert(hipMalloc(&d_q81, (size_t)nb_n * n_embd) == hipSuccess);
+  assert(hipMalloc(&d_qs0, (size_t)nb_n * nkb * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_qs1, (size_t)nb_n * nkb * sizeof(float)) == hipSuccess);
+
+  assert(hipMemcpy(d_hc, h_hc.data(), hc_sz * sizeof(uint16_t), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_mix, h_mix.data(), h_mix.size() * sizeof(float), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_sc, h_scale.data(), h_scale.size() * sizeof(float), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_base, h_base.data(), h_base.size() * sizeof(float), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_nw, h_nw.data(), h_nw.size() * sizeof(float), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_pin, h_pre_in.data(), h_pre_in.size() * sizeof(float), hipMemcpyHostToDevice) ==
+         hipSuccess);
+
+  for (const float* pin : {(const float*)d_pin, (const float*)nullptr}) {
+    ::setenv("AFF_MHC_MIX_FAST", "0", 1);
+    aff::batch_hc_fused_narrow_hip(d_hc, d_mix, d_sc, d_base, d_nw, d_pre0, d_post0, d_comb0,
+                                   d_cur0, d_norm0, d_part0, d_q80, d_qs0, n_embd, n_hc, nb_n,
+                                   20u, 1e-6f, 1e-6f, 1, nullptr, pin);
+    ::setenv("AFF_MHC_MIX_FAST", "1", 1);
+    aff::batch_hc_fused_narrow_hip(d_hc, d_mix, d_sc, d_base, d_nw, d_pre1, d_post1, d_comb1,
+                                   d_cur1, d_norm1, d_part1, d_q81, d_qs1, n_embd, n_hc, nb_n,
+                                   20u, 1e-6f, 1e-6f, 1, nullptr, pin);
+    ::unsetenv("AFF_MHC_MIX_FAST");
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    std::vector<float> c0((size_t)n_embd * nb_n), c1((size_t)n_embd * nb_n),
+        n0((size_t)n_embd * nb_n), n1((size_t)n_embd * nb_n),
+        cb0((size_t)n_hc * n_hc * nb_n), cb1((size_t)n_hc * n_hc * nb_n);
+    assert(hipMemcpy(c0.data(), d_cur0, c0.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(c1.data(), d_cur1, c1.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(n0.data(), d_norm0, n0.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(n1.data(), d_norm1, n1.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(cb0.data(), d_comb0, cb0.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(cb1.data(), d_comb1, cb1.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(std::memcmp(c0.data(), c1.data(), c0.size() * sizeof(float)) == 0);
+    for (size_t i = 0; i < n0.size(); ++i) assert(std::fabs(n0[i] - n1[i]) <= 1e-5f);
+    for (size_t i = 0; i < cb0.size(); ++i) assert(std::fabs(cb0[i] - cb1[i]) <= 1e-5f);
+  }
+
+  for (void* p : {(void*)d_hc, (void*)d_mix, (void*)d_sc, (void*)d_base, (void*)d_nw, (void*)d_pin,
+                  (void*)d_pre0, (void*)d_pre1, (void*)d_post0, (void*)d_post1, (void*)d_comb0,
+                  (void*)d_comb1, (void*)d_cur0, (void*)d_cur1, (void*)d_norm0, (void*)d_norm1,
+                  (void*)d_part0, (void*)d_part1, (void*)d_q80, (void*)d_q81, (void*)d_qs0,
+                  (void*)d_qs1})
+    (void)hipFree(p);
+  std::printf("PASS: mhc_mix_fast parity (20-WG split-K + Kahan, cur exact, norm/comb <=1e-5)\n");
+  return 0;
+}
+
+int check_flash_exp2_klate_parity() {
+  const uint32_t n = 2u, n_head = 32u, n_raw = 16u, n_comp = 192u, ring = 64u, sliding = 64u;
+  const uint32_t width = aff::kFlashWidth;
+  std::vector<float> h_q((size_t)n * n_head * width), h_sinks(n_head);
+  std::vector<uint8_t> h_raw((size_t)ring * aff::kFlashRowBytes),
+      h_comp((size_t)n_comp * aff::kFlashRowBytes), h_allow((size_t)n * n_comp, 1u);
+  std::vector<float> row(width);
+  uint32_t rng = 5150u;
+  for (size_t i = 0; i < h_q.size(); ++i) {
+    rng = rng * 1664525u + 1013904223u;
+    h_q[i] = 0.3f * (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f);
+  }
+  for (uint32_t h = 0; h < n_head; ++h) h_sinks[h] = -0.5f + 0.03f * (float)h;
+  for (uint32_t r = 0; r < ring; ++r) {
+    for (uint32_t d = 0; d < width; ++d) {
+      rng = rng * 1664525u + 1013904223u;
+      row[d] = 0.25f * (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f);
+    }
+    aff::kv_encode_fp8r_row(row.data(), h_raw.data() + (size_t)r * aff::kFlashRowBytes);
+  }
+  for (uint32_t r = 0; r < n_comp; ++r) {
+    for (uint32_t d = 0; d < width; ++d) {
+      rng = rng * 1664525u + 1013904223u;
+      row[d] = 0.25f * (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f);
+    }
+    aff::kv_encode_fp8r_row(row.data(), h_comp.data() + (size_t)r * aff::kFlashRowBytes);
+  }
+  for (size_t i = 0; i < h_allow.size(); ++i)
+    if ((i % 7u) == 0u) h_allow[i] = 0u;
+
+  float *d_q = nullptr, *d_sinks = nullptr, *d_o0 = nullptr, *d_o1 = nullptr;
+  uint8_t *d_raw = nullptr, *d_comp = nullptr, *d_allow = nullptr;
+  assert(hipMalloc(&d_q, h_q.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_sinks, h_sinks.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_raw, h_raw.size()) == hipSuccess);
+  assert(hipMalloc(&d_comp, h_comp.size()) == hipSuccess);
+  assert(hipMalloc(&d_allow, h_allow.size()) == hipSuccess);
+  assert(hipMalloc(&d_o0, h_q.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_o1, h_q.size() * sizeof(float)) == hipSuccess);
+  assert(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(float), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_sinks, h_sinks.data(), h_sinks.size() * sizeof(float),
+                   hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_raw, h_raw.data(), h_raw.size(), hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_comp, h_comp.data(), h_comp.size(), hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_allow, h_allow.data(), h_allow.size(), hipMemcpyHostToDevice) == hipSuccess);
+
+  const uint32_t pos0 = n_raw - 1u;
+  const float scale = 1.0f / std::sqrt((float)width);
+  ::setenv("AFF_FLASH_EXP2", "0", 1);
+  ::setenv("AFF_FLASH_KLATE", "0", 1);
+  aff::mqa_attend_flash_hip(d_q, d_raw, d_comp, d_allow, nullptr, n_comp, d_sinks, d_o0, 0u, n, n,
+                            pos0, sliding, ring, n_comp, n_head, scale, nullptr);
+  ::setenv("AFF_FLASH_EXP2", "1", 1);
+  ::setenv("AFF_FLASH_KLATE", "1", 1);
+  aff::mqa_attend_flash_hip(d_q, d_raw, d_comp, d_allow, nullptr, n_comp, d_sinks, d_o1, 0u, n, n,
+                            pos0, sliding, ring, n_comp, n_head, scale, nullptr);
+  ::unsetenv("AFF_FLASH_EXP2");
+  ::unsetenv("AFF_FLASH_KLATE");
+  assert(hipDeviceSynchronize() == hipSuccess);
+
+  std::vector<float> o0(h_q.size()), o1(h_q.size());
+  assert(hipMemcpy(o0.data(), d_o0, o0.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+  assert(hipMemcpy(o1.data(), d_o1, o1.size() * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+  for (void* p :
+       {(void*)d_q, (void*)d_sinks, (void*)d_raw, (void*)d_comp, (void*)d_allow, (void*)d_o0,
+        (void*)d_o1})
+    (void)hipFree(p);
+  float max_d = 0.0f;
+  for (size_t i = 0; i < o0.size(); ++i) max_d = std::max(max_d, std::fabs(o0[i] - o1[i]));
+  assert(max_d <= 5e-5f);
+  std::printf("PASS: flash_exp2_klate parity (max_diff=%.3e)\n", max_d);
+  return 0;
+}
+
+int check_expert_had32_dpp_parity() {
+  const uint32_t dim = 512u, total = 20u, nkb = dim / 128u;
+  std::vector<uint16_t> h_g((size_t)dim * total), h_u((size_t)dim * total);
+  std::vector<float> h_w(total);
+  uint32_t rng = 8888u;
+  for (size_t i = 0; i < h_g.size(); ++i) {
+    rng = rng * 1664525u + 1013904223u;
+    h_g[i] = f32_to_bf16_cpu((((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f) * 2.0f);
+    rng = rng * 1664525u + 1013904223u;
+    h_u[i] = f32_to_bf16_cpu((((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f) * 2.0f);
+  }
+  for (uint32_t s = 0; s < total; ++s) h_w[s] = 0.5f + 0.05f * (float)s;
+
+  uint16_t *d_g = nullptr, *d_u = nullptr;
+  float *d_w = nullptr, *d_s0 = nullptr, *d_s1 = nullptr;
+  uint8_t *d_o0 = nullptr, *d_o1 = nullptr;
+  assert(hipMalloc(&d_g, h_g.size() * sizeof(uint16_t)) == hipSuccess);
+  assert(hipMalloc(&d_u, h_u.size() * sizeof(uint16_t)) == hipSuccess);
+  assert(hipMalloc(&d_w, h_w.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_o0, (size_t)total * dim) == hipSuccess);
+  assert(hipMalloc(&d_o1, (size_t)total * dim) == hipSuccess);
+  assert(hipMalloc(&d_s0, (size_t)total * nkb * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_s1, (size_t)total * nkb * sizeof(float)) == hipSuccess);
+  assert(hipMemcpy(d_g, h_g.data(), h_g.size() * sizeof(uint16_t), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_u, h_u.data(), h_u.size() * sizeof(uint16_t), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_w, h_w.data(), h_w.size() * sizeof(float), hipMemcpyHostToDevice) ==
+         hipSuccess);
+
+  ::setenv("AFF_HADAMARD_ROT", "1", 1);
+  ::setenv("AFF_EXPERT_HAD32_DPP", "0", 1);
+  aff::expert_swiglu_quant_hip(d_g, d_u, d_w, d_o0, d_s0, dim, total, 7.0f, nullptr);
+  ::setenv("AFF_EXPERT_HAD32_DPP", "1", 1);
+  aff::expert_swiglu_quant_hip(d_g, d_u, d_w, d_o1, d_s1, dim, total, 7.0f, nullptr);
+  ::unsetenv("AFF_HADAMARD_ROT");
+  ::unsetenv("AFF_EXPERT_HAD32_DPP");
+  assert(hipDeviceSynchronize() == hipSuccess);
+
+  std::vector<uint8_t> o0((size_t)total * dim), o1((size_t)total * dim);
+  std::vector<float> s0((size_t)total * nkb), s1((size_t)total * nkb);
+  assert(hipMemcpy(o0.data(), d_o0, o0.size(), hipMemcpyDeviceToHost) == hipSuccess);
+  assert(hipMemcpy(o1.data(), d_o1, o1.size(), hipMemcpyDeviceToHost) == hipSuccess);
+  assert(hipMemcpy(s0.data(), d_s0, s0.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+         hipSuccess);
+  assert(hipMemcpy(s1.data(), d_s1, s1.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+         hipSuccess);
+  for (void* p :
+       {(void*)d_g, (void*)d_u, (void*)d_w, (void*)d_o0, (void*)d_o1, (void*)d_s0, (void*)d_s1})
+    (void)hipFree(p);
+  assert(o0 == o1);
+  assert(std::memcmp(s0.data(), s1.data(), s0.size() * sizeof(float)) == 0);
+  std::printf("PASS: expert_had32_dpp bit-exact parity\n");
+  return 0;
+}
+
+int check_moe_plan_dpp_parity() {
+  aff::ExpertShardLayout sh{};
+  sh.stride = 4096u;
+  for (int pl = 0; pl < 3; ++pl) {
+    sh.data_off[pl] = 256u * (uint32_t)(pl + 1);
+    sh.scale_off[pl] = 1024u + 256u * (uint32_t)pl;
+    sh.rscale_off[pl] = 2048u + 256u * (uint32_t)pl;
+  }
+  for (uint32_t ne : {256u, 512u}) {
+    for (uint32_t nb : {16u, 128u}) {
+      const uint32_t k = 8u, total = nb * k;
+      uint32_t gcap[8] = {}, goff[8] = {};
+      const uint32_t pstride = aff::moe_plan_bucket_caps(nb, k, ne, false, gcap, false);
+      for (uint32_t g = 1u; g < 8u; ++g) goff[g] = goff[g - 1u] + gcap[g - 1u];
+      std::vector<uint32_t> h_sel(total);
+      std::vector<float> h_wt(total);
+      std::vector<uint64_t> h_plc(ne, 0x100000ull | 1ull);
+      uint32_t rng = 424242u + ne + nb;
+      for (uint32_t b = 0; b < nb; ++b) {
+        for (uint32_t j = 0; j < k; ++j) {
+          rng = rng * 1664525u + 1013904223u;
+          h_sel[(size_t)b * k + j] = (j * 29u + (rng & 31u)) % ne;
+          h_wt[(size_t)b * k + j] = 0.1f + 0.05f * (float)j;
+        }
+      }
+      uint32_t *d_sel = nullptr, *d_tok = nullptr, *d_ord = nullptr, *d_run = nullptr,
+               *d_col = nullptr, *d_cnt = nullptr;
+      float *d_wt = nullptr, *d_wto = nullptr;
+      uint64_t* d_plc = nullptr;
+      aff::ExpertTile* d_tiles = nullptr;
+      aff::MoePlanStatus* d_st = nullptr;
+      uint16_t *d_bg = nullptr, *d_bu = nullptr, *d_bydn = nullptr;
+      assert(hipMalloc(&d_sel, total * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_wt, total * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_plc, ne * sizeof(uint64_t)) == hipSuccess);
+      assert(hipMalloc(&d_tok, 2u * total * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_wto, total * sizeof(float)) == hipSuccess);
+      assert(hipMalloc(&d_ord, total * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_run, (nb + 1u) * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_col, total * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_tiles, (size_t)3u * pstride * sizeof(aff::ExpertTile)) == hipSuccess);
+      assert(hipMalloc(&d_cnt, 8u * sizeof(uint32_t)) == hipSuccess);
+      assert(hipMalloc(&d_st, sizeof(aff::MoePlanStatus)) == hipSuccess);
+      assert(hipMalloc(&d_bg, 64u) == hipSuccess);
+      assert(hipMalloc(&d_bu, 64u) == hipSuccess);
+      assert(hipMalloc(&d_bydn, 64u) == hipSuccess);
+      assert(hipMemset(d_st, 0, sizeof(aff::MoePlanStatus)) == hipSuccess);
+      assert(hipMemcpy(d_sel, h_sel.data(), total * sizeof(uint32_t), hipMemcpyHostToDevice) ==
+             hipSuccess);
+      assert(hipMemcpy(d_wt, h_wt.data(), total * sizeof(float), hipMemcpyHostToDevice) ==
+             hipSuccess);
+      assert(hipMemcpy(d_plc, h_plc.data(), ne * sizeof(uint64_t), hipMemcpyHostToDevice) ==
+             hipSuccess);
+      aff::MoePlanArgs A{};
+      A.sel = d_sel;
+      A.wt = d_wt;
+      A.plc = d_plc;
+      A.nb_tok = nb;
+      A.k = k;
+      A.n_expert = ne;
+      A.tok = d_tok;
+      A.wt_out = d_wto;
+      A.ord = d_ord;
+      A.run = d_run;
+      A.slot_col = d_col;
+      A.tiles = d_tiles;
+      A.counts = d_cnt;
+      A.status = d_st;
+      A.shard = sh;
+      A.bg = d_bg;
+      A.bu = d_bu;
+      A.bydn = d_bydn;
+      A.plane_stride = pstride;
+      for (uint32_t g = 0; g < 8u; ++g) {
+        A.group_off[g] = goff[g];
+        A.group_cap[g] = gcap[g];
+      }
+      assert(aff::moe_plan_hip(A, nullptr));
+      assert(hipDeviceSynchronize() == hipSuccess);
+      std::vector<uint32_t> h_run(nb + 1u), h_ord(total), h_cnt(8u);
+      aff::MoePlanStatus st{};
+      assert(hipMemcpy(h_run.data(), d_run, (nb + 1u) * sizeof(uint32_t), hipMemcpyDeviceToHost) ==
+             hipSuccess);
+      assert(hipMemcpy(h_ord.data(), d_ord, total * sizeof(uint32_t), hipMemcpyDeviceToHost) ==
+             hipSuccess);
+      assert(hipMemcpy(h_cnt.data(), d_cnt, 8u * sizeof(uint32_t), hipMemcpyDeviceToHost) ==
+             hipSuccess);
+      assert(hipMemcpy(&st, d_st, sizeof(st), hipMemcpyDeviceToHost) == hipSuccess);
+      for (void* p : {(void*)d_sel, (void*)d_wt, (void*)d_plc, (void*)d_tok, (void*)d_wto,
+                      (void*)d_ord, (void*)d_run, (void*)d_col, (void*)d_tiles, (void*)d_cnt,
+                      (void*)d_st, (void*)d_bg, (void*)d_bu, (void*)d_bydn})
+        (void)hipFree(p);
+      assert(st.taken == total && st.bad == 0u && st.over == 0u);
+      for (uint32_t b = 0; b <= nb; ++b) assert(h_run[b] == b * k);
+      for (uint32_t b = 0; b < nb; ++b)
+        for (uint32_t m = 1u; m < k; ++m)
+          assert(h_ord[(size_t)b * k + m - 1u] < h_ord[(size_t)b * k + m]);
+    }
+  }
+  std::printf("PASS: moe_plan_dpp prefix scan parity (ne=256/512, nb=16/128)\n");
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -498,6 +1005,12 @@ int main() {
   if (check_indexer_causal_skip_parity() != 0) return 1;
   if (check_prefill_fuse_ar_hc_parity() != 0) return 1;
   if (check_moe_plan_large_tok_lds() != 0) return 1;
+  if (check_bf16x2_rne_parity() != 0) return 1;
+  if (check_router_topk_v2_parity() != 0) return 1;
+  if (check_mhc_mix_fast_parity() != 0) return 1;
+  if (check_flash_exp2_klate_parity() != 0) return 1;
+  if (check_expert_had32_dpp_parity() != 0) return 1;
+  if (check_moe_plan_dpp_parity() != 0) return 1;
   std::printf("PASS: test_v512_kernels\n");
   return 0;
 }

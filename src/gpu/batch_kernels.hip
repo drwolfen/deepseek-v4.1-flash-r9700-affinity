@@ -604,15 +604,29 @@ __device__ __forceinline__ void gemm_fp8_body(
   // FK BYTES a row a K tile, and for the narrow instantiation that is a whole 256-byte cacheline
   // — this card's line size, not 128. At FK = 64 a thread reads a quarter of a line and the other
   // three quarters are only paid for if the line survives in L0 for three more K tiles.
-  constexpr uint32_t kNG = FK / 64;                      // 32-byte granule pairs a thread
+  constexpr uint32_t kSeg = 32u;
+  constexpr uint32_t kTPR = FK / kSeg;                   // threads covering one row (FK/32)
+  constexpr uint32_t kRPP = (MW * kWave) / kTPR;         // rows covered per staging pass
+  constexpr uint32_t kBP  = (FN + kRPP - 1u) / kRPP;     // staging passes for B
+  constexpr uint32_t kAP  = PS ? 1u : ((FM + kRPP - 1u) / kRPP);
+  static_assert(kTPR >= 1u && kRPP >= 1u && (MW * kWave) % kTPR == 0u,
+                "kTPR must divide block threads");
   constexpr uint32_t kFolds = (FK + 127u) / 128u;        // 128-col scale blocks touched per K tile
   static_assert(kFolds <= MW * kWave, "kFolds exceeds block threads");
   static_assert(kFolds * FN <= MW * kWave, "kFolds*FN exceeds block threads");
-  alignas(16) __shared__ uint8_t s_b[FN * (FK + 8u)];
+  constexpr uint32_t kSbSz = FN * (FK + 8u);
+  constexpr uint32_t kSaSz = PS ? 1u : (FM * (FK + 8u));
+  constexpr uint32_t kMaxLdsDbl = (NT == 8u && MW == 8u && FK == 64u) ? 32768u : 49152u;
+  constexpr uint32_t kDblLdsNeed =
+      2u * (kSbSz + (PS ? 0u : kSaSz) + kFolds * (uint32_t)sizeof(uint32_t) +
+            kFolds * FN * (uint32_t)sizeof(float));
+  constexpr bool kDblBuf = (kDblLdsNeed <= kMaxLdsDbl);
+  constexpr uint32_t kBufs = kDblBuf ? 2u : 1u;
+  alignas(16) __shared__ uint8_t s_b[kBufs][kSbSz];
   // Only instantiated for PS == false; an empty array is not legal, so it is one byte otherwise.
-  alignas(16) __shared__ uint8_t s_a[PS ? 1 : FM * (FK + 8u)];
-  __shared__ uint32_t s_ws[kFolds];
-  __shared__ float s_sx[kFolds * FN];
+  alignas(16) __shared__ uint8_t s_a[PS ? 1u : kBufs][kSaSz];
+  __shared__ uint32_t s_ws[kBufs][kFolds];
+  __shared__ float s_sx[kBufs][kFolds * FN];
 
   const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
   const uint32_t wave =
@@ -632,9 +646,7 @@ __device__ __forceinline__ void gemm_fp8_body(
       out[i][j] = wmma::acc_zero();
     }
 
-  // B: FN tokens x 64 B, 32 B a thread. At FN=128 that is every thread; at FN=16 it is the first
-  // 32, and the other 224 sit out a 1 KB copy rather than being given a share of a smaller one.
-  const uint32_t sn = tid >> 1, sk = (tid & 1u) * 32;
+  const uint32_t sn = tid / kTPR, sk = (tid % kTPR) * kSeg;
   const uint32_t ktiles = cols >> 4;
   const uint32_t rt0 = (w_row_off + m0 + wm) >> 4;       // this wave's first row tile
   const uint32_t srow = (w_row_off + m0) >> 7;
@@ -642,65 +654,84 @@ __device__ __forceinline__ void gemm_fp8_body(
   const uint32_t sf = tid / FN, stn = tid % FN;
   const uint32_t sx_tok = n0 + stn;
 
-  // Row-major A staging assignment, identical to B's: 128 rows x 64 B, 32 B a thread.
-  const uint32_t am = tid >> 1;
-
-  // x_ld, not cols: the quantised activation is ONE buffer per sublayer and a grouped GEMM reads a
-  // `cols`-wide window of it at `x_off`. Using cols as the row stride silently reads the wrong
-  // token once the two differ, which is a wrong activation that still looks fluent.
-  const uint8_t* bsrc = Xp + (size_t)(n0 + sn) * x_ld + x_off + sk;
-  const uint8_t* asrc = Wp + (size_t)(w_row_off + m0 + am) * cols + sk;
   const aff::gfx12_rsrc_t rsrc_w = aff::make_gfx12_rsrc(Wp);
   const aff::gfx12_rsrc_t rsrc_sw = aff::make_gfx12_rsrc(Sw);
-  const uint32_t aoff_base = (uint32_t)((size_t)(w_row_off + m0 + am) * cols + sk);
-  const bool b_row = sn < FN && (Full || (n0 + sn) < nb);
-  const bool a_row = !PS && (Full || (m0 + am) < rows);
   // One K tile ahead, in registers. Stage Sw and Sx alongside B/A so the scale fold inside the ks
   // loop reads LDS instead of stalling on in-order VMEM behind the next tile's pb/apf prefetches.
-  Stage8Reg pb[kNG], pa[kNG];
-#pragma unroll
-  for (uint32_t g = 0; g < kNG; ++g) {
-    const uint32_t o = kbeg + g * 64;
-    pb[g] = stage8_load(bsrc + o, b_row && (Full || o + sk + 32 <= cols));
-    if constexpr (!PS) {
-      if constexpr (kBufV2) {
-        pa[g] = stage8_load_buf<aff::kGfx12ThNtRt>(rsrc_w, aoff_base + o,
-                                                   a_row && (Full || o + sk + 32 <= cols));
-      } else {
-        pa[g] = stage8_load<kNtLoad>(asrc + o, a_row && (Full || o + sk + 32 <= cols));
-      }
-    }
-  }
+  Stage8Reg pb[kBP], pa[kAP];
   uint32_t pws = 0u;
   float psx = 0.0f;
-  if (tid < kFolds) {
-    const uint32_t kb0 = (kbeg >> 7) + tid;
-    if (Full || kb0 < sc_cols) {
-      if constexpr (kBufV2) {
-        pws = (uint32_t)aff::buf_load_u8<aff::kGfx12ThNtHt>(rsrc_sw,
-                                                            (uint32_t)((size_t)srow * sc_cols + kb0));
-      } else {
-        pws = aff::load_nt<kNtLoad>(&Sw[(size_t)srow * sc_cols + kb0]);
+
+  auto prefetch_tile = [&](uint32_t kc) __attribute__((always_inline)) {
+    const bool col_live = Full || (kc + sk + kSeg <= cols);
+#pragma unroll
+    for (uint32_t p = 0; p < kBP; ++p) {
+      const uint32_t rn = sn + p * kRPP;
+      if (rn < FN) {
+        const bool live = (Full || (n0 + rn) < nb) && col_live;
+        pb[p] = stage8_load(Xp + (size_t)(n0 + rn) * x_ld + x_off + kc + sk, live);
       }
     }
-  }
-  if (tid < kFolds * FN) {
-    const uint32_t kb0 = (kbeg >> 7) + sf;
-    if ((Full || sx_tok < nb) && (Full || kb0 < sc_cols))
-      psx = Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb0];
-  }
+    if constexpr (!PS) {
+#pragma unroll
+      for (uint32_t p = 0; p < kAP; ++p) {
+        const uint32_t rm = sn + p * kRPP;
+        if (rm < FM) {
+          const bool live = (Full || (m0 + rm) < rows) && col_live;
+          if constexpr (kBufV2) {
+            const uint32_t aoff = (uint32_t)((size_t)(w_row_off + m0 + rm) * cols + kc + sk);
+            pa[p] = stage8_load_buf<aff::kGfx12ThNtRt>(rsrc_w, aoff, live);
+          } else {
+            pa[p] = stage8_load<kNtLoad>(
+                Wp + (size_t)(w_row_off + m0 + rm) * cols + kc + sk, live);
+          }
+        }
+      }
+    }
+    if (tid < kFolds) {
+      const uint32_t kb = (kc >> 7) + tid;
+      if (Full || kb < sc_cols) {
+        if constexpr (kBufV2) {
+          pws = (uint32_t)aff::buf_load_u8<aff::kGfx12ThNtHt>(
+              rsrc_sw, (uint32_t)((size_t)srow * sc_cols + kb));
+        } else {
+          pws = aff::load_nt<kNtLoad>(&Sw[(size_t)srow * sc_cols + kb]);
+        }
+      } else {
+        pws = 0u;
+      }
+    }
+    if (tid < kFolds * FN) {
+      const uint32_t kb = (kc >> 7) + sf;
+      psx = ((Full || sx_tok < nb) && (Full || kb < sc_cols))
+                ? Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb]
+                : 0.0f;
+    }
+  };
 
+  if (kbeg < kend) prefetch_tile(kbeg);
+
+  uint32_t buf = 0u;
   for (uint32_t c0 = kbeg; c0 < kend; c0 += FK) {
     constexpr uint32_t kKT = FK / wmma::kK;
     wmma::i2v apf_pp[kPingPong ? kMWTiles : 1][kPingPong ? 2u : 1u];
-    aff::lds_barrier();
-#pragma unroll
-    for (uint32_t g = 0; g < kNG; ++g) {
-      if (sn < FN) stage8_store<FK>(s_b, sn, sk + g * 64, pb[g]);
-      if (!PS) stage8_store<FK>(s_a, am, sk + g * 64, pa[g]);
+    if constexpr (!kDblBuf) {
+      if (c0 > kbeg) aff::lds_barrier();
     }
-    if (tid < kFolds) s_ws[tid] = pws;
-    if (tid < kFolds * FN) s_sx[tid] = psx;
+#pragma unroll
+    for (uint32_t p = 0; p < kBP; ++p) {
+      const uint32_t rn = sn + p * kRPP;
+      if (rn < FN) stage8_store<FK>(s_b[buf], rn, sk, pb[p]);
+    }
+    if constexpr (!PS) {
+#pragma unroll
+      for (uint32_t p = 0; p < kAP; ++p) {
+        const uint32_t rm = sn + p * kRPP;
+        if (rm < FM) stage8_store<FK>(s_a[buf], rm, sk, pa[p]);
+      }
+    }
+    if (tid < kFolds) s_ws[buf][tid] = pws;
+    if (tid < kFolds * FN) s_sx[buf][tid] = psx;
     if constexpr (kPingPong) {
 #pragma unroll
       for (uint32_t i = 0; i < kMWTiles; ++i) {
@@ -713,60 +744,8 @@ __device__ __forceinline__ void gemm_fp8_body(
       }
     }
     aff::lds_barrier();
-    if constexpr (Full && MTW == 2u) {
-      const uint32_t c1 = c0 + FK;
-      if (c1 < kend) {
-#pragma unroll
-        for (uint32_t g = 0; g < kNG; ++g) {
-          const uint32_t o = c1 + g * 64;
-          pb[g] = stage8_load(bsrc + o, true);
-          if constexpr (!PS) pa[g] = stage8_load(asrc + o, true);
-        }
-        if (tid < kFolds) {
-          const uint32_t kb1 = (c1 >> 7) + tid;
-          pws = Sw[(size_t)srow * sc_cols + kb1];
-        }
-        if (tid < kFolds * FN) {
-          const uint32_t kb1 = (c1 >> 7) + sf;
-          psx = Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb1];
-        }
-      }
-    } else {
-      const uint32_t c1 = c0 + FK;
-      if (c1 < kend) {
-#pragma unroll
-        for (uint32_t g = 0; g < kNG; ++g) {
-          const uint32_t o = c1 + g * 64;
-          const bool live = Full || (o + sk + 32 <= cols);
-          if (sn < FN) pb[g] = stage8_load(bsrc + o, b_row && live);
-          if constexpr (!PS) {
-            if constexpr (kBufV2)
-              pa[g] = stage8_load_buf<aff::kGfx12ThNtRt>(rsrc_w, aoff_base + o, a_row && live);
-            else
-              pa[g] = stage8_load<kNtLoad>(asrc + o, a_row && live);
-          }
-        }
-        if (tid < kFolds) {
-          const uint32_t kb1 = (c1 >> 7) + tid;
-          if (Full || kb1 < sc_cols) {
-            if constexpr (kBufV2) {
-              pws = (uint32_t)aff::buf_load_u8<aff::kGfx12ThNtHt>(
-                  rsrc_sw, (uint32_t)((size_t)srow * sc_cols + kb1));
-            } else {
-              pws = aff::load_nt<kNtLoad>(&Sw[(size_t)srow * sc_cols + kb1]);
-            }
-          } else {
-            pws = 0u;
-          }
-        }
-        if (tid < kFolds * FN) {
-          const uint32_t kb1 = (c1 >> 7) + sf;
-          psx = ((Full || sx_tok < nb) && (Full || kb1 < sc_cols))
-                    ? Sx[(size_t)sx_tok * sx_ld + (x_off >> 7) + kb1]
-                    : 0.0f;
-        }
-      }
-    }
+    const uint32_t c1 = c0 + FK;
+    if (c1 < kend) prefetch_tile(c1);
 
     wmma::i2v apf[(PS && !kPingPong) ? kMWTiles : 1][(PS && !kPingPong) ? kKT : 1];
     if constexpr (PS && !kPingPong) {
@@ -802,26 +781,38 @@ __device__ __forceinline__ void gemm_fp8_body(
         }
       }
       wmma::i2v af[kMWTiles], bf[kNWTiles];
+      if constexpr (PS) {
 #pragma unroll
-      for (uint32_t i = 0; i < kMWTiles; ++i)
-        af[i] = PS ? (kPingPong ? apf_pp[i][kt_step & 1u] : apf[i][kt_step])
-                   : load_frag8<FK>(s_a, wm + i * 16, ks, lane);
+        for (uint32_t i = 0; i < kMWTiles; ++i)
+          af[i] = kPingPong ? apf_pp[i][kt_step & 1u] : apf[i][kt_step];
+      } else {
+#pragma unroll
+        for (uint32_t i = 0; i < kMWTiles; ++i)
+          af[i] = load_frag8<FK>(s_a[buf], wm + i * 16, ks, lane);
+      }
 #pragma unroll
       for (uint32_t j = 0; j < kNWTiles; ++j)
-        bf[j] = load_frag8<FK>(s_b, wn + j * 16, ks, lane);
+        bf[j] = load_frag8<FK>(s_b[buf], wn + j * 16, ks, lane);
 #pragma unroll
       for (uint32_t i = 0; i < kMWTiles; ++i)
 #pragma unroll
         for (uint32_t j = 0; j < kNWTiles; ++j) raw[i][j] = wmma::mma_fp8(af[i], bf[j], raw[i][j]);
+#if defined(__gfx1201__) && __has_builtin(__builtin_amdgcn_sched_group_barrier)
+      if constexpr (!kPingPong) {
+        __builtin_amdgcn_sched_group_barrier(0x100, (int)(PS ? kNWTiles : (kMWTiles + kNWTiles)),
+                                             0);
+        __builtin_amdgcn_sched_group_barrier(0x008, (int)(kMWTiles * kNWTiles), 0);
+      }
+#endif
 
     // End of a 128-column scale block: fold both scales in from LDS and reset.
     if ((c0 + ks + wmma::kK) % 128u == 0 || c0 + ks + wmma::kK >= kend) {
       const uint32_t fold = ks >> 7;
-      const uint32_t e = s_ws[fold];
+      const uint32_t e = s_ws[buf][fold];
       const float ws = __uint_as_float(e ? (e << 23) : 0u);
 #pragma unroll
       for (uint32_t j = 0; j < kNWTiles; ++j) {
-        const float s = ws * s_sx[fold * FN + wn + j * 16 + fc];
+        const float s = ws * s_sx[buf][fold * FN + wn + j * 16 + fc];
 #pragma unroll
         for (uint32_t i = 0; i < kMWTiles; ++i)
 #pragma unroll
@@ -832,6 +823,7 @@ __device__ __forceinline__ void gemm_fp8_body(
       }
     }
     }
+    if constexpr (kDblBuf) buf ^= 1u;
   }
 
   const bool split_active = (ws_rows != 0u);
@@ -1597,8 +1589,9 @@ __device__ __forceinline__ void gemm_wmma_body(
       // free rather than lossy: this staging has always truncated to bf16 right here, so a bf16
       // arena hands the matrix core exactly the operand it was going to get anyway — it just moves
       // half the bytes to do it, and skips 32 v_cvt per thread per stage.
-      uint16_t h[8][4];
+      uint32_t packed[4][4];
       if (XB) {
+        uint16_t h[8][4];
         const uint16_t* xb = (const uint16_t*)Xp + xo;
         if (vec) {
 #pragma unroll
@@ -1615,6 +1608,11 @@ __device__ __forceinline__ void gemm_wmma_body(
               h[kk][tt] = in ? xb[(size_t)kk * nb + tt] : (uint16_t)0;
             }
         }
+#pragma unroll
+        for (uint32_t tt = 0; tt < 4; ++tt)
+#pragma unroll
+          for (uint32_t q = 0; q < 4; ++q)
+            packed[tt][q] = (uint32_t)h[q * 2][tt] | ((uint32_t)h[q * 2 + 1][tt] << 16);
       } else {
         const float* xb = (const float*)Xp + xo;
         float f[8][4];
@@ -1634,20 +1632,17 @@ __device__ __forceinline__ void gemm_wmma_body(
             }
         }
 #pragma unroll
-        for (uint32_t kk = 0; kk < 8; ++kk)
+        for (uint32_t tt = 0; tt < 4; ++tt)
 #pragma unroll
-          for (uint32_t tt = 0; tt < 4; ++tt) h[kk][tt] = wmma::f32_to_bf16(f[kk][tt]);
+          for (uint32_t q = 0; q < 4; ++q)
+            packed[tt][q] = wmma::bf16x2_rne(f[q * 2][tt], f[q * 2 + 1][tt]);
       }
       // One granule a token: k is 8-aligned by construction, so each store is a whole 16 B.
 #pragma unroll
       for (uint32_t tt = 0; tt < 4; ++tt) {
         const uint32_t row = bt + tt;
-        uint32_t d[4];
-#pragma unroll
-        for (uint32_t q = 0; q < 4; ++q)
-          d[q] = (uint32_t)h[q * 2][tt] | ((uint32_t)h[q * 2 + 1][tt] << 16);
         *(uint4*)(s_b + row * kWLdsRow + ((((bk >> 3) ^ (row & 7u))) << 3)) =
-            make_uint4(d[0], d[1], d[2], d[3]);
+            make_uint4(packed[tt][0], packed[tt][1], packed[tt][2], packed[tt][3]);
       }
     }
     aff::lds_barrier();
@@ -1665,6 +1660,10 @@ __device__ __forceinline__ void gemm_wmma_body(
       for (uint32_t i = 0; i < MT; ++i)
 #pragma unroll
         for (uint32_t j = 0; j < NT; ++j) acc[i][j] = wmma::mma_bf16(af[i], bf[j], acc[i][j]);
+#if defined(__gfx1201__) && __has_builtin(__builtin_amdgcn_sched_group_barrier)
+      __builtin_amdgcn_sched_group_barrier(0x100, (int)(MT + NT), 0);
+      __builtin_amdgcn_sched_group_barrier(0x008, (int)(MT * NT), 0);
+#endif
     }
   }
 
@@ -2021,7 +2020,6 @@ __device__ __forceinline__ void gemm_bf16x12_body(
     if (b_stager) {
       const size_t xo = (size_t)(c0 + bk) * nb + n0 + bt;
       const bool vec = Full || ((nb & 3u) == 0 && n0 + bt + 4 <= nb && c0 + bk + 8 <= cols);
-      uint16_t h[8][4];
       const float* xb = X + xo;
       float f[8][4];
       if (vec) {
@@ -2040,16 +2038,12 @@ __device__ __forceinline__ void gemm_bf16x12_body(
           }
       }
 #pragma unroll
-      for (uint32_t kk = 0; kk < 8; ++kk)
-#pragma unroll
-        for (uint32_t tt = 0; tt < 4; ++tt) h[kk][tt] = wmma::f32_to_bf16(f[kk][tt]);
-#pragma unroll
       for (uint32_t tt = 0; tt < 4; ++tt) {
         const uint32_t row = bt + tt;
         uint32_t d[4];
 #pragma unroll
         for (uint32_t q = 0; q < 4; ++q)
-          d[q] = (uint32_t)h[q * 2][tt] | ((uint32_t)h[q * 2 + 1][tt] << 16);
+          d[q] = wmma::bf16x2_rne(f[q * 2][tt], f[q * 2 + 1][tt]);
         *(uint4*)(s_b + row * kWLdsRow + ((((bk >> 3) ^ (row & 7u))) << 3)) =
             make_uint4(d[0], d[1], d[2], d[3]);
       }
@@ -2067,6 +2061,10 @@ __device__ __forceinline__ void gemm_bf16x12_body(
       for (uint32_t i = 0; i < MT; ++i)
 #pragma unroll
         for (uint32_t j = 0; j < NT; ++j) acc[i][j] = wmma::mma_bf16(af[i], bf[j], acc[i][j]);
+#if defined(__gfx1201__) && __has_builtin(__builtin_amdgcn_sched_group_barrier)
+      __builtin_amdgcn_sched_group_barrier(0x100, (int)(MT + NT), 0);
+      __builtin_amdgcn_sched_group_barrier(0x008, (int)(MT * NT), 0);
+#endif
     }
   }
 
@@ -3091,6 +3089,29 @@ __device__ inline void hc_gates_lane(const float* __restrict__ mix, uint32_t nb,
   }
 }
 
+static inline bool mhc_mix_fast_enabled() {
+  const char* s = std::getenv("AFF_MHC_MIX_FAST");
+  return !(s && s[0] == '0' && s[1] == '\0');
+}
+
+// Single-barrier DPP wave-butterfly + Kahan reduction across kBlkStripe (=64) stripes per token.
+// Every wave holds 4 stripes x 8 tokens (bl = lane & 7, s_in_w = lane >> 3), so XOR 16 and XOR 8
+// reduce the 4 stripes in registers before writing 16 wave partials into dedicated `red_w`.
+__device__ __forceinline__ float stripe_sum_fast(float* red_w, uint32_t bl, float v) {
+  v += aff::dpp_xor_lane<16u>(v);
+  v += aff::dpp_xor_lane<8u>(v);
+  const uint32_t w = threadIdx.x >> 5;
+  const uint32_t l = threadIdx.x & 31u;
+  if (l < kBlkTok) red_w[w * kBlkTok + l] = v;
+  aff::lds_barrier();
+  aff::wmma::KahanF32 tot;
+  constexpr uint32_t kWaves = kBlkThreads >> 5;
+#pragma unroll
+  for (uint32_t wk = 0; wk < kWaves; ++wk) tot.add(red_w[wk * kBlkTok + bl]);
+  return tot.total();
+}
+
+template <bool Fast = false>
 __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
     const uint16_t* __restrict__ hc, const float* __restrict__ mix, const float* __restrict__ scale,
     const float* __restrict__ base, const float* __restrict__ nw, float* __restrict__ pre_out,
@@ -3099,6 +3120,7 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
     float hc_eps, float rms_eps, int has_control, const float* __restrict__ pre_in,
     uint8_t* __restrict__ q8, float* __restrict__ qs) {
   __shared__ float red[kBlkStripe * kBlkTok];
+  __shared__ float red_w[Fast ? (2u * (kBlkThreads >> 5) * kBlkTok) : 1u];
   __shared__ float s_pre[kBlkTok * 8], s_post[kBlkTok * 8], s_comb[kBlkTok * 64];
   __shared__ float s_scale[kBlkTok];
   __shared__ __align__(16) uint8_t s_q8[kBlkTok][128];
@@ -3108,13 +3130,26 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
   const uint64_t hc_dim = (uint64_t)n_embd * n_hc;
 
   if (has_control) {
-    float acc = 0.0f;
-    if (live)
-      for (uint64_t i = s; i < hc_dim; i += kBlkStripe) {
-        const float v = wmma::bf16_to_f32(hc[i * nb + b]);
-        acc += v * v;
-      }
-    const float tot = stripe_sum(red, s, bl, acc);
+    float acc_tot = 0.0f;
+    if constexpr (Fast) {
+      aff::wmma::KahanF32 acc;
+      if (live)
+        for (uint64_t i = s; i < hc_dim; i += kBlkStripe) {
+          const float v = wmma::bf16_to_f32(hc[i * nb + b]);
+          acc.add(v * v);
+        }
+      acc_tot = acc.total();
+    } else {
+      float acc = 0.0f;
+      if (live)
+        for (uint64_t i = s; i < hc_dim; i += kBlkStripe) {
+          const float v = wmma::bf16_to_f32(hc[i * nb + b]);
+          acc += v * v;
+        }
+      acc_tot = acc;
+    }
+    const float tot = Fast ? stripe_sum_fast(red_w, bl, acc_tot)
+                           : stripe_sum(red, s, bl, acc_tot);
     if (s == 0) s_scale[bl] = rsqrtf(tot / (float)hc_dim + rms_eps);
     aff::lds_barrier();
     // One thread per token does the whole 4x4 Sinkhorn; the matvec that produced `mix` already ran
@@ -3138,20 +3173,41 @@ __global__ __launch_bounds__(kBlkThreads) void batch_hc_fused_kernel(
     aff::lds_barrier();
   }
 
-  float sq = 0.0f;
+  float sq_tot = 0.0f;
   float* const cur_out = cur ? cur : norm;
-  if (live)
-    for (uint32_t d = s; d < n_embd; d += kBlkStripe) {
-      float acc = 0.0f;
-      if (has_control)
-        for (uint32_t h = 0; h < n_hc; ++h)
-          acc += wmma::bf16_to_f32(hc[((size_t)h * n_embd + d) * nb + b]) * s_pre[bl * 8 + h];
-      else
-        acc = wmma::bf16_to_f32(hc[(size_t)d * nb + b]);
-      cur_out[(size_t)d * nb + b] = acc;
-      sq += acc * acc;
-    }
-  const float inv = rsqrtf(stripe_sum(red, s, bl, sq) / (float)n_embd + rms_eps);
+  if constexpr (Fast) {
+    aff::wmma::KahanF32 sq;
+    if (live)
+      for (uint32_t d = s; d < n_embd; d += kBlkStripe) {
+        float acc = 0.0f;
+        if (has_control)
+          for (uint32_t h = 0; h < n_hc; ++h)
+            acc += wmma::bf16_to_f32(hc[((size_t)h * n_embd + d) * nb + b]) * s_pre[bl * 8 + h];
+        else
+          acc = wmma::bf16_to_f32(hc[(size_t)d * nb + b]);
+        cur_out[(size_t)d * nb + b] = acc;
+        sq.add(acc * acc);
+      }
+    sq_tot = sq.total();
+  } else {
+    float sq = 0.0f;
+    if (live)
+      for (uint32_t d = s; d < n_embd; d += kBlkStripe) {
+        float acc = 0.0f;
+        if (has_control)
+          for (uint32_t h = 0; h < n_hc; ++h)
+            acc += wmma::bf16_to_f32(hc[((size_t)h * n_embd + d) * nb + b]) * s_pre[bl * 8 + h];
+        else
+          acc = wmma::bf16_to_f32(hc[(size_t)d * nb + b]);
+        cur_out[(size_t)d * nb + b] = acc;
+        sq += acc * acc;
+      }
+    sq_tot = sq;
+  }
+  const float red_sq =
+      Fast ? stripe_sum_fast(red_w + (kBlkThreads >> 5) * kBlkTok, bl, sq_tot)
+           : stripe_sum(red, s, bl, sq_tot);
+  const float inv = rsqrtf(red_sq / (float)n_embd + rms_eps);
   if (q8 && qs && (n_embd & 127u) == 0u) {
     const uint32_t nkb = n_embd >> 7;
     for (uint32_t kb = 0u; kb < nkb; ++kb) {
@@ -3309,6 +3365,63 @@ __device__ __forceinline__ void hcn_block_sum(float* __restrict__ s, float* acc,
   }
 }
 
+// Single-barrier wave-butterfly reduction + Kahan tail across waves. Writes results into s[0..NB-1].
+template <uint32_t NB>
+__device__ __forceinline__ void hcn_block_sum_fast(float* __restrict__ s,
+                                                   aff::wmma::KahanF32* acc, uint32_t tid) {
+  constexpr uint32_t kWaves = kHcnThreads >> 5;
+  float v[NB];
+#pragma unroll
+  for (uint32_t b = 0; b < NB; ++b) v[b] = aff::wave_reduce_add_dpp(acc[b].total());
+  if ((tid & 31u) == 0u) {
+    const uint32_t w = tid >> 5;
+#pragma unroll
+    for (uint32_t b = 0; b < NB; ++b) s[b * kWaves + w] = v[b];
+  }
+  aff::lds_barrier();
+  if (tid < NB) {
+    aff::wmma::KahanF32 tot;
+#pragma unroll
+    for (uint32_t w = 0; w < kWaves; ++w) tot.add(s[tid * kWaves + w]);
+    s[tid] = tot.total();
+  }
+}
+
+// Joint single-barrier wave-butterfly reduction for two [NB] Kahan vectors.
+// Writes slot 0 into s[0..NB-1] and slot 1 into s[NB..2*NB-1].
+template <uint32_t NB>
+__device__ __forceinline__ void hcn_block_sum2_fast(float* __restrict__ s,
+                                                    aff::wmma::KahanF32* acc0,
+                                                    aff::wmma::KahanF32* acc1, uint32_t tid) {
+  constexpr uint32_t kWaves = kHcnThreads >> 5;
+  constexpr uint32_t kHalf = NB * kWaves;
+  float v0[NB], v1[NB];
+#pragma unroll
+  for (uint32_t b = 0; b < NB; ++b) {
+    v0[b] = aff::wave_reduce_add_dpp(acc0[b].total());
+    v1[b] = aff::wave_reduce_add_dpp(acc1[b].total());
+  }
+  if ((tid & 31u) == 0u) {
+    const uint32_t w = tid >> 5;
+#pragma unroll
+    for (uint32_t b = 0; b < NB; ++b) {
+      s[b * kWaves + w] = v0[b];
+      s[kHalf + b * kWaves + w] = v1[b];
+    }
+  }
+  aff::lds_barrier();
+  if (tid < NB) {
+    aff::wmma::KahanF32 t0, t1;
+#pragma unroll
+    for (uint32_t w = 0; w < kWaves; ++w) {
+      t0.add(s[tid * kWaves + w]);
+      t1.add(s[kHalf + tid * kWaves + w]);
+    }
+    s[tid] = t0.total();
+    s[NB + tid] = t1.total();
+  }
+}
+
 // One dim-major row of NB bf16, as NB floats in registers. The cast to uint4 is what makes it a
 // single global_load_b128 (two at NB=16) instead of NB separate ushort loads.
 template <uint32_t NB>
@@ -3328,22 +3441,37 @@ __device__ __forceinline__ void hcn_row(const uint16_t* __restrict__ p, float* v
 }
 
 // Sum of squares of the whole [n_embd * n_hc][NB] control plane, one partial row per block.
-template <uint32_t NB>
+template <uint32_t NB, bool Fast = false>
 __global__ __launch_bounds__(kHcnThreads) void hcn_sq_kernel(const uint16_t* __restrict__ hc,
                                                              float* __restrict__ part,
-                                                             uint64_t hc_dim) {
-  __shared__ float s[NB * kHcnThreads];
+                                                             uint64_t hc_dim,
+                                                             uint32_t n_part = kHcnChunks) {
+  constexpr uint32_t kLds = Fast ? (NB * (kHcnThreads >> 5)) : (NB * kHcnThreads);
+  __shared__ float s[kLds];
   const uint32_t tid = threadIdx.x;
-  float acc[NB] = {};
-  for (uint64_t i = (uint64_t)blockIdx.x * kHcnThreads + tid; i < hc_dim;
-       i += (uint64_t)kHcnChunks * kHcnThreads) {
-    float v[NB];
-    hcn_row<NB>(hc + i * NB, v);
+  if constexpr (Fast) {
+    aff::wmma::KahanF32 acc[NB];
+    for (uint64_t i = (uint64_t)blockIdx.x * kHcnThreads + tid; i < hc_dim;
+         i += (uint64_t)n_part * kHcnThreads) {
+      float v[NB];
+      hcn_row<NB>(hc + i * NB, v);
 #pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) acc[b] += v[b] * v[b];
+      for (uint32_t b = 0; b < NB; ++b) acc[b].add(v[b] * v[b]);
+    }
+    hcn_block_sum_fast<NB>(s, acc, tid);
+    if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid];
+  } else {
+    float acc[NB] = {};
+    for (uint64_t i = (uint64_t)blockIdx.x * kHcnThreads + tid; i < hc_dim;
+         i += (uint64_t)n_part * kHcnThreads) {
+      float v[NB];
+      hcn_row<NB>(hc + i * NB, v);
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b) acc[b] += v[b] * v[b];
+    }
+    hcn_block_sum<NB>(s, acc, tid);
+    if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
   }
-  hcn_block_sum<NB>(s, acc, tid);
-  if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
 }
 
 // The 4x4 Sinkhorn, one thread per token. Unchanged arithmetic — it is `hc_gates_lane`, the same
@@ -3353,7 +3481,7 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_sq_kernel(const uint16_t* __r
 // cur = the pre-gated lane sum, and the partial sums of squares the norm below needs. NH is a
 // template argument for the same reason it is one in batch_hc_expand_reg_kernel: at a runtime trip
 // count the four loads do not unroll and `pre` is re-read for every one of them.
-template <uint32_t NB, uint32_t NH>
+template <uint32_t NB, uint32_t NH, bool Fast = false>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((NB == 16u && NH == 4u) ? 12 : 1,
                                    (NB == 16u && NH == 4u) ? 12 : 16)))
@@ -3364,8 +3492,9 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_expand_kernel(
     const float* __restrict__ base, float* __restrict__ pre_out, float* __restrict__ post_out,
     float* __restrict__ comb_out, float* __restrict__ cur, float* __restrict__ part,
     uint32_t n_embd, uint64_t hc_dim, uint32_t iters, float hc_eps, float rms_eps,
-    const float* __restrict__ pre_in) {
-  __shared__ float s[NB * kHcnThreads];
+    const float* __restrict__ pre_in, uint32_t n_part = kHcnChunks) {
+  constexpr uint32_t kLds = Fast ? (NB * (kHcnThreads >> 5)) : (NB * kHcnThreads);
+  __shared__ float s[kLds];
   // The gates, computed HERE and redundantly in every block rather than in a launch of their own.
   // The Sinkhorn is a long dependent chain in NB threads whatever runs it, so doing it in every
   // block costs the same latency as doing it once — and as its own launch it is a dispatch gap and a
@@ -3374,7 +3503,13 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_expand_kernel(
   const uint32_t tid = threadIdx.x;
   if (tid < NB) {
     float tot = 0.0f;
-    for (uint32_t c = 0; c < kHcnChunks; ++c) tot += part_in[(size_t)c * NB + tid];
+    if constexpr (Fast) {
+      aff::wmma::KahanF32 kt;
+      for (uint32_t c = 0; c < n_part; ++c) kt.add(part_in[(size_t)c * NB + tid]);
+      tot = kt.total();
+    } else {
+      for (uint32_t c = 0; c < n_part; ++c) tot += part_in[(size_t)c * NB + tid];
+    }
     float pre[NH], post[NH], comb[NH * NH];
     hc_gates_lane_nh<NH>(mix, NB, tid, rsqrtf(tot / (float)hc_dim + rms_eps), scale, base, pre,
                          post, comb, iters, hc_eps);
@@ -3397,9 +3532,10 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_expand_kernel(
       for (uint32_t h = 0; h < NH; ++h) s_pre[h * NB + tid] = pre_in[(size_t)h * NB + tid];
   }
   aff::lds_barrier();
-  float acc[NB] = {};
+  float acc_raw[Fast ? 1u : NB] = {};
+  aff::wmma::KahanF32 acc_k[Fast ? NB : 1u];
   const bool vec_cur = (NB == 16u) && (((uintptr_t)cur & 15u) == 0u);
-  for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += kHcnChunks * kHcnThreads) {
+  for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
     float o[NB] = {};
 #pragma unroll 1
     for (uint32_t h = 0; h < NH; ++h) {
@@ -3423,11 +3559,21 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_expand_kernel(
 #pragma unroll
       for (uint32_t b = 0; b < NB; ++b) cur[(size_t)d * NB + b] = o[b];
     }
+    if constexpr (Fast) {
 #pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) acc[b] += o[b] * o[b];
+      for (uint32_t b = 0; b < NB; ++b) acc_k[b].add(o[b] * o[b]);
+    } else {
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b) acc_raw[b] += o[b] * o[b];
+    }
   }
-  hcn_block_sum<NB>(s, acc, tid);
-  if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
+  if constexpr (Fast) {
+    hcn_block_sum_fast<NB>(s, acc_k, tid);
+    if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid];
+  } else {
+    hcn_block_sum<NB>(s, acc_raw, tid);
+    if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
+  }
 }
 
 // The HEAD's collapse, which is hcn_expand_kernel with three quarters of the gate deleted.
@@ -3443,14 +3589,15 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_expand_kernel(
 // and was a serial walk there, and the mix scale is applied to the four dots instead of to the
 // 16384 inputs of them. It is the DRAFT's head, and a draft's arithmetic cannot reach the output:
 // greedy speculation emits the target's argmax whatever the draft proposed. Only acceptance moves.
-template <uint32_t NB, uint32_t NH>
+template <uint32_t NB, uint32_t NH, bool Fast = false>
 __global__ __launch_bounds__(kHcnThreads) void hcn_head_gate_kernel(
     const uint16_t* __restrict__ hc, const float* __restrict__ part_in,
     const float* __restrict__ mix, const float* __restrict__ scale,
     const float* __restrict__ base, float* __restrict__ cur, float* __restrict__ part,
     uint32_t n_embd, uint64_t hc_dim, float hc_eps, float rms_eps,
-    const float* __restrict__ pre_in) {
-  __shared__ float s[NB * kHcnThreads];
+    const float* __restrict__ pre_in, uint32_t n_part = kHcnChunks) {
+  constexpr uint32_t kLds = Fast ? (NB * (kHcnThreads >> 5)) : (NB * kHcnThreads);
+  __shared__ float s[kLds];
   __shared__ float s_pre[NB * NH];
   const uint32_t tid = threadIdx.x;
   // The gates in every block rather than in a launch of their own, for the reason on the kernel
@@ -3464,7 +3611,13 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_head_gate_kernel(
       for (uint32_t h = 0; h < NH; ++h) s_pre[h * NB + tid] = pre_in[(size_t)h * NB + tid];
     } else {
       float tot = 0.0f;
-      for (uint32_t c = 0; c < kHcnChunks; ++c) tot += part_in[(size_t)c * NB + tid];
+      if constexpr (Fast) {
+        aff::wmma::KahanF32 kt;
+        for (uint32_t c = 0; c < n_part; ++c) kt.add(part_in[(size_t)c * NB + tid]);
+        tot = kt.total();
+      } else {
+        for (uint32_t c = 0; c < n_part; ++c) tot += part_in[(size_t)c * NB + tid];
+      }
       const float mix_scale = rsqrtf(tot / (float)hc_dim + rms_eps);
 #pragma unroll
       for (uint32_t h = 0; h < NH; ++h) {
@@ -3474,51 +3627,96 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_head_gate_kernel(
     }
   }
   aff::lds_barrier();
-  float g[NH][NB];
+  if constexpr (Fast) {
+    aff::wmma::KahanF32 acc[NB];
+    for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
+      float o[NB] = {};
+      auto step_h = [&](uint32_t h) __attribute__((always_inline)) {
+        float v[NB];
+        hcn_row<NB>(hc + ((size_t)h * n_embd + d) * NB, v);
 #pragma unroll
-  for (uint32_t h = 0; h < NH; ++h)
+        for (uint32_t b = 0; b < NB; ++b) o[b] += v[b] * s_pre[h * NB + b];
+      };
+      if constexpr (NH <= 4u) {
 #pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) g[h][b] = s_pre[h * NB + b];
-  float acc[NB] = {};
-  for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += kHcnChunks * kHcnThreads) {
-    float o[NB] = {};
+        for (uint32_t h = 0; h < NH; ++h) step_h(h);
+      } else {
+#pragma unroll 2
+        for (uint32_t h = 0; h < NH; ++h) step_h(h);
+      }
 #pragma unroll
-    for (uint32_t h = 0; h < NH; ++h) {
-      float v[NB];
-      hcn_row<NB>(hc + ((size_t)h * n_embd + d) * NB, v);
-#pragma unroll
-      for (uint32_t b = 0; b < NB; ++b) o[b] += v[b] * g[h][b];
+      for (uint32_t b = 0; b < NB; ++b) {
+        cur[(size_t)d * NB + b] = o[b];
+        acc[b].add(o[b] * o[b]);
+      }
     }
+    hcn_block_sum_fast<NB>(s, acc, tid);
+    if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid];
+  } else {
+    float acc[NB] = {};
+    for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
+      float o[NB] = {};
+      auto step_h = [&](uint32_t h) __attribute__((always_inline)) {
+        float v[NB];
+        hcn_row<NB>(hc + ((size_t)h * n_embd + d) * NB, v);
 #pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) {
-      cur[(size_t)d * NB + b] = o[b];
-      acc[b] += o[b] * o[b];
+        for (uint32_t b = 0; b < NB; ++b) o[b] += v[b] * s_pre[h * NB + b];
+      };
+      if constexpr (NH <= 4u) {
+#pragma unroll
+        for (uint32_t h = 0; h < NH; ++h) step_h(h);
+      } else {
+#pragma unroll 2
+        for (uint32_t h = 0; h < NH; ++h) step_h(h);
+      }
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b) {
+        cur[(size_t)d * NB + b] = o[b];
+        acc[b] += o[b] * o[b];
+      }
     }
+    hcn_block_sum<NB>(s, acc, tid);
+    if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
   }
-  hcn_block_sum<NB>(s, acc, tid);
-  if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
 }
 
 // The has_control == 0 form: `cur` is lane 0 of `hc` and there is nothing to gate.
-template <uint32_t NB>
+template <uint32_t NB, bool Fast = false>
 __global__ __launch_bounds__(kHcnThreads) void hcn_copy_kernel(const uint16_t* __restrict__ hc,
                                                                float* __restrict__ cur,
                                                                float* __restrict__ part,
-                                                               uint32_t n_embd) {
-  __shared__ float s[NB * kHcnThreads];
+                                                               uint32_t n_embd,
+                                                               uint32_t n_part = kHcnChunks) {
+  constexpr uint32_t kLds = Fast ? (NB * (kHcnThreads >> 5)) : (NB * kHcnThreads);
+  __shared__ float s[kLds];
   const uint32_t tid = threadIdx.x;
-  float acc[NB] = {};
-  for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += kHcnChunks * kHcnThreads) {
-    float v[NB];
-    hcn_row<NB>(hc + (size_t)d * NB, v);
+  if constexpr (Fast) {
+    aff::wmma::KahanF32 acc[NB];
+    for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
+      float v[NB];
+      hcn_row<NB>(hc + (size_t)d * NB, v);
 #pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) {
-      cur[(size_t)d * NB + b] = v[b];
-      acc[b] += v[b] * v[b];
+      for (uint32_t b = 0; b < NB; ++b) {
+        cur[(size_t)d * NB + b] = v[b];
+        acc[b].add(v[b] * v[b]);
+      }
     }
+    hcn_block_sum_fast<NB>(s, acc, tid);
+    if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid];
+  } else {
+    float acc[NB] = {};
+    for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
+      float v[NB];
+      hcn_row<NB>(hc + (size_t)d * NB, v);
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b) {
+        cur[(size_t)d * NB + b] = v[b];
+        acc[b] += v[b] * v[b];
+      }
+    }
+    hcn_block_sum<NB>(s, acc, tid);
+    if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
   }
-  hcn_block_sum<NB>(s, acc, tid);
-  if (tid < NB) part[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
 }
 
 // The query's per-head RMS scale, with the grid on `head_dim` instead of on the token count.
@@ -3530,23 +3728,38 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_copy_kernel(const uint16_t* _
 // over dim through the tree above.
 //
 // Not bit-identical: a serial walk over head_dim becomes pairwise. Prefill keeps the old kernel.
-template <uint32_t NB>
+template <uint32_t NB, bool Fast = false>
 __global__ __launch_bounds__(kHcnThreads) void hcn_head_rms_inv_kernel(
     const float* __restrict__ x, float* __restrict__ inv, uint32_t head_dim, float eps) {
-  __shared__ float s[NB * kHcnThreads];
+  constexpr uint32_t kLds = Fast ? (NB * (kHcnThreads >> 5)) : (NB * kHcnThreads);
+  __shared__ float s[kLds];
   const uint32_t tid = threadIdx.x, h = blockIdx.x;
   const float* p = x + (size_t)h * head_dim * NB;
-  float acc[NB] = {};
-  for (uint32_t i = tid; i < head_dim; i += kHcnThreads) {
-    const float* q = p + (size_t)i * NB;
+  if constexpr (Fast) {
+    aff::wmma::KahanF32 acc[NB];
+    for (uint32_t i = tid; i < head_dim; i += kHcnThreads) {
+      const float* q = p + (size_t)i * NB;
 #pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) {
-      const float v = q[b];
-      acc[b] += v * v;
+      for (uint32_t b = 0; b < NB; ++b) {
+        const float v = q[b];
+        acc[b].add(v * v);
+      }
     }
+    hcn_block_sum_fast<NB>(s, acc, tid);
+    if (tid < NB) inv[(size_t)h * NB + tid] = rsqrtf(s[tid] / (float)head_dim + eps);
+  } else {
+    float acc[NB] = {};
+    for (uint32_t i = tid; i < head_dim; i += kHcnThreads) {
+      const float* q = p + (size_t)i * NB;
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b) {
+        const float v = q[b];
+        acc[b] += v * v;
+      }
+    }
+    hcn_block_sum<NB>(s, acc, tid);
+    if (tid < NB) inv[(size_t)h * NB + tid] = rsqrtf(s[tid * kHcnThreads] / (float)head_dim + eps);
   }
-  hcn_block_sum<NB>(s, acc, tid);
-  if (tid < NB) inv[(size_t)h * NB + tid] = rsqrtf(s[tid * kHcnThreads] / (float)head_dim + eps);
 }
 
 // Every block re-runs the kHcnChunks-term tail reduction rather than a fifth launch computing it
@@ -3568,7 +3781,7 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_head_rms_inv_kernel(
 // vectors rather than a dim-major plane. matvec_multix_hip is the one: it reads each token's whole
 // row and the head is a matvec, not a GEMM. The store pattern is the one q8 already uses — thread
 // `d` writing [b][d] for each b — so it is coalesced across the block and costs a store, not a pass.
-template <uint32_t NB>
+template <uint32_t NB, bool Fast = false>
 __global__ __launch_bounds__(kHcnThreads) void hcn_norm_kernel(const float* __restrict__ cur,
                                                                const float* __restrict__ part,
                                                                const float* __restrict__ nw,
@@ -3584,7 +3797,13 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_kernel(const float* __re
   const uint32_t tid = threadIdx.x;
   if (tid < NB) {
     float tot = 0.0f;
-    for (uint32_t c = 0; c < n_part; ++c) tot += part[(size_t)c * NB + tid];
+    if constexpr (Fast) {
+      aff::wmma::KahanF32 kt;
+      for (uint32_t c = 0; c < n_part; ++c) kt.add(part[(size_t)c * NB + tid]);
+      tot = kt.total();
+    } else {
+      for (uint32_t c = 0; c < n_part; ++c) tot += part[(size_t)c * NB + tid];
+    }
     s_inv[tid] = rsqrtf(tot / (float)n_embd + rms_eps);
   }
   aff::lds_barrier();
@@ -3682,11 +3901,12 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_kernel(const float* __re
 // On V4.1 `pre_in` comes from the previous sublayer, so `cur` = sum_h hc * pre_in does not depend
 // on sum(hc^2). Reading `hc` once computes `cur`, `part_cur` (sum cur^2), and `part_hc` (sum hc^2)
 // together, cutting HBM traffic on `hc` in half and saving a kernel launch per sublayer per GPU.
-template <uint32_t NB, uint32_t NH>
+template <uint32_t NB, uint32_t NH, bool Fast = false>
 __global__ __launch_bounds__(kHcnThreads) void hcn_v41_collapse_sq_kernel(
     const uint16_t* __restrict__ hc, const float* __restrict__ pre_in, float* __restrict__ cur,
     float* __restrict__ part_hc, float* __restrict__ part_cur, uint32_t n_embd, uint32_t n_part) {
-  __shared__ float s[NB * kHcnThreads];
+  constexpr uint32_t kLds = Fast ? (2u * NB * (kHcnThreads >> 5)) : (NB * kHcnThreads);
+  __shared__ float s[kLds];
   __shared__ float s_pre[NB * NH];
   const uint32_t tid = threadIdx.x;
   if (tid < NB) {
@@ -3694,54 +3914,99 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_v41_collapse_sq_kernel(
     for (uint32_t h = 0; h < NH; ++h) s_pre[h * NB + tid] = pre_in[(size_t)h * NB + tid];
   }
   aff::lds_barrier();
-  float acc_cur[NB] = {}, acc_hc[NB] = {};
   const bool vec_cur = (NB == 16u) && (((uintptr_t)cur & 15u) == 0u);
-  for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
-    float o[NB] = {};
-    auto step_h = [&](uint32_t h) __attribute__((always_inline)) {
-      float v[NB];
-      hcn_row<NB>(hc + ((size_t)h * n_embd + d) * NB, v);
+  if constexpr (Fast) {
+    aff::wmma::KahanF32 acc_cur[NB], acc_hc[NB];
+    for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
+      float o[NB] = {};
+      auto step_h = [&](uint32_t h) __attribute__((always_inline)) {
+        float v[NB];
+        hcn_row<NB>(hc + ((size_t)h * n_embd + d) * NB, v);
 #pragma unroll
-      for (uint32_t b = 0; b < NB; ++b) {
-        o[b] += v[b] * s_pre[h * NB + b];
-        acc_hc[b] += v[b] * v[b];
-      }
-    };
-    if constexpr (NH <= 4u) {
+        for (uint32_t b = 0; b < NB; ++b) {
+          o[b] += v[b] * s_pre[h * NB + b];
+          acc_hc[b].add(v[b] * v[b]);
+        }
+      };
+      if constexpr (NH <= 4u) {
 #pragma unroll
-      for (uint32_t h = 0; h < NH; ++h) step_h(h);
-    } else {
+        for (uint32_t h = 0; h < NH; ++h) step_h(h);
+      } else {
 #pragma unroll 2
-      for (uint32_t h = 0; h < NH; ++h) step_h(h);
-    }
-    if constexpr (NB == 16u) {
-      if (vec_cur) {
+        for (uint32_t h = 0; h < NH; ++h) step_h(h);
+      }
+      if constexpr (NB == 16u) {
+        if (vec_cur) {
 #pragma unroll
-        for (uint32_t q = 0; q < 4u; ++q) {
-          *(float4*)(cur + (size_t)d * NB + q * 4u) =
-              make_float4(o[q * 4u], o[q * 4u + 1u], o[q * 4u + 2u], o[q * 4u + 3u]);
+          for (uint32_t q = 0; q < 4u; ++q) {
+            *(float4*)(cur + (size_t)d * NB + q * 4u) =
+                make_float4(o[q * 4u], o[q * 4u + 1u], o[q * 4u + 2u], o[q * 4u + 3u]);
+          }
+        } else {
+#pragma unroll
+          for (uint32_t b = 0; b < NB; ++b) cur[(size_t)d * NB + b] = o[b];
         }
       } else {
 #pragma unroll
         for (uint32_t b = 0; b < NB; ++b) cur[(size_t)d * NB + b] = o[b];
       }
-    } else {
 #pragma unroll
-      for (uint32_t b = 0; b < NB; ++b) cur[(size_t)d * NB + b] = o[b];
+      for (uint32_t b = 0; b < NB; ++b) acc_cur[b].add(o[b] * o[b]);
     }
+    hcn_block_sum2_fast<NB>(s, acc_cur, acc_hc, tid);
+    if (tid < NB) {
+      part_cur[(size_t)blockIdx.x * NB + tid] = s[tid];
+      part_hc[(size_t)blockIdx.x * NB + tid] = s[NB + tid];
+    }
+  } else {
+    float acc_cur[NB] = {}, acc_hc[NB] = {};
+    for (uint32_t d = blockIdx.x * kHcnThreads + tid; d < n_embd; d += n_part * kHcnThreads) {
+      float o[NB] = {};
+      auto step_h = [&](uint32_t h) __attribute__((always_inline)) {
+        float v[NB];
+        hcn_row<NB>(hc + ((size_t)h * n_embd + d) * NB, v);
 #pragma unroll
-    for (uint32_t b = 0; b < NB; ++b) acc_cur[b] += o[b] * o[b];
+        for (uint32_t b = 0; b < NB; ++b) {
+          o[b] += v[b] * s_pre[h * NB + b];
+          acc_hc[b] += v[b] * v[b];
+        }
+      };
+      if constexpr (NH <= 4u) {
+#pragma unroll
+        for (uint32_t h = 0; h < NH; ++h) step_h(h);
+      } else {
+#pragma unroll 2
+        for (uint32_t h = 0; h < NH; ++h) step_h(h);
+      }
+      if constexpr (NB == 16u) {
+        if (vec_cur) {
+#pragma unroll
+          for (uint32_t q = 0; q < 4u; ++q) {
+            *(float4*)(cur + (size_t)d * NB + q * 4u) =
+                make_float4(o[q * 4u], o[q * 4u + 1u], o[q * 4u + 2u], o[q * 4u + 3u]);
+          }
+        } else {
+#pragma unroll
+          for (uint32_t b = 0; b < NB; ++b) cur[(size_t)d * NB + b] = o[b];
+        }
+      } else {
+#pragma unroll
+        for (uint32_t b = 0; b < NB; ++b) cur[(size_t)d * NB + b] = o[b];
+      }
+#pragma unroll
+      for (uint32_t b = 0; b < NB; ++b) acc_cur[b] += o[b] * o[b];
+    }
+    hcn_block_sum<NB>(s, acc_cur, tid);
+    if (tid < NB) part_cur[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
+    aff::lds_barrier();
+    hcn_block_sum<NB>(s, acc_hc, tid);
+    if (tid < NB) part_hc[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
   }
-  hcn_block_sum<NB>(s, acc_cur, tid);
-  if (tid < NB) part_cur[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
-  aff::lds_barrier();
-  hcn_block_sum<NB>(s, acc_hc, tid);
-  if (tid < NB) part_hc[(size_t)blockIdx.x * NB + tid] = s[tid * kHcnThreads];
 }
 
 // V4.1 narrow RMSNorm + FP8 quantisation + single-block Sinkhorn gate writeback (`blockIdx.x == 0`).
 // Blocks 1..N-1 never run the 20-iter Sinkhorn chain, and in block 0 only warp 0 runs it after q8.
-template <uint32_t NB, uint32_t NH>
+template <uint32_t NB, uint32_t NH, bool Fast = false>
 #ifdef __HIP_DEVICE_COMPILE__
 __attribute__((amdgpu_waves_per_eu((NB == 16u && NH == 4u) ? 16 : 1,
                                    (NB == 16u && NH == 4u) ? 16 : 16)))
@@ -3760,7 +4025,13 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_v41_kernel(
   const uint32_t tid = threadIdx.x;
   if (tid < NB) {
     float tot = 0.0f;
-    for (uint32_t c = 0; c < n_part; ++c) tot += part_cur[(size_t)c * NB + tid];
+    if constexpr (Fast) {
+      aff::wmma::KahanF32 kt;
+      for (uint32_t c = 0; c < n_part; ++c) kt.add(part_cur[(size_t)c * NB + tid]);
+      tot = kt.total();
+    } else {
+      for (uint32_t c = 0; c < n_part; ++c) tot += part_cur[(size_t)c * NB + tid];
+    }
     s_inv[tid] = rsqrtf(tot / (float)n_embd + rms_eps);
   }
   aff::lds_barrier();
@@ -3851,7 +4122,13 @@ __global__ __launch_bounds__(kHcnThreads) void hcn_norm_v41_kernel(
   }
   if (blockIdx.x == 0 && tid < NB) {
     float tot_hc = 0.0f;
-    for (uint32_t c = 0; c < n_part; ++c) tot_hc += part_hc[(size_t)c * NB + tid];
+    if constexpr (Fast) {
+      aff::wmma::KahanF32 khc;
+      for (uint32_t c = 0; c < n_part; ++c) khc.add(part_hc[(size_t)c * NB + tid]);
+      tot_hc = khc.total();
+    } else {
+      for (uint32_t c = 0; c < n_part; ++c) tot_hc += part_hc[(size_t)c * NB + tid];
+    }
     float pre[NH], post[NH], comb[NH * NH];
     hc_gates_lane_nh<NH>(mix, NB, tid, rsqrtf(tot_hc / (float)hc_dim + rms_eps), scale, base, pre,
                          post, comb, iters, hc_eps);
@@ -3960,17 +4237,14 @@ __global__ void batch_hc_expand_reg_vec4_kernel(
       acc[2] += cv4.z * v[src][2];
       acc[3] += cv4.w * v[src][3];
     }
-    const uint16_t h0 = wmma::f32_to_bf16(acc[0]);
-    const uint16_t h1 = wmma::f32_to_bf16(acc[1]);
-    const uint16_t h2 = wmma::f32_to_bf16(acc[2]);
-    const uint16_t h3 = wmma::f32_to_bf16(acc[3]);
-    *(uint2*)(out_hc + ((size_t)dst * n_embd + d) * nb + b0) =
-        make_uint2((uint32_t)h0 | ((uint32_t)h1 << 16), (uint32_t)h2 | ((uint32_t)h3 << 16));
+    const uint32_t p01 = wmma::bf16x2_rne(acc[0], acc[1]);
+    const uint32_t p23 = wmma::bf16x2_rne(acc[2], acc[3]);
+    *(uint2*)(out_hc + ((size_t)dst * n_embd + d) * nb + b0) = make_uint2(p01, p23);
     if (tap) {
-      tap_acc[0] += wmma::bf16_to_f32(h0);
-      tap_acc[1] += wmma::bf16_to_f32(h1);
-      tap_acc[2] += wmma::bf16_to_f32(h2);
-      tap_acc[3] += wmma::bf16_to_f32(h3);
+      tap_acc[0] += wmma::bf16_to_f32((uint16_t)(p01 & 0xFFFFu));
+      tap_acc[1] += wmma::bf16_to_f32((uint16_t)(p01 >> 16));
+      tap_acc[2] += wmma::bf16_to_f32((uint16_t)(p23 & 0xFFFFu));
+      tap_acc[3] += wmma::bf16_to_f32((uint16_t)(p23 >> 16));
     }
   }
   if (tap) {
@@ -5532,8 +5806,13 @@ bool batch_head_rms_rope_tr_hip(const float* x, uint16_t* dst, float* inv, uint3
   }
   if (!inv) return false;
   if (nb == kNarrowTok) {
-    AFF_BLAUNCH((hcn_head_rms_inv_kernel<kNarrowTok>), dim3(n_head), dim3(kHcnThreads), 0,
-                (hipStream_t)stream, x, inv, head_dim, eps);
+    if (mhc_mix_fast_enabled()) {
+      AFF_BLAUNCH((hcn_head_rms_inv_kernel<kNarrowTok, true>), dim3(n_head), dim3(kHcnThreads), 0,
+                  (hipStream_t)stream, x, inv, head_dim, eps);
+    } else {
+      AFF_BLAUNCH((hcn_head_rms_inv_kernel<kNarrowTok, false>), dim3(n_head), dim3(kHcnThreads), 0,
+                  (hipStream_t)stream, x, inv, head_dim, eps);
+    }
   } else {
     const uint32_t thr = 256, blk_inv = (n_head * nb + thr - 1) / thr;
     AFF_BLAUNCH(batch_head_rms_inv_kernel, dim3(blk_inv), dim3(thr), 0, (hipStream_t)stream,
@@ -5801,10 +6080,17 @@ void batch_hc_fused_hip(const uint16_t* hc, const float* mix, const float* scale
                         const float* pre_in, uint8_t* q8, float* qs) {
   const bool emit_q8 =
       q8 && qs && (n_embd & 127u) == 0u && (((uintptr_t)q8 & 15u) == 0u);
-  AFF_BLAUNCH(batch_hc_fused_kernel, dim3((nb + kBlkTok - 1) / kBlkTok), dim3(kBlkThreads),
-                     0, (hipStream_t)stream, hc, mix, scale, base, nw, pre, post, comb, cur, norm,
-                     n_embd, n_hc, nb, iters, hc_eps, rms_eps, has_control, pre_in,
-                     emit_q8 ? q8 : nullptr, emit_q8 ? qs : nullptr);
+  if (mhc_mix_fast_enabled()) {
+    AFF_BLAUNCH((batch_hc_fused_kernel<true>), dim3((nb + kBlkTok - 1) / kBlkTok), dim3(kBlkThreads),
+                0, (hipStream_t)stream, hc, mix, scale, base, nw, pre, post, comb, cur, norm,
+                n_embd, n_hc, nb, iters, hc_eps, rms_eps, has_control, pre_in,
+                emit_q8 ? q8 : nullptr, emit_q8 ? qs : nullptr);
+  } else {
+    AFF_BLAUNCH((batch_hc_fused_kernel<false>), dim3((nb + kBlkTok - 1) / kBlkTok),
+                dim3(kBlkThreads), 0, (hipStream_t)stream, hc, mix, scale, base, nw, pre, post,
+                comb, cur, norm, n_embd, n_hc, nb, iters, hc_eps, rms_eps, has_control, pre_in,
+                emit_q8 ? q8 : nullptr, emit_q8 ? qs : nullptr);
+  }
 }
 
 void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float* scale,
@@ -5822,7 +6108,10 @@ void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float
   }
   constexpr uint32_t NB = kNarrowTok;
   const hipStream_t st = (hipStream_t)stream;
-  const dim3 g(kHcnChunks), t(kHcnThreads);
+  const bool fast = mhc_mix_fast_enabled();
+  const uint32_t nblk = std::max<uint32_t>(1u, (n_embd + kHcnThreads - 1u) / kHcnThreads);
+  const uint32_t n_part = fast ? std::min<uint32_t>(kHcnChunks, nblk) : kHcnChunks;
+  const dim3 g(n_part), t(kHcnThreads);
   // TWO partial planes. The expand kernel reads the first (every block re-derives the gates from
   // it) and writes the second, and one plane would let block 0's write race block 5's read.
   float* const part2 = part + (size_t)kHcnChunks * NB;
@@ -5831,41 +6120,72 @@ void batch_hc_fused_narrow_hip(const uint16_t* hc, const float* mix, const float
     return !s || !*s || std::strcmp(s, "0") != 0;
   }();
   if (has_control && pre_in && v41_hc_fused) {
-    const uint32_t nblk = (n_embd + kHcnThreads - 1) / kHcnThreads;
-    const uint32_t n_part = std::min<uint32_t>(kHcnChunks, nblk);
-#define AFF_HCN_V41(NH)                                                                           \
+    const uint32_t v41_part = std::min<uint32_t>(kHcnChunks, nblk);
+#define AFF_HCN_V41(NH, FAST)                                                                     \
   do {                                                                                            \
-    AFF_BLAUNCH((hcn_v41_collapse_sq_kernel<NB, NH>), dim3(n_part), t, 0, st, hc, pre_in, cur,    \
-                part, part2, n_embd, n_part);                                                     \
-    AFF_BLAUNCH((hcn_norm_v41_kernel<NB, NH>), dim3(nblk), t, 0, st, cur, part2, part, mix,       \
+    AFF_BLAUNCH((hcn_v41_collapse_sq_kernel<NB, NH, FAST>), dim3(v41_part), t, 0, st, hc, pre_in, \
+                cur, part, part2, n_embd, v41_part);                                              \
+    AFF_BLAUNCH((hcn_norm_v41_kernel<NB, NH, FAST>), dim3(nblk), t, 0, st, cur, part2, part, mix, \
                 scale, base, pre, post, comb, nw, norm, q8, qs, n_embd, (uint64_t)n_embd * NH,    \
-                n_part, iters, hc_eps, rms_eps);                                                  \
+                v41_part, iters, hc_eps, rms_eps);                                                \
   } while (0)
-    if (n_hc == 1)      { AFF_HCN_V41(1); }
-    else if (n_hc == 2) { AFF_HCN_V41(2); }
-    else if (n_hc == 4) { AFF_HCN_V41(4); }
-    else if (n_hc == 8) { AFF_HCN_V41(8); }
-    else { aff::ui::fatal("batch_hc_fused_narrow: n_hc=%u\n", n_hc); std::abort(); }
+    if (fast) {
+      if (n_hc == 1)      { AFF_HCN_V41(1, true); }
+      else if (n_hc == 2) { AFF_HCN_V41(2, true); }
+      else if (n_hc == 4) { AFF_HCN_V41(4, true); }
+      else if (n_hc == 8) { AFF_HCN_V41(8, true); }
+      else { aff::ui::fatal("batch_hc_fused_narrow: n_hc=%u\n", n_hc); std::abort(); }
+    } else {
+      if (n_hc == 1)      { AFF_HCN_V41(1, false); }
+      else if (n_hc == 2) { AFF_HCN_V41(2, false); }
+      else if (n_hc == 4) { AFF_HCN_V41(4, false); }
+      else if (n_hc == 8) { AFF_HCN_V41(8, false); }
+      else { aff::ui::fatal("batch_hc_fused_narrow: n_hc=%u\n", n_hc); std::abort(); }
+    }
 #undef AFF_HCN_V41
     return;
   }
   if (has_control) {
-    AFF_BLAUNCH((hcn_sq_kernel<NB>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc);
-#define AFF_HCN_X(NH)                                                                             \
-  AFF_BLAUNCH((hcn_expand_kernel<NB, NH>), g, t, 0, st, hc, part, mix, scale, base, pre, post,     \
-              comb, cur, part2, n_embd, (uint64_t)n_embd * n_hc, iters, hc_eps, rms_eps, pre_in)
-    if (n_hc == 1)      { AFF_HCN_X(1); }
-    else if (n_hc == 2) { AFF_HCN_X(2); }
-    else if (n_hc == 4) { AFF_HCN_X(4); }
-    else if (n_hc == 8) { AFF_HCN_X(8); }
-    else { aff::ui::fatal("batch_hc_fused_narrow: n_hc=%u\n", n_hc); std::abort(); }
+    if (fast) {
+      AFF_BLAUNCH((hcn_sq_kernel<NB, true>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc,
+                  n_part);
+    } else {
+      AFF_BLAUNCH((hcn_sq_kernel<NB, false>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc,
+                  n_part);
+    }
+#define AFF_HCN_X(NH, FAST)                                                                       \
+  AFF_BLAUNCH((hcn_expand_kernel<NB, NH, FAST>), g, t, 0, st, hc, part, mix, scale, base, pre,    \
+              post, comb, cur, part2, n_embd, (uint64_t)n_embd * n_hc, iters, hc_eps, rms_eps,    \
+              pre_in, n_part)
+    if (fast) {
+      if (n_hc == 1)      { AFF_HCN_X(1, true); }
+      else if (n_hc == 2) { AFF_HCN_X(2, true); }
+      else if (n_hc == 4) { AFF_HCN_X(4, true); }
+      else if (n_hc == 8) { AFF_HCN_X(8, true); }
+      else { aff::ui::fatal("batch_hc_fused_narrow: n_hc=%u\n", n_hc); std::abort(); }
+    } else {
+      if (n_hc == 1)      { AFF_HCN_X(1, false); }
+      else if (n_hc == 2) { AFF_HCN_X(2, false); }
+      else if (n_hc == 4) { AFF_HCN_X(4, false); }
+      else if (n_hc == 8) { AFF_HCN_X(8, false); }
+      else { aff::ui::fatal("batch_hc_fused_narrow: n_hc=%u\n", n_hc); std::abort(); }
+    }
 #undef AFF_HCN_X
   } else {
-    AFF_BLAUNCH((hcn_copy_kernel<NB>), g, t, 0, st, hc, cur, part2, n_embd);
+    if (fast) {
+      AFF_BLAUNCH((hcn_copy_kernel<NB, true>), g, t, 0, st, hc, cur, part2, n_embd, n_part);
+    } else {
+      AFF_BLAUNCH((hcn_copy_kernel<NB, false>), g, t, 0, st, hc, cur, part2, n_embd, n_part);
+    }
   }
   // n_embd/kHcnThreads blocks, each owning 256 contiguous dims — see the note on the kernel.
-  AFF_BLAUNCH((hcn_norm_kernel<NB>), dim3((n_embd + kHcnThreads - 1) / kHcnThreads), t, 0, st, cur,
-              part2, nw, norm, q8, qs, n_embd, rms_eps, (float*)nullptr);
+  if (fast) {
+    AFF_BLAUNCH((hcn_norm_kernel<NB, true>), dim3(nblk), t, 0, st, cur, part2, nw, norm, q8, qs,
+                n_embd, rms_eps, (float*)nullptr, n_part);
+  } else {
+    AFF_BLAUNCH((hcn_norm_kernel<NB, false>), dim3(nblk), t, 0, st, cur, part2, nw, norm, q8, qs,
+                n_embd, rms_eps, (float*)nullptr, n_part);
+  }
 }
 
 // The head's collapse: sum of squares, gate, weighted lane sum, rms_norm. Three launches and no
@@ -5882,21 +6202,44 @@ void batch_hc_head_narrow_hip(const uint16_t* hc, const float* mix, const float*
   }
   constexpr uint32_t NB = kNarrowTok;
   const hipStream_t st = (hipStream_t)stream;
-  const dim3 g(kHcnChunks), t(kHcnThreads);
+  const bool fast = mhc_mix_fast_enabled();
+  const uint32_t nblk = std::max<uint32_t>(1u, (n_embd + kHcnThreads - 1u) / kHcnThreads);
+  const uint32_t n_part = fast ? std::min<uint32_t>(kHcnChunks, nblk) : kHcnChunks;
+  const dim3 g(n_part), t(kHcnThreads);
   float* const part2 = part + (size_t)kHcnChunks * NB;   // two planes, for the reason above
-  if (!pre_in)
-    AFF_BLAUNCH((hcn_sq_kernel<NB>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc);
-#define AFF_HCH_X(NH)                                                                             \
-  AFF_BLAUNCH((hcn_head_gate_kernel<NB, NH>), g, t, 0, st, hc, part, mix, scale, base, cur, part2, \
-              n_embd, (uint64_t)n_embd * n_hc, hc_eps, rms_eps, pre_in)
-  if (n_hc == 1)      { AFF_HCH_X(1); }
-  else if (n_hc == 2) { AFF_HCH_X(2); }
-  else if (n_hc == 4) { AFF_HCH_X(4); }
-  else if (n_hc == 8) { AFF_HCH_X(8); }
-  else { aff::ui::fatal("batch_hc_head_narrow: n_hc=%u\n", n_hc); std::abort(); }
+  if (!pre_in) {
+    if (fast) {
+      AFF_BLAUNCH((hcn_sq_kernel<NB, true>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc,
+                  n_part);
+    } else {
+      AFF_BLAUNCH((hcn_sq_kernel<NB, false>), g, t, 0, st, hc, part, (uint64_t)n_embd * n_hc,
+                  n_part);
+    }
+  }
+#define AFF_HCH_X(NH, FAST)                                                                       \
+  AFF_BLAUNCH((hcn_head_gate_kernel<NB, NH, FAST>), g, t, 0, st, hc, part, mix, scale, base, cur, \
+              part2, n_embd, (uint64_t)n_embd * n_hc, hc_eps, rms_eps, pre_in, n_part)
+  if (fast) {
+    if (n_hc == 1)      { AFF_HCH_X(1, true); }
+    else if (n_hc == 2) { AFF_HCH_X(2, true); }
+    else if (n_hc == 4) { AFF_HCH_X(4, true); }
+    else if (n_hc == 8) { AFF_HCH_X(8, true); }
+    else { aff::ui::fatal("batch_hc_head_narrow: n_hc=%u\n", n_hc); std::abort(); }
+  } else {
+    if (n_hc == 1)      { AFF_HCH_X(1, false); }
+    else if (n_hc == 2) { AFF_HCH_X(2, false); }
+    else if (n_hc == 4) { AFF_HCH_X(4, false); }
+    else if (n_hc == 8) { AFF_HCH_X(8, false); }
+    else { aff::ui::fatal("batch_hc_head_narrow: n_hc=%u\n", n_hc); std::abort(); }
+  }
 #undef AFF_HCH_X
-  AFF_BLAUNCH((hcn_norm_kernel<NB>), dim3((n_embd + kHcnThreads - 1) / kHcnThreads), t, 0, st, cur,
-              part2, nw, norm, (uint8_t*)nullptr, (float*)nullptr, n_embd, rms_eps, norm_tm);
+  if (fast) {
+    AFF_BLAUNCH((hcn_norm_kernel<NB, true>), dim3(nblk), t, 0, st, cur, part2, nw, norm,
+                (uint8_t*)nullptr, (float*)nullptr, n_embd, rms_eps, norm_tm, n_part);
+  } else {
+    AFF_BLAUNCH((hcn_norm_kernel<NB, false>), dim3(nblk), t, 0, st, cur, part2, nw, norm,
+                (uint8_t*)nullptr, (float*)nullptr, n_embd, rms_eps, norm_tm, n_part);
+  }
 }
 
 void batch_hc_norm_v41_only_hip(const float* cur, const float* mix, const float* scale,
@@ -5918,15 +6261,24 @@ void batch_hc_norm_v41_only_hip(const float* cur, const float* mix, const float*
   const dim3 t(kHcnThreads);
   const uint32_t nblk = (n_embd + kHcnThreads - 1) / kHcnThreads;
   float* const part2 = part + (size_t)kHcnChunks * NB;
-#define AFF_HCN_V41_ONLY(NH)                                                                      \
-  AFF_BLAUNCH((hcn_norm_v41_kernel<NB, NH>), dim3(nblk), t, 0, st, cur, part2, part, mix,         \
+  const bool fast = mhc_mix_fast_enabled();
+#define AFF_HCN_V41_ONLY(NH, FAST)                                                                \
+  AFF_BLAUNCH((hcn_norm_v41_kernel<NB, NH, FAST>), dim3(nblk), t, 0, st, cur, part2, part, mix,   \
               scale, base, pre, post, comb, nw, norm, q8, qs, n_embd, (uint64_t)n_embd * NH,      \
               n_part, iters, hc_eps, rms_eps)
-  if (n_hc == 1)      { AFF_HCN_V41_ONLY(1); }
-  else if (n_hc == 2) { AFF_HCN_V41_ONLY(2); }
-  else if (n_hc == 4) { AFF_HCN_V41_ONLY(4); }
-  else if (n_hc == 8) { AFF_HCN_V41_ONLY(8); }
-  else { aff::ui::fatal("batch_hc_norm_v41_only: n_hc=%u\n", n_hc); std::abort(); }
+  if (fast) {
+    if (n_hc == 1)      { AFF_HCN_V41_ONLY(1, true); }
+    else if (n_hc == 2) { AFF_HCN_V41_ONLY(2, true); }
+    else if (n_hc == 4) { AFF_HCN_V41_ONLY(4, true); }
+    else if (n_hc == 8) { AFF_HCN_V41_ONLY(8, true); }
+    else { aff::ui::fatal("batch_hc_norm_v41_only: n_hc=%u\n", n_hc); std::abort(); }
+  } else {
+    if (n_hc == 1)      { AFF_HCN_V41_ONLY(1, false); }
+    else if (n_hc == 2) { AFF_HCN_V41_ONLY(2, false); }
+    else if (n_hc == 4) { AFF_HCN_V41_ONLY(4, false); }
+    else if (n_hc == 8) { AFF_HCN_V41_ONLY(8, false); }
+    else { aff::ui::fatal("batch_hc_norm_v41_only: n_hc=%u\n", n_hc); std::abort(); }
+  }
 #undef AFF_HCN_V41_ONLY
 }
 
@@ -5946,9 +6298,15 @@ void batch_hc_head_norm_only_hip(const float* cur, const float* nw, float* norm,
   const hipStream_t st = (hipStream_t)stream;
   const dim3 t(kHcnThreads);
   float* const part2 = part + (size_t)kHcnChunks * NB;
-  AFF_BLAUNCH((hcn_norm_kernel<NB>), dim3((n_embd + kHcnThreads - 1) / kHcnThreads), t, 0, st,
-              cur, part2, nw, norm, (uint8_t*)nullptr, (float*)nullptr, n_embd, rms_eps, norm_tm,
-              n_part);
+  if (mhc_mix_fast_enabled()) {
+    AFF_BLAUNCH((hcn_norm_kernel<NB, true>), dim3((n_embd + kHcnThreads - 1) / kHcnThreads), t, 0,
+                st, cur, part2, nw, norm, (uint8_t*)nullptr, (float*)nullptr, n_embd, rms_eps,
+                norm_tm, n_part);
+  } else {
+    AFF_BLAUNCH((hcn_norm_kernel<NB, false>), dim3((n_embd + kHcnThreads - 1) / kHcnThreads), t,
+                0, st, cur, part2, nw, norm, (uint8_t*)nullptr, (float*)nullptr, n_embd, rms_eps,
+                norm_tm, n_part);
+  }
 }
 
 void batch_hc_expand_hip(uint16_t* out_hc, float* block, const uint16_t* hc,
@@ -6225,11 +6583,175 @@ void router_hash_wt_hip(const float* logits, const uint32_t* sel, const uint32_t
   AFF_HIP_CHECK(hipGetLastError());
 }
 
+static inline bool router_topk_v2_enabled() {
+  const char* s = std::getenv("AFF_ROUTER_TOPK_V2");
+  return !(s && s[0] == '0' && s[1] == '\0');
+}
+
+__device__ __forceinline__ uint64_t wave_min_u64_dpp(uint64_t v) {
+  auto step = [&](auto tag) {
+    constexpr uint32_t L = decltype(tag)::value;
+    const uint32_t plo = aff::dpp_xor_lane<L>((uint32_t)v);
+    const uint32_t phi = aff::dpp_xor_lane<L>((uint32_t)(v >> 32));
+    const uint64_t pv = ((uint64_t)phi << 32) | (uint64_t)plo;
+    if (pv < v) v = pv;
+  };
+  step(std::integral_constant<uint32_t, 16u>{});
+  step(std::integral_constant<uint32_t, 8u>{});
+  step(std::integral_constant<uint32_t, 4u>{});
+  step(std::integral_constant<uint32_t, 2u>{});
+  step(std::integral_constant<uint32_t, 1u>{});
+  return v;
+}
+
+__device__ __forceinline__ uint64_t router_topk_key_f32(float v, uint32_t e) {
+  if (!(v > -3.0e38f)) return 0ull;
+  const uint32_t raw = __float_as_uint(v);
+  const uint32_t u = (raw == 0x80000000u) ? 0u : raw;
+  const uint32_t ord = (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+  return ((uint64_t)ord << 16) | (uint64_t)(~e & 0xFFFFu);
+}
+
+template <uint32_t MAXOWN>
+__device__ __forceinline__ uint32_t router_topk_select_wave(
+    const uint64_t (&key)[MAXOWN], const float (&sc)[MAXOWN], const uint8_t (&res_v)[MAXOWN],
+    uint32_t k, uint32_t lane, uint32_t& my_best, float& my_bscore, uint32_t& has_prot) {
+  uint64_t P = ~0ull;
+  uint32_t got = 0u;
+  has_prot = 0u;
+  for (uint32_t r = 0; r < k; ++r) {
+    uint64_t d = ~0ull;
+#pragma unroll
+    for (uint32_t i = 0; i < MAXOWN; ++i) {
+      if (key[i] != 0ull) {
+        const uint64_t t = P - key[i];
+        if (t < d) d = t;
+      }
+    }
+    const uint64_t best = P - wave_min_u64_dpp(d);
+    if (best == 0ull) break;
+    const uint32_t win_e = (uint32_t)(~best) & 0xFFFFu;
+    float my_sc = 0.0f;
+    int my_prot = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < MAXOWN; ++i) {
+      if (key[i] == best) {
+        my_sc = sc[i];
+        my_prot = (int)((res_v[i] >> 1) & 1u);
+      }
+    }
+#ifdef __HIP_DEVICE_COMPILE__
+    const float win_sc = __builtin_bit_cast(
+        float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, my_sc), (int)(win_e & 31u)));
+    const int win_prot = __builtin_amdgcn_readlane(my_prot, (int)(win_e & 31u));
+#else
+    const float win_sc = __shfl(my_sc, (int)(win_e & 31u), 32);
+    const int win_prot = __shfl(my_prot, (int)(win_e & 31u), 32);
+#endif
+    has_prot |= (uint32_t)win_prot;
+    if (lane == r) {
+      my_best = win_e;
+      my_bscore = win_sc;
+    }
+    P = best - 1ull;
+    ++got;
+  }
+  return got;
+}
+
+template <uint32_t MAXOWN>
+__global__ __launch_bounds__(32) void router_topk_v2_kernel(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    const uint8_t* __restrict__ resident, uint32_t* __restrict__ sel, float* __restrict__ wt,
+    uint32_t* __restrict__ nsel, uint32_t n_expert, uint32_t nb, uint32_t k, int norm_topk_prob,
+    float routed_scaling, float res_bias) {
+  const uint32_t b = blockIdx.x;
+  const uint32_t lane = threadIdx.x & 31u;
+
+  float raw[MAXOWN];
+  float bi_v[MAXOWN];
+  uint8_t res_v[MAXOWN];
+#pragma unroll
+  for (uint32_t i = 0; i < MAXOWN; ++i) {
+    const uint32_t e = lane + i * aff::kWave;
+    const uint32_t ee = (e < n_expert) ? e : 0u;
+    raw[i] = logits[(size_t)ee * nb + b];
+    bi_v[i] = bias ? bias[ee] : 0.0f;
+    res_v[i] = resident ? resident[ee] : 1u;
+  }
+
+  float sc[MAXOWN];
+  uint64_t key[MAXOWN];
+  const bool use_res_bias = (res_bias > 0.0f && resident != nullptr);
+#pragma unroll
+  for (uint32_t i = 0; i < MAXOWN; ++i) {
+    const uint32_t e = lane + i * aff::kWave;
+    const bool ok = e < n_expert;
+    const float x = raw[i];
+    const float sp = (x > 20.0f) ? x : log1pf(expf(x));
+    sc[i] = ok ? sqrtf(sp) : 0.0f;
+    if (use_res_bias) {
+      key[i] = ok ? router_topk_key_f32(sc[i] + bi_v[i], e) : 0ull;
+    } else {
+      const bool live = !resident || (res_v[i] != 0u);
+      key[i] = (ok && live) ? router_topk_key_f32(sc[i] + bi_v[i], e) : 0ull;
+    }
+  }
+
+  uint32_t my_best = 0u;
+  float my_bscore = 0.0f;
+  uint32_t has_prot = 0u;
+  uint32_t got = router_topk_select_wave(key, sc, res_v, k, lane, my_best, my_bscore, has_prot);
+
+  if (use_res_bias && !has_prot) {
+#pragma unroll
+    for (uint32_t i = 0; i < MAXOWN; ++i) {
+      const uint32_t e = lane + i * aff::kWave;
+      const bool ok = e < n_expert;
+      const float bonus = (res_v[i] & 1u) ? res_bias : 0.0f;
+      key[i] = ok ? router_topk_key_f32(sc[i] + bi_v[i] + bonus, e) : 0ull;
+    }
+    uint32_t unused_prot = 0u;
+    got = router_topk_select_wave(key, sc, res_v, k, lane, my_best, my_bscore, unused_prot);
+  }
+
+  double sum = 0.0;
+  for (uint32_t r = 0; r < got; ++r) {
+#ifdef __HIP_DEVICE_COMPILE__
+    const float sc_r = __builtin_bit_cast(
+        float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, my_bscore), (int)r));
+#else
+    const float sc_r = __shfl(my_bscore, (int)r, 32);
+#endif
+    sum += (double)sc_r;
+  }
+  if (sum < 6.103515625e-5) sum = 6.103515625e-5;
+  const double inv = norm_topk_prob ? 1.0 / sum : 1.0;
+  if (lane < got) {
+    sel[(size_t)b * k + lane] = my_best;
+    wt[(size_t)b * k + lane] = (float)((double)my_bscore * inv * (double)routed_scaling);
+  }
+  if (lane == 0u) nsel[b] = got;
+}
+
 void router_topk_hip(const float* logits, const float* bias, const uint8_t* resident,
                      uint32_t* sel, float* wt, uint32_t* nsel, uint32_t n_expert, uint32_t nb,
                      uint32_t live, uint32_t k, int norm_topk_prob, float routed_scaling,
                      void* stream, float res_bias) {
   if (!live || !n_expert || !k || k > kTopKMax) return;
+  if (router_topk_v2_enabled() && n_expert <= 512u) {
+    if (n_expert <= 256u) {
+      hipLaunchKernelGGL((router_topk_v2_kernel<8u>), dim3(live), dim3(aff::kWave), 0,
+                         (hipStream_t)stream, logits, bias, resident, sel, wt, nsel, n_expert, nb,
+                         k, norm_topk_prob, routed_scaling, res_bias);
+    } else {
+      hipLaunchKernelGGL((router_topk_v2_kernel<16u>), dim3(live), dim3(aff::kWave), 0,
+                         (hipStream_t)stream, logits, bias, resident, sel, wt, nsel, n_expert, nb,
+                         k, norm_topk_prob, routed_scaling, res_bias);
+    }
+    AFF_HIP_CHECK(hipGetLastError());
+    return;
+  }
   const size_t lds = (size_t)n_expert * 2 * sizeof(float);
   hipLaunchKernelGGL(router_topk_kernel, dim3(live), dim3(256), lds, (hipStream_t)stream, logits,
                      bias, resident, sel, wt, nsel, n_expert, nb, k, norm_topk_prob,
