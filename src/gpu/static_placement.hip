@@ -101,7 +101,6 @@ struct StaticPlacement::Impl {
   std::vector<float>   bonus_evict_heat;
   std::vector<uint8_t> bonus_evict_want;
   std::vector<float*>   d_cb;        // codebook, per card
-  std::vector<hipStream_t> stream;
   // ---- the hybrid stream ------------------------------------------------------------------------
   //
   // One per card, and it exists so that the experts this card does NOT hold can be read over PCIe
@@ -284,7 +283,6 @@ StaticPlacement::~StaticPlacement() {
     (void)hipFree(impl_->slab[i]);
     if (i < impl_->bonus_slab.size() && impl_->bonus_slab[i]) (void)hipFree(impl_->bonus_slab[i]);
     (void)hipFree(impl_->d_cb[i]);
-    (void)hipStreamDestroy(impl_->stream[i]);
   }
   for (size_t i = 0; i < plc_.size(); ++i)
     if (plc_[i]) { (void)hipSetDevice(devs_[i]); (void)hipFree(plc_[i]); }
@@ -1299,7 +1297,6 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
   I.free_bonus.assign(devs_.size(), {});
   bonus_off_.assign(devs_.size() * order.size(), UINT64_MAX);
   I.d_cb.resize(devs_.size());
-  I.stream.resize(devs_.size());
 
   static const bool bonus_slab_on = [] {
     const char* s = std::getenv("AFF_BONUS_SLAB");
@@ -1323,7 +1320,6 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     slab_alloc_bytes_.push_back((per_gpu[i] + shadow_slots_) * slot_stride + 4096);   // amdnas-fixes weight-verify
     cb_bytes_ = cb_bytes;
     AFF_HIP_CHECK(hipMemcpy(I.d_cb[i], cb_src, cb_bytes, hipMemcpyHostToDevice));
-    AFF_HIP_CHECK(hipStreamCreate(&I.stream[i]));
     if (bonus_slab_on && tp_parts_ > 1 && raw_per_gpu[i] > total_slots &&
         n_resident < order.size()) {
       const uint64_t bslots =
@@ -1423,18 +1419,24 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     };
     size_t verify_every = 0;
     if (const char* v = getenv("AFF_SLAB_VERIFY")) verify_every = (size_t)atoll(v);
+    constexpr size_t kMaxDevs = kMaxRanks;
+    hipStream_t loader_st[kMaxDevs] = {};
+    std::mutex loader_mu[kMaxDevs];
+    for (size_t d = 0; d < devs_.size(); ++d) {
+      note(hipSetDevice(devs_[d]), "hipSetDevice", d, 0);
+      note(hipStreamCreate(&loader_st[d]), "hipStreamCreate", d, 0);
+    }
     std::vector<std::thread> th;
     for (int t = 0; t < kReaders; ++t) {
       th.emplace_back([&, t] {
-        // One pinned buffer and one stream per reader. Pinned is what lets the H2D be a real DMA
-        // rather than a staged copy through a bounce buffer.
+        // One pinned buffer per reader, sharing one loader stream per card (guarded by
+        // loader_mu[d]). Pinned is what lets the H2D be a real DMA rather than a staged copy
+        // through a bounce buffer.
         std::vector<void*> pin(devs_.size(), nullptr);
-        std::vector<hipStream_t> st(devs_.size());
         std::vector<uint8_t> scratch;      // one plane's worth, reused; grows once per reader
         for (size_t d = 0; d < devs_.size(); ++d) {
           note(hipSetDevice(devs_[d]), "hipSetDevice", d, 0);
           note(hipHostMalloc(&pin[d], I.stride, hipHostMallocDefault), "hipHostMalloc(pin)", d, 0);
-          note(hipStreamCreate(&st[d]), "hipStreamCreate", d, 0);
         }
         std::vector<uint8_t> vrf;    // readback target, grown on first use
         // Under TP=2 the pread lands in pin[0] and each card's shard is cut out of it into its own
@@ -1477,31 +1479,37 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
                     (const uint8_t*)pin_sh[p]);
                 if (bad) tp2_bad.fetch_add(bad);
               }
-              note(hipSetDevice(devs_[p]), "hipSetDevice", p, slot);
-              note(hipMemcpyAsync(I.slab[p] + slot * shard_.stride, pin_sh[p], shard_.stride,
-                                  hipMemcpyHostToDevice, st[p]), "hipMemcpyAsync(shard)", p, slot);
-              note(hipStreamSynchronize(st[p]), "hipStreamSynchronize(shard)", p, slot);
-              if (verify_every && j % verify_every == 0) {
-                if (vrf.size() < shard_.stride) vrf.resize(shard_.stride);
-                note(hipMemcpy(vrf.data(), I.slab[p] + slot * shard_.stride, shard_.stride,
-                               hipMemcpyDeviceToHost), "hipMemcpy(verify)", p, slot);
-                vrf_n.fetch_add(1);
-                if (memcmp(vrf.data(), pin_sh[p], shard_.stride)) vrf_bad.fetch_add(1);
+              {
+                std::lock_guard<std::mutex> lk(loader_mu[p]);
+                note(hipSetDevice(devs_[p]), "hipSetDevice", p, slot);
+                note(hipMemcpyAsync(I.slab[p] + slot * shard_.stride, pin_sh[p], shard_.stride,
+                                    hipMemcpyHostToDevice, loader_st[p]), "hipMemcpyAsync(shard)", p, slot);
+                note(hipStreamSynchronize(loader_st[p]), "hipStreamSynchronize(shard)", p, slot);
+                if (verify_every && j % verify_every == 0) {
+                  if (vrf.size() < shard_.stride) vrf.resize(shard_.stride);
+                  note(hipMemcpy(vrf.data(), I.slab[p] + slot * shard_.stride, shard_.stride,
+                                 hipMemcpyDeviceToHost), "hipMemcpy(verify)", p, slot);
+                  vrf_n.fetch_add(1);
+                  if (memcmp(vrf.data(), pin_sh[p], shard_.stride)) vrf_bad.fetch_add(1);
+                }
               }
             }
             device_of_[idx] = 0;                    // resident; "which card" no longer applies
             offset_of_[idx] = slot * shard_.stride;
           } else {
-            note(hipSetDevice(devs_[d]), "hipSetDevice", d, slot);
-            note(hipMemcpyAsync(I.slab[d] + slot * I.stride, pin[d], I.stride,
-                                hipMemcpyHostToDevice, st[d]), "hipMemcpyAsync", d, slot);
-            note(hipStreamSynchronize(st[d]), "hipStreamSynchronize", d, slot);
-            if (verify_every && j % verify_every == 0) {
-              if (vrf.size() < I.stride) vrf.resize(I.stride);
-              note(hipMemcpy(vrf.data(), I.slab[d] + slot * I.stride, I.stride,
-                             hipMemcpyDeviceToHost), "hipMemcpy(verify)", d, slot);
-              vrf_n.fetch_add(1);
-              if (memcmp(vrf.data(), pin[d], I.stride)) vrf_bad.fetch_add(1);
+            {
+              std::lock_guard<std::mutex> lk(loader_mu[d]);
+              note(hipSetDevice(devs_[d]), "hipSetDevice", d, slot);
+              note(hipMemcpyAsync(I.slab[d] + slot * I.stride, pin[d], I.stride,
+                                  hipMemcpyHostToDevice, loader_st[d]), "hipMemcpyAsync", d, slot);
+              note(hipStreamSynchronize(loader_st[d]), "hipStreamSynchronize", d, slot);
+              if (verify_every && j % verify_every == 0) {
+                if (vrf.size() < I.stride) vrf.resize(I.stride);
+                note(hipMemcpy(vrf.data(), I.slab[d] + slot * I.stride, I.stride,
+                               hipMemcpyDeviceToHost), "hipMemcpy(verify)", d, slot);
+                vrf_n.fetch_add(1);
+                if (memcmp(vrf.data(), pin[d], I.stride)) vrf_bad.fetch_add(1);
+              }
             }
             device_of_[idx] = (int)d;
             offset_of_[idx] = slot * I.stride;
@@ -1525,17 +1533,19 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
           if (tr) aff::expert_transpose_planes_host((uint8_t*)pin[0], aff->layer(layer), scratch);
           aff::expert_shard_host((const uint8_t*)pin[0], aff->layer(layer), shard_, tp_parts_,
                                  (uint32_t)d, (uint8_t*)pin_sh[d]);
-          note(hipSetDevice(devs_[d]), "hipSetDevice(bonus)", d, bslot);
-          note(hipMemcpyAsync(I.bonus_slab[d] + bslot * shard_.stride, pin_sh[d], shard_.stride,
-                              hipMemcpyHostToDevice, st[d]), "hipMemcpyAsync(bonus)", d, bslot);
-          note(hipStreamSynchronize(st[d]), "hipStreamSynchronize(bonus)", d, bslot);
+          {
+            std::lock_guard<std::mutex> lk(loader_mu[d]);
+            note(hipSetDevice(devs_[d]), "hipSetDevice(bonus)", d, bslot);
+            note(hipMemcpyAsync(I.bonus_slab[d] + bslot * shard_.stride, pin_sh[d], shard_.stride,
+                                hipMemcpyHostToDevice, loader_st[d]), "hipMemcpyAsync(bonus)", d, bslot);
+            note(hipStreamSynchronize(loader_st[d]), "hipStreamSynchronize(bonus)", d, bslot);
+          }
           bonus_off_[d * order.size() + idx] = bslot * shard_.stride;
           I.bonus_owner[d][bslot] = idx;
         }
         for (size_t d = 0; d < devs_.size(); ++d) {
           (void)hipSetDevice(devs_[d]);
           (void)hipHostFree(pin[d]);
-          (void)hipStreamDestroy(st[d]);
         }
         for (size_t d = 0; d < pin_sh.size(); ++d) {
           (void)hipSetDevice(devs_[d]);
@@ -1544,6 +1554,12 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
       });
     }
     for (auto& x : th) x.join();
+    for (size_t d = 0; d < devs_.size(); ++d) {
+      if (loader_st[d]) {
+        (void)hipSetDevice(devs_[d]);
+        (void)hipStreamDestroy(loader_st[d]);
+      }
+    }
     if (verify_every)
       aff::ui::err("slab verify: %zu experts read back, %zu mismatched\n",
                    vrf_n.load(), vrf_bad.load());
