@@ -64,9 +64,42 @@ constexpr int kTpFp8DefaultStages = 8;
 constexpr int kTpFp8MaxStages = 8;
 constexpr uint32_t kTpArFlagFastRel   = 1u << 0;
 constexpr uint32_t kTpArFlagWakeEarly = 1u << 1;
+constexpr uint32_t kTpArFlagParity    = 1u << 2;
 // Per-peer flag stride: [0, kTpMaxBlocks) holds unstaged block flags;
 // [kTpMaxBlocks, (1 + kTpFp8MaxStages) * kTpMaxBlocks) holds per-(stage, block) flags.
 constexpr size_t kTpFlagStride = (size_t)kTpMaxBlocks * (1u + (size_t)kTpFp8MaxStages);
+
+// Device-resident per-block seq + lockstep slot parity (`r4d_ar_seq.h`). Every launch steps
+// `ctrs[kTpMaxBlocks .. 2*kTpMaxBlocks)` across all active/idle blocks so mixed grid widths
+// stay phase-locked on alternating double-buffer slots without host barriers.
+__device__ __forceinline__ void tp_ar_seq_take_nb(unsigned int* __restrict__ ctrs,
+                                                  unsigned int b, unsigned int nb,
+                                                  unsigned int tid, unsigned int nt,
+                                                  unsigned int& s_seq, unsigned int& s_slot,
+                                                  bool use_parity) {
+  if (tid == 0u) {
+    const unsigned int s = atomicAdd(&ctrs[b], 1u) + 1u;
+    s_seq = s;
+    if (!use_parity) s_slot = s & 1u;
+  }
+  if (use_parity) {
+    unsigned int* const par = ctrs + kTpMaxBlocks;
+    const unsigned int pt = (nt > 32u) ? 32u : 0u;
+    if (tid == pt) s_slot = (atomicAdd(&par[b], 1u) + 1u) & 1u;
+    for (unsigned int j = b + (tid + 1u) * nb; j < (unsigned int)kTpMaxBlocks; j += nt * nb) {
+      atomicAdd(&par[j], 1u);
+    }
+  }
+}
+
+__device__ __forceinline__ void tp_ar_seq_take(unsigned int* __restrict__ ctrs,
+                                               unsigned int b, unsigned int nb,
+                                               unsigned int tid, unsigned int nt,
+                                               unsigned int& s_seq, unsigned int& s_slot,
+                                               bool use_parity) {
+  tp_ar_seq_take_nb(ctrs, b, nb, tid, nt, s_seq, s_slot, use_parity);
+  aff::lds_barrier();
+}
 
 __device__ __forceinline__ void store_sys_rel(unsigned int* p, unsigned int v) {
   __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -121,11 +154,11 @@ __global__ __launch_bounds__(256) void tp_ar_kernel(const float4* __restrict__ i
     for (int j = 0; j < NPEER; ++j) store_sys_relaxed(push.wake[j], 1u);
   }
 
-  __shared__ unsigned int s_seq;
-  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  aff::lds_barrier();
+  __shared__ unsigned int s_seq, s_slot;
+  tp_ar_seq_take(seq_ctrs, (unsigned int)b, (unsigned int)nb, (unsigned int)tid, (unsigned int)nt,
+                 s_seq, s_slot, (ar_flags & kTpArFlagParity) != 0u);
   const unsigned int s = s_seq;
-  const int slot = (int)(s % TpContext::kTpSlots);
+  const int slot = (int)s_slot;
 
   if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) {
 #pragma unroll
@@ -330,11 +363,11 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_kernel(const float* __restrict_
 #pragma unroll
     for (int j = 0; j < NPEER; ++j) store_sys_relaxed(push.wake[j], 1u);
   }
-  __shared__ unsigned int s_seq;
-  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  aff::lds_barrier();
+  __shared__ unsigned int s_seq, s_slot;
+  tp_ar_seq_take(seq_ctrs, (unsigned int)b, (unsigned int)nb, (unsigned int)tid, (unsigned int)nt,
+                 s_seq, s_slot, (ar_flags & kTpArFlagParity) != 0u);
   const unsigned int s = s_seq;
-  const int slot = (int)(s % TpContext::kTpSlots);
+  const int slot = (int)s_slot;
 
   if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) {
 #pragma unroll
@@ -570,11 +603,11 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_staged_kernel(const float* __re
                                         int stages, uint32_t ar_flags) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], 1u);
-  __shared__ unsigned int s_seq;
-  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  aff::lds_barrier();
+  __shared__ unsigned int s_seq, s_slot;
+  tp_ar_seq_take(seq_ctrs, (unsigned int)b, (unsigned int)nb, (unsigned int)tid, (unsigned int)nt,
+                 s_seq, s_slot, (ar_flags & kTpArFlagParity) != 0u);
   const unsigned int s = s_seq;
-  const int slot = (int)(s % TpContext::kTpSlots);
+  const int slot = (int)s_slot;
 
   if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
 
@@ -734,11 +767,11 @@ __global__ __launch_bounds__(256) void tp_ar_fp8_hc_expand_kernel(
     int scale_off_bytes, int stages, int zb, uint32_t ar_flags) {
   const int b = blockIdx.x, grid_nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], 1u);
-  __shared__ unsigned int s_seq;
-  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  aff::lds_barrier();
+  __shared__ unsigned int s_seq, s_slot;
+  tp_ar_seq_take(seq_ctrs, (unsigned int)b, (unsigned int)grid_nb, (unsigned int)tid,
+                 (unsigned int)nt, s_seq, s_slot, (ar_flags & kTpArFlagParity) != 0u);
   const unsigned int s = s_seq;
-  const int slot = (int)(s % TpContext::kTpSlots);
+  const int slot = (int)s_slot;
 
   if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
 
@@ -1087,11 +1120,11 @@ __global__ __launch_bounds__(256) void tp_ar_coded_kernel(
     uint32_t ar_flags) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], 1u);
-  __shared__ unsigned int s_seq;
-  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  aff::lds_barrier();
+  __shared__ unsigned int s_seq, s_slot;
+  tp_ar_seq_take(seq_ctrs, (unsigned int)b, (unsigned int)nb, (unsigned int)tid, (unsigned int)nt,
+                 s_seq, s_slot, (ar_flags & kTpArFlagParity) != 0u);
   const unsigned int s = s_seq;
-  const int slot = (int)(s % TpContext::kTpSlots);
+  const int slot = (int)s_slot;
   if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
 
   unsigned char* const pb_bytes = push.base[0] + (size_t)slot * slot_stride_bytes;
@@ -1201,11 +1234,11 @@ __global__ __launch_bounds__(256) void tp_ar_coded_staged_kernel(
     int stages, uint32_t ar_flags) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   if ((ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], 1u);
-  __shared__ unsigned int s_seq;
-  if (tid == 0) s_seq = atomicAdd(&seq_ctrs[b], 1u) + 1u;
-  aff::lds_barrier();
+  __shared__ unsigned int s_seq, s_slot;
+  tp_ar_seq_take(seq_ctrs, (unsigned int)b, (unsigned int)nb, (unsigned int)tid, (unsigned int)nt,
+                 s_seq, s_slot, (ar_flags & kTpArFlagParity) != 0u);
   const unsigned int s = s_seq;
-  const int slot = (int)(s % TpContext::kTpSlots);
+  const int slot = (int)s_slot;
   if (!(ar_flags & kTpArFlagWakeEarly) && b == 0 && tid == 0) store_sys_relaxed(push.wake[0], s);
 
   unsigned char* const pb_bytes = push.base[0] + (size_t)slot * slot_stride_bytes;
@@ -1353,14 +1386,15 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
 
   constexpr bool kPreDpp = HasPreCollapse && HcDpp;
   constexpr bool kPreLds = HasPreCollapse && !HcDpp;
-  __shared__ unsigned int s_seq;
+  __shared__ unsigned int s_seq, s_slot;
   __shared__ float s_pre[HasPreCollapse ? (NH * 16u) : 1u];
   __shared__ float s_red_cur[kPreLds ? (16u * 256u) : 1u];
   __shared__ float s_red_hc[kPreLds ? (16u * 256u) : 1u];
   // 1 KiB per-wave reduction buffer ([hc/cur][tok][wave]) replacing 32 KiB s_red_cur/hc when HcDpp.
   __shared__ float s_dpp[kPreDpp ? 2u : 1u][kPreDpp ? (LiveOne ? 1u : 16u) : 1u][kPreDpp ? 8u : 1u];
   const uint32_t eff_live = LiveOne ? 1u : live;
-  if (tid == 0u) s_seq = atomicAdd(&seq_ctrs[b_blk], 1u) + 1u;
+  tp_ar_seq_take_nb(seq_ctrs, b_blk, ar_blk, tid, nt, s_seq, s_slot,
+                    (ar_flags & kTpArFlagParity) != 0u);
   if constexpr (HasPreCollapse) {
     if (tid < NH * 16u) {
       const uint32_t h = tid >> 4;
@@ -1376,7 +1410,7 @@ __global__ __launch_bounds__(256) void tp_ar_batch_hc_expand_kernel(
   }
   aff::lds_barrier();
   const unsigned int s = s_seq;
-  const int slot = (int)(s % TpContext::kTpSlots);
+  const int slot = (int)s_slot;
 
   if (!(ar_flags & kTpArFlagWakeEarly) && b_blk == 0u && tid == 0u) {
     store_sys_relaxed(peer_wake, s);
@@ -2044,9 +2078,9 @@ bool tp_init(TpContext* ctx, size_t max_floats, std::string* err, ihipStream_t* 
                  "memset flags", err))
       return false;
 
-    if (!hip_try(hipMalloc(&ctx->seq[r], kTpMaxBlocks * sizeof(unsigned)), "seq alloc", err))
+    if (!hip_try(hipMalloc(&ctx->seq[r], 2u * kTpMaxBlocks * sizeof(unsigned)), "seq alloc", err))
       return false;
-    if (!hip_try(hipMemset(ctx->seq[r], 0, kTpMaxBlocks * sizeof(unsigned)), "memset seq", err))
+    if (!hip_try(hipMemset(ctx->seq[r], 0, 2u * kTpMaxBlocks * sizeof(unsigned)), "memset seq", err))
       return false;
   }
   // One word for every rank, in PINNED HOST memory so the host reads it with a load rather than a
@@ -2074,7 +2108,7 @@ void tp_reset_seq(TpContext& ctx) {
                      (size_t)(ctx.ranks - 1) * kTpFlagStride * sizeof(unsigned),
                      (hipStream_t)ctx.stream[r]));
       set_device(ctx.dev[r]);
-      AFF_HIP_CHECK(hipMemsetAsync(ctx.seq[r], 0, kTpMaxBlocks * sizeof(unsigned),
+      AFF_HIP_CHECK(hipMemsetAsync(ctx.seq[r], 0, 2u * kTpMaxBlocks * sizeof(unsigned),
                                    (hipStream_t)ctx.stream[r]));
     }
     // fseq and fflags are 2-element arrays (fold path, 2 ranks only). Do not index past it.
@@ -2210,15 +2244,22 @@ static inline size_t tp_ar_prefetch_max_bytes() {
   return mb > 0 ? ((size_t)mb << 20) : 0u;
 }
 
+static inline bool tp_ar_parity_enabled() {
+  const char* v = std::getenv("AFF_TP_AR_PARITY");
+  return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
 static inline uint32_t tp_ar_flags_cfg() {
   uint32_t f = 0u;
   if (tp_ar_fast_rel_enabled()) f |= kTpArFlagFastRel;
   if (tp_ar_wake_store_enabled()) f |= kTpArFlagWakeEarly;
+  if (tp_ar_parity_enabled()) f |= kTpArFlagParity;
   return f;
 }
 
 static inline void tp_sync_on_grid_change(TpContext& ctx, int nb) {
-  if (ctx.ranks > 1 && ctx.last_scratch_nb != 0 && ctx.last_scratch_nb != nb) {
+  if (!tp_ar_parity_enabled() &&
+      ctx.ranks > 1 && ctx.last_scratch_nb != 0 && ctx.last_scratch_nb != nb) {
     for (size_t r = 0; r < ctx.ranks; ++r) {
       set_device(ctx.dev[r]);
       AFF_HIP_CHECK(hipStreamSynchronize((hipStream_t)ctx.stream[r]));

@@ -208,25 +208,37 @@ AFF_TARGET_AVX512 inline void matvec_bf16_v2_avx512(const uint16_t* W, const flo
 }  // namespace detail
 
 inline void matvec_bf16_v1(const uint16_t* W, const float* x, uint64_t rows, uint64_t cols,
-                           float* out) noexcept {
+                           float* out, CpuIsa isa) noexcept {
 #if AFF_CPU_X86
-  const CpuIsa isa = active_cpu_isa();
   if (isa >= CpuIsa::Avx512) { detail::matvec_bf16_v1_avx512(W, x, rows, cols, out); return; }
   if (isa == CpuIsa::Avx2)   { detail::matvec_bf16_v1_avx2(W, x, rows, cols, out); return; }
   if (isa == CpuIsa::Avx1)   { detail::matvec_bf16_v1_avx1(W, x, rows, cols, out); return; }
+#else
+  (void)isa;
+#endif
+  detail::matvec_bf16_v1_scalar(W, x, rows, cols, out);
+}
+
+inline void matvec_bf16_v1(const uint16_t* W, const float* x, uint64_t rows, uint64_t cols,
+                           float* out) noexcept {
+  matvec_bf16_v1(W, x, rows, cols, out, active_cpu_isa());
+}
+
+inline void matvec_bf16_v2(const uint16_t* W, const float* x, uint64_t rows, uint64_t cols,
+                           float* out, CpuIsa isa) noexcept {
+#if AFF_CPU_X86
+  if (isa >= CpuIsa::Avx512) { detail::matvec_bf16_v2_avx512(W, x, rows, cols, out); return; }
+  if (isa == CpuIsa::Avx2)   { detail::matvec_bf16_v2_avx2(W, x, rows, cols, out); return; }
+  if (isa == CpuIsa::Avx1)   { detail::matvec_bf16_v2_avx1(W, x, rows, cols, out); return; }
+#else
+  (void)isa;
 #endif
   detail::matvec_bf16_v1_scalar(W, x, rows, cols, out);
 }
 
 inline void matvec_bf16_v2(const uint16_t* W, const float* x, uint64_t rows, uint64_t cols,
                            float* out) noexcept {
-#if AFF_CPU_X86
-  const CpuIsa isa = active_cpu_isa();
-  if (isa >= CpuIsa::Avx512) { detail::matvec_bf16_v2_avx512(W, x, rows, cols, out); return; }
-  if (isa == CpuIsa::Avx2)   { detail::matvec_bf16_v2_avx2(W, x, rows, cols, out); return; }
-  if (isa == CpuIsa::Avx1)   { detail::matvec_bf16_v2_avx1(W, x, rows, cols, out); return; }
-#endif
-  detail::matvec_bf16_v1_scalar(W, x, rows, cols, out);
+  matvec_bf16_v2(W, x, rows, cols, out, active_cpu_isa());
 }
 
 }  // namespace aff

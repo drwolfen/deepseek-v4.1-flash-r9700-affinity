@@ -526,8 +526,9 @@ void expert_gemv_scaled(const ExpertMatrixView& m, const Codebook& cb,
   std::vector<float> xe(npair), xo(npair);
   for (uint64_t i = 0; i < npair; ++i) { xe[i] = x[2 * i]; xo[i] = x[2 * i + 1]; }
 
-  const int eff_var = cpu_kernel_variant();
   const CpuIsa isa = active_cpu_isa();
+  const int eff_var = (g_cpu_variant >= 0) ? g_cpu_variant
+                                           : ((isa >= CpuIsa::Avx512Vbmi) ? 4 : 2);
 
   if (eff_var == 1 || isa == CpuIsa::Scalar) {
     for (uint64_t r = 0; r < m.rows; ++r) {
