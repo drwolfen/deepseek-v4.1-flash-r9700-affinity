@@ -9868,17 +9868,25 @@ bool DenseGpu::batch_slice_tail(uint32_t off, uint32_t keep, uint32_t n_embd, ui
         AFF_HIP_CHECK(hipMemsetAsync(qtm8 + live_b, 0, (size_t)(new_nb - keep) * nq_r * elem_b, st));
       }
       if (D.b_qtm_e4m3) {
-        const float* const sc_src = b_qtm_qscales(D.b_qtm, nh_r, width, old_nb);
-        float* const sc_dst = b_qtm_qscales(D.b_qtm, nh_r, width, new_nb);
-        const uint32_t gx = (new_nb + 255u) / 256u;
-        for (uint32_t r0 = 0; r0 < nh_r; r0 += band_rows) {
-          const uint32_t cnt = std::min(band_rows, nh_r - r0);
-          hipLaunchKernelGGL((slice_tail_pack_kernel<float>), dim3(gx, cnt), dim3(256), 0, st,
-                             sc_src + (size_t)r0 * old_nb, D.b_y, cnt, old_nb, new_nb, off, keep);
-          AFF_HIP_CHECK(hipGetLastError());
-          AFF_HIP_CHECK(hipMemcpyAsync(sc_dst + (size_t)r0 * new_nb, D.b_y,
-                                       (size_t)cnt * new_nb * sizeof(float),
-                                       hipMemcpyDeviceToDevice, st));
+        // dst_qs is token-major [nb, nh_r] floats (batch_head_rope_q8_tr_kernel: wtok * n_head + h).
+        const uint8_t* const sc_src =
+            reinterpret_cast<const uint8_t*>(b_qtm_qscales(D.b_qtm, nh_r, width, old_nb));
+        uint8_t* const sc_dst =
+            reinterpret_cast<uint8_t*>(b_qtm_qscales(D.b_qtm, nh_r, width, new_nb));
+        const size_t qs_live_b = (size_t)keep * nh_r * sizeof(float);
+        const size_t qs_src_off = (size_t)off * nh_r * sizeof(float);
+        if (sc_dst != sc_src || qs_src_off != 0u) {
+          for (size_t done = 0; done < qs_live_b; done += stg_bytes) {
+            const size_t chunk = std::min(stg_bytes, qs_live_b - done);
+            AFF_HIP_CHECK(hipMemcpyAsync(D.b_y, sc_src + qs_src_off + done, chunk,
+                                         hipMemcpyDeviceToDevice, st));
+            AFF_HIP_CHECK(
+                hipMemcpyAsync(sc_dst + done, D.b_y, chunk, hipMemcpyDeviceToDevice, st));
+          }
+        }
+        if (new_nb > keep) {
+          AFF_HIP_CHECK(hipMemsetAsync(sc_dst + qs_live_b, 0,
+                                       (size_t)(new_nb - keep) * nh_r * sizeof(float), st));
         }
       }
     }
@@ -10053,6 +10061,7 @@ Model::BatchOps DenseGpu::batch_ops() {
                      const uint32_t* nsel, int np, float rs, float* wt) {
     return static_cast<DenseGpu*>(c)->batch_router_hash(h, ne, nd, k, sel, nsel, np, rs, wt);
   };
+  o.slice_tail = slice_tail_cb;
   return o;
 }
 

@@ -639,9 +639,7 @@ uint32_t StaticPlacement::act_drain() {
     act_tail_ = h - kActSlots;
   }
   static thread_local std::vector<uint32_t> distinct, cnts;
-#if defined(AFF_HEAT_APPEND)
   if (ecfg_.strategy == PlacementEngineConfig::Strategy::Demand) heat_.clear_demand();
-#endif
   uint32_t took = 0;
   for (; act_tail_ < h; ++act_tail_, ++took) {
     const ActRecord& R = act_ring_->slot[act_tail_ % kActSlots];
@@ -669,11 +667,7 @@ uint32_t StaticPlacement::act_drain() {
       missing.clear();
       for (uint32_t e : distinct)
         if (device_of_[(size_t)layer * n_expert_ + e] < 0) missing.push_back(e);
-#if defined(AFF_HEAT_APPEND)
       heat_.note_missing(layer, missing.data(), (uint32_t)missing.size(), true);
-#else
-      heat_.note_missing(layer, missing.data(), (uint32_t)missing.size());
-#endif
     }
     ++act_seen_;
   }
