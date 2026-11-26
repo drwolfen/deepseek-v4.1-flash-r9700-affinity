@@ -650,16 +650,26 @@ void test_suffix_gate_deadlock_recovery() {
   }
   REQUIRE(gate.good_steps == 10u);
 
-  // Edit boundary causes partial rejection (`11/12`), then short `m=7` trap right after rejection.
+  // Near-complete partial accept (11/12, only 1 rejected < 4) must NOT trigger edit-boundary guard,
+  // allowing fast recovery on short m=7 matches.
   gate.observe(12, 11);
-  REQUIRE(gate.last_rejected);
-  aff::SuffixDraftIndex::Proposal trap{/*n=*/12, /*match_len=*/7, /*score=*/1.0f, /*expect=*/12.0f};
-  // Post-divergence guard requires match_len >= min_match + 6 (10), so m=7 is skipped cleanly!
-  REQUIRE(!gate.should_preempt(trap, 4, 2.0f, true, dsp_acc, dsp_ms, 184.0f, 1.05f));
+  REQUIRE(!gate.last_rejected);
+  aff::SuffixDraftIndex::Proposal trap_7{/*n=*/12, /*match_len=*/7, /*score=*/1.0f, /*expect=*/12.0f};
+  REQUIRE(gate.should_preempt(trap_7, 4, 2.0f, true, dsp_acc, dsp_ms, 184.0f, 1.05f));
 
-  // Even after harsh 0/12 misses that drop acc_ema below 0.65 and trigger cooldown, a verbatim
-  // streak (match_len >= 12, n >= 8, expect >= 8.0) breaks the old deadlock immediately once m >= 12.
+  // Edit boundary rejecting >= 4 tokens with >= 50% accept (8/12) sets last_rejected and raises
+  // req_match to min_match + 3 (7): m=6 is skipped cleanly while m=7 recovers.
+  gate.observe(12, 8);
+  REQUIRE(gate.last_rejected);
+  aff::SuffixDraftIndex::Proposal trap_6{/*n=*/12, /*match_len=*/6, /*score=*/1.0f, /*expect=*/12.0f};
+  REQUIRE(!gate.should_preempt(trap_6, 4, 2.0f, true, dsp_acc, dsp_ms, 184.0f, 1.05f));
+  REQUIRE(gate.should_preempt(trap_7, 4, 2.0f, true, dsp_acc, dsp_ms, 184.0f, 1.05f));
+
+  // Total 0/12 miss also sets last_rejected. Even after harsh 0/12 misses that drop acc_ema below
+  // 0.65 and trigger cooldown, a verbatim streak (match_len >= 12, n >= 8, expect >= 8.0) breaks
+  // the old deadlock immediately once m >= 12.
   gate.observe(12, 0);
+  REQUIRE(gate.last_rejected);
   gate.observe(12, 0);
   REQUIRE(gate.miss_streak == 2u);
   REQUIRE(gate.cooldown == 4u);
@@ -695,6 +705,21 @@ void test_suffix_burst_depth_15() {
   REQUIRE(prop.n == 15);
   REQUIRE(prop.match_len >= 12);
   for (int i = 0; i < 15; ++i) REQUIRE(out[i] == static_cast<int32_t>(1000u + i));
+
+  // Verify burst_hi gate threshold: requires good_steps >= 3, acc_ema >= 0.94, match_len >= 16.
+  aff::SuffixGate gate;
+  gate.reset();
+  gate.observe(12, 12);
+  gate.observe(12, 12);
+  REQUIRE(gate.good_steps == 2u);
+  REQUIRE(gate.acc_ema >= 0.94f);
+  REQUIRE(!(gate.good_steps >= 3u && gate.acc_ema >= 0.94f && idx.match_len() >= 16u));
+  gate.observe(12, 12);
+  REQUIRE(gate.good_steps == 3u);
+  REQUIRE(gate.acc_ema >= 0.94f);
+  if (idx.rust_sam_active()) {
+    REQUIRE(idx.match_len() >= 16u);
+  }
   std::printf("PASS: test_suffix_burst_depth_15\n");
 }
 

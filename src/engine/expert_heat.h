@@ -152,7 +152,8 @@ public:
   //
   // `note_missing` hands the dispatch's misses over; `pick_demand` then drains that list. It is not
   // const — the list is consumed, so the engine cannot issue the same transfer twice in one tick.
-  void note_missing(uint32_t layer, const uint32_t* experts, uint32_t n);
+  void clear_demand();
+  void note_missing(uint32_t layer, const uint32_t* experts, uint32_t n, bool append = false);
   bool pick_demand(uint32_t* promote, uint32_t* demote);
   // Preload helper for predictive hints (e.g. DSpark draft lookahead): given a pooled `idx`,
   // chooses the coldest unbusy, unprotected VRAM victim not in `protect_list[0..n_protect-1]`.
@@ -200,9 +201,10 @@ private:
   // resident experts, and promote into the one with the fewest. Maintained here rather than
   // recomputed, because `pick` runs once a layer dispatch.
   std::vector<uint32_t> res_count_;
-  // This dispatch's misses, as global indices, consumed by `pick_demand`. Reserved at init to
-  // n_expert so a tick never allocates — a layer cannot miss on more experts than it has.
+  // Queued misses, as global indices, consumed by `pick_demand`. Reserved at init to
+  // n_layer * n_expert so multi-layer append drains never reallocate.
   std::vector<uint32_t> demand_;
+  std::vector<uint8_t> demand_seen_;
 };
 
 } // namespace aff

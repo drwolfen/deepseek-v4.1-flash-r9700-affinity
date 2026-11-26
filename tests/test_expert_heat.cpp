@@ -489,6 +489,115 @@ void test_pin_numa0_behavior() {
   std::printf("PASS: test_pin_numa0_behavior\n");
 }
 
+void test_demand_append_dedup_and_clear() {
+  ExpertHeat eh;
+  HeatParams p;
+  p.decay = 1.0f;
+  p.hysteresis = 1.25f;
+  p.min_gain = 1.5f;
+  // 3 layers, 4 experts each -> 12 global indices.
+  eh.init(/*n_layer=*/3, /*n_expert=*/4, p);
+
+  // Layer 0: 3 in Vram (0,1,2), 1 in Pool (3).
+  eh.set_tier(0, ExpertTier::Vram);
+  eh.set_tier(1, ExpertTier::Vram);
+  eh.set_tier(2, ExpertTier::Vram);
+  eh.set_tier(3, ExpertTier::Pool);
+  // Layer 1: 1 in Vram (4), 3 in Pool (5,6,7).
+  eh.set_tier(4, ExpertTier::Vram);
+  eh.set_tier(5, ExpertTier::Pool);
+  eh.set_tier(6, ExpertTier::Pool);
+  eh.set_tier(7, ExpertTier::Pool);
+  // Layer 2: 2 in Vram (8,9), 2 in Pool (10,11).
+  eh.set_tier(8, ExpertTier::Vram);
+  eh.set_tier(9, ExpertTier::Vram);
+  eh.set_tier(10, ExpertTier::Pool);
+  eh.set_tier(11, ExpertTier::Pool);
+
+  // Warm up pooled candidates with distinct credits:
+  // idx 3 (cold miss: heat 1.0 < min_gain 1.5, rejected),
+  // idx 5 (heat 2.0 >= 1.5, accepted),
+  // idx 7 (heat 3.0 >= 1.5, accepted),
+  // idx 11 (heat 4.0 >= 1.5, accepted).
+  const uint32_t e0[] = {3};
+  const uint32_t c0[] = {1};
+  eh.observe(0, e0, 1, c0);
+  const uint32_t e1[] = {1, 3};
+  const uint32_t c1[] = {2, 3};
+  eh.observe(1, e1, 2, c1);
+  const uint32_t e2[] = {3};
+  const uint32_t c2[] = {4};
+  eh.observe(2, e2, 1, c2);
+
+  // Multi-layer append with duplicates both within a call and across calls.
+  const uint32_t m0[] = {3, 3};
+  const uint32_t m1[] = {1, 3, 1};
+  const uint32_t m1_dup[] = {1};
+  const uint32_t m2[] = {3, 3};
+  eh.clear_demand();
+  eh.note_missing(0, m0, 2, /*append=*/true);
+  eh.note_missing(1, m1, 3, /*append=*/true);
+  eh.note_missing(1, m1_dup, 1, /*append=*/true);
+  eh.note_missing(2, m2, 2, /*append=*/true);
+
+  uint32_t prom = 0, dem = 0;
+  // First pick skips idx 3 (heat 1.0 < 1.5), admits idx 5 (layer 1 expert 1),
+  // demotes coldest from layer 0 (res_count 3 > layer 2's 2 > layer 1's 1).
+  CHECK(eh.pick_demand(&prom, &dem));
+  CHECK(prom == 5u);
+  CHECK(dem < 4u);
+  eh.set_busy(prom, true);
+  eh.set_busy(dem, true);
+
+  // Second pick continues through remaining queue: idx 7 (deduped from [1, 3, 1] + [1]).
+  CHECK(eh.pick_demand(&prom, &dem));
+  CHECK(prom == 7u);
+  CHECK(dem < 4u);
+  eh.set_busy(prom, true);
+  eh.set_busy(dem, true);
+
+  // Third pick returns idx 11 (deduped from [3, 3] on layer 2).
+  CHECK(eh.pick_demand(&prom, &dem));
+  CHECK(prom == 11u);
+  CHECK(dem < 4u);
+  eh.set_busy(prom, true);
+  eh.set_busy(dem, true);
+
+  // Queue is now empty because duplicates were filtered.
+  CHECK(!eh.pick_demand(&prom, &dem));
+
+  // Verify clear_demand() resets demand_seen_ and drops queued misses.
+  eh.set_busy(5, false);
+  eh.set_busy(7, false);
+  eh.set_busy(11, false);
+  eh.set_busy(0, false);
+  eh.set_busy(1, false);
+  eh.set_busy(2, false);
+  eh.note_missing(1, m1, 3, /*append=*/true);
+  eh.clear_demand();
+  CHECK(!eh.pick_demand(&prom, &dem));
+  eh.note_missing(1, m1, 3, /*append=*/true);
+  CHECK(eh.pick_demand(&prom, &dem));
+  CHECK(prom == 5u);
+
+  // Verify default append=false clears prior queued layers.
+  eh.note_missing(2, m2, 2);
+  CHECK(eh.pick_demand(&prom, &dem));
+  CHECK(prom == 11u);
+  CHECK(!eh.pick_demand(&prom, &dem));
+
+  // Verify pick_demand() and pick() choose the exact same victim (tie-break included) when
+  // the hottest pooled expert is also at the head of demand_.
+  const uint32_t d_hot[] = {3};
+  eh.note_missing(2, d_hot, 1);  // idx 11 (heat 4.0, hottest overall)
+  uint32_t p_pick = 0, d_pick = 0;
+  CHECK(eh.pick(&p_pick, &d_pick));
+  CHECK(eh.pick_demand(&prom, &dem));
+  CHECK(prom == p_pick && dem == d_pick);
+
+  std::printf("PASS: test_demand_append_dedup_and_clear\n");
+}
+
 }  // namespace
 
 int main() {
@@ -498,6 +607,7 @@ int main() {
   test_engram_barrett_and_push_parity();
   test_expert_kernel_v2_parity();
   test_pin_numa0_behavior();
+  test_demand_append_dedup_and_clear();
   std::printf("PASS: all expert_heat tests passed.\n");
   return 0;
 }

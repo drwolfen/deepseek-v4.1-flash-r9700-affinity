@@ -2231,6 +2231,16 @@ int main(int argc, char** argv) {
   // block — and released around anything that waits on the network, so a slow reader cannot stall
   // the cards.
   std::mutex engine_mu;
+  uint32_t last_slot = UINT32_MAX;
+  auto activate_slot = [&](uint32_t s) -> bool {
+    if (dense_gpu.n_slots() > 1 && last_slot != UINT32_MAX && last_slot != s) {
+      dense_gpu.sync_devices();
+      dense_gpu.tp_reset_seq();
+    }
+    if (!dense_gpu.set_slot(s)) return false;
+    last_slot = s;
+    return true;
+  };
   // Context-bucketed adaptive verification EMAs (<32K, 32K..128K, >=128K), seeded across turns.
   struct SpecEmaBucket {
     std::mutex mu;
@@ -2423,7 +2433,6 @@ int main(int argc, char** argv) {
                      occurrences, cont.size(), out.size(), (double)sc->dry_delta);
     };
     const bool slot_dbg = std::getenv("AFF_SLOT_DEBUG") != nullptr;
-    const bool n_slots_gt1 = dense_gpu.n_slots() > 1;
     uint64_t tap_hash_prev = 0, kv_hash_prev = 0;
     const uint32_t dbg_layer = dense_gpu.kv_layers_debug() ? dense_gpu.kv_layers_debug() - 1u : 0u;
     uint32_t my_blocks = 0, my_accepted = 0;   // LOCAL, not model.profile(): uncontaminated
@@ -2449,7 +2458,7 @@ int main(int argc, char** argv) {
     const char* aw_env = std::getenv("AFF_ADAPTIVE_WIDTH");
     const bool adaptive_width_on = (!aw_env || !*aw_env || std::strcmp(aw_env, "0") != 0) && kConfT <= 0.0f;
     const char* aq1_env = std::getenv("AFF_DRAFT_ADAPTIVE_Q1");
-    const bool adaptive_q1_on = !(aq1_env && *aq1_env && std::strcmp(aq1_env, "0") == 0);
+    const bool adaptive_q1_on = aq1_env && *aq1_env && std::strcmp(aq1_env, "0") != 0;
     // SuffixDecoding empirical n-gram drafting and adaptive draft depth stop.
     const int sfx_min_match = [] {
       const char* v = std::getenv("AFF_DRAFT_SUFFIX_MIN_MATCH");
@@ -2481,6 +2490,15 @@ int main(int argc, char** argv) {
       const long x = std::strtol(v, &end, 10);
       if (end == v) return sfx_max;
       return (uint32_t)std::clamp<long>(x, (long)sfx_max, (long)(aff::kSpecTok - 1u));
+    }();
+    const uint32_t sfx_burst_hi = [sfx_burst_max] {
+      const char* v = std::getenv("AFF_DRAFT_SUFFIX_BURST_HI");
+      const uint32_t def = std::clamp<uint32_t>(15u, sfx_burst_max, aff::kSpecTok - 1u);
+      if (!v || !*v) return def;
+      char* end = nullptr;
+      const long x = std::strtol(v, &end, 10);
+      if (end == v) return def;
+      return (uint32_t)std::clamp<long>(x, (long)sfx_burst_max, (long)(aff::kSpecTok - 1u));
     }();
     const float sfx_min_expect = [] {
       const char* v = std::getenv("AFF_DRAFT_SUFFIX_MIN_EXPECT");
@@ -2571,7 +2589,7 @@ int main(int argc, char** argv) {
       // the emit callback, and emit writes to a socket.
       std::unique_lock<std::mutex> step(engine_mu);
       const auto step_t0 = std::chrono::steady_clock::now();
-      if (!dense_gpu.set_slot(slot)) {
+      if (!activate_slot(slot)) {
         aff::ui::fatal("fatal: slot %u out of range\n", slot);
         std::abort();
       }
@@ -2609,10 +2627,14 @@ int main(int argc, char** argv) {
         const uint32_t max_nd = std::min<uint32_t>(aff::kSpecTok - 1u, rem_out - 1u);
         const bool dspark_eligible = draft_on && st.pos && !skip_draft;
         if (draft_suffix_on && suffix_idx && max_nd >= (uint32_t)sfx_min_match) {
+          const size_t cur_mlen = suffix_idx->match_len();
           const bool burst_ok = aff::suffix_gate_v2_enabled() && sfx_gate.good_steps >= 2u &&
                                 sfx_gate.miss_streak == 0u && sfx_gate.acc_ema >= 0.85f &&
-                                suffix_idx->match_len() >= 12u;
-          const uint32_t eff_sfx_max = burst_ok ? sfx_burst_max : sfx_max;
+                                cur_mlen >= 12u;
+          const bool burst_hi_ok = burst_ok && sfx_gate.good_steps >= 3u &&
+                                   sfx_gate.acc_ema >= 0.94f && cur_mlen >= 16u;
+          const uint32_t eff_sfx_max =
+              burst_hi_ok ? sfx_burst_hi : (burst_ok ? sfx_burst_max : sfx_max);
           auto prop = suffix_idx->propose(
               hist, 1ull, sfx_min_match,
               (int)std::min<uint32_t>(eff_sfx_max, max_nd), sfx_min_score, suffix_buf.data());
@@ -2686,9 +2708,8 @@ int main(int argc, char** argv) {
               float survival = 1.0f;
               float exp_commits = 1.0f; // target bonus token at the accept frontier
               if (adaptive_q1_on) {
-                const float c1_raw = (cost_samples[1] > 2u && cost_ema[1] > 1.0f)
-                    ? cost_ema[1]
-                    : (cost_ema[2] > 1.0f ? cost_ema[2] * 0.85f : std::max(cost_ema[1], 1.0f));
+                // model.dspark_draft() already ran this step, so q=1 still pays the sunk draft cost.
+                const float c1_raw = std::max(cost_ema[1], cost_ema[2] * 0.98f);
                 util[1] = 1.0f / std::max(c1_raw, 1.0f);
                 best_u = util[1];
                 best_q = 1u;
@@ -2867,7 +2888,6 @@ int main(int argc, char** argv) {
       }
       // Positions P..P+k are real; P+k+1 holds tail and is fed by the next block.
       model.rollback(&st, P + k + 1);
-      if (n_slots_gt1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
       if (slot_dbg) { tap_hash_prev = dense_gpu.tap_hash_debug();
                       kv_hash_prev = dense_gpu.kv_hash_debug(dbg_layer); }
       const double step_ms =
@@ -2876,9 +2896,9 @@ int main(int argc, char** argv) {
       if (adaptive_width_on && !forcing && !close_cut) {
         const uint32_t q_off = std::min<uint32_t>(nd + 1, kMaxQ - 1);
         // Update step cost EMA after warmup (ignore first 2 cold steps per width, clamp outliers).
-        // Under greedy decoding (temp=0 / !sc), avoid wall-clock timing jitter altering verify width decisions (PR #967).
+        // Under greedy decoding (temp<=0 / !sc), avoid wall-clock timing jitter altering verify width decisions (PR #967).
         // Also isolate from SuffixDecoding steps, which skip dspark_draft overhead.
-        if (sc && !used_suffix && q_off < kMaxQ && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
+        if (sc && sc->temperature > 0.0f && !used_suffix && q_off < kMaxQ && ++cost_samples[q_off] > 2 && step_ms > 1.0) {
           const float old_c = cost_ema[q_off];
           const float clamped_ms = (old_c > 0.0f)
               ? std::min((float)step_ms, old_c * 1.25f)
@@ -2993,10 +3013,9 @@ int main(int argc, char** argv) {
         if (!emit(next)) { stop = true; break; }
         if ((!forcing || i == k) && check_think_closed && check_think_closed()) {
           std::unique_lock<std::mutex> step(engine_mu);
-          dense_gpu.set_slot(slot);
+          activate_slot(slot);
           if (i < k) {
             model.rollback(&st, P + i + 1);
-            if (n_slots_gt1) { dense_gpu.sync_devices(); dense_gpu.tp_reset_seq(); }
             seed_n = vb.tap_rows ? std::min<uint32_t>(vb.tap_rows, i + 1) : 0u;
             seed_pos0 = P;
             tail = next;
@@ -3784,7 +3803,7 @@ int main(int argc, char** argv) {
         // against the other slot's publish, which mutates the same index and stage pool. lookup
         // was previously outside the lock, racing publish's hash-table writes.
         std::unique_lock<std::mutex> step(engine_mu);
-        dense_gpu.set_slot(slot);
+        activate_slot(slot);
         hit = prefix_cache.lookup(ids.data(), n_pre, &matched);   // index only, no I/O
         if (hit) kv_reserve_for((uint64_t)hit + 2);
         if (hit && prefix_cache.restore(ids.data(), hit, &rerr)) {
@@ -3841,10 +3860,17 @@ int main(int argc, char** argv) {
       dry_hint.dry_ngram = sample_cfg.dry_ngram;
       return launch_suffix_acquire(ids, &dry_hint);
     }();
+    const uint32_t promote_min_rem = [] {
+      const char* s = std::getenv("AFF_PCACHE_PROMOTE_MIN_REM");
+      if (!s || !*s) return 512u;
+      char* end = nullptr;
+      const unsigned long x = std::strtoul(s, &end, 10);
+      return end == s ? 512u : (uint32_t)x;
+    }();
     uint32_t promote = 0;
     if (prefix_cache.ready() && pv.count == 0) {
       const uint64_t b = (uint64_t)matched_blocks * prefix_cache.block_tokens();
-      if (b > from && b + c.sliding <= n_pre) promote = (uint32_t)b;
+      if (b > from && b + std::max<uint32_t>(c.sliding, promote_min_rem) <= n_pre) promote = (uint32_t)b;
     }
     if (promote) {
       if (!heartbeat_fn()) {
@@ -3853,7 +3879,7 @@ int main(int argc, char** argv) {
         return;
       }
       std::unique_lock<std::mutex> step(engine_mu);
-      dense_gpu.set_slot(slot);
+      activate_slot(slot);
       kv_reserve_for((uint64_t)promote + 2);
       watch_prefill(true);
       bool pre_ok = false;
@@ -3923,7 +3949,7 @@ int main(int argc, char** argv) {
         return;
       }
       std::unique_lock<std::mutex> step(engine_mu);
-      dense_gpu.set_slot(slot);
+      activate_slot(slot);
       kv_reserve_for(target == n_pre ? (uint64_t)ids.size() + 2 : (uint64_t)target + 2);
       watch_prefill(true);
       bool pre_ok = false;
@@ -3959,7 +3985,7 @@ int main(int argc, char** argv) {
     if (prefill_ckpt_pos == n_pre && prefix_cache.ready() && pv.count == 0 &&
         n_pre >= last_ckpt_pos + prefix_cache.block_tokens()) {
       std::unique_lock<std::mutex> step(engine_mu);
-      dense_gpu.set_slot(slot);
+      activate_slot(slot);
       std::string perr;
       if (!prefix_cache.publish(ids.data(), n_pre, &perr))
         aff::ui::err("prefix cache: %s\n", perr.c_str());
@@ -3971,7 +3997,7 @@ int main(int argc, char** argv) {
 #ifdef AFF_WITH_HIP
     if (pcache_verify && n_pre) {
       std::unique_lock<std::mutex> step(engine_mu);
-      dense_gpu.set_slot(slot);
+      activate_slot(slot);
       // Every live row, in the region order the store uses. The append-only parts are hashed only
       // as far as the position reaches, because rows past it are whatever the last conversation
       // left and are never read; the rings are hashed whole, because all of them are live.
@@ -4337,7 +4363,7 @@ int main(int argc, char** argv) {
       const uint32_t upto = (uint32_t)std::min<size_t>(st.pos, cache_end);
       {
         std::unique_lock<std::mutex> step(engine_mu);
-        dense_gpu.set_slot(slot);
+        activate_slot(slot);
         if (st.pos > upto) model.rollback(&st, upto);
         if (!post_sse && upto) {
           const auto t_pub0 = std::chrono::steady_clock::now();
@@ -4351,10 +4377,10 @@ int main(int argc, char** argv) {
         }
       }
       if (post_sse && upto) {
-        res->post_send = [&prefix_cache, &dense_gpu, &engine_mu, slot, upto,
+        res->post_send = [&prefix_cache, &activate_slot, &engine_mu, slot, upto,
                           pub_ids = std::move(hist)]() {
           std::unique_lock<std::mutex> step(engine_mu);
-          dense_gpu.set_slot(slot);
+          activate_slot(slot);
           const auto t_pub0 = std::chrono::steady_clock::now();
           std::string perr;
           if (!prefix_cache.publish(pub_ids.data(), upto, &perr))

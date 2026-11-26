@@ -763,6 +763,10 @@ public:
     // Optional hint naming up to two weight handles (`h0`, `h1`, -1 when unused) to prefetch
     // beside the upcoming cross-card all-reduce (`AFF_PREFETCH_BESIDE`).
     void (*prefetch_hint)(void* ctx, int32_t h0, int32_t h1) = nullptr;
+    // Slice the live prefill batch down to trailing tokens [off, off + keep) -> [0, keep)
+    // inside a folded bounded-replay tail chunk (after layer replay_cut's attention inputs).
+    bool (*slice_tail)(void* ctx, uint32_t off, uint32_t keep, uint32_t n_embd, uint32_t n_hc,
+                       uint32_t n_head, uint32_t width, uint32_t qr_dim) = nullptr;
     void* ctx = nullptr;
   };
   void set_batch_ops(const BatchOps& b) { bops_ = b; }

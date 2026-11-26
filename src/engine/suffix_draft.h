@@ -953,12 +953,12 @@ struct SuffixGate {
       // Never let bare 4-token (min_match) or cold 5-token collisions preempt GPU DSpark;
       // require a strong exact anchor (>= min_match + 2) to enter suffix mode, or
       // >= min_match + 1 once a proven high-acceptance streak is active.
-      // After a rejected suffix block (edit boundary), require a stronger >= min_match + 6 anchor
+      // After a rejected suffix block (edit boundary), require a stronger >= min_match + 3 anchor
       // so short collisions skip cleanly onto one DSpark block before verbatim matching resumes.
       int req_match = (steps > 0 && miss_streak == 0 && acc_ema >= 0.80f)
                           ? (min_match + 1)
                           : (min_match + 2);
-      if (v2 && last_rejected) req_match = std::max(req_match, min_match + 6);
+      if (v2 && last_rejected) req_match = std::max(req_match, min_match + 3);
       if (prop.match_len < req_match) {
         if (cooldown > 0) --cooldown;
         return false;
@@ -992,7 +992,7 @@ struct SuffixGate {
     const float alpha = (v2 && good_steps >= 3u && miss_streak == 0u) ? 0.25f : 0.45f;
     acc_ema = (1.0f - alpha) * acc_ema + alpha * rate;
     ++steps;
-    last_rejected = (k < nd && k * 2u >= nd);
+    last_rejected = (k == 0u || (k < nd && (nd - k) >= 4u && k * 2u >= nd));
     if (k >= 4u && (k * 2u >= nd)) ++good_steps;
     if (k < 2u || (k * 2u < nd)) {
       ++miss_streak;

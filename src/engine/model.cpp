@@ -1958,36 +1958,63 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
   // A prefill is a sequence of ubatches and EVERY ubatch re-sweeps the experts it touches. A short
   // last ubatch therefore pays for a whole extra sweep and amortises it over almost no tokens.
   // Avalon measures +18% on a 19k prompt from splitting into as FEW equal ubatches as the cap
-  // allows, instead of `cap`-sized ones with a remainder. Off by default, so the old chunking stays
-  // one restart away (unset AFF_EQUAL_UBATCH) while the two are compared.
+  // allows, instead of `cap`-sized ones with a remainder. On by default (`AFF_EQUAL_UBATCH=0`
+  // disables).
   static const bool equal_ubatch = [] {
     const char* e = std::getenv("AFF_EQUAL_UBATCH");
-    return e && *e && std::strcmp(e, "0") != 0;
+    return !e || !*e || std::strcmp(e, "0") != 0;
   }();
+  static const bool skip_dead_replay_cut = [] {
+    const char* v = std::getenv("AFF_SKIP_DEAD_REPLAY_CUT");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  static const bool fold_replay_tail_on = [] {
+    const char* v = std::getenv("AFF_FOLD_REPLAY_TAIL");
+    return !v || !*v || std::strcmp(v, "0") != 0;
+  }();
+  const bool can_fold_tail =
+      fold_replay_tail_on && replay_cut < cfg_.n_layer && bops_.slice_tail != nullptr &&
+      !(vision && vision->count > 0) && (!blk || tap_rows <= cfg_.sliding);
 
   for (uint32_t base = 0; base < n; ) {
     // Where the current SEGMENT ends. Two things cut a prefill into segments that cannot be
     // crossed: bounded replay (everything before the final sliding window runs only up to the last
-    // KV source) and a vision span. The cap applies INSIDE a segment, never across one.
+    // KV source, or folds into the last chunk when n - base <= chunk) and a vision span. The cap
+    // applies INSIDE a segment, never across one.
     uint32_t limit = n;
-    if (replay_cut < cfg_.n_layer && base < replay_from) limit = std::min(limit, replay_from);
+    if (replay_cut < cfg_.n_layer && base < replay_from && !can_fold_tail) {
+      limit = std::min(limit, replay_from);
+    }
     if (vision && vision->count > 0 && vision->embeddings) {
       const uint32_t v_start = vision->start;
       const uint32_t v_end = vision->start + vision->count;
       if (base < v_start) limit = std::min(limit, v_start);
       else if (base < v_end) limit = std::min(limit, v_end);
     }
-    uint32_t live;
-    if (equal_ubatch) {
-      // As few equal ubatches as the cap allows: n_chunks = ceil(seg / chunk), each ceil(seg /
-      // n_chunks) tokens. They differ by at most one token, and NONE is padded — a padded token
-      // would run every layer and advance `s->pos` as if the prompt held it.
-      const uint32_t seg = limit - base;
-      const uint32_t n_chunks = (seg + chunk - 1) / chunk;
-      live = (seg + n_chunks - 1) / n_chunks;
-    } else {
-      live = std::min(chunk, limit - base);
+    auto compute_live = [&](uint32_t lim) -> uint32_t {
+      if (equal_ubatch) {
+        // As few equal ubatches as the cap allows: n_chunks = ceil(seg / chunk), each ceil(seg /
+        // n_chunks) tokens. They differ by at most one token, and NONE is padded — a padded token
+        // would run every layer and advance `s->pos` as if the prompt held it.
+        const uint32_t seg = lim - base;
+        const uint32_t n_chunks = (seg + chunk - 1) / chunk;
+        return (seg + n_chunks - 1) / n_chunks;
+      }
+      return std::min(chunk, lim - base);
+    };
+    uint32_t live = compute_live(limit);
+    // Never split [replay_from..n) across two chunks when starting before replay_from.
+    if (replay_cut < cfg_.n_layer && base < replay_from &&
+        base + live > replay_from && base + live < n) {
+      limit = std::min(limit, replay_from);
+      live = compute_live(limit);
     }
+    const bool folded_tail =
+        can_fold_tail && base < replay_from && base + live == n && limit == n;
+    const uint32_t tail_keep = folded_tail ? (n - replay_from) : 0u;
+    const uint32_t tail_off = folded_tail ? (live - tail_keep) : 0u;
+    const uint32_t live_orig = live;
+    uint32_t base_cur = base;
     const bool is_image_chunk = (vision && vision->count > 0 &&
                                  base >= vision->start &&
                                  base < vision->start + vision->count);
@@ -1999,7 +2026,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       if (blk) blk->tap_rows = 0;
       return false;
     }
-    const uint32_t pos0 = s->pos;
+    uint32_t pos0 = s->pos;
     const bool chunk_has_vision =
         vision && vision->count > 0 && vision->embeddings &&
         base < vision->start + vision->count && base + live > vision->start;
@@ -2039,9 +2066,9 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
     AFF_PH(hyper);
 
     // ---- Engram: this chunk's hash ids AND dequantised table rows -----------------------------
-    // Gather Engram slot 0 (layer 1) upfront with parallel_for threshold 2 (also parallelizing
-    // DSpark verify blocks), and overlap later slots (layer 14) asynchronously on the background
-    // pool while GPUs execute layers 0..13.
+    // Hoist Engram slot 0 (layer 1) onto the background worker before layer 0 so layer 0 GPU work
+    // overlaps with slot 0 gather, then synchronize before layer 1 and overlap tail slots (layer 14)
+    // in the background between layers 1 and 14.
     const uint32_t eng_in_dim = eng_c_.n_cols * eng_c_.head_dim;
     const uint32_t eng_raw_stride = eng_t_.raw_mxfp8_stride();
     bool use_raw_eng =
@@ -2058,78 +2085,63 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       }
     }
     const uint32_t async_min_live = engram_async_dec_env() ? 1u : 64u;
-    const bool async_eng_tail = (eng_on_ && live >= async_min_live && eng_c_.n_layer > 1u);
+    const bool async_eng = (eng_on_ && eng_c_.n_layer > 0u && live_orig >= async_min_live);
+    struct EngramWaitGuard {
+      EngramBgWorker* w = nullptr;
+      void arm(EngramBgWorker* worker) { w = worker; }
+      void sync() { if (w) { w->wait(); w = nullptr; } }
+      ~EngramWaitGuard() { sync(); }
+    } eng_wait;
     if (eng_on_ && eng_c_.n_layer > 0) {
       if (!eng_h_.ready()) eng_h_.init(&eng_c_, 0);
-      eng_ids_.resize((size_t)live * eng_c_.n_layer * eng_c_.n_cols);
+      eng_ids_.resize((size_t)live_orig * eng_c_.n_layer * eng_c_.n_cols);
       if (use_raw_eng)
-        eng_raw_.resize((size_t)eng_c_.n_layer * live * eng_raw_stride);
+        eng_raw_.resize((size_t)eng_c_.n_layer * live_orig * eng_raw_stride);
       else
-        eng_rows_.resize((size_t)eng_c_.n_layer * live * eng_in_dim);
+        eng_rows_.resize((size_t)eng_c_.n_layer * live_orig * eng_in_dim);
       const uint8_t* alive_ptr = nullptr;
       if (is_image_chunk) {
-        ensure_size(sc.eng_alive, live);
-        std::fill_n(sc.eng_alive.data(), live, (uint8_t)0);
+        ensure_size(sc.eng_alive, live_orig);
+        std::fill_n(sc.eng_alive.data(), live_orig, (uint8_t)0);
         alive_ptr = sc.eng_alive.data();
       }
-      eng_h_.push(ids + base, live, pos0, eng_ids_.data(), alive_ptr);
-      if (!async_eng_tail && live < 64u) {
+      eng_h_.push(ids + base, live_orig, pos0, eng_ids_.data(), alive_ptr);
+      if (!async_eng) {
         for (uint32_t i = 0; i < eng_c_.n_layer; ++i) {
-          for (uint32_t t = 0; t < live; ++t) {
+          for (uint32_t t = 0; t < live_orig; ++t) {
             const int64_t* const idp =
                 eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols;
             if (use_raw_eng) {
               eng_t_.gather_mxfp8(i, idp,
-                                  eng_raw_.data() + ((size_t)i * live + t) * eng_raw_stride);
+                                  eng_raw_.data() + ((size_t)i * live_orig + t) * eng_raw_stride);
             } else {
-              eng_t_.gather(i, idp, eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
+              eng_t_.gather(i, idp, eng_rows_.data() + ((size_t)i * live_orig + t) * eng_in_dim);
             }
           }
         }
       } else {
-        parallel_for((uint64_t)live, 2, [&](uint64_t t0, uint64_t t1) {
-          for (uint64_t t = t0; t < t1; ++t) {
-            const int64_t* const idp = eng_ids_.data() + (size_t)t * eng_c_.n_layer * eng_c_.n_cols;
-            if (use_raw_eng) {
-              eng_t_.gather_mxfp8(0, idp, eng_raw_.data() + (size_t)t * eng_raw_stride);
-            } else {
-              eng_t_.gather(0, idp, eng_rows_.data() + (size_t)t * eng_in_dim);
-            }
-          }
-        });
-        if (async_eng_tail) {
-          if (!sc.eng_bg) sc.eng_bg = std::make_unique<EngramBgWorker>();
-          EngramBgWorker* const bg = sc.eng_bg.get();
-          const uint32_t tail_layers = eng_c_.n_layer - 1u;
-          const uint64_t tail_jobs = (uint64_t)tail_layers * live;
-          bg->launch([this, bg, live, eng_in_dim, eng_raw_stride, use_raw_eng, tail_jobs] {
-            bg->parallel_for_tail(tail_jobs, 2, [&](uint64_t j0, uint64_t j1) {
-              for (uint64_t j = j0; j < j1; ++j) {
-                const uint32_t i = 1u + (uint32_t)(j / live);
-                const uint64_t t = j % live;
-                const int64_t* const idp =
-                    eng_ids_.data() + ((size_t)t * eng_c_.n_layer + i) * eng_c_.n_cols;
-                if (use_raw_eng) {
-                  eng_t_.gather_mxfp8(i, idp,
-                                      eng_raw_.data() + ((size_t)i * live + t) * eng_raw_stride);
-                } else {
-                  eng_t_.gather(i, idp, eng_rows_.data() + ((size_t)i * live + t) * eng_in_dim);
-                }
+        if (!sc.eng_bg) sc.eng_bg = std::make_unique<EngramBgWorker>();
+        EngramBgWorker* const bg = sc.eng_bg.get();
+        bg->launch([this, bg, live_orig, eng_in_dim, eng_raw_stride, use_raw_eng] {
+          bg->parallel_for_tail((uint64_t)live_orig, 2, [&](uint64_t t0, uint64_t t1) {
+            for (uint64_t t = t0; t < t1; ++t) {
+              const int64_t* const idp =
+                  eng_ids_.data() + (size_t)t * eng_c_.n_layer * eng_c_.n_cols;
+              if (use_raw_eng) {
+                eng_t_.gather_mxfp8(0, idp, eng_raw_.data() + (size_t)t * eng_raw_stride);
+              } else {
+                eng_t_.gather(0, idp, eng_rows_.data() + (size_t)t * eng_in_dim);
               }
-            });
+            }
           });
-        }
+        });
+        eng_wait.arm(bg);
       }
     }
 
-    const bool early_replay_chunk = (replay_cut < cfg_.n_layer && base + live <= replay_from);
+    const bool early_replay_chunk =
+        !folded_tail && (replay_cut < cfg_.n_layer && base + live <= replay_from);
     const uint32_t layer_limit = early_replay_chunk ? (replay_cut + 1u) : cfg_.n_layer;
-
-    struct EngramWaitGuard {
-      EngramBgWorker* w = nullptr;
-      void sync() { if (w) { w->wait(); w = nullptr; } }
-      ~EngramWaitGuard() { sync(); }
-    } eng_wait{async_eng_tail ? sc.eng_bg.get() : nullptr};
 
     for (uint32_t l = 0; l < layer_limit; ++l) {
       const LayerWeights& w = layers_[l];
@@ -2141,14 +2153,39 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // that genuinely costs -- `live * n_cols` random rows of a 91.6 GiB mmap.
       if (eng_on_ && eng_slot_[l] >= 0 && bops_.engram) {
         const uint32_t i = (uint32_t)eng_slot_[l];
-        if (i > 0u) eng_wait.sync();
+        if (async_eng) {
+          eng_wait.sync();
+          if (i == 0u && eng_c_.n_layer > 1u) {
+            EngramBgWorker* const bg = sc.eng_bg.get();
+            const uint32_t tail_layers = eng_c_.n_layer - 1u;
+            const uint64_t tail_jobs = (uint64_t)tail_layers * live_orig;
+            bg->launch([this, bg, live_orig, eng_in_dim, eng_raw_stride, use_raw_eng, tail_jobs] {
+              bg->parallel_for_tail(tail_jobs, 2, [&](uint64_t j0, uint64_t j1) {
+                for (uint64_t j = j0; j < j1; ++j) {
+                  const uint32_t si = 1u + (uint32_t)(j / live_orig);
+                  const uint64_t t = j % live_orig;
+                  const int64_t* const idp =
+                      eng_ids_.data() + ((size_t)t * eng_c_.n_layer + si) * eng_c_.n_cols;
+                  if (use_raw_eng) {
+                    eng_t_.gather_mxfp8(si, idp,
+                                        eng_raw_.data() + ((size_t)si * live_orig + t) * eng_raw_stride);
+                  } else {
+                    eng_t_.gather(si, idp,
+                                  eng_rows_.data() + ((size_t)si * live_orig + t) * eng_in_dim);
+                  }
+                }
+              });
+            });
+            eng_wait.arm(bg);
+          }
+        }
         bool eng_ok = false;
         if (use_raw_eng) {
-          const uint8_t* layer_raw = eng_raw_.data() + (size_t)i * live * eng_raw_stride;
+          const uint8_t* layer_raw = eng_raw_.data() + (size_t)i * live_orig * eng_raw_stride;
           eng_ok = bops_.engram_mxfp8(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], layer_raw, live,
                                       eng_in_dim, E, HC, cfg_.rms_eps);
         } else {
-          const float* layer_rows = eng_rows_.data() + (size_t)i * live * eng_in_dim;
+          const float* layer_rows = eng_rows_.data() + (size_t)i * live_orig * eng_in_dim;
           eng_ok = bops_.engram(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], layer_rows, live,
                                 eng_in_dim, E, HC, cfg_.rms_eps);
         }
@@ -2175,6 +2212,89 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       const bool skip_short_seq = sparse_indexer_on && indexer_short_seq_skip(pos0 + live, cfg_.index_topk);
       const bool idx_may_run = !skip_short_seq && w.ratio && cfg_.is_index_source(l) && w.idx_wq_b &&
                                cfg_.index_topk < st.n_comp + live / w.ratio + 1u;
+
+      if (skip_dead_replay_cut && early_replay_chunk && l == replay_cut) {
+        // Dead replay-cut layer: nothing after l == replay_cut runs on tokens before replay_from,
+        // so only build compressed KV/index keys and (if within the final sliding window) raw SWA
+        // keys, advance LayerState across live tokens, and skip attention/FFN completely.
+        if (!bops_.hc_pre(bops_.ctx, w.hc_attn_fn.gpu, w.hc_attn_scale_gpu, w.hc_attn_base_gpu,
+                          w.attn_norm_gpu, E, HC, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
+                          nullptr))
+          return false;
+        AFF_PH(hyper);
+
+        const bool need_raw_kv = ((uint64_t)base + live + cfg_.sliding > replay_from);
+        if (need_raw_kv) {
+          const RopeDerived rd = rope_derive(w.rope, ROT);
+          if (!bops_.attn_qkv(bops_.ctx, w.wq_a.gpu, w.wq_b.gpu, w.q_norm_gpu, w.wkv.gpu,
+                              w.kv_norm_gpu, E, QR, NH, W, ROT, rd, cfg_.rms_eps, nullptr, true))
+            return false;
+          AFF_PH(attn_proj);
+        }
+
+        const bool has_idx = cfg_.v41 ? (cfg_.is_kv_source(l) && w.idx_wk && w.idx_k_norm)
+                                      : (w.ratio == 4 && w.idx_comp_wkv && w.idx_comp_wgate);
+        const bool dev_comp = bops_.compress && w.ratio && w.comp_wkv &&
+                              (w.comp_wgate || cfg_.v41) && cfg_.is_kv_source(l);
+        uint32_t n_out = 0;
+        if (w.ratio) {
+          const uint64_t cap = st.comp_rows;
+          for (uint32_t b = 0; b < live; ++b)
+            if ((pos0 + b + 1) % w.ratio == 0 && st.n_comp + n_out + 1 <= cap) ++n_out;
+        }
+        if (dev_comp) {
+          CompressArgs ca;
+          ca.layer = l; ca.n = live; ca.pos0 = pos0; ca.ratio = w.ratio; ca.n_out = n_out;
+          ca.h_kv = w.comp_wkv.gpu; ca.h_sc = w.comp_wgate.gpu;
+          if (has_idx && cfg_.v41) {
+            ca.h_idx_wk = w.idx_wk.gpu; ca.idx_k_norm = w.idx_k_norm;
+          } else if (has_idx) {
+            ca.h_ikv = w.idx_comp_wkv.gpu; ca.h_isc = w.idx_comp_wgate.gpu;
+          }
+          ca.h_iproj = -1;
+          ca.ape = w.comp_ape;   ca.norm = w.comp_norm;
+          ca.iape = w.idx_comp_ape; ca.inorm = w.idx_comp_norm;
+          ca.width = W; ca.idx_dim = IHD; ca.n_embd = E;
+          ca.n_rot = kCompressorRot; ca.rope = rope_derive(w.rope, kCompressorRot);
+          ca.slot0 = st.n_comp; ca.idx_slot0 = st.n_idx_comp;
+          ca.idx_heads = 0u;
+          ca.iscale = 1.0f / std::sqrt((float)(IHD * INH));
+          ca.eps = cfg_.rms_eps;
+          if (!bops_.compress(bops_.ctx, ca)) return false;
+        } else if (w.ratio && cfg_.is_kv_source(l)) {
+          aff::ui::fatal("fatal: layer %u has a compressor and the device cannot run it\n", l);
+          std::abort();
+        }
+        AFF_PH(compressor);
+
+        if (need_raw_kv) {
+          for (uint32_t g0 = 0; g0 < live; g0 += kAttnBatch) {
+            const uint32_t gn = std::min<uint32_t>(kAttnBatch, live - g0);
+            if (!bops_.kv_commit(bops_.ctx, l, g0, gn, pos0 + g0, W, ROT)) return false;
+          }
+          AFF_PH(attention);
+        }
+
+        const uint32_t n_comp_end = st.n_comp + n_out;
+        const bool shares_kv = w.ratio && w.kv_owner != l;
+        for (uint32_t b = 0; b < live; ++b) {
+          const uint32_t pos = pos0 + b;
+          st.raw_head = (st.raw_head + 1) % cfg_.sliding;
+          if (st.n_raw < cfg_.sliding) ++st.n_raw;
+          if (dev_comp) {
+            if ((pos + 1) % w.ratio == 0 && st.n_comp < n_comp_end) {
+              ++st.n_comp;
+              if (has_idx) ++st.n_idx_comp;
+            }
+          } else if (shares_kv && (pos + 1) % w.ratio == 0 &&
+                     st.n_comp < s->layer[w.kv_owner].n_comp) {
+            if (cfg_.v41) ++st.n_idx_comp;
+            ++st.n_comp;
+          }
+        }
+        break;
+      }
+
       // Null, not `normb`: neither host buffer this sublayer could ask for has a reader. The
       // compressors take `norm` on device and the indexer's query projection takes `qr_norm` there,
       // and nothing between here and the FFN sublayer looks at a host copy — the FFN sublayer
@@ -2238,6 +2358,52 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         aff::ui::fatal("fatal: layer %u has a compressor and the device cannot run it\n", l);
         std::abort();
       }
+      const uint32_t n_comp_end = st.n_comp + n_out;   // what the device just emitted, in total
+      const bool shares_kv = w.ratio && w.kv_owner != l;
+      bool sliced_here = false;
+      if (folded_tail && l == replay_cut) {
+        // Folded tail: commit all live_orig raw SWA keys before slicing, advance LayerState across
+        // [0..tail_off) on replay_cut and layers > replay_cut, slice device buffers to tail_keep,
+        // then run indexer_q -> indexer -> attend -> attn_out -> FFN and L21..39 on tail_keep.
+        for (uint32_t g0 = 0; g0 < live_orig; g0 += kAttnBatch) {
+          const uint32_t gn = std::min<uint32_t>(kAttnBatch, live_orig - g0);
+          if (!bops_.kv_commit(bops_.ctx, l, g0, gn, pos0 + g0, W, ROT)) return false;
+        }
+        for (uint32_t b = 0; b < tail_off; ++b) {
+          const uint32_t pos = pos0 + b;
+          st.raw_head = (st.raw_head + 1) % cfg_.sliding;
+          if (st.n_raw < cfg_.sliding) ++st.n_raw;
+          if (dev_comp) {
+            if ((pos + 1) % w.ratio == 0 && st.n_comp < n_comp_end) {
+              ++st.n_comp;
+              if (has_idx) ++st.n_idx_comp;
+            }
+          } else if (shares_kv && (pos + 1) % w.ratio == 0 &&
+                     st.n_comp < s->layer[w.kv_owner].n_comp) {
+            if (cfg_.v41) ++st.n_idx_comp;
+            ++st.n_comp;
+          }
+        }
+        for (uint32_t ls = replay_cut + 1u; ls < cfg_.n_layer; ++ls) {
+          LayerState& st_skip = s->layer[ls];
+          const uint32_t r_skip = layers_[ls].ratio;
+          for (uint32_t b = 0; b < tail_off; ++b) {
+            const uint32_t pos = pos0 + b;
+            st_skip.raw_head = (st_skip.raw_head + 1) % cfg_.sliding;
+            if (st_skip.n_raw < cfg_.sliding) ++st_skip.n_raw;
+            if (r_skip && layers_[ls].kv_owner != ls && (pos + 1) % r_skip == 0 &&
+                st_skip.n_comp < s->layer[layers_[ls].kv_owner].n_comp) {
+              if (cfg_.v41) ++st_skip.n_idx_comp;
+              ++st_skip.n_comp;
+            }
+          }
+        }
+        if (!bops_.slice_tail(bops_.ctx, tail_off, tail_keep, E, HC, NH, W, QR)) return false;
+        live = tail_keep;
+        pos0 += tail_off;
+        base_cur += tail_off;
+        sliced_here = true;
+      }
       if (idx_may_run) {
         // The indexer's query projection reads qr_norm, not `norm` — a different activation, so a
         // second batch. It stays ON DEVICE: nothing on the host reads it, and draining it back only
@@ -2278,8 +2444,6 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // each token sees its own prefix of it.
       bool idx_run = false;
       uint32_t idx_keys = 0;
-      const uint32_t n_comp_end = st.n_comp + n_out;   // what the device just emitted, in total
-      const bool shares_kv = w.ratio && w.kv_owner != l;
 
       // Wave 3 Item 1: Prefill chunk metadata built once per request chunk range (vLLM PR #67712 pattern)
       IndexerChunkMeta chunk_meta = build_indexer_chunk_metadata(
@@ -2356,7 +2520,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         IndexerSubChunkView sub = slice_indexer_subchunk(chunk_meta, (uint32_t)sub_idx);
         const uint32_t g0 = sub.token_start;
         const uint32_t gn = sub.token_len;
-        if (!bops_.kv_commit(bops_.ctx, l, g0, gn, pos0 + g0, W, ROT)) return false;
+        if (!sliced_here && !bops_.kv_commit(bops_.ctx, l, g0, gn, pos0 + g0, W, ROT)) return false;
         // Null `allowed`: the indexer left the admission mask on device, in the buffer this reads.
         if (!bops_.attend(bops_.ctx, l, g0, gn, pos0 + g0, nullptr, mstride, ncompb.data() + g0, kq,
                           raw_floor))
@@ -2396,14 +2560,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       }
       AFF_PH(router);
 
-      if (w.shexp_gate &&
-          !bops_.shexp(bops_.ctx, w.shexp_gate.gpu, w.shexp_up.gpu, w.shexp_down.gpu, E,
-                       cfg_.moe_inter, cfg_.swiglu_limit))
-        return false;
-      AFF_PH(ffn_dense);
-
-      // Route every token BEFORE dispatching any of them: the batched pass groups by expert, which
-      // it cannot do while the selections are still arriving one token at a time.
+      // Route every token BEFORE dispatching any of them (and before shexp so router_topk +
+      // route_publish run ahead of shexp overlap).
       const uint32_t KS = cfg_.n_expert_used;
       ensure_size(selb, (size_t)live * KS);
       ensure_size(swb, (size_t)live * KS);
@@ -2456,7 +2614,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // GEMM's own logits, so `norm` never comes back.
       if (dev_hash) {
         for (uint32_t b = 0; b < live; ++b) {
-          const int32_t* row = w.hash_table.data() + (size_t)ids[base + b] * cfg_.n_expert_used;
+          const int32_t* row = w.hash_table.data() + (size_t)ids[base_cur + b] * cfg_.n_expert_used;
           uint32_t n_sel = cfg_.n_expert_used;
           for (uint32_t k = 0; k < n_sel; ++k) { sel[k] = (uint32_t)row[k]; sw[k] = 1.0f; }
           force_resident(l, nullptr, sel.data(), sw.data(), &n_sel);
@@ -2475,7 +2633,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         const float* xb = normb.data() + (size_t)b * E;
         uint32_t n_sel = 0;
         if (hashed) {
-          const int32_t* row = w.hash_table.data() + (size_t)ids[base + b] * cfg_.n_expert_used;
+          const int32_t* row = w.hash_table.data() + (size_t)ids[base_cur + b] * cfg_.n_expert_used;
           for (uint32_t k = 0; k < cfg_.n_expert_used; ++k) { sel[k] = (uint32_t)row[k]; sw[k] = 1.0f; }
           n_sel = cfg_.n_expert_used;
           force_resident(l, nullptr, sel.data(), sw.data(), &n_sel);
@@ -2509,6 +2667,12 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         }
       }
       AFF_PH(route);
+
+      if (w.shexp_gate &&
+          !bops_.shexp(bops_.ctx, w.shexp_gate.gpu, w.shexp_up.gpu, w.shexp_down.gpu, E,
+                       cfg_.moe_inter, cfg_.swiglu_limit))
+        return false;
+      AFF_PH(ffn_dense);
 
       // The batched pass first: it reads the chunk arena in VRAM and accumulates straight into the
       // device block, so it needs no host activation and returns no host contribution. What it
@@ -2627,7 +2791,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       // hc_post — the layer's output, not either sublayer's — and concatenated in tap order.
       // Fusing the tap write into batch_hc_expand_reg_kernel computes h.mean(dim=2) from the
       // expanded bf16 values already in registers, saving 3 kernel launches and 3 b_hc reads/step.
-      const bool do_tap = !tap_at.empty() && tap_at[l] >= 0 && base + live > tap_first;
+      const bool do_tap = !tap_at.empty() && tap_at[l] >= 0 && base_cur + live > tap_first;
       static const bool fuse_tap = [] {
         const char* v = std::getenv("AFF_FUSE_HC_TAP");
         return !v || !*v || std::strcmp(v, "0") != 0;
@@ -2644,16 +2808,16 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         bops_.prefetch_hint(bops_.ctx, pf0, pf1);
       }
       if (do_tap && fuse_tap && w.hc_ffn_fn.data != nullptr && bops_.hc_post_tap) {
-        const uint32_t b_lo = base >= tap_first ? 0u : tap_first - base;
+        const uint32_t b_lo = base_cur >= tap_first ? 0u : tap_first - base_cur;
         if (!bops_.hc_post_tap(bops_.ctx, true, (uint32_t)tap_at[l], NT, b_lo, live - b_lo,
-                               base + b_lo - tap_first, tap_rows, E, HC))
+                               base_cur + b_lo - tap_first, tap_rows, E, HC))
           return false;
       } else {
         if (!bops_.hc_post(bops_.ctx, w.hc_ffn_fn.data != nullptr, E, HC)) return false;
         if (do_tap) {
-          const uint32_t b_lo = base >= tap_first ? 0u : tap_first - base;
+          const uint32_t b_lo = base_cur >= tap_first ? 0u : tap_first - base_cur;
           if (!bops_.hc_tap(bops_.ctx, (uint32_t)tap_at[l], NT, b_lo, live - b_lo,
-                            base + b_lo - tap_first, tap_rows, E, HC))
+                            base_cur + b_lo - tap_first, tap_rows, E, HC))
             return false;
         }
       }
@@ -2677,8 +2841,8 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       }
     }
 
-    s->pos += live;
-    if (prof_on) prof_.tokens += live;
+    s->pos += live_orig;
+    if (prof_on) prof_.tokens += live_orig;
 
     // ---- the head ----------------------------------------------------------------------------
     // A block wants every position's winner; prefill wants the last position's logits. The collapse
@@ -2756,7 +2920,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         return false;
       }
       AFF_PH(head);
-    } else if (logits && base + live >= n) {
+    } else if (logits && base + live_orig >= n) {
       // ---- THE LAST CHUNK'S LOGITS, AND ONLY IF SOMEONE ASKED FOR THEM ---------------------------
       //
       // `logits` is an optional out-parameter, and a caller can take neither the per-position head
@@ -2800,7 +2964,7 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
       if (head_) dense_mv(head_, norm, cfg_.vocab, E, logits->data());
       AFF_PH(head);
     }
-    base += live;
+    base += live_orig;
   }
   (void)fetch; (void)fetch_ctx;
   return true;
