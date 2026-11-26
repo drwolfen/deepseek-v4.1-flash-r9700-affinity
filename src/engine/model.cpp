@@ -2180,12 +2180,13 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
           }
         }
         bool eng_ok = false;
+        const size_t eng_tok_off = (size_t)i * live_orig + (size_t)(live_orig - live);
         if (use_raw_eng) {
-          const uint8_t* layer_raw = eng_raw_.data() + (size_t)i * live_orig * eng_raw_stride;
+          const uint8_t* layer_raw = eng_raw_.data() + eng_tok_off * eng_raw_stride;
           eng_ok = bops_.engram_mxfp8(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], layer_raw, live,
                                       eng_in_dim, E, HC, cfg_.rms_eps);
         } else {
-          const float* layer_rows = eng_rows_.data() + (size_t)i * live_orig * eng_in_dim;
+          const float* layer_rows = eng_rows_.data() + eng_tok_off * eng_in_dim;
           eng_ok = bops_.engram(bops_.ctx, w.engram_wkv.gpu, eng_qk_[l], layer_rows, live,
                                 eng_in_dim, E, HC, cfg_.rms_eps);
         }
@@ -2403,6 +2404,11 @@ bool Model::forward_prefill(const uint32_t* ids, uint32_t n, SeqState* s,
         pos0 += tail_off;
         base_cur += tail_off;
         sliced_here = true;
+        // Rebuild D.b_qtm and D.b_qr at the post-slice nb stride (D.b_qtm is not sliced in place,
+        // and kv_commit already ran on live_orig so it stays skipped via !sliced_here below).
+        if (!bops_.attn_qkv(bops_.ctx, w.wq_a.gpu, w.wq_b.gpu, w.q_norm_gpu, w.wkv.gpu,
+                            w.kv_norm_gpu, E, QR, NH, W, ROT, rd, cfg_.rms_eps, nullptr, true))
+          return false;
       }
       if (idx_may_run) {
         // The indexer's query projection reads qr_norm, not `norm` — a different activation, so a
