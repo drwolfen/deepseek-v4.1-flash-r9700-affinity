@@ -446,6 +446,7 @@ int main(int argc, char** argv) {
   // on costs no hit rate. It also bounds how many transfers can be in flight, which is why it is not
   // larger.
   uint32_t placement_shadow = 32;
+  bool placement_shadow_set = false;
   std::string route_trace_path;
   // Fitted by `aff-profile` from --route-trace records; overrides the container's imatrix-derived
   // profile for BOTH consumers. See AffReader::profile().
@@ -602,7 +603,10 @@ int main(int argc, char** argv) {
     else if (a == "--placement-decay") pcfg.heat.decay = (float)std::strtod(nxt(), nullptr);
     else if (a == "--placement-hysteresis") pcfg.heat.hysteresis = (float)std::strtod(nxt(), nullptr);
     else if (a == "--placement-min-gain") pcfg.heat.min_gain = (float)std::strtod(nxt(), nullptr);
-    else if (a == "--placement-shadow") placement_shadow = (uint32_t)std::strtoul(nxt(), nullptr, 10);
+    else if (a == "--placement-shadow") {
+      placement_shadow = (uint32_t)std::strtoul(nxt(), nullptr, 10);
+      placement_shadow_set = true;
+    }
     else if (a == "--placement-lead") pcfg.max_lead_blocks = (uint32_t)std::strtoul(nxt(), nullptr, 10);
     else if (a == "--route-trace") route_trace_path = nxt();
     else if (a == "--expert-profile") expert_profile_path = nxt();
@@ -1467,8 +1471,15 @@ int main(int argc, char** argv) {
   // Before init(), because the shadow slots are part of the slab allocation. Reserved only for the
   // moving strategies: the static arm has to be byte-for-byte the old configuration, or the A/B
   // compares two amounts of free VRAM as well as two placements.
-  if (pcfg.strategy != PlacementEngineConfig::Strategy::Static)
+  if (pcfg.strategy != PlacementEngineConfig::Strategy::Static) {
+    const bool pool_full_cfg = [] {
+      const char* s = std::getenv("AFF_POOL_FULL");
+      return !s || !*s || std::strcmp(s, "0") != 0;
+    }();
+    if (!placement_shadow_set && pool_full_cfg && host_pool_mib != 0.0)
+      placement_shadow = 12;
     placement.reserve_shadow_slots(placement_shadow);
+  }
   if (!imatrix_out_path.empty())
     gpu_headroom_mib = std::max(gpu_headroom_mib, 512.0) + 420.0;
   placement.set_driver_headroom_mib(gpu_headroom_mib);
@@ -2231,15 +2242,8 @@ int main(int argc, char** argv) {
   // block — and released around anything that waits on the network, so a slow reader cannot stall
   // the cards.
   std::mutex engine_mu;
-  uint32_t last_slot = UINT32_MAX;
   auto activate_slot = [&](uint32_t s) -> bool {
-    if (dense_gpu.n_slots() > 1 && last_slot != UINT32_MAX && last_slot != s) {
-      dense_gpu.sync_devices();
-      dense_gpu.tp_reset_seq();
-    }
-    if (!dense_gpu.set_slot(s)) return false;
-    last_slot = s;
-    return true;
+    return dense_gpu.set_slot(s);
   };
   // Context-bucketed adaptive verification EMAs (<32K, 32K..128K, >=128K), seeded across turns.
   struct SpecEmaBucket {

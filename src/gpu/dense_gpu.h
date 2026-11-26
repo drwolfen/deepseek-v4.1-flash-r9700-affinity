@@ -442,8 +442,8 @@ private:
   // Allocate every non-zero rank's copy of the selection block and rank 0's publish event. Latched
   // once through `route_ready_`: 0 untried, 1 built, 2 refused. Three states rather than a bool so
   // a refusal is not retried per layer AND is distinguishable from "not yet" at the reader.
-  bool route_mirror(uint32_t n_expert, uint32_t k);
-  void route_publish();
+  bool route_mirror(size_t owner, uint32_t n_expert, uint32_t k);
+  void route_publish(size_t owner);
   uint8_t route_ready_ = 0;
   uint64_t route_seq_ = 0;   // monotone; the ring slot is seq % kRouteSlots
   uint64_t tp_calls_ = 0;    // collectives issued, for the periodic tp_check
@@ -554,6 +554,7 @@ private:
   static constexpr uint32_t kMaxSlots = 16;
   uint32_t n_slots_ = 1;
   uint32_t slot_ = 0;
+  uint32_t last_slot_ = UINT32_MAX;
 
  public:
   uint32_t n_slots() const { return n_slots_; }
@@ -577,7 +578,7 @@ private:
   uint32_t kv_layers_debug() const;
   // Set BEFORE any call that touches sequence state. Refuses out of range rather than wrapping,
   // because a silently-wrong slot is another sequence's KV.
-  bool set_slot(uint32_t s) { if (s >= n_slots_) return false; slot_ = s; return true; }
+  bool set_slot(uint32_t s);
   uint32_t slot() const { return slot_; }
   // Called once, before init(): the slot count is a load-time property because every per-slot
   // buffer is sized from it.
@@ -657,7 +658,8 @@ private:
   bool     batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t n_head, uint32_t dim,
                            int32_t h_proj, uint64_t n_embd, float scale);
   // `devp` is an Impl::Dev*, which this header cannot name — Impl is opaque here on purpose.
-  bool     idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim);
+  bool     idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim,
+                    void* rt_items = nullptr);
   // Both of the layer's compressors for a whole chunk: five GEMMs, four transposes, two pooling
   // kernels and two ring updates. See gpu/compressor_gpu.h.
   bool     batch_compress(const Model::CompressArgs& a);
@@ -669,7 +671,10 @@ private:
   // `idx_width` sizes V4's index-compressor ring; `idx_keys` asks for the KEY CACHE alone, which
   // is what V4.1 needs — it has no second compressor but every kv-source layer still owns keys.
   bool     compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_t width,
-                         uint32_t idx_width, bool idx_keys = false);
+                         uint32_t idx_width, bool idx_keys = false, void* rt_items = nullptr,
+                         void* hist_resets = nullptr);
+  bool     upload_comp_norms(void* devp, const Model::CompressArgs& a, uint32_t cw, uint32_t iw,
+                             bool has_idx, void* stream);
   // V4.1's index keys, built from the latent the KV compressor publishes rather than from a second
   // compressor. `v41_idx_ok` is the shape contract for `wk`, whose input is the latent and not
   // `norm`; `devp` is an Impl::Dev* and `rank` its index. Both no-ops on V4.
@@ -751,6 +756,7 @@ private:
   // The same head, sampled. The vocabulary is Row-split, so a nucleus over one card's band is not a
   // nucleus: the peer's half is gathered first and the draw happens over the whole distribution.
   // Scratch for the sampler's small transfers, sized once at the block width.
+  void*    smp_slab_ = nullptr;
   void*    smp_ctrl_ = nullptr;
   void*    smp_out_ = nullptr;
   void*    smp_h_ctrl_ = nullptr;

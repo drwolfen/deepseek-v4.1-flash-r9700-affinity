@@ -337,13 +337,13 @@ struct DenseGpu::Impl {
     // contiguous, independently allocated sequence: its own KV ring, compressed cache, indexer
     // key cache and compressor window. Everything else in Dev is shared model state.
     std::vector<std::vector<uint8_t*>> a_raw_s, a_comp_s;
+    uint8_t* a_raw_slab = nullptr;
     // The compressed cache is reserved for the whole context the engine can serve and backed only
     // as far as the sequence has actually reached. `a_comp[l]` is the span's base and never moves,
     // so every kernel keeps its linear addressing. See gpu/vmem.h for why this and not paging.
     std::vector<std::vector<VirtualSpan>> a_comp_span_s;
     std::vector<std::vector<VirtualSpan>> a_idx8_span_s;
     std::vector<std::vector<VirtualSpan>> a_idxs_span_s;
-    hipStream_t a_kv_zero = nullptr;   // shared by every span on this card; see attn_init
     std::vector<float*>   a_sink;
     // The indexer's compressed keys as the scoring kernel wants them: E4M3 rows with one f32 scale
     // each, written once when the compressor emits them.
@@ -355,6 +355,7 @@ struct DenseGpu::Impl {
     std::vector<uint32_t> c_ratio;      // the ring size follows from it, so it is remembered
     // Per-layer constants, uploaded on the layer's first chunk and kept.
     std::vector<float*>   c_ape, c_norm, ci_ape, ci_norm;
+    std::vector<uint8_t>  c_norm_uploaded;
     // This chunk's four projections, token-major, which is what the pool indexes by position.
     float* c_kv = nullptr;  float* c_sc = nullptr;
     float* ci_kv = nullptr; float* ci_sc = nullptr;
@@ -437,6 +438,7 @@ struct DenseGpu::Impl {
     const void* mk_w2_src = nullptr;
     uint32_t mk_w2_rows = 0;
     uint32_t mk_w2_rank = 0;
+    uint32_t mk_w2_norm_cap = 0;
     uint16_t* b_noise_bf16 = nullptr;                     // cached DSpark noise embedding row
     uint32_t b_noise_embd = 0;
     uint32_t b_noise_tok = 0xFFFFFFFFu;
@@ -545,6 +547,7 @@ struct DenseGpu::Impl {
     std::vector<const float*> rbias_src;         // tracks which bias pointer is currently on device
     size_t r_back = 0, r_woff = 0, r_noff = 0;   // the sel/wt/n block and its interior offsets
     uint32_t r_k = 0;
+    uint32_t r_k_cap = 0;
     uint32_t r_bias_stride = 0;
     uint8_t* b_rres = nullptr;
     // ---- THE SELECTION, ON EVERY CARD ------------------------------------------------------------
@@ -572,10 +575,9 @@ struct DenseGpu::Impl {
     // boundary still has waits of its own. `route_wait` guards the wrap anyway — a host that IS 64
     // layers ahead is not the bottleneck, so blocking it there costs nothing.
     static constexpr uint32_t kRouteSlots = 64;
-    uint32_t* b_rsel_m = nullptr;  float* b_rwt_m = nullptr;   // rank 0: its own block, unringed
-    void* m_ring = nullptr;                      // rank > 0: kRouteSlots blocks
-    void* ev_route[kRouteSlots] = {};            // rank 0: one per slot
-    size_t route_woff_slot[kRouteSlots] = {};    // per-slot byte offset to wt inside m_ring[slot]
+    uint32_t* b_rsel_m = nullptr;  float* b_rwt_m = nullptr;   // owner: its own block, unringed
+    void* m_ring = nullptr;                      // peer: kRouteSlots blocks
+    void* ev_route[kRouteSlots] = {};            // owner: one per slot
     size_t b_q_floats = 0;                       // float capacity of b_q (nq * b_cap_)
     size_t b_qtm_bytes = 0;                      // byte capacity of b_qtm
     size_t b_q_c_end = 0;                        // byte end of c_* alias band in b_q
@@ -611,10 +613,33 @@ struct DenseGpu::Impl {
       size_t used = 0;
     };
     std::vector<WeightSlab> weight_slabs;
+    struct RuntimeSlab {
+      uint8_t* base = nullptr;
+      size_t cap = 0;
+      bool finegrained = false;
+    };
+    std::vector<RuntimeSlab> runtime_slabs;
   };
   std::vector<Dev> dev;
   TpContext tp;
+  bool router_split = false;
   size_t router_owner = 0;
+  std::vector<size_t> router_owners;
+  size_t route_slot_stride = 0;
+  size_t last_route_owner = 0;
+  size_t route_owner_slot[Dev::kRouteSlots] = {};
+  size_t route_woff_slot[Dev::kRouteSlots] = {};
+  uint8_t route_ready_owner[kMaxRanks] = {};
+  size_t router_owner_for(int32_t h) const {
+    const size_t R = dev.size();
+    if (R < 2u) return 0u;
+    if (h >= 0 && (size_t)h < router_owners.size()) {
+      const size_t o = router_owners[(size_t)h];
+      return o < R ? o : 0u;
+    }
+    if (router_split && h >= 0) return (size_t)h % R;
+    return router_owner < R ? router_owner : 0u;
+  }
   uint64_t single_max_rows = 0;
   uint64_t single_max_cols = 0;
   uint16_t* h_embed_pinned = nullptr;
@@ -1080,6 +1105,50 @@ inline bool weight_slab_owns(const DevT& D, const void* p) {
   return false;
 }
 
+template <typename DevT>
+inline bool runtime_slab_owns(const DevT& D, const void* p) {
+  if (!p) return false;
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+  for (const auto& sl : D.runtime_slabs) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sl.base);
+    if (sl.base && addr >= base && addr < base + sl.cap) return true;
+  }
+  return false;
+}
+
+struct RuntimeAllocItem {
+  void** out = nullptr;
+  size_t bytes = 0;
+  bool zero = false;
+};
+
+template <typename DevT>
+inline bool runtime_slab_alloc(DevT& D, const RuntimeAllocItem* items, size_t n,
+                               const char* tag, std::string* err, bool finegrained = false) {
+  size_t total = 0;
+  bool any_zero = false;
+  for (size_t i = 0; i < n; ++i) {
+    if (!items[i].out || !items[i].bytes) continue;
+    total += align_up_sz(items[i].bytes, 256u);
+    any_zero |= items[i].zero;
+  }
+  if (!total) return true;
+  uint8_t* base = nullptr;
+  const hipError_t e = finegrained
+      ? hipExtMallocWithFlags(reinterpret_cast<void**>(&base), total, hipDeviceMallocFinegrained)
+      : hipMalloc(reinterpret_cast<void**>(&base), total);
+  if (!hip_try(e, tag, err) || !base) return false;
+  if (any_zero) AFF_HIP_CHECK(hipMemset(base, 0, total));
+  size_t off = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!items[i].out || !items[i].bytes) continue;
+    *items[i].out = base + off;
+    off += align_up_sz(items[i].bytes, 256u);
+  }
+  D.runtime_slabs.push_back(typename DevT::RuntimeSlab{base, total, finegrained});
+  return true;
+}
+
 struct WeightSlabMark {
   size_t dev_idx = 0;
   size_t slab_idx = 0;
@@ -1161,14 +1230,21 @@ inline bool dense_weight_alloc(DevT& D, size_t dev_idx, size_t bytes,
   return hipMalloc(reinterpret_cast<void**>(out), bytes) == hipSuccess && *out != nullptr;
 }
 
+struct RouterOwnerCfg {
+  bool split = false;
+  size_t fixed = 0;
+};
+
 template <typename DevVecT>
-inline size_t resolve_router_owner(const DevVecT& devs) {
-  if (devs.size() < 2u) return 0u;
+inline RouterOwnerCfg resolve_router_owner(const DevVecT& devs) {
+  if (devs.size() < 2u) return {false, 0u};
   const char* env = std::getenv("AFF_ROUTER_RANK");
-  if (env && *env && std::strcmp(env, "auto") != 0) {
+  if (!env || !*env || std::strcmp(env, "split") == 0) return {true, 0u};
+  if (std::strcmp(env, "auto") != 0) {
     char* end = nullptr;
     const long idx = std::strtol(env, &end, 10);
-    if (end != env && idx >= 0 && (size_t)idx < devs.size()) return (size_t)idx;
+    if (end != env && *end == '\0' && idx >= 0 && (size_t)idx < devs.size())
+      return {false, (size_t)idx};
   }
   size_t best = 0u;
   uint64_t best_free = 0u;
@@ -1179,7 +1255,7 @@ inline size_t resolve_router_owner(const DevVecT& devs) {
       best = d;
     }
   }
-  return best;
+  return {false, best};
 }
 
 template <typename ShardT, typename DevT>
@@ -1235,32 +1311,48 @@ DenseGpu::~DenseGpu() {
     if (D.b_dx == D.b_q) D.b_dx = nullptr;
     if (D.fsplit.o == D.b_y) D.fsplit.o = nullptr;
     if (D.i_bsc == D.b_y) D.i_bsc = nullptr;
+    auto free_rt = [&](auto*& p) {
+      if (p && !runtime_slab_owns(D, p) && !weight_slab_owns(D, p) && !D.is_bq_alias(p))
+        (void)hipFree(p);
+      p = nullptr;
+    };
     for (float** p : {&D.e_in, &D.e_out, &D.e_stage,
                       &D.c_kv, &D.c_sc, &D.ci_kv, &D.ci_sc, &D.c_lat, &D.ci_ky, &D.c_py,
                       &D.i_q, &D.i_qs, &D.i_w, &D.i_sc}) {
-      if (*p && !D.is_bq_alias(*p)) (void)hipFree(*p);
-      *p = nullptr;
+      free_rt(*p);
     }
-    if (D.i_q8 && !D.is_bq_alias(D.i_q8)) (void)hipFree(D.i_q8);
-    D.i_q8 = nullptr;
-    for (void* p : {(void*)D.i_bsc, (void*)D.i_nc, (void*)D.i_ncb, (void*)D.a_cand, (void*)D.b_cand,
-                    (void*)D.a_cand_ids, (void*)D.a_cand_n, (void*)D.b_cand_ids, (void*)D.b_cand_n})
-      if (p) (void)hipFree(p);
-    float* const bufs[] = {
-      D.d_g, D.d_u, D.d_a, D.d_p, D.d_x, D.d_y,
-      D.d_hc, D.d_hc_next, D.d_pre, D.d_pre_prev, D.d_post, D.d_comb, D.d_mix, D.d_cur, D.d_norm, D.d_block,
-      D.a_q, D.a_out, D.d_rlog,
-      D.b_mix, D.b_pre, D.b_pre_prev, D.b_post, D.b_comb, D.b_cur, D.b_norm, D.b_block,
-      D.b_hcp, D.b_emb, D.b_q, D.b_hinv, D.b_kv, D.b_qr, D.b_g, D.b_u, D.b_y, D.b_tm,
-      D.b_head, D.b_amx, D.mk_w2_norm, D.b_dx, D.b_dm};
-    for (float* p : bufs) if (p) (void)hipFree(p);
-    for (uint16_t* p : {D.b_hc, D.b_hc_next, D.b_qtm, D.b_noise_bf16}) if (p) (void)hipFree(p);
+    free_rt(D.i_q8);
+    free_rt(D.i_bsc);
+    free_rt(D.i_nc);
+    free_rt(D.i_ncb);
+    free_rt(D.a_cand);
+    free_rt(D.b_cand);
+    free_rt(D.a_cand_ids);
+    free_rt(D.a_cand_n);
+    free_rt(D.b_cand_ids);
+    free_rt(D.b_cand_n);
+    float** const bufs[] = {
+      &D.d_g, &D.d_u, &D.d_a, &D.d_p, &D.d_x, &D.d_y,
+      &D.d_hc, &D.d_hc_next, &D.d_pre, &D.d_pre_prev, &D.d_post, &D.d_comb, &D.d_mix, &D.d_cur,
+      &D.d_norm, &D.d_block, &D.d_gpart, &D.d_mpart, &D.d_qrn,
+      &D.a_q, &D.a_out, &D.d_rlog,
+      &D.b_mix, &D.b_pre, &D.b_pre_prev, &D.b_post, &D.b_comb, &D.b_cur, &D.b_norm, &D.b_block,
+      &D.b_hcp, &D.b_emb, &D.b_q, &D.b_hinv, &D.b_kv, &D.b_qr, &D.b_g, &D.b_u, &D.b_y, &D.b_tm,
+      &D.b_head, &D.b_amx, &D.mk_w2_norm, &D.b_dx, &D.b_dm};
+    for (float** p : bufs) free_rt(*p);
+    for (uint16_t** p : {&D.b_hc, &D.b_hc_next, &D.b_qtm, &D.b_noise_bf16}) free_rt(*p);
     for (float* p : D.vec) if (p && !weight_slab_owns(D, p)) (void)hipFree(p);
     for (uint16_t* p : D.router) if (p && !weight_slab_owns(D, p)) (void)hipFree(p);
+    for (float* p : D.a_sink) if (p && !weight_slab_owns(D, p)) (void)hipFree(p);
     for (auto& sl : D.weight_slabs) if (sl.base) { (void)hipFree(sl.base); sl.base = nullptr; }
     D.weight_slabs.clear();
     for (float* p : D.b_tap_s) if (p) (void)hipFree(p);
-    for (auto& v : D.a_raw_s)  for (uint8_t* p : v) if (p) (void)hipFree(p);
+    if (D.a_raw_slab) {
+      (void)hipFree(D.a_raw_slab);
+      D.a_raw_slab = nullptr;
+    } else {
+      for (auto& v : D.a_raw_s) for (uint8_t* p : v) if (p) (void)hipFree(p);
+    }
     for (size_t sl = 0; sl < D.a_comp_s.size(); ++sl) {
       for (size_t l = 0; l < D.a_comp_s[sl].size(); ++l) {
         const bool is_vmem = sl < D.a_comp_span_s.size() && l < D.a_comp_span_s[sl].size() &&
@@ -1274,7 +1366,7 @@ DenseGpu::~DenseGpu() {
         const bool is_vmem = sl < D.a_idx8_span_s.size() && l < D.a_idx8_span_s[sl].size() &&
                              D.a_idx8_span_s[sl][l].reserved();
         if (is_vmem) D.a_idx8_span_s[sl][l].release();
-        else if (D.a_idx8_s[sl][l]) (void)hipFree(D.a_idx8_s[sl][l]);
+        else free_rt(D.a_idx8_s[sl][l]);
       }
     }
     for (size_t sl = 0; sl < D.a_idxs_s.size(); ++sl) {
@@ -1282,44 +1374,60 @@ DenseGpu::~DenseGpu() {
         const bool is_vmem = sl < D.a_idxs_span_s.size() && l < D.a_idxs_span_s[sl].size() &&
                              D.a_idxs_span_s[sl][l].reserved();
         if (is_vmem) D.a_idxs_span_s[sl][l].release();
-        else if (D.a_idxs_s[sl][l]) (void)hipFree(D.a_idxs_s[sl][l]);
+        else free_rt(D.a_idxs_s[sl][l]);
       }
     }
-    for (float* p : D.c_pend) if (p) (void)hipFree(p);
-    for (float* p : D.a_sink) if (p) (void)hipFree(p);
-    if (D.a_allow) (void)hipFree(D.a_allow);
-    if (D.fsplit.o) (void)hipFree(D.fsplit.o);
-    if (D.fsplit.ml) (void)hipFree(D.fsplit.ml);
-    if (D.topk.hist) (void)hipFree(D.topk.hist);
-    if (D.topk.state) (void)hipFree(D.topk.state);
-    if (D.topk.tie) (void)hipFree(D.topk.tie);
-    for (uint32_t* q : {D.a_adm, D.a_admn, D.b_adm, D.b_admn}) if (q) (void)hipFree(q);
-    if (D.b_mbest) (void)hipFree(D.b_mbest);
-    if (D.b_mpeer) (void)hipFree(D.b_mpeer);
-    if (D.b_mk_fg) (void)hipFree(D.b_mk_fg);
-    if (D.b_mk_flag) (void)hipFree(D.b_mk_flag);
-    if (D.b_ids) (void)hipFree(D.b_ids);
+    for (auto& v : D.c_hkv_s)  for (float*& p : v) free_rt(p);
+    for (auto& v : D.c_hsc_s)  for (float*& p : v) free_rt(p);
+    for (auto& v : D.ci_hkv_s) for (float*& p : v) free_rt(p);
+    for (auto& v : D.ci_hsc_s) for (float*& p : v) free_rt(p);
+    for (float*& p : D.c_norm)  free_rt(p);
+    for (float*& p : D.ci_norm) free_rt(p);
+    for (float*& p : D.c_ape)   free_rt(p);
+    for (float*& p : D.ci_ape)  free_rt(p);
+    for (float*& p : D.c_pend)  free_rt(p);
+    free_rt(D.a_allow);
+    free_rt(D.fsplit.o);
+    free_rt(D.fsplit.ml);
+    free_rt(D.topk.hist);
+    free_rt(D.topk.state);
+    free_rt(D.topk.tie);
+    free_rt(D.a_adm);
+    free_rt(D.a_admn);
+    free_rt(D.b_adm);
+    free_rt(D.b_admn);
+    free_rt(D.b_mbest);
+    free_rt(D.b_mpeer);
+    free_rt(D.b_mk_fg);
+    free_rt(D.b_mk_flag);
+    free_rt(D.b_ids);
     if (D.h_ids) (void)hipHostFree(D.h_ids);
     for (hipEvent_t& e : D.ev_mk) if (e) (void)hipEventDestroy(e);
     if (D.ev_amx) (void)hipEventDestroy(D.ev_amx);
-    if (D.b_apeer) (void)hipFree(D.b_apeer);
-    if (D.b_hids) (void)hipFree(D.b_hids);
+    free_rt(D.b_apeer);
+    free_rt(D.b_hids);
     if (D.h_hids) (void)hipHostFree(D.h_hids);
     D.tok.free();
     if (D.h_y) (void)hipHostFree(D.h_y);
     if (D.h_norm) (void)hipHostFree(D.h_norm);
     if (D.h_tm) (void)hipHostFree(D.h_tm);
-    if (D.b_allow) (void)hipFree(D.b_allow);
+    free_rt(D.b_allow);
     norm_q8_invalidate_dev(D.id);
-    for (void* p : {(void*)D.q8, (void*)D.qs, (void*)D.q8_sw, (void*)D.qs_sw})
-      if (p) (void)hipFree(p);
+    free_rt(D.q8);
+    free_rt(D.qs);
+    free_rt(D.q8_sw);
+    free_rt(D.qs_sw);
     for (StageRing* r : {&D.ncomp, &D.ncomp_idx, &D.ncomp_idxb, &D.rsel, &D.emb, &D.emb_dec,
                          &D.eng, &D.rres})
       r->free();
-    if (D.b_ncomp) (void)hipFree(D.b_ncomp);
+    free_rt(D.b_ncomp);
     // b_rwt/b_rn alias interior offsets of b_rsel; h_rwt/h_rn alias interior offsets of h_rsel.
-    for (void* p : {(void*)D.b_rsel, (void*)D.b_rbias, (void*)D.b_rres, D.m_ring})
-      if (p) (void)hipFree(p);
+    free_rt(D.b_rsel);
+    free_rt(D.b_rbias);
+    free_rt(D.b_rres);
+    free_rt(D.m_ring);
+    for (auto& sl : D.runtime_slabs) if (sl.base) { (void)hipFree(sl.base); sl.base = nullptr; }
+    D.runtime_slabs.clear();
     for (void*& ev : D.ev_route) if (ev) { (void)hipEventDestroy((hipEvent_t)ev); ev = nullptr; }
     if (D.h_rsel) (void)hipHostFree(D.h_rsel);
     for (auto& s : D.stg) {
@@ -1343,7 +1451,14 @@ DenseGpu::~DenseGpu() {
     if (e.uva_host) { (void)hipHostFree(e.uva_host); e.uva_host = nullptr; }
   }
   if (!impl_->dev.empty()) (void)hipSetDevice(impl_->dev[0].id);
-  for (void* p : {smp_ctrl_, smp_out_}) if (p) (void)hipFree(p);
+  if (smp_slab_) {
+    (void)hipFree(smp_slab_);
+    smp_slab_ = nullptr;
+    smp_ctrl_ = nullptr;
+    smp_out_ = nullptr;
+  } else {
+    for (void* p : {smp_ctrl_, smp_out_}) if (p) (void)hipFree(p);
+  }
   for (void* p : {smp_h_ctrl_, smp_h_out_}) if (p) (void)hipHostFree(p);
   delete impl_;
   impl_ = nullptr;
@@ -1383,12 +1498,15 @@ bool DenseGpu::ensure_single_arena(Impl& I, size_t d) {
   Impl::Dev& D = I.dev[d];
   if (D.single_ready) return true;
   AFF_HIP_CHECK(hipSetDevice(D.id));
-  if (hipMalloc(&D.d_x, I.single_max_cols * sizeof(float)) != hipSuccess) return false;
-  if (hipMalloc(&D.d_y, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
-  if (hipMalloc(&D.d_g, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
-  if (hipMalloc(&D.d_u, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
-  if (hipMalloc(&D.d_a, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
-  if (hipMalloc(&D.d_p, I.single_max_rows * sizeof(float)) != hipSuccess) return false;
+  const RuntimeAllocItem items[] = {
+    {reinterpret_cast<void**>(&D.d_x), I.single_max_cols * sizeof(float), false},
+    {reinterpret_cast<void**>(&D.d_y), I.single_max_rows * sizeof(float), false},
+    {reinterpret_cast<void**>(&D.d_g), I.single_max_rows * sizeof(float), false},
+    {reinterpret_cast<void**>(&D.d_u), I.single_max_rows * sizeof(float), false},
+    {reinterpret_cast<void**>(&D.d_a), I.single_max_rows * sizeof(float), false},
+    {reinterpret_cast<void**>(&D.d_p), I.single_max_rows * sizeof(float), false},
+  };
+  if (!runtime_slab_alloc(D, items, 6, "single-token arena", nullptr)) return false;
   if (hipHostMalloc(&D.h_y, I.single_max_rows * sizeof(float), hipHostMallocDefault) != hipSuccess)
     return false;
   for (auto& s : D.stg) {
@@ -1404,13 +1522,14 @@ bool DenseGpu::ensure_single_attn(size_t d) {
   Impl::Dev& D = impl_->dev[d];
   if (D.a_q && D.a_out && D.a_allow) return true;
   AFF_HIP_CHECK(hipSetDevice(D.id));
-  if (!D.a_q && hipMalloc(&D.a_q, (uint64_t)a_hpr_ * a_width_ * sizeof(float)) != hipSuccess)
-    return false;
-  if (!D.a_out && hipMalloc(&D.a_out, (uint64_t)a_hpr_ * a_width_ * sizeof(float)) != hipSuccess)
-    return false;
-  if (!D.a_allow && hipMalloc(&D.a_allow, a_maxcomp_ ? a_maxcomp_ : 1) != hipSuccess)
-    return false;
-  return true;
+  const size_t q_bytes = (size_t)a_hpr_ * a_width_ * sizeof(float);
+  const size_t allow_bytes = a_maxcomp_ ? a_maxcomp_ : 1u;
+  const RuntimeAllocItem items[] = {
+    {reinterpret_cast<void**>(&D.a_q), D.a_q ? 0u : q_bytes, false},
+    {reinterpret_cast<void**>(&D.a_out), D.a_out ? 0u : q_bytes, false},
+    {reinterpret_cast<void**>(&D.a_allow), D.a_allow ? 0u : allow_bytes, false},
+  };
+  return runtime_slab_alloc(D, items, 3, "single-token attn", nullptr);
 }
 
 bool DenseGpu::ensure_shexp_stream(size_t d) {
@@ -1494,7 +1613,12 @@ bool DenseGpu::init(uint64_t max_rows, uint64_t max_cols, std::string* err, size
     (void)batch_splitk_reserve_hip(kSplitKMainPeakFloats, impl_->dev[d].stream);
   }
   st_.ranks = use;
-  impl_->router_owner = resolve_router_owner(impl_->dev);
+  {
+    const RouterOwnerCfg rcfg = resolve_router_owner(impl_->dev);
+    impl_->router_split = rcfg.split;
+    impl_->router_owner = rcfg.fixed;
+    impl_->router_owners.clear();
+  }
 
   // The all-reduce runs on the ENGINE's streams: the reduction consumes what the previous kernel
   // on that stream produced, and a separate stream would need an event pair per call — 86 a token
@@ -2476,16 +2600,33 @@ int32_t DenseGpu::reg_router(const uint16_t* w, const float* bias, uint32_t n_ex
   if (!impl_ || !w || impl_->dev.empty()) return -1;
   (void)bias;
   const size_t R = impl_->dev.size();
+  const int32_t h = (int32_t)n_router_;
   const bool r0_only = router_rank0_only_enabled();
-  const size_t owner = impl_->router_owner < R ? impl_->router_owner : 0u;
+  const size_t owner = impl_->router_owner_for(h);
   if (r0_only && n_router_ == 0 && R >= 2u) {
     uint64_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
     (void)hip_free_vram_checked(impl_->dev[0].id, &f0, &t0);
     (void)hip_free_vram_checked(impl_->dev[owner].id, &f1, &t1);
-    aff::ui::err("dense-gpu: router owner rank %zu (rank 0 free %.0f MiB, owner free %.0f MiB)\n",
-                 owner, f0 / 1048576.0, f1 / 1048576.0);
+    if (impl_->router_split) {
+      aff::ui::err("dense-gpu: router split 50/50 across %zu ranks (AFF_ROUTER_RANK=split)\n", R);
+    } else {
+      aff::ui::err("dense-gpu: router owner rank %zu (rank 0 free %.0f MiB, owner free %.0f MiB)\n",
+                   owner, f0 / 1048576.0, f1 / 1048576.0);
+    }
   }
   if (n_expert > r_max_expert_) r_max_expert_ = n_expert;
+  auto rollback_router = [&](size_t count) {
+    for (size_t k = 0; k < count; ++k) {
+      Impl::Dev& KD = impl_->dev[k];
+      if (KD.router.size() > (size_t)h) {
+        if (KD.router.back() && !weight_slab_owns(KD, KD.router.back())) {
+          (void)hipSetDevice(KD.id);
+          (void)hipFree(KD.router.back());
+        }
+        KD.router.pop_back();
+      }
+    }
+  };
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -2502,14 +2643,21 @@ int32_t DenseGpu::reg_router(const uint16_t* w, const float* bias, uint32_t n_ex
     // slower, so a silent CPU fallback here is a degradation, not a failure.
     size_t freeb = 0, totalb = 0;
     AFF_HIP_CHECK(hipMemGetInfo(&freeb, &totalb));
-    if (!weight_slab_can_fit(D, nbytes) && freeb < nbytes + kAllocHeadroom) return -1;
+    if (!weight_slab_can_fit(D, nbytes) && freeb < nbytes + kAllocHeadroom) {
+      rollback_router(d);
+      return -1;
+    }
     uint16_t* p = nullptr;
-    if (nbytes && !dense_weight_alloc(D, d, nbytes, freeb, kAllocHeadroom, &p)) return -1;
+    if (nbytes && !dense_weight_alloc(D, d, nbytes, freeb, kAllocHeadroom, &p)) {
+      rollback_router(d);
+      return -1;
+    }
     if (nbytes) AFF_HIP_CHECK(hipMemcpy(p, w, nbytes, hipMemcpyHostToDevice));
     if (!D.d_rlog || n_expert > D.d_rlog_cap) {
       if (D.d_rlog) { (void)hipFree(D.d_rlog); D.d_rlog = nullptr; D.d_rlog_cap = 0; }
       if (hipMalloc(&D.d_rlog, (size_t)n_expert * sizeof(float)) != hipSuccess) {
         if (!weight_slab_owns(D, p)) (void)hipFree(p);
+        rollback_router(d);
         return -1;
       }
       D.d_rlog_cap = n_expert;
@@ -2519,6 +2667,7 @@ int32_t DenseGpu::reg_router(const uint16_t* w, const float* bias, uint32_t n_ex
     D.router_rows = nr;
     st_.bytes += nbytes;
   }
+  impl_->router_owners.push_back(owner);
   ++st_.tensors;
   return (int32_t)(n_router_++);
 }
@@ -2529,7 +2678,7 @@ bool DenseGpu::router(int32_t h, const float* x, uint32_t n_expert, uint64_t n_e
   if (h < 0 || (size_t)h >= n_router_ || !logits) return false;
   const size_t R = impl_->dev.size();
   const bool r0_only = router_rank0_only_enabled();
-  const size_t owner = impl_->router_owner < R ? impl_->router_owner : 0u;
+  const size_t owner = impl_->router_owner_for(h);
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     uint64_t r0 = 0, nr = 0;
@@ -3631,25 +3780,28 @@ bool DenseGpu::hc_init(uint32_t n_embd, uint32_t n_hc, std::string* err) {
   if (!impl_ || impl_->dev.empty()) { if (err) *err = "no device"; return false; }
   const uint64_t hc_dim = (uint64_t)n_embd * n_hc;
   const uint32_t n_out = 2 * n_hc + n_hc * n_hc;
+  // Sized for the largest triangle hc_pre will accept (n_hc <= 8 -> 36), so the buffer does not
+  // depend on which n_hc the wide path ends up taking.
+  const uint32_t nblk = (n_embd + kHcThreads - 1) / kHcThreads;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    AFF_HIP_CHECK(hipMalloc(&D.d_hc, hc_dim * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_hc_next, hc_dim * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_mix, n_out * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_pre, n_hc * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_pre_prev, n_hc * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_post, n_hc * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_comb, (uint64_t)n_hc * n_hc * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_cur, n_embd * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_norm, n_embd * sizeof(float)));
-    AFF_HIP_CHECK(hipMalloc(&D.d_block, n_embd * sizeof(float)));
-    // Sized for the largest triangle hc_pre will accept (n_hc <= 8 -> 36), so the buffer does not
-    // depend on which n_hc the wide path ends up taking.
-    const uint32_t nblk = (n_embd + kHcThreads - 1) / kHcThreads;
-    AFF_HIP_CHECK(hipMalloc(&D.d_gpart, (uint64_t)nblk * 36 * sizeof(float)));
-    // SPLIT x KM at the largest n_hc this kernel serves. Generous and allocated once.
-    AFF_HIP_CHECK(hipMalloc(&D.d_mpart, (uint64_t)kHcSplit * 72 * sizeof(float)));
+    const RuntimeAllocItem items[] = {
+      {reinterpret_cast<void**>(&D.d_hc), (size_t)hc_dim * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_hc_next), (size_t)hc_dim * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_mix), (size_t)n_out * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_pre), (size_t)n_hc * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_pre_prev), (size_t)n_hc * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_post), (size_t)n_hc * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_comb), (size_t)n_hc * n_hc * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_cur), (size_t)n_embd * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_norm), (size_t)n_embd * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_block), (size_t)n_embd * sizeof(float), false},
+      {reinterpret_cast<void**>(&D.d_gpart), (size_t)nblk * 36 * sizeof(float), false},
+      // SPLIT x KM at the largest n_hc this kernel serves. Generous and allocated once.
+      {reinterpret_cast<void**>(&D.d_mpart), (size_t)kHcSplit * 72 * sizeof(float), false},
+    };
+    if (!runtime_slab_alloc(D, items, 12, "hc runtime slab", err)) return false;
   }
   hc_ok_ = true;
   return true;
@@ -4085,7 +4237,7 @@ bool DenseGpu::kv_commit_positions(uint64_t positions, std::string* err) {
       if (D.a_comp_span_s[slot_][l].reserved()) {
         const size_t was = D.a_comp_span_s[slot_][l].committed();
         if (!D.a_comp_span_s[slot_][l].commit_to((uint64_t)comp_rows_for((uint32_t)l, positions) * rb,
-                                                 D.a_kv_zero, err))
+                                                 D.stream, err))
           return false;
         st_.kv_bytes += D.a_comp_span_s[slot_][l].committed() - was;
       }
@@ -4094,13 +4246,13 @@ bool DenseGpu::kv_commit_positions(uint64_t positions, std::string* err) {
             std::min<uint64_t>(comp_rows_for((uint32_t)l, positions), a_comp_rows_[l]);
         if (l < D.a_idx8_span_s[slot_].size() && D.a_idx8_span_s[slot_][l].reserved()) {
           const size_t was8 = D.a_idx8_span_s[slot_][l].committed();
-          if (!D.a_idx8_span_s[slot_][l].commit_to(idx_rows * kIdxDim, D.a_kv_zero, err))
+          if (!D.a_idx8_span_s[slot_][l].commit_to(idx_rows * kIdxDim, D.stream, err))
             return false;
           st_.kv_bytes += D.a_idx8_span_s[slot_][l].committed() - was8;
         }
         if (l < D.a_idxs_span_s[slot_].size() && D.a_idxs_span_s[slot_][l].reserved()) {
           const size_t wass = D.a_idxs_span_s[slot_][l].committed();
-          if (!D.a_idxs_span_s[slot_][l].commit_to(idx_rows * sizeof(float), D.a_kv_zero, err))
+          if (!D.a_idxs_span_s[slot_][l].commit_to(idx_rows * sizeof(float), D.stream, err))
             return false;
           st_.kv_bytes += D.a_idxs_span_s[slot_][l].committed() - wass;
         }
@@ -4220,6 +4372,8 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
   // sliding + kAttnBatch - 1 slots, not `sliding` — that is what lets a whole sub-batch commit
   // before any of it attends. ~7 MB a card across 43 layers at kAttnBatch 256.
   const uint64_t raw_b = (uint64_t)a_ring_ * rb;
+  const uint64_t raw_slice = align256((size_t)raw_b);
+  const uint64_t raw_slab_b = raw_slice * (uint64_t)n_slots_ * (uint64_t)n_layer;
   uint64_t comp_total = 0;
   for (uint32_t l = 0; l < n_layer; ++l) comp_total += (uint64_t)a_comp_rows_[l] * rb;
   // The CACHE is replicated and the HEADS are split, so a card holds the whole cache and half the
@@ -4259,7 +4413,7 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
     // slots at the shipped --kv-size.
     uint64_t comp_now = 0;
     for (uint32_t l = 0; l < n_layer; ++l) comp_now += init_commit_bytes(l);
-    const uint64_t need = (raw_b * n_layer + comp_now) * n_slots_ +
+    const uint64_t need = raw_slab_b + comp_now * n_slots_ +
                           (uint64_t)a_hpr_ * width * 2 * sizeof(float);
     if (freeb < need + kKvAllocHeadroom) {
       if (err) *err = "KV cache needs " + std::to_string(need >> 20) + " MiB on card " +
@@ -4286,21 +4440,22 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
       D.a_idxs_span_s[sl].clear();
       D.a_idxs_span_s[sl].resize(n_layer);
     }
-    // ONE zeroing stream a card, shared by every layer's span. Per-span streams cost 640 MiB of
-    // host RAM across 86 of them, which comes out of the expert pool and strands experts on the
-    // SSD tier — the pool is sized from what is left after everything else the process holds.
-    if (!D.a_kv_zero)
-      AFF_HIP_CHECK(hipStreamCreateWithFlags(&D.a_kv_zero, hipStreamNonBlocking));
+    if (raw_slab_b) {
+      if (!hip_try(hipMalloc(&D.a_raw_slab, raw_slab_b), "KV raw slab", err)) return false;
+      AFF_HIP_CHECK(hipMemset(D.a_raw_slab, 0, raw_slab_b));
+    }
     uint64_t comp_committed = 0;
     for (uint32_t sl = 0; sl < n_slots_; ++sl)
     for (uint32_t l = 0; l < n_layer; ++l) {
-      AFF_HIP_CHECK(hipMalloc(&D.a_raw_s[sl][l], raw_b));
-      AFF_HIP_CHECK(hipMemset(D.a_raw_s[sl][l], 0, raw_b));
+      if (D.a_raw_slab) {
+        const size_t idx = (size_t)sl * n_layer + l;
+        D.a_raw_s[sl][l] = D.a_raw_slab + idx * raw_slice;
+      }
       const uint64_t cb = (uint64_t)a_comp_rows_[l] * rb;
       if (cb) {
         std::string verr;
         if (!D.a_comp_span_s[sl][l].reserve(D.id, cb, &verr) ||
-            !D.a_comp_span_s[sl][l].commit_to(init_commit_bytes(l), D.a_kv_zero, &verr)) {
+            !D.a_comp_span_s[sl][l].commit_to(init_commit_bytes(l), D.stream, &verr)) {
           if (err) *err = "KV layer " + std::to_string(l) + " on card " + std::to_string(d) +
                           " slot " + std::to_string(sl) + ": " + verr;
           return false;
@@ -4310,14 +4465,19 @@ bool DenseGpu::attn_init(uint32_t n_layer, uint32_t n_head, uint32_t width, uint
       }
     }
     if (!skip_single_arena_enabled()) {
-      AFF_HIP_CHECK(hipMalloc(&D.a_q, (uint64_t)a_hpr_ * width * sizeof(float)));
-      AFF_HIP_CHECK(hipMalloc(&D.a_out, (uint64_t)a_hpr_ * width * sizeof(float)));
-      AFF_HIP_CHECK(hipMalloc(&D.a_allow, a_maxcomp_ ? a_maxcomp_ : 1));
+      const size_t q_bytes = (size_t)a_hpr_ * width * sizeof(float);
+      const size_t allow_bytes = a_maxcomp_ ? a_maxcomp_ : 1u;
+      const RuntimeAllocItem items[] = {
+        {reinterpret_cast<void**>(&D.a_q), q_bytes, false},
+        {reinterpret_cast<void**>(&D.a_out), q_bytes, false},
+        {reinterpret_cast<void**>(&D.a_allow), allow_bytes, false},
+      };
+      if (!runtime_slab_alloc(D, items, 3, "single attn slab", err)) return false;
     }
     // What is BACKED, not what is reserved: the reservation is address space and the whole point
     // of it is that it costs no VRAM. A ledger that counted the reservation would report 4.3 GiB a
     // card that placement is in fact using for experts.
-    st_.kv_bytes += raw_b * n_layer * n_slots_ + comp_committed;
+    st_.kv_bytes += raw_slab_b + comp_committed;
   }
   kv_backed_.store(a_backed_init_, std::memory_order_release);
   attn_ok_ = true;
@@ -4351,7 +4511,13 @@ void DenseGpu::upload_sink(uint32_t layer) {
     const size_t off = std::min(h.size(), (size_t)d * a_hpr_);
     const size_t n = std::min((size_t)a_hpr_, h.size() - off);
     if (!n) continue;
-    if (!D.a_sink[layer]) AFF_HIP_CHECK(hipMalloc(&D.a_sink[layer], n * sizeof(float)));
+    if (!D.a_sink[layer]) {
+      const size_t nbytes = n * sizeof(float);
+      size_t freeb = 0, totalb = 0;
+      if (!weight_slab_can_fit(D, nbytes)) (void)hipMemGetInfo(&freeb, &totalb);
+      if (!dense_weight_alloc(D, d, nbytes, freeb, kAllocHeadroom, &D.a_sink[layer]))
+        AFF_HIP_CHECK(hipMalloc(&D.a_sink[layer], nbytes));
+    }
     AFF_HIP_CHECK(hipMemcpy(D.a_sink[layer], h.data() + off, n * sizeof(float),
                             hipMemcpyHostToDevice));
   }
@@ -4976,48 +5142,63 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    struct Alloc { float** p; size_t bytes; uint64_t rows; const char* name; };
+    struct Alloc { float** p; size_t bytes; uint64_t rows; const char* name; bool small_rt; };
+    const size_t cur_bytes = cur_narrow ? ((size_t)n_embd * kNarrowTok * sizeof(float))
+                                        : ((size_t)n_embd * nb * sizeof(float));
+    const bool cur_in_slab = cur_narrow || cur_bytes <= (2u << 20);
     const Alloc as[] = {
-      {&D.b_mix, (size_t)nout * nb * sizeof(float), nout, "mix"},
-      {&D.b_pre, (size_t)n_hc * nb * sizeof(float), n_hc, "pre"},
-      {&D.b_pre_prev, (size_t)n_hc * nb * sizeof(float), n_hc, "pre prev"},
-      {&D.b_post, (size_t)n_hc * nb * sizeof(float), n_hc, "post"},
-      {&D.b_comb, (size_t)n_hc * n_hc * nb * sizeof(float), (uint64_t)n_hc * n_hc, "comb"},
-      {&D.b_cur, cur_narrow ? ((size_t)n_embd * kNarrowTok * sizeof(float))
-                            : ((size_t)n_embd * nb * sizeof(float)),
-       cur_narrow ? 0ull : n_embd, "cur"},
-      {&D.b_norm, (size_t)n_embd * nb * sizeof(float), n_embd, "norm"},
-      {&D.b_block, (size_t)n_embd * nb * sizeof(float), n_embd, "block"},
+      {&D.b_mix, (size_t)nout * nb * sizeof(float), nout, "mix", true},
+      {&D.b_pre, (size_t)n_hc * nb * sizeof(float), n_hc, "pre", true},
+      {&D.b_pre_prev, (size_t)n_hc * nb * sizeof(float), n_hc, "pre prev", true},
+      {&D.b_post, (size_t)n_hc * nb * sizeof(float), n_hc, "post", true},
+      {&D.b_comb, (size_t)n_hc * n_hc * nb * sizeof(float), (uint64_t)n_hc * n_hc, "comb", true},
+      {&D.b_cur, cur_bytes, cur_narrow ? 0ull : n_embd, "cur", cur_in_slab},
+      {&D.b_norm, (size_t)n_embd * nb * sizeof(float), n_embd, "norm", false},
+      {&D.b_block, (size_t)n_embd * nb * sizeof(float), n_embd, "block", false},
       // Rows, not tokens: TWO [kHcnChunks][nb] planes and the loop below multiplies by nb. Two,
       // because the expand kernel reads one to re-derive the gates and writes the other.
-      {&D.b_hcp, (size_t)2u * kHcnChunks * nb * sizeof(float), 2 * kHcnChunks, "hc partials"},
+      {&D.b_hcp, (size_t)2u * kHcnChunks * nb * sizeof(float), 2 * kHcnChunks, "hc partials", true},
       // Disjoint activation alias: b_emb is only read at batch_begin/block_add/head* while b_y dead.
       {&D.b_emb, emb_aliases_y ? 0u : ((size_t)n_embd * nb * sizeof(float)),
-       emb_aliases_y ? 0ull : n_embd, "emb"},
-      {&D.b_q, (size_t)nq * nb * sizeof(float), nq, "q"},
-      {&D.b_kv, lazy_bkv ? 0u : ((size_t)width * nb * sizeof(float)), lazy_bkv ? 0ull : width, "kv"},
+       emb_aliases_y ? 0ull : n_embd, "emb", false},
+      {&D.b_q, (size_t)nq * nb * sizeof(float), nq, "q", false},
+      {&D.b_kv, lazy_bkv ? 0u : ((size_t)width * nb * sizeof(float)), lazy_bkv ? 0ull : width, "kv", false},
       // One float a head a token: the per-head RMS scale; omitted when no_qrms_ (V4.1).
       {&D.b_hinv, no_qrms_ ? 0u : ((size_t)(nq / width) * nb * sizeof(float)),
-       no_qrms_ ? 0ull : (nq / width), "hinv"},
+       no_qrms_ ? 0ull : (nq / width), "hinv", true},
       {&D.b_qr, qr_in_g ? 0u : ((size_t)b_qr_cap_ * nb * sizeof(float)),
-       qr_in_g ? 0ull : b_qr_cap_, "qr"},
+       qr_in_g ? 0ull : b_qr_cap_, "qr", false},
       {&D.b_g, g_aliases_block ? 0u : ((size_t)b_g_cap_ * nb * sizeof(float)),
-       g_aliases_block ? 0ull : b_g_cap_, "g"},
+       g_aliases_block ? 0ull : b_g_cap_, "g", false},
       // Under AFF_DENSE_ARENA_ALIAS[_V2] b_u backs b_head and aliases b_qtm.
-      {&D.b_u, u_in_qtm ? 0u : u_bytes, u_in_qtm ? 0ull : b_u_cap_, "u"},
-      {&D.b_y, (size_t)b_y_cap_ * nb * sizeof(float), b_y_cap_, "y"},
-      {&D.b_tm, b_tm_cap_ ? ((size_t)b_tm_cap_ * nb * sizeof(float)) : 0u, b_tm_cap_, "tm"},
+      {&D.b_u, u_in_qtm ? 0u : u_bytes, u_in_qtm ? 0ull : b_u_cap_, "u", false},
+      {&D.b_y, (size_t)b_y_cap_ * nb * sizeof(float), b_y_cap_, "y", false},
+      {&D.b_tm, b_tm_cap_ ? ((size_t)b_tm_cap_ * nb * sizeof(float)) : 0u, b_tm_cap_, "tm", false},
     };
     uint64_t arena_rows = 0;
     size_t arena_f32_bytes = 0;
+    std::vector<RuntimeAllocItem> small_items;
+    small_items.reserve(16);
     for (const Alloc& a : as) {
       if (!a.bytes) continue;
-      if (!hip_try(hipMalloc(a.p, a.bytes), "hipMalloc batch", err))
-        return false;
-      AFF_HIP_CHECK(hipMemset(*a.p, 0, a.bytes));
+      if (a.small_rt) {
+        small_items.push_back({reinterpret_cast<void**>(a.p), a.bytes, true});
+      } else {
+        if (!hip_try(hipMalloc(a.p, a.bytes), "hipMalloc batch", err))
+          return false;
+        AFF_HIP_CHECK(hipMemset(*a.p, 0, a.bytes));
+      }
       arena_rows += a.rows;
       arena_f32_bytes += a.bytes;
     }
+    small_items.push_back({reinterpret_cast<void**>(&D.b_ncomp), (size_t)nb * sizeof(uint32_t), false});
+    small_items.push_back({reinterpret_cast<void**>(&D.b_amx), 2u * kNarrowTok * sizeof(float), false});
+    small_items.push_back({reinterpret_cast<void**>(&D.b_apeer),
+                           (kMaxRanks - 1) * 2u * kNarrowTok * sizeof(float), false});
+    small_items.push_back({reinterpret_cast<void**>(&D.b_hids),
+                           (size_t)kNarrowTok * sizeof(uint32_t), false});
+    if (!runtime_slab_alloc(D, small_items.data(), small_items.size(), "batch runtime slab", err))
+      return false;
     if (emb_aliases_y) D.b_emb = D.b_y;
     if (g_aliases_block) D.b_g = D.b_block;
     if (qr_in_g) D.b_qr = D.b_g + (size_t)2048u * nb;
@@ -5097,16 +5278,6 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
         return false;
       D.b_allow_rows = tile;
     }
-    if (!hip_try(hipMalloc(&D.b_ncomp, (size_t)nb * sizeof(uint32_t)), "hipMalloc ncomp", err))
-      return false;
-    // The block head's output plane and the argmax that reads it. Here rather than in draft_init:
-    // the verify block's head is the TARGET's, so with the draft off nothing would allocate them
-    // and batch_head would refuse every block on `vocab > b_vocab_`. The draft's own head writes
-    // this same plane.
-    //
-    // kNarrowTok columns, not nb: a verify block is at most kNarrowTok wide, so this is 8.3 MB a
-    // card rather than the 634 MB a prompt chunk's width would ask for. When AFF_DENSE_ARENA_ALIAS
-    // is active b_head aliases b_u, whose layer lifetime is disjoint from every head pass.
     if (alias_on) {
       D.b_head = D.b_u;
     } else {
@@ -5115,14 +5286,6 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
         return false;
       AFF_HIP_CHECK(hipMemset(D.b_head, 0, (size_t)vocab * kNarrowTok * sizeof(float)));
     }
-    if (!hip_try(hipMalloc(&D.b_amx, 2u * kNarrowTok * sizeof(float)), "argmax", err)) return false;
-    // The cross-card combine's three, on every card because `batch_head` runs the exchange on rank
-    // 0 and the peer copy needs a destination there — 320 bytes a card for a round trip a block.
-    if (!hip_try(hipMalloc(&D.b_apeer, (kMaxRanks - 1) * 2u * kNarrowTok * sizeof(float)),
-                 "argmax peer", err))
-      return false;
-    if (!hip_try(hipMalloc(&D.b_hids, (size_t)kNarrowTok * sizeof(uint32_t)), "block ids", err))
-      return false;
     if (!hip_try(hipHostMalloc(&D.h_hids, (size_t)kNarrowTok * sizeof(uint32_t),
                                hipHostMallocDefault), "block ids staging", err))
       return false;
@@ -5182,44 +5345,50 @@ bool DenseGpu::draft_init(uint32_t n_embd, uint32_t tap_in, uint32_t vocab, uint
   if (!vocab || !tap_in || !n_embd) { if (err) *err = "draft shapes are zero"; return false; }
   (void)markov_rank;
   const bool dx_alias_bq = alias_bdx_enabled() && dense_arena_alias_v2_enabled();
+  const size_t R = impl_->dev.size();
+  const size_t chunk = ((vocab + R - 1u) / R + kRowAlign - 1u) / kRowAlign * kRowAlign;
+  const size_t max_nr = std::min<size_t>(vocab, chunk);
   uint64_t bytes = 0;
-  for (size_t d = 0; d < impl_->dev.size(); ++d) {
+  for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    std::vector<RuntimeAllocItem> items;
     if (dx_alias_bq && D.b_q && D.b_q_floats >= (size_t)tap_in * kNarrowTok) {
       D.b_dx = D.b_q;
     } else {
-      if (!hip_try(hipMalloc(&D.b_dx, (size_t)tap_in * kNarrowTok * sizeof(float)), "draft tap",
-                   err))
-        return false;
-      AFF_HIP_CHECK(hipMemset(D.b_dx, 0, (size_t)tap_in * kNarrowTok * sizeof(float)));
-      bytes += (size_t)tap_in * kNarrowTok * sizeof(float);
+      const size_t dx_b = (size_t)tap_in * kNarrowTok * sizeof(float);
+      items.push_back({reinterpret_cast<void**>(&D.b_dx), dx_b, true});
+      bytes += dx_b;
     }
-    if (!hip_try(hipMalloc(&D.b_dm, (size_t)n_embd * kNarrowTok * sizeof(float)), "draft main_x",
-                 err))
+    const size_t dm_b = (size_t)n_embd * kNarrowTok * sizeof(float);
+    items.push_back({reinterpret_cast<void**>(&D.b_dm), dm_b, true});
+    bytes += dm_b;
+    items.push_back({reinterpret_cast<void**>(&D.b_mbest), (size_t)kNarrowTok * sizeof(uint64_t), false});
+    items.push_back({reinterpret_cast<void**>(&D.b_mpeer), (kMaxRanks - 1) * sizeof(uint64_t), false});
+    items.push_back({reinterpret_cast<void**>(&D.b_ids),
+                     (size_t)(2u * kNarrowTok + 4u) * sizeof(uint32_t), false});
+    items.push_back({reinterpret_cast<void**>(&D.b_noise_bf16),
+                     (size_t)n_embd * sizeof(uint16_t), false});
+    if (max_nr) {
+      items.push_back({reinterpret_cast<void**>(&D.mk_w2_norm), max_nr * sizeof(float), false});
+    }
+    if (!runtime_slab_alloc(D, items.data(), items.size(), "draft runtime slab", err))
       return false;
-    AFF_HIP_CHECK(hipMemset(D.b_dm, 0, (size_t)n_embd * kNarrowTok * sizeof(float)));
-    bytes += (size_t)n_embd * kNarrowTok * sizeof(float);
-    if (!hip_try(hipMalloc(&D.b_mbest, (size_t)kNarrowTok * sizeof(uint64_t)), "markov best", err))
-      return false;
-    if (!hip_try(hipMalloc(&D.b_mpeer, (kMaxRanks - 1) * sizeof(uint64_t)), "markov peer keys", err))
-      return false;
-    if (impl_->dev.size() > 1u) {
+    D.b_noise_embd = n_embd;
+    D.b_noise_tok = 0xFFFFFFFFu;
+    D.mk_w2_src = nullptr;
+    D.mk_w2_rows = 0;
+    D.mk_w2_rank = 0;
+    D.mk_w2_norm_cap = (uint32_t)max_nr;
+    if (R > 1u) {
       const size_t fg_cnt = 2u * kNarrowTok * (kMaxRanks - 1u);
-      if (!hip_try(hipExtMallocWithFlags((void**)&D.b_mk_fg, fg_cnt * sizeof(uint64_t),
-                                         hipDeviceMallocFinegrained),
-                   "markov p2p fg", err))
+      const RuntimeAllocItem fg_items[] = {
+        {reinterpret_cast<void**>(&D.b_mk_fg), fg_cnt * sizeof(uint64_t), true},
+        {reinterpret_cast<void**>(&D.b_mk_flag), fg_cnt * sizeof(unsigned int), true},
+      };
+      if (!runtime_slab_alloc(D, fg_items, 2, "markov p2p fg slab", err, /*finegrained=*/true))
         return false;
-      if (!hip_try(hipExtMallocWithFlags((void**)&D.b_mk_flag, fg_cnt * sizeof(unsigned int),
-                                         hipDeviceMallocFinegrained),
-                   "markov p2p flag", err))
-        return false;
-      AFF_HIP_CHECK(hipMemset(D.b_mk_fg, 0, fg_cnt * sizeof(uint64_t)));
-      AFF_HIP_CHECK(hipMemset(D.b_mk_flag, 0, fg_cnt * sizeof(unsigned int)));
     }
-    if (!hip_try(hipMalloc(&D.b_ids, (size_t)(2u * kNarrowTok + 4u) * sizeof(uint32_t)),
-                 "markov id chain", err))
-      return false;
     if (!hip_try(hipHostMalloc(&D.h_ids, (size_t)(2u * kNarrowTok + 4u) * sizeof(uint32_t),
                                hipHostMallocDefault), "markov ids readback", err))
       return false;
@@ -5255,6 +5424,12 @@ struct HipDeviceGuard {
   int prev = -1;
   HipDeviceGuard() { (void)hipGetDevice(&prev); }
   ~HipDeviceGuard() { if (prev >= 0) (void)hipSetDevice(prev); }
+};
+struct HistResetJob {
+  uint32_t slot = 0;
+  uint32_t layer = 0;
+  uint32_t width = 0;
+  uint32_t idx_width = 0;
 };
 }  // namespace
 
@@ -5371,10 +5546,16 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
   for (uint32_t l = 0; l < n_layer; ++l)
     if (!v41 || key_layers[l]) max_ratio = std::max(max_ratio, ratios[l]);
   const uint32_t cap = std::max<uint32_t>(b_cap_ ? b_cap_ : 1u, max_ratio);
-  const uint32_t saved_slot = slot_;
+  struct SlotGuard {
+    uint32_t& s;
+    uint32_t saved;
+    ~SlotGuard() { s = saved; }
+  } slot_guard{slot_, slot_};
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
+    std::vector<RuntimeAllocItem> rt_items;
+    std::vector<HistResetJob> hist_resets;
     for (uint32_t s = 0; s < n_slots_; ++s) {
       slot_ = s;
       for (uint32_t l = 0; l < n_layer; ++l) {
@@ -5387,19 +5568,26 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
         // it those layers would take the early return below on their first real call and never get
         // one. Null means V4, where owning a ring and owning keys are the same thing.
         const bool keys = v41 ? (key_layers[l] != 0) : false;
-        if (!compress_grow(&D, l, r, comp_width(r, width),
-                           (!v41 && r == 4u) ? comp_width(r, idx_dim) : 0u, keys)) {
-          slot_ = saved_slot;
+        const uint32_t iw = (!v41 && r == 4u) ? comp_width(r, idx_dim) : 0u;
+        if (!compress_grow(&D, l, r, comp_width(r, width), iw, keys, &rt_items, &hist_resets)) {
           if (err) *err = "compressor state for layer " + std::to_string(l);
           return false;
         }
+        if (s == 0u) {
+          if (!D.c_norm[l])
+            rt_items.push_back({reinterpret_cast<void**>(&D.c_norm[l]),
+                                (size_t)width * sizeof(float), false});
+          if ((keys || iw) && !D.ci_norm[l])
+            rt_items.push_back({reinterpret_cast<void**>(&D.ci_norm[l]),
+                                (size_t)idx_dim * sizeof(float), false});
+        }
       }
     }
-    slot_ = saved_slot;
+    slot_ = slot_guard.saved;
     // The compressor's per-chunk projection arena. batch_compress sizes this from b_nb_, THIS
     // chunk's token count, which is never more than b_cap_.
     if (!ensure_comp_scratch(D, cap, width, idx_dim, need_csc, !v41, 0u, err)) return false;
-    if (idx_heads && !idx_grow(&D, cap, idx_heads, idx_dim)) {
+    if (idx_heads && !idx_grow(&D, cap, idx_heads, idx_dim, &rt_items)) {
       if (err) *err = "indexer query and score planes";
       return false;
     }
@@ -5424,27 +5612,23 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
         D.i_bsc = D.b_y;
         D.i_bsc_rows = (uint32_t)std::min<size_t>(b_cap_, by_bytes / (bc * sizeof(float)));
       } else {
-        if (!hip_try(hipMalloc(&D.i_bsc, bsc_min_bytes), "block scores", err))
-          return false;
+        rt_items.push_back({reinterpret_cast<void**>(&D.i_bsc), bsc_min_bytes, false});
         D.i_bsc_rows = i_tile_;
       }
       if (use_gather_cand) {
-        if (!hip_try(hipMalloc(&D.a_cand_ids, (size_t)cand_topk_cap_ * sizeof(uint16_t)),
-                     "candidate block ids (decode)", err) ||
-            !hip_try(hipMalloc(&D.a_cand_n, sizeof(uint32_t)),
-                     "candidate block count (decode)", err))
-          return false;
-        if (b_cap_ &&
-            (!hip_try(hipMalloc(&D.b_cand_ids,
-                                (size_t)b_cap_ * cand_topk_cap_ * sizeof(uint16_t)),
-                      "candidate block ids", err) ||
-             !hip_try(hipMalloc(&D.b_cand_n, (size_t)b_cap_ * sizeof(uint32_t)),
-                      "candidate block counts", err)))
-          return false;
+        rt_items.push_back({reinterpret_cast<void**>(&D.a_cand_ids),
+                            (size_t)cand_topk_cap_ * sizeof(uint16_t), false});
+        rt_items.push_back({reinterpret_cast<void**>(&D.a_cand_n), sizeof(uint32_t), false});
+        if (b_cap_) {
+          rt_items.push_back({reinterpret_cast<void**>(&D.b_cand_ids),
+                              (size_t)b_cap_ * cand_topk_cap_ * sizeof(uint16_t), false});
+          rt_items.push_back({reinterpret_cast<void**>(&D.b_cand_n),
+                              (size_t)b_cap_ * sizeof(uint32_t), false});
+        }
       } else {
-        if (!hip_try(hipMalloc(&D.a_cand, bc), "candidate blocks (decode)", err)) return false;
-        if (b_cap_ && !hip_try(hipMalloc(&D.b_cand, (size_t)b_cap_ * bc), "candidate blocks", err))
-          return false;
+        rt_items.push_back({reinterpret_cast<void**>(&D.a_cand), bc, false});
+        if (b_cap_)
+          rt_items.push_back({reinterpret_cast<void**>(&D.b_cand), (size_t)b_cap_ * bc, false});
       }
     }
     // The flash key split. kSplitTok is the launch size above which the natural grid already fills
@@ -5456,11 +5640,10 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
       const uint64_t ob = flash_split_bytes(kSplitTok, a_hpr_, kSplitSlots, &mlb);
       if (v2_alias && D.b_y && by_bytes >= ob) {
         D.fsplit.o = D.b_y;
-      } else if (!hip_try(hipMalloc(&D.fsplit.o, ob), "flash split numerators", err)) {
-        return false;
+      } else {
+        rt_items.push_back({reinterpret_cast<void**>(&D.fsplit.o), ob, false});
       }
-      if (!hip_try(hipMalloc(&D.fsplit.ml, mlb), "flash split softmax state", err))
-        return false;
+      rt_items.push_back({reinterpret_cast<void**>(&D.fsplit.ml), mlb, false});
       D.fsplit.tok_cap = kSplitTok;
       D.fsplit.slots = kSplitSlots;
     }
@@ -5468,27 +5651,33 @@ bool DenseGpu::reserve_runtime(uint32_t n_layer, const uint32_t* ratios, uint32_
       const uint32_t kTopkTok = idx_topk_v2_enabled() ? 16u : 8u;
       uint64_t sb = 0, tb = 0;
       const uint64_t hb = idx_topk_scratch_bytes(kTopkTok, &sb, &tb);
-      if (!hip_try(hipMalloc(&D.topk.hist, hb), "top-k histogram", err) ||
-          !hip_try(hipMalloc(&D.topk.state, sb), "top-k select state", err) ||
-          !hip_try(hipMalloc(&D.topk.tie, tb), "top-k tie list", err))
-        return false;
-      AFF_HIP_CHECK(hipMemset(D.topk.hist, 0, hb));
-      AFF_HIP_CHECK(hipMemset(D.topk.state, 0, sb));
-      AFF_HIP_CHECK(hipMemset(D.topk.tie, 0, tb));
+      rt_items.push_back({reinterpret_cast<void**>(&D.topk.hist), hb, true});
+      rt_items.push_back({reinterpret_cast<void**>(&D.topk.state), sb, true});
+      rt_items.push_back({reinterpret_cast<void**>(&D.topk.tie), tb, true});
       D.topk.tok_cap = kTopkTok;
     }
     // The admitted-row lists. kAdmCap is the largest index_topk this path will serve; above it the
     // top-k keeps the mask and attention keeps walking every row, which is correct and slow rather
     // than wrong. 512 is what this model asks for.
     if (!D.a_adm) {
-      if (!hip_try(hipMalloc(&D.a_adm, (size_t)kAdmCap * sizeof(uint32_t)), "admitted list", err) ||
-          !hip_try(hipMalloc(&D.a_admn, sizeof(uint32_t)), "admitted count", err) ||
-          !hip_try(hipMalloc(&D.b_adm, (size_t)cap * kAdmCap * sizeof(uint32_t)),
-                   "admitted list, chunk", err) ||
-          !hip_try(hipMalloc(&D.b_admn, (size_t)cap * sizeof(uint32_t)), "admitted counts", err))
-        return false;
-      AFF_HIP_CHECK(hipMemset(D.a_admn, 0, sizeof(uint32_t)));
-      AFF_HIP_CHECK(hipMemset(D.b_admn, 0, (size_t)cap * sizeof(uint32_t)));
+      rt_items.push_back({reinterpret_cast<void**>(&D.a_adm),
+                          (size_t)kAdmCap * sizeof(uint32_t), false});
+      rt_items.push_back({reinterpret_cast<void**>(&D.a_admn), sizeof(uint32_t), true});
+      rt_items.push_back({reinterpret_cast<void**>(&D.b_adm),
+                          (size_t)cap * kAdmCap * sizeof(uint32_t), false});
+      rt_items.push_back({reinterpret_cast<void**>(&D.b_admn),
+                          (size_t)cap * sizeof(uint32_t), true});
+    }
+    if (!runtime_slab_alloc(D, rt_items.data(), rt_items.size(), "runtime slab", err))
+      return false;
+    for (const HistResetJob& hj : hist_resets) {
+      const uint32_t hist = comp_hist(D.c_ratio[hj.layer]);
+      compressor_hist_reset_hip(D.c_hkv_s[hj.slot][hj.layer], D.c_hsc_s[hj.slot][hj.layer],
+                                hj.width, hist, D.stream);
+      if (hj.idx_width) {
+        compressor_hist_reset_hip(D.ci_hkv_s[hj.slot][hj.layer], D.ci_hsc_s[hj.slot][hj.layer],
+                                  hj.idx_width, hist, D.stream);
+      }
     }
   }
   return true;
@@ -5768,7 +5957,7 @@ bool DenseGpu::batch_begin_draft_bf16(uint32_t n_live, uint32_t pos0, const uint
     keepalive_notify_active(D.id);
     if (!D.b_noise_bf16 || D.b_noise_embd != n_embd || D.b_noise_tok != noise_tok) {
       if (D.b_noise_bf16 && D.b_noise_embd != n_embd) {
-        (void)hipFree(D.b_noise_bf16);
+        if (!runtime_slab_owns(D, D.b_noise_bf16)) (void)hipFree(D.b_noise_bf16);
         D.b_noise_bf16 = nullptr;
       }
       if (!D.b_noise_bf16) {
@@ -6171,13 +6360,14 @@ bool DenseGpu::batch_kv_commit(uint32_t layer, uint32_t b0, uint32_t n, uint32_t
 //
 // Grows the indexer's per-token arenas; both entry points call it, since the query projection lands
 // in i_q before batch_indexer runs and whichever comes first must have allocated them.
-bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
+bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim,
+                        void* rt_items_v) {
   Impl::Dev& D = *(Impl::Dev*)devp;
   if (D.i_cap_tok >= n) return true;
   const uint32_t cap = n;
   for (void** p : {(void**)&D.i_q, (void**)&D.i_q8, (void**)&D.i_qs, (void**)&D.i_w,
                    (void**)&D.i_sc, (void**)&D.i_nc, (void**)&D.i_ncb}) {
-    if (*p && !D.is_bq_alias(*p)) (void)hipFree(*p);
+    if (*p && !D.is_bq_alias(*p) && !runtime_slab_owns(D, *p)) (void)hipFree(*p);
     *p = nullptr;
   }
   D.ncomp_idx.free();
@@ -6236,11 +6426,17 @@ bool DenseGpu::idx_grow(void* devp, uint32_t n, uint32_t n_head, uint32_t dim) {
     if (hipMalloc(&D.i_sc, (size_t)i_tile_ * row) != hipSuccess) return false;
     D.i_sc_bytes = sc_bytes;
   }
-  if (hipMalloc(&D.i_nc, (size_t)cap * sizeof(uint32_t)) != hipSuccess) return false;
+  auto* rt_items = static_cast<std::vector<RuntimeAllocItem>*>(rt_items_v);
+  if (rt_items) {
+    rt_items->push_back({reinterpret_cast<void**>(&D.i_nc), (size_t)cap * sizeof(uint32_t), false});
+    rt_items->push_back({reinterpret_cast<void**>(&D.i_ncb), (size_t)cap * sizeof(uint32_t), false});
+  } else {
+    if (hipMalloc(&D.i_nc, (size_t)cap * sizeof(uint32_t)) != hipSuccess) return false;
+    if (hipMalloc(&D.i_ncb, (size_t)cap * sizeof(uint32_t)) != hipSuccess) return false;
+  }
   if (!D.ncomp_idx.fit((size_t)cap * sizeof(uint32_t), kRingCountBudget)) return false;
   // The same counts in BLOCKS, for the candidate pre-filter's select. Allocated whether or not the
   // model has one: two arrays of `cap` uint32 against branching this function on a config value.
-  if (hipMalloc(&D.i_ncb, (size_t)cap * sizeof(uint32_t)) != hipSuccess) return false;
   if (!D.ncomp_idxb.fit((size_t)cap * sizeof(uint32_t), kRingCountBudget)) return false;
   D.i_cap_tok = cap;
   return true;
@@ -6296,7 +6492,8 @@ bool DenseGpu::batch_indexer_q(int32_t h, uint64_t rows, uint64_t cols, uint32_t
 // HOST walk this replaces was a quarter of the wall, most of it the device idling in a drain.
 // See gpu/compressor_gpu.h for why the pooling was never sequential.
 bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_t width,
-                             uint32_t idx_width, bool idx_keys) {
+                             uint32_t idx_width, bool idx_keys, void* rt_items_v,
+                             void* hist_resets_v) {
   Impl::Dev& D = *(Impl::Dev*)devp;
   const uint32_t nl = (uint32_t)D.a_comp_s[slot_].size();
   if (layer >= nl) return false;
@@ -6305,6 +6502,7 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
   if (D.c_ratio.empty()) {
     D.c_ape.assign(nl, nullptr);  D.c_norm.assign(nl, nullptr);
     D.ci_ape.assign(nl, nullptr); D.ci_norm.assign(nl, nullptr);
+    D.c_norm_uploaded.assign(nl, 0u);
     D.c_ratio.assign(nl, 0u);
   }
   // Per-sequence state: sized once PER SLOT, lazily, on that slot's first touch.
@@ -6314,27 +6512,38 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
     D.a_idx8_s[slot_].assign(nl, nullptr); D.a_idxs_s[slot_].assign(nl, nullptr);
   }
   if (D.c_hkv_s[slot_][layer]) return true;
+  auto* rt_items = static_cast<std::vector<RuntimeAllocItem>*>(rt_items_v);
+  auto* hist_resets = static_cast<std::vector<HistResetJob>*>(hist_resets_v);
   const uint32_t hist = comp_hist(ratio);
   const size_t hb = (size_t)hist * width * sizeof(float);
-  if (hipMalloc(&D.c_hkv_s[slot_][layer], hb) != hipSuccess) return false;
-  if (hipMalloc(&D.c_hsc_s[slot_][layer], hb) != hipSuccess) return false;
-  compressor_hist_reset_hip(D.c_hkv_s[slot_][layer], D.c_hsc_s[slot_][layer], width, hist, D.stream);
-  // The index COMPRESSOR's pooling ring exists only on V4's ratio-4 layers; idx_width 0 says so.
-  // V4.1 has no such compressor and passes 0 here — but it still owns a key cache, built by `wk`
-  // off the KV latent, so the two allocations are asked for separately. Conflating them is what
-  // left build_v41_keys writing into a null cache on the first run.
-  if (idx_width) {
-    const size_t ihb = (size_t)hist * idx_width * sizeof(float);
-    if (hipMalloc(&D.ci_hkv_s[slot_][layer], ihb) != hipSuccess) return false;
-    if (hipMalloc(&D.ci_hsc_s[slot_][layer], ihb) != hipSuccess) return false;
-    compressor_hist_reset_hip(D.ci_hkv_s[slot_][layer], D.ci_hsc_s[slot_][layer], idx_width, hist, D.stream);
+  if (rt_items && hist_resets) {
+    rt_items->push_back({reinterpret_cast<void**>(&D.c_hkv_s[slot_][layer]), hb, false});
+    rt_items->push_back({reinterpret_cast<void**>(&D.c_hsc_s[slot_][layer]), hb, false});
+    if (idx_width) {
+      const size_t ihb = (size_t)hist * idx_width * sizeof(float);
+      rt_items->push_back({reinterpret_cast<void**>(&D.ci_hkv_s[slot_][layer]), ihb, false});
+      rt_items->push_back({reinterpret_cast<void**>(&D.ci_hsc_s[slot_][layer]), ihb, false});
+    }
+    hist_resets->push_back(HistResetJob{slot_, layer, width, idx_width});
+  } else {
+    if (hipMalloc(&D.c_hkv_s[slot_][layer], hb) != hipSuccess) return false;
+    if (hipMalloc(&D.c_hsc_s[slot_][layer], hb) != hipSuccess) return false;
+    compressor_hist_reset_hip(D.c_hkv_s[slot_][layer], D.c_hsc_s[slot_][layer], width, hist,
+                              D.stream);
+    if (idx_width) {
+      const size_t ihb = (size_t)hist * idx_width * sizeof(float);
+      if (hipMalloc(&D.ci_hkv_s[slot_][layer], ihb) != hipSuccess) return false;
+      if (hipMalloc(&D.ci_hsc_s[slot_][layer], ihb) != hipSuccess) return false;
+      compressor_hist_reset_hip(D.ci_hkv_s[slot_][layer], D.ci_hsc_s[slot_][layer], idx_width,
+                                hist, D.stream);
+    }
   }
   if (idx_keys || idx_width) {
     const uint32_t irows = idx_compact_alloc_enabled() ? a_comp_rows_[layer] : a_maxcomp_;
     const size_t b8 = (size_t)irows * kIdxDim;
     const size_t bs = (size_t)irows * sizeof(float);
     size_t gran = 0u;
-    const bool use_vmem = idx_vmem_enabled() && D.a_kv_zero &&
+    const bool use_vmem = idx_vmem_enabled() && D.stream &&
                           VirtualSpan::granularity_for(D.id, &gran, nullptr) && gran > 0u;
     uint32_t init_rows =
         std::max<uint32_t>(1u, std::min<uint32_t>(irows, comp_rows_for(layer, a_init_pos_ ? a_init_pos_ : 1u)));
@@ -6348,11 +6557,13 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
         layer < D.a_idx8_span_s[slot_].size()) {
       std::string verr;
       if (!D.a_idx8_span_s[slot_][layer].reserve(D.id, b8, &verr) ||
-          !D.a_idx8_span_s[slot_][layer].commit_to((size_t)init_rows * kIdxDim, D.a_kv_zero, &verr))
+          !D.a_idx8_span_s[slot_][layer].commit_to((size_t)init_rows * kIdxDim, D.stream, &verr))
         return false;
       D.a_idx8_s[slot_][layer] = static_cast<uint8_t*>(D.a_idx8_span_s[slot_][layer].ptr());
       st_.kv_bytes += D.a_idx8_span_s[slot_][layer].committed();
       synced_zero = true;
+    } else if (rt_items) {
+      rt_items->push_back({reinterpret_cast<void**>(&D.a_idx8_s[slot_][layer]), b8, true});
     } else {
       if (hipMalloc(&D.a_idx8_s[slot_][layer], b8) != hipSuccess) return false;
     }
@@ -6360,17 +6571,59 @@ bool DenseGpu::compress_grow(void* devp, uint32_t layer, uint32_t ratio, uint32_
         layer < D.a_idxs_span_s[slot_].size()) {
       std::string verr;
       if (!D.a_idxs_span_s[slot_][layer].reserve(D.id, bs, &verr) ||
-          !D.a_idxs_span_s[slot_][layer].commit_to((size_t)init_rows * sizeof(float), D.a_kv_zero, &verr))
+          !D.a_idxs_span_s[slot_][layer].commit_to((size_t)init_rows * sizeof(float), D.stream, &verr))
         return false;
       D.a_idxs_s[slot_][layer] = static_cast<float*>(D.a_idxs_span_s[slot_][layer].ptr());
       st_.kv_bytes += D.a_idxs_span_s[slot_][layer].committed();
       synced_zero = true;
+    } else if (rt_items) {
+      rt_items->push_back({reinterpret_cast<void**>(&D.a_idxs_s[slot_][layer]), bs, true});
     } else {
       if (hipMalloc(&D.a_idxs_s[slot_][layer], bs) != hipSuccess) return false;
     }
-    if (synced_zero) AFF_HIP_CHECK(hipStreamSynchronize(D.a_kv_zero));
+    if (synced_zero) AFF_HIP_CHECK(hipStreamSynchronize(D.stream));
   }
   D.c_ratio[layer] = ratio;
+  return true;
+}
+
+bool DenseGpu::upload_comp_norms(void* devp, const Model::CompressArgs& a, uint32_t cw,
+                                 uint32_t iw, bool has_idx, void* stream) {
+  Impl::Dev& D = *(Impl::Dev*)devp;
+  hipStream_t st = (hipStream_t)stream;
+  if (D.c_norm_uploaded.size() <= a.layer)
+    D.c_norm_uploaded.resize(D.a_comp_s[slot_].size(), 0u);
+  if (D.c_norm_uploaded[a.layer]) return true;
+  if (!D.c_norm[a.layer] &&
+      hipMalloc(&D.c_norm[a.layer], (size_t)a.width * sizeof(float)) != hipSuccess)
+    return false;
+  AFF_HIP_CHECK(hipMemcpyAsync(D.c_norm[a.layer], a.norm, (size_t)a.width * sizeof(float),
+                               hipMemcpyHostToDevice, st));
+  if (a.ape) {
+    const size_t ab = (size_t)a.ratio * cw * sizeof(float);
+    if (!D.c_ape[a.layer] && hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
+    AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
+  }
+  if (a.h_idx_wk >= 0) {
+    if (!D.ci_norm[a.layer] &&
+        hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
+      return false;
+    AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.idx_k_norm,
+                                 (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
+  }
+  if (has_idx) {
+    if (!D.ci_norm[a.layer] &&
+        hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
+      return false;
+    AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.inorm,
+                                 (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
+    if (a.iape) {
+      const size_t iab = (size_t)a.ratio * iw * sizeof(float);
+      if (!D.ci_ape[a.layer] && hipMalloc(&D.ci_ape[a.layer], iab) != hipSuccess) return false;
+      AFF_HIP_CHECK(hipMemcpyAsync(D.ci_ape[a.layer], a.iape, iab, hipMemcpyHostToDevice, st));
+    }
+  }
+  D.c_norm_uploaded[a.layer] = 1u;
   return true;
 }
 
@@ -6474,45 +6727,7 @@ bool DenseGpu::batch_compress(const Model::CompressArgs& a) {
     // One arena for every layer, sized from the widest: the ratio-4 layers carry both halves of the
     // projection in one row and the ratio-128 layers half of that.
     if (!ensure_comp_scratch(D, b_nb_, a_width_, kIdxDim, gated, has_idx, 0u, nullptr)) return false;
-    // The layer's ape and norm weights, once, and ASYNCHRONOUSLY. A blocking hipMemcpy here waits
-    // for the device, and by the time layer L runs there is a whole 1536-token layer in the queue —
-    // four of them a layer a card across 43 layers, on the one pass where this guard is false,
-    // which is why hybrid prefill's spread was always in the first chunk.
-    //
-    // Async on the layer's own stream needs no sync: the kernels that read these are issued on `st`
-    // behind them, and the sources are the model's own weights, which outlive the process.
-    //
-    // Keyed on `c_norm`, not on `c_ape`: V4.1 has no ape, so an ape-keyed guard would never latch
-    // and every chunk would allocate and copy the norm again.
-    if (!D.c_norm[a.layer]) {
-      if (hipMalloc(&D.c_norm[a.layer], (size_t)a.width * sizeof(float)) != hipSuccess) return false;
-      AFF_HIP_CHECK(hipMemcpyAsync(D.c_norm[a.layer], a.norm, (size_t)a.width * sizeof(float),
-                                   hipMemcpyHostToDevice, st));
-      if (a.ape) {
-        const size_t ab = (size_t)a.ratio * cw * sizeof(float);
-        if (hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
-        AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
-      }
-      // V4.1's `k_norm` takes the same slot V4's index-compressor norm does: same width, same
-      // lifetime, and the two never coexist — a layer has one indexer key source or the other.
-      if (a.h_idx_wk >= 0) {
-        if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
-          return false;
-        AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.idx_k_norm,
-                                     (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
-      }
-      if (has_idx) {
-        if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
-          return false;
-        AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.inorm,
-                                     (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
-        if (a.iape) {
-          const size_t iab = (size_t)a.ratio * iw * sizeof(float);
-          if (hipMalloc(&D.ci_ape[a.layer], iab) != hipSuccess) return false;
-          AFF_HIP_CHECK(hipMemcpyAsync(D.ci_ape[a.layer], a.iape, iab, hipMemcpyHostToDevice, st));
-        }
-      }
-    }
+    if (!upload_comp_norms(&D, a, cw, iw, has_idx, st)) return false;
 
     // GEMMs into one dim-major staging block, then transposes: the pool indexes by POSITION, so it
     // wants token-major, and the transpose is the same one batch_indexer_q uses.
@@ -6941,39 +7156,7 @@ bool DenseGpu::compress_one(const Model::CompressArgs& a) {
     hipStream_t st = D.stream;
     if (!compress_grow(&D, a.layer, a.ratio, cw, iw, a.h_idx_wk >= 0)) return false;
     if (2u * (uint64_t)(cw + iw) + a.idx_heads > D.cap_mid) return false;
-    // Same lazy upload as the batched path above, same reason for being async — see there.
-    //
-    // Keyed on `c_norm`, not on `c_ape`: V4.1 has no ape, so an ape-keyed guard would never latch
-    // and every chunk would allocate and copy the norm again.
-    if (!D.c_norm[a.layer]) {
-      if (hipMalloc(&D.c_norm[a.layer], (size_t)a.width * sizeof(float)) != hipSuccess) return false;
-      AFF_HIP_CHECK(hipMemcpyAsync(D.c_norm[a.layer], a.norm, (size_t)a.width * sizeof(float),
-                                   hipMemcpyHostToDevice, st));
-      if (a.ape) {
-        const size_t ab = (size_t)a.ratio * cw * sizeof(float);
-        if (hipMalloc(&D.c_ape[a.layer], ab) != hipSuccess) return false;
-        AFF_HIP_CHECK(hipMemcpyAsync(D.c_ape[a.layer], a.ape, ab, hipMemcpyHostToDevice, st));
-      }
-      // V4.1's `k_norm` takes the same slot V4's index-compressor norm does: same width, same
-      // lifetime, and the two never coexist — a layer has one indexer key source or the other.
-      if (a.h_idx_wk >= 0) {
-        if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
-          return false;
-        AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.idx_k_norm,
-                                     (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
-      }
-      if (has_idx) {
-        if (hipMalloc(&D.ci_norm[a.layer], (size_t)a.idx_dim * sizeof(float)) != hipSuccess)
-          return false;
-        AFF_HIP_CHECK(hipMemcpyAsync(D.ci_norm[a.layer], a.inorm,
-                                     (size_t)a.idx_dim * sizeof(float), hipMemcpyHostToDevice, st));
-        if (a.iape) {
-          const size_t iab = (size_t)a.ratio * iw * sizeof(float);
-          if (hipMalloc(&D.ci_ape[a.layer], iab) != hipSuccess) return false;
-          AFF_HIP_CHECK(hipMemcpyAsync(D.ci_ape[a.layer], a.iape, iab, hipMemcpyHostToDevice, st));
-        }
-      }
-    }
+    if (!upload_comp_norms(&D, a, cw, iw, has_idx, st)) return false;
     // ---- buffer `norm`, project the whole group at the pool -------------------------------------
     //
     // The four compressor projections are read by exactly one thing, the pool, which runs every
@@ -7899,7 +8082,7 @@ bool DenseGpu::batch_router(int32_t h, uint32_t n_expert, uint64_t n_embd, float
   if (!ensure_by(n_expert) || !ensure_btm(n_expert)) return false;
   const size_t R = impl_->dev.size();
   const bool r0_only = router_rank0_only_enabled();
-  const size_t owner = impl_->router_owner < R ? impl_->router_owner : 0u;
+  const size_t owner = impl_->router_owner_for(h);
   for (size_t d = 0; d < R; ++d) {
     Impl::Dev& D = impl_->dev[d];
     uint64_t r0 = 0, nr = 0;
@@ -7941,75 +8124,128 @@ bool DenseGpu::batch_norm_fetch(float* norm_host) {
 bool DenseGpu::router_scratch(size_t rank, uint32_t n_expert, uint32_t k) {
   if (rank >= impl_->dev.size() || !b_cap_ || !n_expert || !k) return false;
   Impl::Dev& D = impl_->dev[rank];
-  if (D.h_rn) return true;
+  const uint32_t bias_stride = std::max(std::max(r_max_expert_, n_expert), D.r_bias_stride);
+  if (D.h_rn && k <= D.r_k_cap && n_expert <= D.r_bias_stride &&
+      D.rbias_src.size() >= n_router_)
+    return true;
+  const bool first_alloc = !D.h_rn;
+  if (!first_alloc) AFF_HIP_CHECK(hipStreamSynchronize(D.stream));
+  const uint32_t k_alloc = std::max(D.r_k_cap, k);
   // b_cap_, NOT b_nb_. b_nb_ is THIS chunk's rounded token count, and the first chunk of a run can
   // be a short prompt; sizing from it and then meeting a full chunk overruns the allocation, which
   // surfaces as "invalid argument" on the copy rather than as a bad answer. h_rn is assigned last
   // and is the guard, so a partial failure retries rather than leaving half-null pointers behind a
   // satisfied test.
-  const size_t nk = (size_t)b_cap_ * k;
-  const uint32_t bias_stride = std::max(r_max_expert_, n_expert);
+  const size_t nk = (size_t)b_cap_ * k_alloc;
   // sel, wt and n in ONE allocation, device and pinned alike, in that order: the three come back
   // together every layer, and as three allocations that is three D2H copies — each of which ROCm
-  // runs as a copyBuffer kernel carrying a full dispatch gap. Contiguous, it is one copy. bias and
-  // res stay separate: they go the other way, and only when placement supplies them.
+  // runs as a copyBuffer kernel carrying a full dispatch gap. Contiguous, it is one copy.
   const size_t o_wt = nk * sizeof(uint32_t), o_n = o_wt + nk * sizeof(float);
   const size_t back = o_n + (size_t)b_cap_ * sizeof(uint32_t);
-  void* p[5] = {nullptr};
-  bool ok = hipMalloc(&p[0], back) == hipSuccess &&
-            // One slice per router handle with uniform bias_stride (max n_expert across target
-            // and draft stages), so draft stages (n_expert=128) never alias target layers' slots.
-            hipMalloc(&p[1], (size_t)n_router_ * bias_stride * sizeof(float)) == hipSuccess &&
-            hipMalloc(&p[2], (size_t)bias_stride) == hipSuccess &&
-            // Pinned: these come straight back, and a pageable D2H is a bounce-buffer copy.
-            hipHostMalloc(&p[3], back, hipHostMallocDefault) == hipSuccess;
-  if (!ok) {
-    for (int i = 0; i < 3; ++i) if (p[i]) (void)hipFree(p[i]);
-    if (p[3]) (void)hipHostFree(p[3]);
-    return false;
-  }
   // The UPWARD staging is a ring of the same block, because a hash layer hands the card a selection
-  // the host looked up and then goes straight on to the next layer. `hb` above stays a single block:
+  // the host looked up and then goes straight on to the next layer. `hb` below stays a single block:
   // it is the D2H direction, where the host is the consumer and the copy has already landed by the
   // time anything reads it. Only the H2D direction can be overwritten under a pending DMA.
-  if (!D.rsel.fit(back, kRingCountBudget)) {
-    for (int i = 0; i < 3; ++i) if (p[i]) (void)hipFree(p[i]);
-    (void)hipHostFree(p[3]);
-    return false;
+  if (!D.rsel.fit(back, kRingCountBudget)) return false;
+  void* hb_raw = nullptr;
+  if (hipHostMalloc(&hb_raw, back, hipHostMallocDefault) != hipSuccess) return false;
+  void* b_rsel_new = nullptr;
+  void* b_rbias_new = nullptr;
+  void* b_rres_new = nullptr;
+  const bool need_bias = first_alloc || bias_stride > D.r_bias_stride ||
+                         D.rbias_src.size() < n_router_;
+  // One slice per router handle with uniform bias_stride (max n_expert across target
+  // and draft stages), so draft stages (n_expert=128) never alias target layers' slots.
+  const size_t bias_bytes = (size_t)n_router_ * bias_stride * sizeof(float);
+  const size_t res_bytes = (size_t)bias_stride;
+  if (first_alloc) {
+    const RuntimeAllocItem items[] = {
+      {&b_rsel_new, back, false},
+      {&b_rbias_new, bias_bytes, false},
+      {&b_rres_new, res_bytes, false},
+    };
+    if (!runtime_slab_alloc(D, items, 3, "router scratch slab", nullptr)) {
+      (void)hipHostFree(hb_raw);
+      return false;
+    }
+  } else {
+    bool ok = hipMalloc(&b_rsel_new, back) == hipSuccess;
+    if (ok && need_bias) {
+      ok = hipMalloc(&b_rbias_new, bias_bytes) == hipSuccess &&
+           hipMalloc(&b_rres_new, res_bytes) == hipSuccess;
+    }
+    if (!ok) {
+      if (b_rsel_new) (void)hipFree(b_rsel_new);
+      if (b_rbias_new) (void)hipFree(b_rbias_new);
+      if (b_rres_new) (void)hipFree(b_rres_new);
+      (void)hipHostFree(hb_raw);
+      return false;
+    }
+    if (D.h_rsel) (void)hipHostFree(D.h_rsel);
+    if (D.b_rsel && !runtime_slab_owns(D, D.b_rsel)) (void)hipFree(D.b_rsel);
+    if (need_bias) {
+      if (D.b_rbias && !runtime_slab_owns(D, D.b_rbias)) (void)hipFree(D.b_rbias);
+      if (D.b_rres && !runtime_slab_owns(D, D.b_rres)) (void)hipFree(D.b_rres);
+    }
   }
-  uint8_t* const db = (uint8_t*)p[0];
-  uint8_t* const hb = (uint8_t*)p[3];
+  uint8_t* const db = (uint8_t*)b_rsel_new;
+  uint8_t* const hb = (uint8_t*)hb_raw;
   D.b_rsel = (uint32_t*)db; D.b_rwt = (float*)(db + o_wt); D.b_rn = (uint32_t*)(db + o_n);
-  D.b_rbias = (float*)p[1]; D.b_rres = (uint8_t*)p[2];
-  D.rbias_src.assign(n_router_, nullptr);
+  if (need_bias) {
+    D.b_rbias = (float*)b_rbias_new; D.b_rres = (uint8_t*)b_rres_new;
+    D.rbias_src.assign(n_router_, nullptr);
+    D.r_bias_stride = bias_stride;
+  }
   D.r_back = back; D.r_woff = o_wt; D.r_noff = o_n;
   D.r_k = k;
-  D.r_bias_stride = bias_stride;
+  D.r_k_cap = k_alloc;
   D.h_rsel = (uint32_t*)hb; D.h_rwt = (float*)(hb + o_wt);
-  D.b_rsel_m = D.b_rsel; D.b_rwt_m = D.b_rwt;        // rank 0 reads its own block
+  D.b_rsel_m = D.b_rsel; D.b_rwt_m = D.b_rwt;        // owner reads its own block
   D.h_rn = (uint32_t*)(hb + o_n);                    // last: it is the guard above
   return true;
 }
 
 // ---- the selection, pushed to every other card ---------------------------------------------------
 //
-// One allocation per rank laid out exactly like rank 0's, so the push is a single peer copy of the
-// whole sel/wt/n block rather than three, and `route_dev` hands every rank the same shape.
-bool DenseGpu::route_mirror(uint32_t n_expert, uint32_t k) {
+// One allocation per rank laid out identically across owners, so the push is a single peer copy of
+// the whole sel/wt/n block rather than three, and `route_dev` hands every rank the same shape.
+bool DenseGpu::route_mirror(size_t owner, uint32_t n_expert, uint32_t k) {
   const size_t R = impl_->dev.size();
   if (R < 2) return true;
-  const size_t owner = (router_rank0_only_enabled() && impl_->router_owner < R) ? impl_->router_owner : 0u;
+  if (owner >= R) return false;
   Impl::Dev& Downer = impl_->dev[owner];
   if (!Downer.r_back) return false;
+  const size_t need_stride = std::max(impl_->route_slot_stride, Downer.r_back);
+  if (need_stride > impl_->route_slot_stride && impl_->route_slot_stride > 0) {
+    for (size_t rr = 0; rr < R; ++rr) {
+      Impl::Dev& Dsync = impl_->dev[rr];
+      bool any_ev = false;
+      for (uint32_t s = 0; s < Impl::Dev::kRouteSlots; ++s) {
+        if (Dsync.ev_route[s]) { any_ev = true; break; }
+      }
+      if (!any_ev) continue;
+      AFF_HIP_CHECK(hipSetDevice(Dsync.id));
+      for (uint32_t s = 0; s < Impl::Dev::kRouteSlots; ++s) {
+        if (Dsync.ev_route[s]) AFF_HIP_CHECK(hipEventSynchronize((hipEvent_t)Dsync.ev_route[s]));
+      }
+    }
+    for (size_t r = 0; r < R; ++r) {
+      Impl::Dev& Dr = impl_->dev[r];
+      if (Dr.m_ring && !runtime_slab_owns(Dr, Dr.m_ring)) (void)hipFree(Dr.m_ring);
+      Dr.m_ring = nullptr;
+    }
+    for (size_t rr = 0; rr < kMaxRanks; ++rr) impl_->route_ready_owner[rr] = 0;
+  }
   for (size_t r = 0; r < R; ++r) {
     if (r == owner) continue;
     Impl::Dev& D = impl_->dev[r];
     if (D.m_ring) continue;
     AFF_HIP_CHECK(hipSetDevice(D.id));
     void* p = nullptr;
-    if (hipMalloc(&p, Downer.r_back * Impl::Dev::kRouteSlots) != hipSuccess) return false;
+    if (hipMalloc(&p, need_stride * Impl::Dev::kRouteSlots) != hipSuccess) return false;
     D.m_ring = p;
   }
+  if (impl_->route_slot_stride < need_stride) impl_->route_slot_stride = need_stride;
   AFF_HIP_CHECK(hipSetDevice(Downer.id));
   for (uint32_t s = 0; s < Impl::Dev::kRouteSlots; ++s)
     if (!Downer.ev_route[s] &&
@@ -8027,18 +8263,23 @@ bool DenseGpu::route_mirror(uint32_t n_expert, uint32_t k) {
 // there — a selection that is in range, plausible, and for the wrong tokens. It cost three
 // different `ids-md5` values from three runs of the same binary before the differential check named
 // the layer.
-void DenseGpu::route_publish() {
+void DenseGpu::route_publish(size_t owner) {
   const size_t R = impl_->dev.size();
-  if (R < 2 || route_ready_ != 1) return;
-  const size_t owner = (router_rank0_only_enabled() && impl_->router_owner < R) ? impl_->router_owner : 0u;
+  if (R < 2 || owner >= R || impl_->route_ready_owner[owner] != 1) return;
   Impl::Dev& D = impl_->dev[owner];
   const uint32_t slot = (uint32_t)(route_seq_ % Impl::Dev::kRouteSlots);
-  // Reusing a slot means reusing its event, so the record from a whole ring ago has to be done
-  // first. Only blocks when the host is kRouteSlots layers ahead of the card, where it is not the
-  // thing holding anything up.
-  if (route_seq_ >= Impl::Dev::kRouteSlots)
-    AFF_BLOCK_AT(aff::BlockSite::RouteRing,
-                 AFF_HIP_CHECK(hipEventSynchronize((hipEvent_t)D.ev_route[slot])));
+  // Reusing a slot means reusing its ring slot and event across possibly different layer owners, so
+  // the record from the previous cycle's owner on that slot has to be done first.
+  if (route_seq_ >= Impl::Dev::kRouteSlots) {
+    const size_t prev_owner = impl_->route_owner_slot[slot];
+    Impl::Dev& Dprev = impl_->dev[prev_owner < R ? prev_owner : 0u];
+    if (Dprev.ev_route[slot]) {
+      if (Dprev.id != D.id) AFF_HIP_CHECK(hipSetDevice(Dprev.id));
+      AFF_BLOCK_AT(aff::BlockSite::RouteRing,
+                   AFF_HIP_CHECK(hipEventSynchronize((hipEvent_t)Dprev.ev_route[slot])));
+      if (Dprev.id != D.id) AFF_HIP_CHECK(hipSetDevice(D.id));
+    }
+  }
   const size_t live_nk = (size_t)b_live_ * D.r_k;
   const bool pack_live = b_live_ > 0 && D.r_k > 0 &&
                          (D.route_wt_packed ? ((size_t)b_live_ <= b_cap_)
@@ -8056,7 +8297,7 @@ void DenseGpu::route_publish() {
     peer_woff = live_nk * sizeof(uint32_t);
     copy_bytes = live_nk * (sizeof(uint32_t) + sizeof(float));
   }
-  D.route_woff_slot[slot] = peer_woff;
+  const size_t stride = impl_->route_slot_stride ? impl_->route_slot_stride : D.r_back;
   for (size_t r = 0; r < R; ++r) {
     if (r == owner) continue;
     Impl::Dev& Dr = impl_->dev[r];
@@ -8068,9 +8309,12 @@ void DenseGpu::route_publish() {
     // push is free. Recomputing would buy at most that, while putting the two cards back in the
     // business of deciding something independently — the failure mode the FP8 all-reduce asymmetry
     // already cost a long hunt to find.
-    AFF_HIP_CHECK(hipMemcpyPeerAsync((uint8_t*)Dr.m_ring + (size_t)slot * D.r_back, Dr.id,
+    AFF_HIP_CHECK(hipMemcpyPeerAsync((uint8_t*)Dr.m_ring + (size_t)slot * stride, Dr.id,
                                      D.b_rsel, D.id, copy_bytes, D.stream));
   }
+  impl_->route_owner_slot[slot] = owner;
+  impl_->route_woff_slot[slot] = peer_woff;
+  impl_->last_route_owner = owner;
   AFF_HIP_CHECK(hipEventRecord((hipEvent_t)D.ev_route[slot], D.stream));
   ++route_seq_;
 }
@@ -8081,9 +8325,9 @@ DenseGpu::RouteDev DenseGpu::route_dev(size_t r) const {
   // A refused mirror hands back nulls rather than the owner's pointers, which on another card would be
   // in-bounds, wrong, and silent.
   const size_t n_dev = impl_->dev.size();
-  if (n_dev > 1 && route_ready_ != 1) return R;
   if (!route_seq_) return R;                   // nothing published yet
-  const size_t owner = (router_rank0_only_enabled() && impl_->router_owner < n_dev) ? impl_->router_owner : 0u;
+  const size_t owner = impl_->last_route_owner < n_dev ? impl_->last_route_owner : 0u;
+  if (n_dev > 1 && impl_->route_ready_owner[owner] != 1) return R;
   const Impl::Dev& Downer = impl_->dev[owner];
   const Impl::Dev& D = impl_->dev[r];
   // The slot the LAST publish used, which is the selection the caller is about to dispatch on.
@@ -8093,9 +8337,10 @@ DenseGpu::RouteDev DenseGpu::route_dev(size_t r) const {
     // owner's compute stream, so same-stream ordering is the whole guarantee and no ring is needed.
     R.sel = D.b_rsel_m; R.wt = D.b_rwt_m;
   } else {
-    uint8_t* const base = (uint8_t*)D.m_ring + (size_t)slot * Downer.r_back;
+    const size_t stride = impl_->route_slot_stride ? impl_->route_slot_stride : Downer.r_back;
+    uint8_t* const base = (uint8_t*)D.m_ring + (size_t)slot * stride;
     R.sel = (const uint32_t*)base;
-    R.wt = (const float*)(base + Downer.route_woff_slot[slot]);
+    R.wt = (const float*)(base + impl_->route_woff_slot[slot]);
   }
   // The event is owner rank's whatever rank is asking: it marks the instant the selection exists AND
   // has been pushed, which is the one thing every rank waits for.
@@ -8122,8 +8367,7 @@ bool DenseGpu::batch_router_hash(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   // that arm is unreachable, so the D2H below fed nothing and the drain behind it waited for the
   // whole previous layer to hand the host a number it would not look at.
   if (!sel || !nsel) return false;
-  const size_t R = impl_->dev.size();
-  const size_t owner = (router_rank0_only_enabled() && impl_->router_owner < R) ? impl_->router_owner : 0u;
+  const size_t owner = router_rank0_only_enabled() ? impl_->router_owner_for(h) : 0u;
   Impl::Dev& D = impl_->dev[owner];
   if (!D.router[h]) return false;
   AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -8132,7 +8376,11 @@ bool DenseGpu::batch_router_hash(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   // The mirror is latched by whichever router path runs first, and on this model that is a HASH
   // layer — layer 0. Latching it only in the top-k path left the first routed layers pushing
   // nothing at all.
-  if (!route_ready_) route_ready_ = route_mirror(n_expert, k) ? 1 : 2;
+  if (owner < kMaxRanks &&
+      (!impl_->route_ready_owner[owner] || impl_->route_slot_stride < D.r_back)) {
+    impl_->route_ready_owner[owner] = route_mirror(owner, n_expert, k) ? 1 : 2;
+    route_ready_ = impl_->route_ready_owner[owner];
+  }
   if (b_live_ > b_cap_) return false;
 
   // Up through a RING of the pinned block, not the single slot the results come back through.
@@ -8179,7 +8427,7 @@ bool DenseGpu::batch_router_hash(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   D.route_wt_packed = pack_alias;
   // The mirror, before the readback and for the same reason: a hash layer's dispatch is device-built
   // too, and its selection came from the host rather than from the top-k.
-  route_publish();
+  route_publish(owner);
   if (wt) {
     AFF_HIP_CHECK(hipMemcpyAsync(D.h_rwt, wt_dst, nk * sizeof(float), hipMemcpyDeviceToHost,
                                  D.stream));
@@ -8207,15 +8455,18 @@ bool DenseGpu::batch_router_topk(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   const bool back = sel != nullptr;
   if (back && (!wt || !nsel)) return false;
   // Router owner rank holds the gate and runs top-k over all logits on device here.
-  const size_t R = impl_->dev.size();
-  const size_t owner = (router_rank0_only_enabled() && impl_->router_owner < R) ? impl_->router_owner : 0u;
+  const size_t owner = router_rank0_only_enabled() ? impl_->router_owner_for(h) : 0u;
   Impl::Dev& D = impl_->dev[owner];
   if (!D.router[h]) return false;
   AFF_HIP_CHECK(hipSetDevice(D.id));
 
   if (!router_scratch(owner, n_expert, k)) return false;
   D.r_k = k;
-  if (!route_ready_) route_ready_ = route_mirror(n_expert, k) ? 1 : 2;
+  if (owner < kMaxRanks &&
+      (!impl_->route_ready_owner[owner] || impl_->route_slot_stride < D.r_back)) {
+    impl_->route_ready_owner[owner] = route_mirror(owner, n_expert, k) ? 1 : 2;
+    route_ready_ = impl_->route_ready_owner[owner];
+  }
   if (b_live_ > b_cap_) return false;
   // ---- the bias is per LAYER and never changes; the residency mask is per CALL -------------------
   //
@@ -8282,7 +8533,7 @@ bool DenseGpu::batch_router_topk(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   //
   // The whole block, `sel` and `wt` and `n` together, for the reason router_scratch gives — three
   // copies is three dispatches, and at 43 layers a block that is the cost of the thing itself.
-  route_publish();
+  route_publish(owner);
   if (back) {
     // One copy of the whole sel/wt/n block, padding included — see router_scratch.
     AFF_HIP_CHECK(hipMemcpyAsync(D.h_rsel, D.b_rsel, D.r_back, hipMemcpyDeviceToHost, D.stream));
@@ -8957,16 +9208,25 @@ bool DenseGpu::batch_head_sample(int32_t h, uint64_t vocab, uint64_t n_embd, uin
     uint32_t tail[2u * kPenaltyCap];
   };
   if (!smp_cap_ || smp_cap_ < n) {
-    for (void** p : {(void**)&smp_ctrl_, (void**)&smp_out_})
-      if (*p) { (void)hipFree(*p); *p = nullptr; }
+    if (smp_slab_) {
+      (void)hipFree(smp_slab_);
+      smp_slab_ = nullptr;
+      smp_ctrl_ = nullptr;
+      smp_out_ = nullptr;
+    } else {
+      for (void** p : {(void**)&smp_ctrl_, (void**)&smp_out_})
+        if (*p) { (void)hipFree(*p); *p = nullptr; }
+    }
     for (void** p : {(void**)&smp_h_ctrl_, (void**)&smp_h_out_})
       if (*p) { (void)hipHostFree(*p); *p = nullptr; }
-    if (hipMalloc(&smp_ctrl_, sizeof(SmpCtrlBuf)) != hipSuccess) return false;
-    if (hipMalloc(&smp_out_, (size_t)kNarrowTok * sizeof(SpecDraw)) != hipSuccess) return false;
+    const size_t ctrl_b = align_up_sz(sizeof(SmpCtrlBuf), 256u);
+    const size_t out_b = (size_t)kNarrowTok * sizeof(SpecDraw);
+    if (hipMalloc(&smp_slab_, ctrl_b + out_b) != hipSuccess) return false;
+    smp_ctrl_ = smp_slab_;
+    smp_out_ = static_cast<uint8_t*>(smp_slab_) + ctrl_b;
     if (hipHostMalloc(&smp_h_ctrl_, sizeof(SmpCtrlBuf), hipHostMallocDefault) != hipSuccess)
       return false;
-    if (hipHostMalloc(&smp_h_out_, (size_t)kNarrowTok * sizeof(SpecDraw), hipHostMallocDefault) !=
-        hipSuccess)
+    if (hipHostMalloc(&smp_h_out_, out_b, hipHostMallocDefault) != hipSuccess)
       return false;
     smp_cap_ = kNarrowTok;
   }
@@ -9314,6 +9574,17 @@ void DenseGpu::sync_devices() {
   for (auto& D : impl_->dev) { AFF_HIP_CHECK(hipSetDevice(D.id)); AFF_HIP_CHECK(hipDeviceSynchronize()); }
 }
 
+bool DenseGpu::set_slot(uint32_t s) {
+  if (s >= n_slots_) return false;
+  if (n_slots_ > 1u && last_slot_ != UINT32_MAX && last_slot_ != s) {
+    sync_devices();
+    tp_reset_seq();
+  }
+  slot_ = s;
+  last_slot_ = s;
+  return true;
+}
+
 uint64_t DenseGpu::tap_hash_debug() {
   if (!impl_ || impl_->dev.empty()) return 0;
   Impl::Dev& D = impl_->dev[0];
@@ -9624,8 +9895,18 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
       if (shape_ok && w2_src) {
         if (!D.mk_w2_norm || D.mk_w2_src != w2_src || D.mk_w2_rows != (uint32_t)nr[d] ||
             D.mk_w2_rank != rank) {
-          if (D.mk_w2_norm) { (void)hipFree(D.mk_w2_norm); D.mk_w2_norm = nullptr; }
-          if (hipMalloc(&D.mk_w2_norm, (size_t)nr[d] * sizeof(float)) == hipSuccess) {
+          const bool need_alloc = !D.mk_w2_norm || (uint32_t)nr[d] > D.mk_w2_norm_cap;
+          if (need_alloc) {
+            if (D.mk_w2_norm && !runtime_slab_owns(D, D.mk_w2_norm)) (void)hipFree(D.mk_w2_norm);
+            D.mk_w2_norm = nullptr;
+            D.mk_w2_norm_cap = 0;
+            if (hipMalloc(&D.mk_w2_norm, (size_t)nr[d] * sizeof(float)) == hipSuccess) {
+              D.mk_w2_norm_cap = (uint32_t)nr[d];
+            } else {
+              D.mk_w2_norm = nullptr;
+            }
+          }
+          if (D.mk_w2_norm) {
             if (fp8_w2) {
               markov_w2_norm_fp8_g128_hip(static_cast<const uint8_t*>(w2_src),
                                           W2.sh[d].fp8_scales + w2_rel_row * (rank / 128u),
@@ -9638,7 +9919,6 @@ bool DenseGpu::draft_head(int32_t h_head, uint64_t vocab, uint64_t n_embd, uint3
             D.mk_w2_rows = (uint32_t)nr[d];
             D.mk_w2_rank = rank;
           } else {
-            D.mk_w2_norm = nullptr;
             D.mk_w2_src = nullptr;
             D.mk_w2_rows = 0;
             D.mk_w2_rank = 0;
