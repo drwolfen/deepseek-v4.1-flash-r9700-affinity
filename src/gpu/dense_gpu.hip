@@ -8816,7 +8816,7 @@ bool DenseGpu::batch_shexp(int32_t hg, int32_t hu, int32_t hd, uint64_t hidden, 
     const char* s = std::getenv("AFF_OVERLAP_SHEXP");
     return s && *s && std::strcmp(s, "0") != 0;
   };
-  const bool want_overlap = overlap_shexp_enabled();
+  const bool want_overlap = overlap_shexp_enabled() && !impl_->draft_graph_capturing;
 
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
@@ -10675,20 +10675,6 @@ void DenseGpu::vram_loan_ranges(size_t rank, std::vector<VramLoanRange>* out) co
       blk_guard = std::max(blk_guard, qr_off + (size_t)b_qr_cap_ * kNarrowTok * sizeof(float));
     }
     push_tail(D.b_block, D.b_block_bytes, blk_guard);
-  }
-  {
-    size_t y_guard = kGuard;
-    if (D.fsplit.o && D.fsplit.o == D.b_y && a_width_ == kFlashWidth && D.fsplit.slots) {
-      y_guard = std::max(
-          y_guard,
-          align256((size_t)flash_split_bytes(D.fsplit.tok_cap, a_hpr_, D.fsplit.slots, nullptr)));
-    }
-    push_tail(D.b_y, D.b_y_bytes, y_guard);
-  }
-  if (D.i_sc && !D.is_bq_alias(D.i_sc) && D.i_sc_bytes) {
-    const size_t isc_guard =
-        std::max(kGuard, align256((size_t)kNarrowTok * a_maxcomp_ * sizeof(float)));
-    push_tail(D.i_sc, D.i_sc_bytes, isc_guard);
   }
 }
 
