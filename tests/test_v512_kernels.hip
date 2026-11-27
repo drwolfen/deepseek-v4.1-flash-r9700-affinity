@@ -1,3 +1,4 @@
+#include "gpu/attention_gpu.h"
 #include "gpu/attn_flash.h"
 #include "gpu/batch_kernels.h"
 #include "gpu/dense_gpu.h"
@@ -6,6 +7,7 @@
 #include "gpu/hip_common.h"
 #include "gpu/indexer_gpu.h"
 #include "gpu/moe_plan.h"
+#include "gpu/static_placement.h"
 #include "gpu/wmma.h"
 #include "quant/source_dtypes.h"
 
@@ -992,6 +994,287 @@ int check_moe_plan_dpp_parity() {
   return 0;
 }
 
+int check_flash_flat_win_parity() {
+  const uint32_t n = 5u, n_head = 32u, width = aff::kFlashWidth, n_rot = 64u;
+  const uint32_t ring = 256u, sliding = 128u, flat_win = 133u, flat_raw0 = 180u;
+  std::vector<uint16_t> h_q((size_t)n * n_head * width);
+  std::vector<float> h_sinks(n_head), row(width);
+  std::vector<uint8_t> h_raw((size_t)ring * aff::kFlashRowBytes);
+  uint32_t rng = 4040u;
+  for (size_t i = 0; i < h_q.size(); ++i) {
+    rng = rng * 1664525u + 1013904223u;
+    h_q[i] = f32_to_bf16_cpu(0.3f * (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f));
+  }
+  for (uint32_t h = 0; h < n_head; ++h) h_sinks[h] = -0.4f + 0.02f * (float)h;
+  for (uint32_t r = 0; r < ring; ++r) {
+    for (uint32_t d = 0; d < width; ++d) {
+      rng = rng * 1664525u + 1013904223u;
+      row[d] = 0.25f * (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f);
+    }
+    aff::kv_encode_fp8r_row(row.data(), h_raw.data() + (size_t)r * aff::kFlashRowBytes);
+  }
+
+  uint16_t* d_q = nullptr;
+  float *d_sinks = nullptr, *d_ob = nullptr, *d_of = nullptr;
+  uint8_t* d_raw = nullptr;
+  assert(hipMalloc(&d_q, h_q.size() * sizeof(uint16_t)) == hipSuccess);
+  assert(hipMalloc(&d_sinks, h_sinks.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_raw, h_raw.size()) == hipSuccess);
+  assert(hipMalloc(&d_ob, h_q.size() * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_of, h_q.size() * sizeof(float)) == hipSuccess);
+  assert(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(uint16_t), hipMemcpyHostToDevice) ==
+         hipSuccess);
+  assert(hipMemcpy(d_sinks, h_sinks.data(), h_sinks.size() * sizeof(float),
+                   hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_raw, h_raw.data(), h_raw.size(), hipMemcpyHostToDevice) == hipSuccess);
+
+  const float scale = 1.0f / std::sqrt((float)width);
+  for (int with_sink = 0; with_sink < 2; ++with_sink) {
+    const float* sp = with_sink ? d_sinks : nullptr;
+    aff::mqa_attend_batch_hip(aff::KvDtype::FP8R, d_q, d_raw, nullptr, nullptr, nullptr, sp, d_ob,
+                              0u, n, n, 100u, sliding, ring, 0u, 0u, n_head, width, n_rot, scale,
+                              nullptr, /*q_bf16=*/true, flat_win, flat_raw0);
+    aff::mqa_attend_flash_hip(d_q, d_raw, nullptr, nullptr, nullptr, 0u, sp, d_of, 0u, n, n, 100u,
+                              sliding, ring, 0u, n_head, scale, nullptr, /*q_bf16=*/true, nullptr,
+                              0u, nullptr, 0u, 0u, nullptr, flat_win, flat_raw0);
+    assert(hipDeviceSynchronize() == hipSuccess);
+    std::vector<float> hb(h_q.size()), hf(h_q.size());
+    assert(hipMemcpy(hb.data(), d_ob, hb.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(hf.data(), d_of, hf.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    float max_err = 0.0f;
+    for (size_t i = 0; i < hb.size(); ++i) {
+      assert(std::isfinite(hf[i]));
+      max_err = std::max(max_err, std::fabs(hb[i] - hf[i]));
+    }
+    assert(max_err <= 2.5e-2f);
+  }
+  for (void* p : {(void*)d_q, (void*)d_sinks, (void*)d_raw, (void*)d_ob, (void*)d_of})
+    (void)hipFree(p);
+  std::printf("PASS: mqa_attend_flash_hip flat_win parity vs mqa_attend_batch_hip (q_bf16=true)\n");
+  return 0;
+}
+
+int check_flash_lowm_nosplit_parity() {
+  const uint32_t n_head = 32u, ring = 128u, sliding = 64u, width = aff::kFlashWidth;
+  struct Case { uint32_t n_tok, n_raw, n_comp; };
+  const Case cases[] = {{2u, 64u, 64u}, {4u, 64u, 192u}};  // tiles=2 and n_tok=4,tiles=4
+  const float scale = 1.0f / std::sqrt((float)width);
+  for (const Case& c : cases) {
+    std::vector<float> h_q((size_t)c.n_tok * n_head * width), h_sinks(n_head), row(width);
+    std::vector<uint8_t> h_raw((size_t)ring * aff::kFlashRowBytes),
+        h_comp((size_t)c.n_comp * aff::kFlashRowBytes);
+    uint32_t rng = 7700u + c.n_tok;
+    for (size_t i = 0; i < h_q.size(); ++i) {
+      rng = rng * 1664525u + 1013904223u;
+      h_q[i] = 0.25f * (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f);
+    }
+    for (uint32_t h = 0; h < n_head; ++h) h_sinks[h] = -0.3f + 0.01f * (float)h;
+    for (uint32_t r = 0; r < ring; ++r) {
+      for (uint32_t d = 0; d < width; ++d) {
+        rng = rng * 1664525u + 1013904223u;
+        row[d] = 0.25f * (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f);
+      }
+      aff::kv_encode_fp8r_row(row.data(), h_raw.data() + (size_t)r * aff::kFlashRowBytes);
+    }
+    for (uint32_t r = 0; r < c.n_comp; ++r) {
+      for (uint32_t d = 0; d < width; ++d) {
+        rng = rng * 1664525u + 1013904223u;
+        row[d] = 0.25f * (((float)(int32_t)(rng >> 16) / 32768.0f) - 1.0f);
+      }
+      aff::kv_encode_fp8r_row(row.data(), h_comp.data() + (size_t)r * aff::kFlashRowBytes);
+    }
+
+    const uint32_t split_slots = 16u;
+    const size_t split_o_bytes = (size_t)split_slots * c.n_tok * n_head * width * sizeof(float);
+    const size_t split_ml_bytes = (size_t)split_slots * c.n_tok * n_head * 2u * sizeof(float);
+    float *d_q = nullptr, *d_sinks = nullptr, *d_o0 = nullptr, *d_o1 = nullptr;
+    float *d_po = nullptr, *d_pml = nullptr;
+    uint8_t *d_raw = nullptr, *d_comp = nullptr;
+    assert(hipMalloc(&d_q, h_q.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_sinks, h_sinks.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_raw, h_raw.size()) == hipSuccess);
+    assert(hipMalloc(&d_comp, h_comp.size()) == hipSuccess);
+    assert(hipMalloc(&d_o0, h_q.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_o1, h_q.size() * sizeof(float)) == hipSuccess);
+    assert(hipMalloc(&d_po, split_o_bytes) == hipSuccess);
+    assert(hipMalloc(&d_pml, split_ml_bytes) == hipSuccess);
+    assert(hipMemcpy(d_q, h_q.data(), h_q.size() * sizeof(float), hipMemcpyHostToDevice) ==
+           hipSuccess);
+    assert(hipMemcpy(d_sinks, h_sinks.data(), h_sinks.size() * sizeof(float),
+                     hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_raw, h_raw.data(), h_raw.size(), hipMemcpyHostToDevice) == hipSuccess);
+    assert(hipMemcpy(d_comp, h_comp.data(), h_comp.size(), hipMemcpyHostToDevice) == hipSuccess);
+
+    aff::FlashSplit fs{};
+    fs.o = d_po;
+    fs.ml = d_pml;
+    fs.tok_cap = c.n_tok;
+    fs.slots = split_slots;
+    const uint32_t pos0 = c.n_raw - 1u;
+
+    ::setenv("AFF_FLASH_LOWM_NOSPLIT", "0", 1);
+    ::setenv("AFF_FLASH_SPLIT_V2", "1", 1);
+    ::setenv("AFF_FLASH_MIN_TILES", "1", 1);
+    aff::mqa_attend_flash_hip(d_q, d_raw, d_comp, nullptr, nullptr, c.n_comp, d_sinks, d_o0, 0u,
+                              c.n_tok, c.n_tok, pos0, sliding, ring, c.n_comp, n_head, scale,
+                              nullptr, false, &fs);
+    // Poison split scratch so AFF_FLASH_LOWM_NOSPLIT=1 proves no split-K touch.
+    assert(hipMemset(d_po, 0x7f, split_o_bytes) == hipSuccess);
+    ::setenv("AFF_FLASH_LOWM_NOSPLIT", "1", 1);
+    aff::mqa_attend_flash_hip(d_q, d_raw, d_comp, nullptr, nullptr, c.n_comp, d_sinks, d_o1, 0u,
+                              c.n_tok, c.n_tok, pos0, sliding, ring, c.n_comp, n_head, scale,
+                              nullptr, false, &fs);
+    ::unsetenv("AFF_FLASH_LOWM_NOSPLIT");
+    ::unsetenv("AFF_FLASH_SPLIT_V2");
+    ::unsetenv("AFF_FLASH_MIN_TILES");
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    std::vector<float> h0(h_q.size()), h1(h_q.size());
+    assert(hipMemcpy(h0.data(), d_o0, h0.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    assert(hipMemcpy(h1.data(), d_o1, h1.size() * sizeof(float), hipMemcpyDeviceToHost) ==
+           hipSuccess);
+    for (size_t i = 0; i < h0.size(); ++i) {
+      assert(std::isfinite(h1[i]));
+      assert(std::fabs(h0[i] - h1[i]) <= 1e-4f);
+    }
+    for (void* p : {(void*)d_q, (void*)d_sinks, (void*)d_raw, (void*)d_comp, (void*)d_o0,
+                    (void*)d_o1, (void*)d_po, (void*)d_pml})
+      (void)hipFree(p);
+  }
+  std::printf("PASS: AFF_FLASH_LOWM_NOSPLIT parity vs split (tiles=2; n_tok=4,tiles=4)\n");
+  return 0;
+}
+
+int check_hip_graph_capture_replay_parity() {
+  const uint32_t dim = 256u, nb = 16u;
+  const size_t n = (size_t)dim * nb;
+  std::vector<float> h_x(n), h_blk(n), h_w(dim, 1.0f);
+  for (size_t i = 0; i < n; ++i) {
+    h_x[i] = 0.05f * (float)((int)(i % 29u) - 14);
+    h_blk[i] = 0.01f * (float)((int)(i % 13u) - 6);
+  }
+  float *d_x0 = nullptr, *d_x1 = nullptr, *d_b0 = nullptr, *d_b1 = nullptr, *d_y0 = nullptr,
+        *d_y1 = nullptr, *d_w = nullptr;
+  assert(hipMalloc(&d_x0, n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_x1, n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_b0, n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_b1, n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_y0, n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_y1, n * sizeof(float)) == hipSuccess);
+  assert(hipMalloc(&d_w, dim * sizeof(float)) == hipSuccess);
+  assert(hipMemcpy(d_x0, h_x.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_x1, h_x.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_b0, h_blk.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_b1, h_blk.data(), n * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(d_w, h_w.data(), dim * sizeof(float), hipMemcpyHostToDevice) == hipSuccess);
+
+  hipStream_t s0 = nullptr, s1 = nullptr;
+  hipEvent_t ev_fork = nullptr, ev_join = nullptr;
+  assert(hipStreamCreateWithFlags(&s0, hipStreamNonBlocking) == hipSuccess);
+  assert(hipStreamCreateWithFlags(&s1, hipStreamNonBlocking) == hipSuccess);
+  assert(hipEventCreateWithFlags(&ev_fork, hipEventDisableTiming) == hipSuccess);
+  assert(hipEventCreateWithFlags(&ev_join, hipEventDisableTiming) == hipSuccess);
+
+  auto launch_seq = [&](float* dx, float* db, float* dy) {
+    aff::batch_rms_norm_hip(dx, d_w, nullptr, dy, dim, nb, 1e-5f, s0);
+    assert(hipEventRecord(ev_fork, s0) == hipSuccess);
+    assert(hipStreamWaitEvent(s1, ev_fork, 0) == hipSuccess);
+    aff::batch_hc_add_hip(db, dy, n, s1);
+    assert(hipEventRecord(ev_join, s1) == hipSuccess);
+    assert(hipStreamWaitEvent(s0, ev_join, 0) == hipSuccess);
+    aff::batch_rms_norm_hip(db, d_w, nullptr, dx, dim, nb, 1e-5f, s0);
+  };
+
+  for (int it = 0; it < 3; ++it) launch_seq(d_x0, d_b0, d_y0);
+
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  assert(hipStreamBeginCapture(s0, hipStreamCaptureModeRelaxed) == hipSuccess);
+  launch_seq(d_x1, d_b1, d_y1);
+  assert(hipStreamEndCapture(s0, &graph) == hipSuccess);
+  assert(graph != nullptr);
+  assert(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == hipSuccess);
+  assert(hipGraphDestroy(graph) == hipSuccess);
+  for (int it = 0; it < 3; ++it) assert(hipGraphLaunch(exec, s0) == hipSuccess);
+  assert(hipStreamSynchronize(s0) == hipSuccess);
+  assert(hipGraphExecDestroy(exec) == hipSuccess);
+
+  std::vector<float> r0(n), r1(n);
+  assert(hipMemcpy(r0.data(), d_x0, n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+  assert(hipMemcpy(r1.data(), d_x1, n * sizeof(float), hipMemcpyDeviceToHost) == hipSuccess);
+  assert(std::memcmp(r0.data(), r1.data(), n * sizeof(float)) == 0);
+  (void)hipEventDestroy(ev_fork);
+  (void)hipEventDestroy(ev_join);
+  (void)hipStreamDestroy(s0);
+  (void)hipStreamDestroy(s1);
+  for (void* p : {(void*)d_x0, (void*)d_x1, (void*)d_b0, (void*)d_b1, (void*)d_y0, (void*)d_y1,
+                  (void*)d_w})
+    (void)hipFree(p);
+  std::printf("PASS: HIP Graph capture + multi-replay fork/join parity (bit-exact)\n");
+  return 0;
+}
+
+int check_vram_loan_ranges_and_reclaim_invariants() {
+  aff::DenseGpu dg;
+  std::string err;
+  const uint32_t cap = 2048u, n_embd = 2048u, n_hc = 4u, n_head = 32u, width = 512u,
+                 max_mid = 4096u, vocab = 1024u, idx_topk = 64u;
+  assert(dg.init(max_mid, n_embd, &err, 1u));
+  assert(dg.batch_init(cap, n_embd, n_hc, n_head, width, max_mid, vocab, idx_topk, &err));
+
+  ::setenv("AFF_VRAM_LOAN", "0", 1);
+  std::vector<aff::DenseGpu::VramLoanRange> ranges;
+  dg.vram_loan_ranges(0u, &ranges);
+  assert(ranges.empty());
+
+  ::setenv("AFF_VRAM_LOAN", "1", 1);
+  dg.vram_loan_ranges(0u, &ranges);
+  assert(!ranges.empty());
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    assert(ranges[i].ptr != nullptr);
+    assert(ranges[i].bytes > 0u);
+    assert((reinterpret_cast<uintptr_t>(ranges[i].ptr) & 255u) == 0u);
+    const uintptr_t ia = reinterpret_cast<uintptr_t>(ranges[i].ptr);
+    const uintptr_t ib = ia + ranges[i].bytes;
+    for (size_t j = i + 1u; j < ranges.size(); ++j) {
+      const uintptr_t ja = reinterpret_cast<uintptr_t>(ranges[j].ptr);
+      const uintptr_t jb = ja + ranges[j].bytes;
+      assert(!(ia < jb && ib > ja));
+    }
+  }
+
+  struct CbState { int pre = 0, post = 0; } cbs{};
+  dg.set_prefill_reclaim_cb(
+      [](void* ctx) { ++static_cast<CbState*>(ctx)->pre; },
+      [](void* ctx) { ++static_cast<CbState*>(ctx)->post; }, &cbs);
+
+  const auto bops = dg.batch_ops();
+  std::vector<float> emb_narrow((size_t)5 * n_embd, 0.1f);
+  assert(bops.begin(bops.ctx, 5u, 0u, emb_narrow.data(), n_embd, n_hc));
+  assert(cbs.pre == 0 && cbs.post == 1);
+
+  std::vector<float> emb_wide((size_t)256u * n_embd, 0.1f);
+  assert(bops.begin(bops.ctx, 256u, 5u, emb_wide.data(), n_embd, n_hc));
+  assert(cbs.pre == 1 && cbs.post == 1);
+
+  aff::StaticPlacement sp;
+  assert(sp.loan_slot_count(0u) == 0u);
+  assert(sp.loan_active_count(0u) == 0u);
+  assert(sp.prefill_stage_slot_count() == 0u);
+  assert(!sp.vram_loan_eligible());
+  sp.mark_vram_loan_eligible(true);
+  assert(!sp.vram_loan_eligible());
+  sp.reclaim_vram_loan();
+  assert(!sp.vram_loan_eligible());
+
+  ::unsetenv("AFF_VRAM_LOAN");
+  std::printf("PASS: DenseGpu::vram_loan_ranges + reclaim callback + StaticPlacement invariants\n");
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1011,6 +1294,10 @@ int main() {
   if (check_flash_exp2_klate_parity() != 0) return 1;
   if (check_expert_had32_dpp_parity() != 0) return 1;
   if (check_moe_plan_dpp_parity() != 0) return 1;
+  if (check_flash_flat_win_parity() != 0) return 1;
+  if (check_flash_lowm_nosplit_parity() != 0) return 1;
+  if (check_hip_graph_capture_replay_parity() != 0) return 1;
+  if (check_vram_loan_ranges_and_reclaim_invariants() != 0) return 1;
   std::printf("PASS: test_v512_kernels\n");
   return 0;
 }

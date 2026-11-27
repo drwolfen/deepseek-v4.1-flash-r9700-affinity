@@ -131,6 +131,9 @@ struct PlacementEngineStats {
   // W3-2b: GPU bonus_slab D2D promotion/demotion counters.
   uint64_t bonus_d2d_promotes = 0, bonus_d2d_demotes = 0, bonus_d2d_bytes = 0;
   uint64_t preload_hints = 0, preload_issued = 0;
+  // W4: VRAM loan & prefill SDMA stager counters.
+  uint64_t loan_promotes = 0, loan_evicts = 0, loan_reclaims = 0, loan_bytes = 0;
+  uint64_t prefill_stage_hits = 0, prefill_stage_bytes = 0;
 };
 
 // Runtime toggle (`AFF_BONUS_D2D`, default OFF unless "1") for GPU bonus_slab D2D promote/evict.
@@ -280,6 +283,18 @@ public:
     ext_ba8_[dv] = ba8;
     ext_ba8_bytes_[dv] = ba8_bytes;
   }
+
+  // W4: Decode-only VRAM loan over idle prefill arena tails + bounded prefill SDMA stager.
+  struct LoanRange { void* ptr = nullptr; size_t bytes = 0; };
+  bool set_vram_loan_ranges(size_t dv, const LoanRange* ranges, size_t n);
+  void set_compute_streams(void* const* streams, size_t n);
+  void reclaim_vram_loan();
+  void mark_vram_loan_eligible(bool on);
+  bool vram_loan_eligible() const { return loan_eligible_; }
+  size_t loan_slot_count(size_t dv) const;
+  size_t loan_active_count(size_t dv) const;
+  bool loan_admit_slot(size_t dv, uint32_t layer, uint32_t expert, void* copy_stream = nullptr);
+  size_t prefill_stage_slot_count() const { return pstage_cap_; }
 
   // PREFILL AND DSPARK VERIFY: a whole chunk's routed experts for one layer, grouped by expert so
   // each one's 8.64 MiB is read once for every token that chose it rather than once per token.
@@ -579,6 +594,19 @@ private:
   uint8_t* d_pref_slab_[8] = {};
   const uint8_t** d_pref_src_[8] = {};
   uint32_t pref_cap_ = 0;
+  std::vector<uint64_t> loan_addr_;           // [dv * n_total + idx] -> ptr (256-aligned) or 0
+  bool loan_eligible_ = false;
+  bool loan_any_active_ = false;
+  uint8_t* pstage_slab_[8] = {};
+  uint32_t pstage_cap_ = 0;
+  bool pstage_active_ = false;
+  bool pstage_mover_drained_ = false;
+  bool ensure_loan_streams_and_stager();
+  void init_prefill_stager();
+  void free_prefill_stager();
+  void drain_prefill_stager();
+  void loan_free_expert_on_promote(uint32_t idx);
+  void loan_tick_admit(void* const* streams);
   uint64_t plan_calls_ = 0, plan_bad_ = 0, plan_over_ = 0;
   uint64_t plan_dispatch_ = 0, host_dispatch_ = 0;
 public:

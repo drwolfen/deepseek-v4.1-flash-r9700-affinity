@@ -469,6 +469,10 @@ public:
     // Only the logits come back; top-k stays on the host, where it is trivial.
     int32_t (*reg_router)(void* ctx, const uint16_t* w, const float* bias, uint32_t n_expert,
                           uint64_t n_embd) = nullptr;
+    // Same as reg_router with explicit weight replication across all TP ranks when `replicated`
+    // is true (used by DSpark stages so captured FFN sublayers avoid peer routing events).
+    int32_t (*reg_router_rep)(void* ctx, const uint16_t* w, const float* bias, uint32_t n_expert,
+                              uint64_t n_embd, bool replicated) = nullptr;
     // `x` null means "use the norm already in VRAM". Returns false if it could not run, in which
     // case the caller does the matvec on the host.
     bool (*router)(void* ctx, int32_t h, const float* x, uint32_t n_expert, uint64_t n_embd,
@@ -767,6 +771,12 @@ public:
     // inside a folded bounded-replay tail chunk (after layer replay_cut's attention inputs).
     bool (*slice_tail)(void* ctx, uint32_t off, uint32_t keep, uint32_t n_embd, uint32_t n_hc,
                        uint32_t n_head, uint32_t width, uint32_t qr_dim) = nullptr;
+    // DSpark per-(slot, B, stage/rank) HIP Graph capture/replay around the pos0-invariant FFN
+    // sublayer (+ optional head collapse on the final stage). `begin` returns true if a cached
+    // graph ALREADY replayed (caller skips eager FFN/collapse kernels); `end` finalizes capture
+    // and launches the newly instantiated graph (or clears failed capture so caller reruns eager).
+    bool (*draft_graph_begin)(void* ctx, uint32_t B, uint32_t stage, bool with_collapse) = nullptr;
+    bool (*draft_graph_end)(void* ctx, uint32_t B, uint32_t stage, bool with_collapse) = nullptr;
     void* ctx = nullptr;
   };
   void set_batch_ops(const BatchOps& b) { bops_ = b; }

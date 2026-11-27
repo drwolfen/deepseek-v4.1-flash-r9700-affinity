@@ -259,7 +259,10 @@ const char* bind_layer_common(const Binder& b, const ModelConfig& cfg, const Mod
   // matvec is still correct — this is the one dense tensor whose device copy is optional. Hash
   // layers too: they do not RANK by the logits, but they still weight by them, and doing that on
   // the host was the largest stall in the prefill.
-  if (dops.reg_router)
+  const bool is_dspark = (p.rfind("mtp.", 0) == 0);
+  if (dops.reg_router_rep)
+    w.router_gpu = dops.reg_router_rep(dops.ctx, w.router_w, w.router_b, ne, cfg.n_embd, is_dspark);
+  else if (dops.reg_router)
     w.router_gpu = dops.reg_router(dops.ctx, w.router_w, w.router_b, ne, cfg.n_embd);
   return nullptr;
 }
@@ -3151,98 +3154,122 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
     // Stage `st` is layer n_layer + st, which is past n_hash_layer, so it routes on the gate like
     // any ordinary layer. No residency mask: the draft's experts are all resident or the run does
     // not start.
-    if (!bops_.hc_pre(bops_.ctx, w.hc_ffn_fn.gpu, w.hc_ffn_scale_gpu, w.hc_ffn_base_gpu,
-                      w.ffn_norm_gpu, E, HC, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
-                      nullptr))
-      return false;
-    if (w.shexp_gate &&
-        !bops_.shexp(bops_.ctx, w.shexp_gate.gpu, w.shexp_up.gpu, w.shexp_down.gpu, E,
-                     cfg_.moe_inter, cfg_.swiglu_limit))
-      return false;
-    // The draft's dispatch is built on the card for exactly the reason the target's is, and the
-    // predicate has to be the DRAFT placement's: the two latch on their own first dispatch, and the
-    // draft's is 43 layers behind the target's. Asking the target's would skip a readback the
-    // draft's dispatch still wanted, one block before the draft's own table was live.
-    //
-    // No `prof_on` term, unlike the target's: the hybrid census walks the target's selection and
-    // does not reach here. The draft has no hybrid tier to take a census of — an expert it cannot
-    // address is refused at load.
-    const bool dev_plan = drops_.dev_plan && drops_.dev_plan(drops_.ctx, st);
-    if (!bops_.router_topk(bops_.ctx, w.router_gpu, NE, E, KS, w.router_b, nullptr,
-                           cfg_.norm_topk_prob ? 1 : 0, cfg_.routed_scaling,
-                           dev_plan ? nullptr : selb.data(),
-                           dev_plan ? nullptr : swb.data(),
-                           dev_plan ? nullptr : nselb.data()))
-      return false;
-    AFF_PH(draft_route);
-    std::fill_n(handled.data(), (size_t)B * KS, (uint8_t)0);
-    drops_.ffn_batch(drops_.ctx, st, selb.data(), swb.data(), B, KS, handled.data());
-    // ---- the guard, and where it moves to under the device build -------------------------------
-    //
-    // Not a fallback: there is nowhere for an unhandled pair to go. The draft's expert pool is a
-    // separate container with no host tier, so it means placement did not take every expert and the
-    // draft would quietly be running a different model.
-    //
-    // The device build cannot answer per slot — nothing about the layer's shape comes back, which is
-    // the entire point — so it counts the same fact into `MoePlanStatus::bad` and `run_batch_device`
-    // aborts on it behind the issue frontier. The check is not weaker, it is later: a slot with no
-    // address is a load-time configuration error that cannot appear mid-run, and the draft refuses
-    // to start with one. `nselb` is stale here under the device build, so the loop must not run at
-    // all rather than read it.
-    if (!dev_plan)
-      for (uint32_t b = 0; b < B; ++b)
-        for (uint32_t j = 0; j < nselb[b]; ++j)
-          if (!handled[(size_t)b * KS + j]) {
-            aff::ui::fatal("fatal: draft stage %u expert %u for token %u is not resident\n",
-                         st, selb[(size_t)b * KS + j], b);
+    const bool with_collapse = (st + 1 == NS);
+    auto run_stage_ffn = [&]() -> bool {
+      if (!bops_.hc_pre(bops_.ctx, w.hc_ffn_fn.gpu, w.hc_ffn_scale_gpu, w.hc_ffn_base_gpu,
+                        w.ffn_norm_gpu, E, HC, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
+                        nullptr))
+        return false;
+      if (w.shexp_gate &&
+          !bops_.shexp(bops_.ctx, w.shexp_gate.gpu, w.shexp_up.gpu, w.shexp_down.gpu, E,
+                       cfg_.moe_inter, cfg_.swiglu_limit))
+        return false;
+      // The draft's dispatch is built on the card for exactly the reason the target's is, and the
+      // predicate has to be the DRAFT placement's: the two latch on their own first dispatch, and the
+      // draft's is 43 layers behind the target's. Asking the target's would skip a readback the
+      // draft's dispatch still wanted, one block before the draft's own table was live.
+      //
+      // No `prof_on` term, unlike the target's: the hybrid census walks the target's selection and
+      // does not reach here. The draft has no hybrid tier to take a census of — an expert it cannot
+      // address is refused at load.
+      const bool dev_plan = drops_.dev_plan && drops_.dev_plan(drops_.ctx, st);
+      if (!bops_.router_topk(bops_.ctx, w.router_gpu, NE, E, KS, w.router_b, nullptr,
+                             cfg_.norm_topk_prob ? 1 : 0, cfg_.routed_scaling,
+                             dev_plan ? nullptr : selb.data(),
+                             dev_plan ? nullptr : swb.data(),
+                             dev_plan ? nullptr : nselb.data()))
+        return false;
+      AFF_PH(draft_route);
+      if (!dev_plan) std::fill_n(handled.data(), (size_t)B * KS, (uint8_t)0);
+      drops_.ffn_batch(drops_.ctx, st, selb.data(), swb.data(), B, KS, handled.data());
+      // ---- the guard, and where it moves to under the device build -------------------------------
+      //
+      // Not a fallback: there is nowhere for an unhandled pair to go. The draft's expert pool is a
+      // separate container with no host tier, so it means placement did not take every expert and the
+      // draft would quietly be running a different model.
+      //
+      // The device build cannot answer per slot — nothing about the layer's shape comes back, which is
+      // the entire point — so it counts the same fact into `MoePlanStatus::bad` and `run_batch_device`
+      // aborts on it behind the issue frontier. The check is not weaker, it is later: a slot with no
+      // address is a load-time configuration error that cannot appear mid-run, and the draft refuses
+      // to start with one. `nselb` is stale here under the device build, so the loop must not run at
+      // all rather than read it.
+      if (!dev_plan)
+        for (uint32_t b = 0; b < B; ++b)
+          for (uint32_t j = 0; j < nselb[b]; ++j)
+            if (!handled[(size_t)b * KS + j]) {
+              aff::ui::fatal("fatal: draft stage %u expert %u for token %u is not resident\n",
+                           st, selb[(size_t)b * KS + j], b);
+              std::abort();
+            }
+      if (bops_.block_reduce && !bops_.block_reduce(bops_.ctx, E)) return false;
+      if (bops_.prefetch_hint) {
+        if (st + 1 < NS)
+          bops_.prefetch_hint(bops_.ctx, D.stage[st + 1].wq_a.gpu, D.stage[st + 1].wkv.gpu);
+        else
+          bops_.prefetch_hint(bops_.ctx, head_.gpu, -1);
+      }
+      if (!bops_.hc_post(bops_.ctx, w.hc_ffn_fn.data != nullptr, E, HC)) return false;
+      AFF_PH(draft_ffn);
+      if (with_collapse) {
+        // ---- the draft's head collapse ----------------------------------------------------------
+        // On the card, in three kernels. batch_hc_head_narrow_hip transcribes the host epilogue
+        // still standing at the end of forward_prefill, which per token copies the whole
+        // [n_hc][n_embd] control plane back behind a stream drain, rms_norms 16384 floats, runs a
+        // 4 x 16384 bf16 matvec, gates, collapses and norms, then uploads the result again — five
+        // round trips and 640 KB each way for data that never had to leave.
+        //
+        // Not bit-identical to it — the sum of squares is a tree rather than a serial walk, and
+        // the mix scale multiplies the four dots rather than their 16384 inputs. That cannot reach
+        // the output: the accept rule is `draft[j] == argmax(target[j])`, so a draft whose last bits
+        // moved proposes a different token and the target either agrees with it or does not. Only
+        // acceptance moves, and acceptance is a property of the prompt to begin with.
+        // `DSparkBlock.forward_head` collapses with `pre_mix` exactly as the model's head does, so
+        // on V4.1 the draft has no head mixer either and reuses what its last stage's FFN computed.
+        if (cfg_.v41) {
+          if (!bops_.collapse_pre || D.norm_gpu < 0) {
+            aff::ui::fatal("fatal: the v4.1 draft head needs collapse_pre and its norm on the device "
+                           "(norm handle %d)\n", D.norm_gpu);
             std::abort();
           }
-    if (bops_.block_reduce && !bops_.block_reduce(bops_.ctx, E)) return false;
-    if (bops_.prefetch_hint) {
-      if (st + 1 < NS)
-        bops_.prefetch_hint(bops_.ctx, D.stage[st + 1].wq_a.gpu, D.stage[st + 1].wkv.gpu);
-      else
-        bops_.prefetch_hint(bops_.ctx, head_.gpu, -1);
+          if (!bops_.collapse_pre(bops_.ctx, D.norm_gpu, E, HC, cfg_.hc_eps, cfg_.rms_eps))
+            return false;
+        } else {
+          if (!bops_.draft_collapse || D.hc_head_fn.gpu < 0 || D.hc_head_scale_gpu < 0 ||
+              D.hc_head_base_gpu < 0 || D.norm_gpu < 0) {
+            aff::ui::fatal("fatal: the draft's head collapse is not bound on the device\n");
+            std::abort();
+          }
+          if (!bops_.draft_collapse(bops_.ctx, D.hc_head_fn.gpu, D.hc_head_scale_gpu,
+                                    D.hc_head_base_gpu, D.norm_gpu, E, HC, cfg_.hc_eps,
+                                    cfg_.rms_eps))
+            return false;
+        }
+        AFF_PH(draft_ep);
+      }
+      return true;
+    };
+
+    const bool dev_plan_here = drops_.dev_plan && drops_.dev_plan(drops_.ctx, st);
+    const bool graph_hook = dev_plan_here && bops_.draft_graph_begin && bops_.draft_graph_end;
+    if (graph_hook) {
+      if (!bops_.draft_graph_begin(bops_.ctx, B, st, with_collapse)) {
+        if (!run_stage_ffn()) {
+          (void)bops_.draft_graph_end(bops_.ctx, B, st, with_collapse);
+          return false;
+        }
+        if (!bops_.draft_graph_end(bops_.ctx, B, st, with_collapse)) {
+          if (!run_stage_ffn()) return false;
+        }
+      }
+    } else {
+      if (!run_stage_ffn()) return false;
     }
-    if (!bops_.hc_post(bops_.ctx, w.hc_ffn_fn.data != nullptr, E, HC)) return false;
-    AFF_PH(draft_ffn);
   }
 
   // ---- the draft's head ----------------------------------------------------------------------
   // The stage's OWN hc_head and norm, and the TARGET's vocabulary projection — shared exactly as
-  // `Transformer.__init__` shares it.
-  //
-  // On the card, in three kernels. batch_hc_head_narrow_hip transcribes the host epilogue still
-  // standing at the end of forward_prefill, which per token copies the whole [n_hc][n_embd] control
-  // plane back behind a stream drain, rms_norms 16384 floats, runs a 4 x 16384 bf16 matvec, gates,
-  // collapses and norms, then uploads the result again — five round trips and 640 KB each way for
-  // data that never had to leave.
-  //
-  // Not bit-identical to it — the sum of squares is a tree rather than a serial walk, and the mix
-  // scale multiplies the four dots rather than their 16384 inputs. That cannot reach the output:
-  // the accept rule is `draft[j] == argmax(target[j])`, so a draft whose last bits moved proposes a
-  // different token and the target either agrees with it or does not. Only acceptance moves, and
-  // acceptance is a property of the prompt to begin with.
-  // `DSparkBlock.forward_head` collapses with `pre_mix` exactly as the model's head does, so on
-  // V4.1 the draft has no head mixer either and reuses what its last stage's FFN computed.
-  if (cfg_.v41) {
-    if (!bops_.collapse_pre || D.norm_gpu < 0) {
-      aff::ui::fatal("fatal: the v4.1 draft head needs collapse_pre and its norm on the device "
-                     "(norm handle %d)\n", D.norm_gpu);
-      std::abort();
-    }
-    if (!bops_.collapse_pre(bops_.ctx, D.norm_gpu, E, HC, cfg_.hc_eps, cfg_.rms_eps)) return false;
-  } else {
-    if (!bops_.draft_collapse || D.hc_head_fn.gpu < 0 || D.hc_head_scale_gpu < 0 ||
-        D.hc_head_base_gpu < 0 || D.norm_gpu < 0) {
-      aff::ui::fatal("fatal: the draft's head collapse is not bound on the device\n");
-      std::abort();
-    }
-    if (!bops_.draft_collapse(bops_.ctx, D.hc_head_fn.gpu, D.hc_head_scale_gpu, D.hc_head_base_gpu,
-                              D.norm_gpu, E, HC, cfg_.hc_eps, cfg_.rms_eps))
-      return false;
-  }
-  AFF_PH(draft_ep);
+  // `Transformer.__init__` shares it. (Head collapse already executed at the end of stage NS-1.)
   // The confidence head, when bound. Advisory only: the accept rule never reads it, so a scoring
   // failure drops the policy and cannot change the output. When batch ops provide draft_head_conf,
   // run confidence scoring and copy both arrays back in one stream drain.

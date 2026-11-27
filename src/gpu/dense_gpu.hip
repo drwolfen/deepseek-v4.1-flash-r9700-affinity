@@ -585,6 +585,14 @@ struct DenseGpu::Impl {
     size_t b_qtm_bytes = 0;                      // byte capacity of b_qtm
     size_t b_q_c_end = 0;                        // byte end of c_* alias band in b_q
     size_t b_q_i_tail_off = 0;                   // byte start of i_q8/i_qs/i_w tail in b_q
+    void*  b_hc_alloc = nullptr;                 // original b_hc allocation (for loan ranges/parity)
+    void*  b_hc_next_alloc = nullptr;            // original b_hc_next allocation
+    float* b_pre_base = nullptr;                 // original b_pre allocation (for parity)
+    size_t b_hc_bytes = 0;
+    size_t b_hc_next_bytes = 0;
+    size_t b_norm_bytes = 0;
+    size_t b_block_bytes = 0;
+    size_t b_y_bytes = 0;
     bool route_wt_packed = false;                // b_rwt aliases D.b_rsel + live_nk
     bool single_ready = false;
     bool is_bq_alias(const void* p) const {
@@ -628,6 +636,47 @@ struct DenseGpu::Impl {
   bool router_split = false;
   size_t router_owner = 0;
   std::vector<size_t> router_owners;
+  std::vector<uint8_t> router_replicated;
+  bool last_route_replicated = false;
+  bool draft_graph_capturing = false;
+  struct DraftGraphKey {
+    uint32_t slot = 0;
+    uint32_t B = 0;
+    uint32_t stage = 0;
+    uint32_t b_nb = 0;
+    uint32_t norm_rows_in = 0;
+    uint32_t ar_pending_in = 0;
+    uint8_t  with_collapse = 0;
+    uint8_t  hc_parity = 0;
+    uint8_t  pre_parity = 0;
+    uint8_t  precollapsed_in = 0;
+    bool operator==(const DraftGraphKey& o) const {
+      return slot == o.slot && B == o.B && stage == o.stage && b_nb == o.b_nb &&
+             norm_rows_in == o.norm_rows_in && ar_pending_in == o.ar_pending_in &&
+             with_collapse == o.with_collapse && hc_parity == o.hc_parity &&
+             pre_parity == o.pre_parity && precollapsed_in == o.precollapsed_in;
+    }
+  };
+  struct DraftGraphEntry {
+    DraftGraphKey key;
+    hipGraphExec_t exec[kMaxRanks] = {};
+    bool ready = false;
+    bool failed = false;
+    uint8_t exit_hc_parity = 0;
+    uint8_t exit_pre_parity = 0;
+    uint8_t exit_precollapsed = 0;
+    uint32_t exit_ar_npart[kMaxRanks] = {};
+    uint32_t exit_ar_pending = 0;
+    uint32_t exit_b_norm_rows = 0;
+  };
+  struct DraftWarmKey { uint32_t slot = 0; uint32_t B = 0; };
+  std::vector<DraftGraphEntry> draft_graphs;
+  std::vector<DraftWarmKey> draft_warms;
+  bool capture_active = false;
+  DraftGraphKey capture_key{};
+  uint32_t capture_entry_ar_npart[kMaxRanks] = {};
+  uint32_t capture_entry_b_ar_pending = 0;
+  uint32_t capture_entry_b_norm_rows = 0;
   size_t route_slot_stride = 0;
   size_t last_route_owner = 0;
   size_t route_owner_slot[Dev::kRouteSlots] = {};
@@ -897,6 +946,21 @@ inline bool head_tm_fast_enabled() {
 inline bool head_greedy_local_enabled() {
   const char* v = std::getenv("AFF_HEAD_GREEDY_LOCAL");
   return !(v && *v && std::strcmp(v, "0") == 0);
+}
+
+inline bool vram_loan_enabled() {
+  const char* v = std::getenv("AFF_VRAM_LOAN");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool dspark_hip_graph_enabled() {
+  const char* v = std::getenv("AFF_DSPARK_HIP_GRAPH");
+  return !v || !*v || std::strcmp(v, "0") != 0;
+}
+
+inline bool dg_tp_ar_parity_enabled() {
+  const char* v = std::getenv("AFF_TP_AR_PARITY");
+  return !v || !*v || std::strcmp(v, "0") != 0;
 }
 
 inline size_t align256(size_t n) { return (n + 255u) & ~size_t(255u); }
@@ -1291,6 +1355,7 @@ inline void free_shard_bufs(ShardT& sh, const DevT& D) {
 
 DenseGpu::~DenseGpu() {
   if (!impl_) return;
+  invalidate_draft_graphs();
   if (impl_->h_embed_pinned) {
     (void)hipHostFree(impl_->h_embed_pinned);
     impl_->h_embed_pinned = nullptr;
@@ -1663,6 +1728,7 @@ Model::DenseOps DenseGpu::ops() {
   o.shexp_collect = &DenseGpu::shexp_collect_cb;
   o.reg_vec = &DenseGpu::reg_vec_cb;
   o.reg_router = &DenseGpu::reg_router_cb;
+  o.reg_router_rep = &DenseGpu::reg_router_rep_cb;
   o.router = &DenseGpu::router_cb;
   o.attn_q = &DenseGpu::attn_q_cb;
   o.attn_kv = &DenseGpu::attn_kv_cb;
@@ -2276,7 +2342,11 @@ int32_t DenseGpu::reg_vec_cb(void* ctx, const float* h, uint64_t n) {
 }
 int32_t DenseGpu::reg_router_cb(void* ctx, const uint16_t* w, const float* bias, uint32_t ne,
                                 uint64_t nd) {
-  return static_cast<DenseGpu*>(ctx)->reg_router(w, bias, ne, nd);
+  return static_cast<DenseGpu*>(ctx)->reg_router(w, bias, ne, nd, false);
+}
+int32_t DenseGpu::reg_router_rep_cb(void* ctx, const uint16_t* w, const float* bias, uint32_t ne,
+                                    uint64_t nd, bool replicated) {
+  return static_cast<DenseGpu*>(ctx)->reg_router(w, bias, ne, nd, replicated);
 }
 bool DenseGpu::router_cb(void* ctx, int32_t h, const float* x, uint32_t ne, uint64_t nd,
                          float* logits) {
@@ -2606,12 +2676,13 @@ inline void router_band(size_t rank, size_t R, uint32_t n_expert, bool r0_only, 
 }  // namespace
 
 int32_t DenseGpu::reg_router(const uint16_t* w, const float* bias, uint32_t n_expert,
-                             uint64_t n_embd) {
+                             uint64_t n_embd, bool replicated) {
   if (!impl_ || !w || impl_->dev.empty()) return -1;
   (void)bias;
   const size_t R = impl_->dev.size();
   const int32_t h = (int32_t)n_router_;
-  const bool r0_only = router_rank0_only_enabled();
+  const bool rep_here = replicated && dspark_hip_graph_enabled();
+  const bool r0_only = rep_here ? false : router_rank0_only_enabled();
   const size_t owner = impl_->router_owner_for(h);
   if (r0_only && n_router_ == 0 && R >= 2u) {
     uint64_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
@@ -2678,6 +2749,7 @@ int32_t DenseGpu::reg_router(const uint16_t* w, const float* bias, uint32_t n_ex
     st_.bytes += nbytes;
   }
   impl_->router_owners.push_back(owner);
+  impl_->router_replicated.push_back(rep_here ? 1u : 0u);
   ++st_.tensors;
   return (int32_t)(n_router_++);
 }
@@ -5152,6 +5224,7 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
                           uint32_t width, uint32_t max_mid, uint32_t vocab, uint32_t index_topk,
                           std::string* err) {
   if (!impl_ || impl_->dev.empty() || !max_tokens) return false;
+  invalidate_draft_graphs();
   const size_t R = impl_->dev.size();
   if (n_head % R) { if (err) *err = "n_head does not split across ranks"; return false; }
   // Round to the GEMM's token tile: a chunk that is not a multiple of it pays for a whole extra
@@ -5252,6 +5325,10 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
     if (emb_aliases_y) D.b_emb = D.b_y;
     if (g_aliases_block) D.b_g = D.b_block;
     if (qr_in_g) D.b_qr = D.b_g + (size_t)2048u * nb;
+    D.b_pre_base = D.b_pre;
+    D.b_norm_bytes = (size_t)n_embd * nb * sizeof(float);
+    D.b_block_bytes = (size_t)n_embd * nb * sizeof(float);
+    D.b_y_bytes = (size_t)b_y_cap_ * nb * sizeof(float);
     D.b_q_floats = (size_t)nq * nb;
     D.b_q_c_end = 0u;
     D.b_q_i_tail_off = 0u;
@@ -5267,6 +5344,10 @@ bool DenseGpu::batch_init(uint32_t max_tokens, uint32_t n_embd, uint32_t n_hc, u
       AFF_HIP_CHECK(hipMemset(*a.p, 0, a.rows * nb * sizeof(uint16_t)));
       brows += a.rows;
     }
+    D.b_hc_alloc = D.b_hc;
+    D.b_hc_bytes = (size_t)hcd * nb * sizeof(uint16_t);
+    D.b_hc_next_alloc = D.b_hc_next;
+    D.b_hc_next_bytes = hc_inplace ? 0u : (size_t)hcd * nb * sizeof(uint16_t);
     D.b_qtm_bytes = qtm_bytes;
     if (u_in_qtm) D.b_u = reinterpret_cast<float*>(D.b_qtm);
     const uint64_t arena_bytes = arena_f32_bytes + brows * nb * sizeof(uint16_t);
@@ -5396,6 +5477,7 @@ bool DenseGpu::draft_init(uint32_t n_embd, uint32_t tap_in, uint32_t vocab, uint
   if (!impl_ || impl_->dev.empty()) { if (err) *err = "no device"; return false; }
   if (!b_cap_) { if (err) *err = "batch_init must run first"; return false; }
   if (!vocab || !tap_in || !n_embd) { if (err) *err = "draft shapes are zero"; return false; }
+  invalidate_draft_graphs();
   (void)markov_rank;
   const bool dx_alias_bq = alias_bdx_enabled() && dense_arena_alias_v2_enabled();
   const size_t R = impl_->dev.size();
@@ -5491,6 +5573,7 @@ bool DenseGpu::ensure_by(uint32_t need_rows, std::string* err) {
   const uint32_t nb = b_cap_ ? b_cap_ : b_nb_;
   if (!nb) return false;
   if (need_rows <= b_y_cap_) return true;
+  if (prefill_reclaim_pre_cb_) prefill_reclaim_pre_cb_(prefill_reclaim_ctx_);
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
@@ -5503,6 +5586,7 @@ bool DenseGpu::ensure_by(uint32_t need_rows, std::string* err) {
     const bool ibsc_was_y = (D.i_bsc && D.i_bsc == D.b_y);
     if (D.b_y) (void)hipFree(D.b_y);
     D.b_y = p;
+    D.b_y_bytes = (size_t)need_rows * nb * sizeof(float);
     if (emb_was_y) D.b_emb = p;
     if (fsplit_was_y) D.fsplit.o = p;
     if (ibsc_was_y) {
@@ -5898,6 +5982,9 @@ bool DenseGpu::batch_begin(uint32_t n_live, uint32_t pos0, const float* emb, uin
                  nb, b_cap_);
     std::abort();
   }
+  if (nb > kNarrowTok && prefill_reclaim_pre_cb_) prefill_reclaim_pre_cb_(prefill_reclaim_ctx_);
+  else if (nb <= kNarrowTok && prefill_reclaim_post_cb_)
+    prefill_reclaim_post_cb_(prefill_reclaim_ctx_);
   b_nb_ = nb; b_live_ = n_live; b_pos0_ = pos0;
   b_ar_pending_ = 0;
   pending_pf0_ = -1;
@@ -5949,6 +6036,9 @@ bool DenseGpu::batch_begin_bf16(uint32_t n_live, uint32_t pos0, const uint16_t* 
                    nb, b_cap_);
     std::abort();
   }
+  if (nb > kNarrowTok && prefill_reclaim_pre_cb_) prefill_reclaim_pre_cb_(prefill_reclaim_ctx_);
+  else if (nb <= kNarrowTok && prefill_reclaim_post_cb_)
+    prefill_reclaim_post_cb_(prefill_reclaim_ctx_);
   b_nb_ = nb; b_live_ = n_live; b_pos0_ = pos0;
   b_ar_pending_ = 0;
   pending_pf0_ = -1;
@@ -5994,6 +6084,9 @@ bool DenseGpu::batch_begin_draft_bf16(uint32_t n_live, uint32_t pos0, const uint
                    n_live, nb, b_cap_);
     std::abort();
   }
+  if (nb > kNarrowTok && prefill_reclaim_pre_cb_) prefill_reclaim_pre_cb_(prefill_reclaim_ctx_);
+  else if (nb <= kNarrowTok && prefill_reclaim_post_cb_)
+    prefill_reclaim_post_cb_(prefill_reclaim_ctx_);
   b_nb_ = nb; b_live_ = n_live; b_pos0_ = pos0;
   b_ar_pending_ = 0;
   pending_pf0_ = -1;
@@ -6127,9 +6220,11 @@ bool DenseGpu::batch_hc_pre(int32_t fn, int32_t sv, int32_t bv, int32_t nw, uint
     // agreeing here is what makes the whole sublayer below one computation rather than two similar
     // ones. Nothing checked it. Sampled, never waited on, and fatal on a mismatch — see digest.h for
     // why a reference check could not see the failure this is for.
-    xrank_check((uint32_t)d, (uint32_t)impl_->dev.size(), D.b_norm,
-                (size_t)n_embd * b_nb_ * sizeof(float), D.stream);
-    xrank_trace((uint32_t)d, "nrm", D.b_norm, (size_t)n_embd * b_nb_ * sizeof(float), D.stream);
+    if (!impl_->draft_graph_capturing) {
+      xrank_check((uint32_t)d, (uint32_t)impl_->dev.size(), D.b_norm,
+                  (size_t)n_embd * b_nb_ * sizeof(float), D.stream);
+      xrank_trace((uint32_t)d, "nrm", D.b_norm, (size_t)n_embd * b_nb_ * sizeof(float), D.stream);
+    }
   }
   b_norm_rows_ = n_embd;
   if (norm_host) {
@@ -8040,7 +8135,7 @@ bool DenseGpu::batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
         D.b_ar_precollapsed = false;
         D.b_ar_npart = 0;
       }
-      if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+      if (!impl_->draft_graph_capturing && (++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
       return true;
     }
   }
@@ -8048,12 +8143,14 @@ bool DenseGpu::batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
     float* p[kMaxRanks];
     for (size_t d = 0; d < impl_->dev.size(); ++d) p[d] = impl_->dev[d].b_block;
     reduce(p, p, (uint64_t)b_ar_pending_ * b_nb_);
-    for (size_t d = 0; d < impl_->dev.size(); ++d) {
-      AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
-      xrank_trace((uint32_t)d, "blk", impl_->dev[d].b_block,
-                  (size_t)b_ar_pending_ * b_nb_ * sizeof(float), impl_->dev[d].stream);
+    if (!impl_->draft_graph_capturing) {
+      for (size_t d = 0; d < impl_->dev.size(); ++d) {
+        AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
+        xrank_trace((uint32_t)d, "blk", impl_->dev[d].b_block,
+                    (size_t)b_ar_pending_ * b_nb_ * sizeof(float), impl_->dev[d].stream);
+      }
+      if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
     }
-    if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
   }
   b_ar_pending_ = 0;
   if (ar) {
@@ -8106,7 +8203,7 @@ bool DenseGpu::batch_hc_post(bool has_control, uint32_t n_embd, uint32_t n_hc) {
       D.b_ar_precollapsed = (fuse_pre && npart > 0u);
       D.b_ar_npart = D.b_ar_precollapsed ? npart : 0u;
     }
-    if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+    if (!impl_->draft_graph_capturing && (++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
     return true;
   }
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
@@ -8375,6 +8472,14 @@ void DenseGpu::route_publish(size_t owner) {
 DenseGpu::RouteDev DenseGpu::route_dev(size_t r) const {
   RouteDev R{};
   if (!impl_ || r >= impl_->dev.size()) return R;
+  if (impl_->last_route_replicated) {
+    const Impl::Dev& D = impl_->dev[r];
+    if (!D.b_rsel_m || !D.b_rwt_m) return R;
+    R.sel = D.b_rsel_m;
+    R.wt = D.b_rwt_m;
+    R.ready = nullptr;
+    return R;
+  }
   // A refused mirror hands back nulls rather than the owner's pointers, which on another card would be
   // in-bounds, wrong, and silent.
   const size_t n_dev = impl_->dev.size();
@@ -8423,6 +8528,7 @@ bool DenseGpu::batch_router_hash(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   const size_t owner = router_rank0_only_enabled() ? impl_->router_owner_for(h) : 0u;
   Impl::Dev& D = impl_->dev[owner];
   if (!D.router[h]) return false;
+  impl_->last_route_replicated = false;
   AFF_HIP_CHECK(hipSetDevice(D.id));
   if (!router_scratch(owner, n_expert, k)) return false;
   D.r_k = k;
@@ -8507,10 +8613,69 @@ bool DenseGpu::batch_router_topk(int32_t h, uint32_t n_expert, uint64_t n_embd, 
   // no way to ask for the readback and not get it, or to skip it and still read `sel`.
   const bool back = sel != nullptr;
   if (back && (!wt || !nsel)) return false;
+  const bool is_rep = (size_t)h < impl_->router_replicated.size() && impl_->router_replicated[h] != 0u;
+  static const float kResBias = [] {
+    const char* v = std::getenv("AFF_RESIDENT_BIAS");
+    return (v && *v) ? (float)std::strtod(v, nullptr) : 0.0f;
+  }();
+  if (is_rep && !back) {
+    if (b_live_ > b_cap_) return false;
+    impl_->last_route_replicated = true;
+    const size_t nk = (size_t)b_live_ * k;
+    const bool pack_alias = route_wt_alias_enabled() && b_live_ > 0 && (nk <= UINT32_MAX);
+    for (size_t d = 0; d < impl_->dev.size(); ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      if (!D.router[h]) return false;
+      AFF_HIP_CHECK(hipSetDevice(D.id));
+      if (!router_scratch(d, n_expert, k)) return false;
+      D.r_k = k;
+      const float* dbias = nullptr;
+      if (bias) {
+        if (n_expert > D.r_bias_stride) return false;
+        float* const slot = D.b_rbias + (size_t)h * D.r_bias_stride;
+        if (D.rbias_src[(size_t)h] != bias) {
+          if (impl_->draft_graph_capturing) return false;
+          AFF_HIP_CHECK(hipMemcpyAsync(slot, bias, n_expert * sizeof(float), hipMemcpyHostToDevice,
+                                       D.stream));
+          D.rbias_src[(size_t)h] = bias;
+        }
+        dbias = slot;
+      }
+      if (resident) {
+        if (impl_->draft_graph_capturing || n_expert > D.r_bias_stride) return false;
+        if (D.rres.fit(n_expert, kRingCountBudget)) {
+          uint32_t rs = 0;
+          uint8_t* const pin = D.rres.claim(&rs);
+          AFF_BLOCK_AT(aff::BlockSite::Begin, AFF_HIP_CHECK(D.rres.wait(rs)));
+          std::memcpy(pin, resident, n_expert);
+          AFF_HIP_CHECK(hipMemcpyAsync(D.b_rres, pin, n_expert, hipMemcpyHostToDevice, D.stream));
+          AFF_HIP_CHECK(D.rres.done(rs, D.stream));
+        } else {
+          AFF_HIP_CHECK(hipMemcpyAsync(D.b_rres, resident, n_expert, hipMemcpyHostToDevice,
+                                       D.stream));
+        }
+      }
+      float* const wt_dst = pack_alias ? reinterpret_cast<float*>(D.b_rsel + nk) : D.b_rwt;
+      { AFF_TRACE(33);
+        batch_gemm_hip(AFF_BF16, D.router[h], nullptr, D.b_norm, D.b_y, n_expert,
+                       (uint32_t)n_embd, b_nb_, D.stream); }
+      { AFF_TRACE(34);
+        router_topk_hip(D.b_y, dbias, resident ? D.b_rres : nullptr, D.b_rsel,
+                        wt_dst, D.b_rn, n_expert, b_nb_, b_live_, k, norm_topk_prob, routed_scaling,
+                        D.stream, kResBias); }
+      D.b_rsel_m = D.b_rsel;
+      D.b_rwt_m = wt_dst;
+      D.route_wt_packed = pack_alias;
+    }
+    ++st_.calls;
+    return true;
+  }
+  impl_->last_route_replicated = false;
   // Router owner rank holds the gate and runs top-k over all logits on device here.
   const size_t owner = router_rank0_only_enabled() ? impl_->router_owner_for(h) : 0u;
   Impl::Dev& D = impl_->dev[owner];
   if (!D.router[h]) return false;
+  impl_->last_route_replicated = false;
   AFF_HIP_CHECK(hipSetDevice(D.id));
 
   if (!router_scratch(owner, n_expert, k)) return false;
@@ -8559,11 +8724,6 @@ bool DenseGpu::batch_router_topk(int32_t h, uint32_t n_expert, uint64_t n_embd, 
       AFF_HIP_CHECK(hipMemcpyAsync(D.b_rres, resident, n_expert, hipMemcpyHostToDevice, D.stream));
     }
   }
-
-  static const float kResBias = [] {
-    const char* v = std::getenv("AFF_RESIDENT_BIAS");
-    return (v && *v) ? (float)std::strtod(v, nullptr) : 0.0f;
-  }();
 
   const size_t nk = (size_t)b_live_ * k;
   const bool pack_alias = route_wt_alias_enabled() && b_live_ > 0 && (nk <= UINT32_MAX);
@@ -8852,14 +9012,16 @@ bool DenseGpu::batch_block_reduce(uint32_t n_embd) {
   // between two RANK COUNTS. The partials before it are each a different share and always differ.
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));   // reduce() left the last rank's device current
-    xrank_trace((uint32_t)d, "blk", impl_->dev[d].b_block,
-                (size_t)n_embd * b_nb_ * sizeof(float), impl_->dev[d].stream);
+    if (!impl_->draft_graph_capturing) {
+      xrank_trace((uint32_t)d, "blk", impl_->dev[d].b_block,
+                  (size_t)n_embd * b_nb_ * sizeof(float), impl_->dev[d].stream);
+    }
   }
   // Did a rank ever give up waiting for its peer? A plain load of pinned memory — no copy and no
   // synchronise — but it is an uncached PCIe read, so not every call. Whatever has landed by the
   // 512th is what gets seen; the point is that the process stops rather than emitting a whole run
   // of wrong text, not that it stops on the exact collective.
-  if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+  if (!impl_->draft_graph_capturing && (++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
   return true;
 }
 
@@ -8979,10 +9141,12 @@ bool DenseGpu::batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_tap
     reduce(p, p, (uint64_t)b_ar_pending_ * b_nb_);
     for (size_t d = 0; d < impl_->dev.size(); ++d) {
       AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
-      xrank_trace((uint32_t)d, "blk", impl_->dev[d].b_block,
-                  (size_t)b_ar_pending_ * b_nb_ * sizeof(float), impl_->dev[d].stream);
+      if (!impl_->draft_graph_capturing) {
+        xrank_trace((uint32_t)d, "blk", impl_->dev[d].b_block,
+                    (size_t)b_ar_pending_ * b_nb_ * sizeof(float), impl_->dev[d].stream);
+      }
     }
-    if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+    if (!impl_->draft_graph_capturing && (++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
   }
   b_ar_pending_ = 0;
   if (ar) {
@@ -9036,7 +9200,7 @@ bool DenseGpu::batch_hc_post_tap(bool has_control, uint32_t slot, uint32_t n_tap
       D.b_ar_precollapsed = (fuse_pre && npart > 0u);
       D.b_ar_npart = D.b_ar_precollapsed ? npart : 0u;
     }
-    if ((++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
+    if (!impl_->draft_graph_capturing && (++tp_calls_ & 511u) == 0u) tp_check(impl_->tp);
     return true;
   }
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
@@ -9744,15 +9908,26 @@ bool DenseGpu::draft_attend(uint32_t layer, uint32_t n, uint32_t pos0, uint32_t 
   if (win_lo > hi) return false;
   const uint32_t win = hi - win_lo + 1u;
   if (win > a_ring_) return false;                // the window may not lap its own ring
+  const char* df_env = std::getenv("AFF_DRAFT_FLASH");
+  const bool draft_flash = !df_env || !*df_env || std::strcmp(df_env, "0") != 0;
+  const bool use_flash =
+      draft_flash && a_dt_ == KvDtype::FP8R && a_width_ == kFlashWidth && (a_hpr_ % 16u) == 0u;
   for (size_t d = 0; d < impl_->dev.size(); ++d) {
     Impl::Dev& D = impl_->dev[d];
     AFF_HIP_CHECK(hipSetDevice(D.id));
-    // Deliberately the VALU kernel and not the flash one: five queries over ~133 keys is a hundredth
-    // of what the flash path's tiling is for, and this way the draft cannot perturb it.
-    mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw_s[slot_][layer], nullptr, nullptr, nullptr,
-                         D.a_sink[layer], D.b_htm, 0, n, b_nb_, pos0, a_sliding_, a_ring_, 0,
-                         a_maxcomp_, a_hpr_, a_width_, a_rot_, scale, D.stream,
-                         /*q_bf16=*/true, win, win_lo % a_ring_);
+    if (use_flash) {
+      const float* const q_sc =
+          D.b_qtm_e4m3 ? b_qtm_qscales(D.b_qtm, a_hpr_, a_width_, b_nb_) : nullptr;
+      mqa_attend_flash_hip(D.b_qtm, D.a_raw_s[slot_][layer], nullptr, nullptr, nullptr, 0u,
+                           D.a_sink[layer], D.b_htm, 0u, n, b_nb_, pos0, a_sliding_, a_ring_,
+                           a_maxcomp_, a_hpr_, scale, D.stream, /*q_bf16=*/!D.b_qtm_e4m3,
+                           /*split=*/nullptr, 0u, nullptr, 0u, 0u, q_sc, win, win_lo % a_ring_);
+    } else {
+      mqa_attend_batch_hip(a_dt_, D.b_qtm, D.a_raw_s[slot_][layer], nullptr, nullptr, nullptr,
+                           D.a_sink[layer], D.b_htm, 0, n, b_nb_, pos0, a_sliding_, a_ring_, 0,
+                           a_maxcomp_, a_hpr_, a_width_, a_rot_, scale, D.stream,
+                           /*q_bf16=*/true, win, win_lo % a_ring_);
+    }
   }
   ++st_.calls;
   return true;
@@ -10433,7 +10608,306 @@ Model::BatchOps DenseGpu::batch_ops() {
     return static_cast<DenseGpu*>(c)->batch_router_hash(h, ne, nd, k, sel, nsel, np, rs, wt);
   };
   o.slice_tail = slice_tail_cb;
+  o.draft_graph_begin = [](void* c, uint32_t B, uint32_t stage, bool with_collapse) {
+    return static_cast<DenseGpu*>(c)->draft_graph_begin(B, stage, with_collapse);
+  };
+  o.draft_graph_end = [](void* c, uint32_t B, uint32_t stage, bool with_collapse) {
+    return static_cast<DenseGpu*>(c)->draft_graph_end(B, stage, with_collapse);
+  };
   return o;
+}
+
+void DenseGpu::set_prefill_reclaim_cb(void (*pre_cb)(void*), void (*post_cb)(void*), void* ctx) {
+  prefill_reclaim_pre_cb_ = pre_cb;
+  prefill_reclaim_post_cb_ = post_cb;
+  prefill_reclaim_ctx_ = ctx;
+}
+
+void DenseGpu::vram_loan_ranges(size_t rank, std::vector<VramLoanRange>* out) const {
+  if (!out) return;
+  out->clear();
+  if (!vram_loan_enabled() || !impl_ || rank >= impl_->dev.size() || !b_cap_) return;
+  const Impl::Dev& D = impl_->dev[rank];
+  constexpr size_t kGuard = 64u << 20;
+  auto push_tail = [&](void* base, size_t total, size_t guard_off) {
+    if (!base || total <= guard_off) return;
+    const size_t off = align256(guard_off);
+    if (total <= off) return;
+    uint8_t* const lo = reinterpret_cast<uint8_t*>(base) + off;
+    const uintptr_t la = reinterpret_cast<uintptr_t>(lo);
+    const uintptr_t lb = reinterpret_cast<uintptr_t>(base) + total;
+    for (const VramLoanRange& ex : *out) {
+      const uintptr_t ea = reinterpret_cast<uintptr_t>(ex.ptr);
+      const uintptr_t eb = ea + ex.bytes;
+      if (la < eb && lb > ea) return;
+    }
+    const size_t avail = (total - off) & ~size_t(255u);
+    if (avail > 0) out->push_back({lo, avail});
+  };
+  push_tail(D.b_hc_alloc, D.b_hc_bytes, kGuard);
+  push_tail(D.b_hc_next_alloc, D.b_hc_next_bytes, kGuard);
+  {
+    const size_t usable_bq =
+        (D.b_q && D.b_q_floats) ? ((D.b_q_floats * sizeof(float)) & ~size_t(255u)) : 0u;
+    const size_t bq_hi =
+        (D.b_q_i_tail_off > 0u) ? std::min(usable_bq, D.b_q_i_tail_off) : usable_bq;
+    size_t bq_guard = kGuard;
+    if (D.is_bq_alias(D.c_kv)) bq_guard = std::max(bq_guard, align256(D.b_q_c_end) + (4u << 20));
+    if (D.i_sc == D.b_q && a_maxcomp_)
+      bq_guard = std::max(bq_guard, align256((size_t)kNarrowTok * a_maxcomp_ * sizeof(float)));
+    push_tail(D.b_q, bq_hi, bq_guard);
+  }
+  {
+    const size_t u_dec_bytes =
+        align256(std::max<size_t>((size_t)b_u_cap_ * kNarrowTok * sizeof(float),
+                                  (size_t)b_vocab_ * kNarrowTok * sizeof(float)));
+    push_tail(D.b_qtm, D.b_qtm_bytes, std::max(kGuard, u_dec_bytes));
+  }
+  push_tail(D.b_norm, D.b_norm_bytes, kGuard);
+  {
+    const bool qr_in_blk =
+        D.b_g && D.b_g == D.b_block && D.b_qr >= D.b_block &&
+        reinterpret_cast<uintptr_t>(D.b_qr) <
+            reinterpret_cast<uintptr_t>(D.b_block) + D.b_block_bytes;
+    size_t blk_guard = kGuard;
+    if (qr_in_blk) {
+      const size_t qr_off = (size_t)(D.b_qr - D.b_block) * sizeof(float);
+      blk_guard = std::max(blk_guard, qr_off + (size_t)b_qr_cap_ * kNarrowTok * sizeof(float));
+    }
+    push_tail(D.b_block, D.b_block_bytes, blk_guard);
+  }
+  {
+    size_t y_guard = kGuard;
+    if (D.fsplit.o && D.fsplit.o == D.b_y && a_width_ == kFlashWidth && D.fsplit.slots) {
+      y_guard = std::max(
+          y_guard,
+          align256((size_t)flash_split_bytes(D.fsplit.tok_cap, a_hpr_, D.fsplit.slots, nullptr)));
+    }
+    push_tail(D.b_y, D.b_y_bytes, y_guard);
+  }
+  if (D.i_sc && !D.is_bq_alias(D.i_sc) && D.i_sc_bytes) {
+    const size_t isc_guard =
+        std::max(kGuard, align256((size_t)kNarrowTok * a_maxcomp_ * sizeof(float)));
+    push_tail(D.i_sc, D.i_sc_bytes, isc_guard);
+  }
+}
+
+void DenseGpu::invalidate_draft_graphs() {
+  if (!impl_) return;
+  if (impl_->capture_active) {
+    for (size_t d = 0; d < impl_->dev.size(); ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      if (!D.stream) continue;
+      (void)hipSetDevice(D.id);
+      hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+      if (hipStreamIsCapturing(D.stream, &cs) == hipSuccess && cs != hipStreamCaptureStatusNone) {
+        hipGraph_t g = nullptr;
+        if (hipStreamEndCapture(D.stream, &g) == hipSuccess && g) (void)hipGraphDestroy(g);
+      }
+    }
+    (void)hipGetLastError();
+    aff::trace::g_capturing = false;
+    impl_->draft_graph_capturing = false;
+    impl_->capture_active = false;
+  }
+  for (auto& e : impl_->draft_graphs) {
+    for (size_t d = 0; d < impl_->dev.size() && d < kMaxRanks; ++d) {
+      if (e.exec[d]) {
+        (void)hipSetDevice(impl_->dev[d].id);
+        (void)hipGraphExecDestroy(e.exec[d]);
+        e.exec[d] = nullptr;
+      }
+    }
+  }
+  impl_->draft_graphs.clear();
+  impl_->draft_warms.clear();
+}
+
+bool DenseGpu::draft_graph_begin(uint32_t B, uint32_t stage, bool with_collapse) {
+  if (!impl_ || impl_->dev.empty() || !b_nb_ || b_nb_ != kNarrowTok || !B ||
+      !dspark_hip_graph_enabled() || route_trace().on() || xrank_trace_enabled())
+    return false;
+  const size_t R = impl_->dev.size();
+  if (R > kMaxRanks || (R > 1u && !dg_tp_ar_parity_enabled())) return false;
+  if (impl_->capture_active) return false;
+  for (size_t d = 0; d < R; ++d) {
+    if (impl_->dev[d].b_shexp_ev) return false;
+  }
+  const Impl::Dev& D0 = impl_->dev[0];
+  Impl::DraftGraphKey key{};
+  key.slot = slot_;
+  key.B = B;
+  key.stage = stage;
+  key.b_nb = b_nb_;
+  key.norm_rows_in = b_norm_rows_;
+  key.ar_pending_in = b_ar_pending_;
+  key.with_collapse = with_collapse ? 1u : 0u;
+  key.hc_parity = (D0.b_hc != D0.b_hc_alloc) ? 1u : 0u;
+  key.pre_parity = (D0.b_pre != D0.b_pre_base) ? 1u : 0u;
+  key.precollapsed_in = D0.b_ar_precollapsed ? 1u : 0u;
+
+  for (const auto& e : impl_->draft_graphs) {
+    if (!(e.key == key)) continue;
+    if (e.failed) return false;
+    if (!e.ready) continue;
+    for (size_t d = 0; d < R; ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      const uint8_t cur_hc = (D.b_hc != D.b_hc_alloc) ? 1u : 0u;
+      if (cur_hc != e.exit_hc_parity && D.b_hc_next) std::swap(D.b_hc, D.b_hc_next);
+      const uint8_t cur_pre = (D.b_pre != D.b_pre_base) ? 1u : 0u;
+      if (cur_pre != e.exit_pre_parity && D.b_pre_prev) std::swap(D.b_pre, D.b_pre_prev);
+      D.b_ar_precollapsed = (e.exit_precollapsed != 0u);
+      D.b_ar_npart = e.exit_ar_npart[d];
+      D.q8_src = nullptr;
+      norm_q8_invalidate(D.id, D.b_norm);
+      D.b_shexp_ev = false;
+    }
+    b_ar_pending_ = e.exit_ar_pending;
+    b_norm_rows_ = e.exit_b_norm_rows;
+    pending_pf0_ = -1;
+    pending_pf1_ = -1;
+    for (size_t d = 0; d < R; ++d) {
+      AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
+      AFF_HIP_CHECK(hipGraphLaunch(e.exec[d], impl_->dev[d].stream));
+    }
+    ++st_.calls;
+    return true;
+  }
+
+  bool warmed = false;
+  for (const auto& w : impl_->draft_warms) {
+    if (w.slot == slot_ && w.B == B) { warmed = true; break; }
+  }
+  if (!warmed) return false;
+
+  impl_->capture_key = key;
+  for (size_t d = 0; d < R; ++d) impl_->capture_entry_ar_npart[d] = impl_->dev[d].b_ar_npart;
+  impl_->capture_entry_b_ar_pending = b_ar_pending_;
+  impl_->capture_entry_b_norm_rows = b_norm_rows_;
+
+  size_t started = 0;
+  bool cap_ok = true;
+  for (size_t d = 0; d < R; ++d) {
+    Impl::Dev& D = impl_->dev[d];
+    if (hipSetDevice(D.id) != hipSuccess ||
+        hipStreamBeginCapture(D.stream, hipStreamCaptureModeRelaxed) != hipSuccess) {
+      cap_ok = false;
+      break;
+    }
+    ++started;
+  }
+  if (!cap_ok) {
+    for (size_t d = 0; d < started; ++d) {
+      (void)hipSetDevice(impl_->dev[d].id);
+      hipGraph_t g = nullptr;
+      if (hipStreamEndCapture(impl_->dev[d].stream, &g) == hipSuccess && g) (void)hipGraphDestroy(g);
+    }
+    (void)hipGetLastError();
+    Impl::DraftGraphEntry fail_e{};
+    fail_e.key = key;
+    fail_e.failed = true;
+    impl_->draft_graphs.push_back(fail_e);
+    return false;
+  }
+  impl_->capture_active = true;
+  impl_->draft_graph_capturing = true;
+  aff::trace::g_capturing = true;
+  return false;
+}
+
+bool DenseGpu::draft_graph_end(uint32_t B, uint32_t stage, bool with_collapse) {
+  (void)stage;
+  if (!impl_) return false;
+  if (!impl_->capture_active) {
+    if (with_collapse && b_nb_ == kNarrowTok && B && dspark_hip_graph_enabled()) {
+      bool found = false;
+      for (const auto& w : impl_->draft_warms)
+        if (w.slot == slot_ && w.B == B) { found = true; break; }
+      if (!found) impl_->draft_warms.push_back({slot_, B});
+    }
+    return true;
+  }
+  const size_t R = impl_->dev.size();
+  aff::trace::g_capturing = false;
+  impl_->draft_graph_capturing = false;
+  impl_->capture_active = false;
+
+  hipGraph_t graphs[kMaxRanks] = {};
+  hipGraphExec_t execs[kMaxRanks] = {};
+  bool ok = (R <= kMaxRanks);
+  for (size_t d = 0; d < R; ++d) {
+    if (hipSetDevice(impl_->dev[d].id) != hipSuccess ||
+        hipStreamEndCapture(impl_->dev[d].stream, &graphs[d]) != hipSuccess || !graphs[d]) {
+      ok = false;
+    }
+  }
+  if (ok) {
+    for (size_t d = 0; d < R; ++d) {
+      if (hipSetDevice(impl_->dev[d].id) != hipSuccess ||
+          hipGraphInstantiate(&execs[d], graphs[d], nullptr, nullptr, 0) != hipSuccess ||
+          !execs[d]) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  for (size_t d = 0; d < R; ++d) {
+    if (graphs[d]) {
+      (void)hipSetDevice(impl_->dev[d].id);
+      (void)hipGraphDestroy(graphs[d]);
+    }
+  }
+  if (!ok) {
+    for (size_t d = 0; d < R; ++d) {
+      if (execs[d]) {
+        (void)hipSetDevice(impl_->dev[d].id);
+        (void)hipGraphExecDestroy(execs[d]);
+      }
+    }
+    (void)hipGetLastError();
+    for (size_t d = 0; d < R; ++d) {
+      Impl::Dev& D = impl_->dev[d];
+      const uint8_t cur_hc = (D.b_hc != D.b_hc_alloc) ? 1u : 0u;
+      if (cur_hc != impl_->capture_key.hc_parity && D.b_hc_next) std::swap(D.b_hc, D.b_hc_next);
+      const uint8_t cur_pre = (D.b_pre != D.b_pre_base) ? 1u : 0u;
+      if (cur_pre != impl_->capture_key.pre_parity && D.b_pre_prev) std::swap(D.b_pre, D.b_pre_prev);
+      D.b_ar_precollapsed = (impl_->capture_key.precollapsed_in != 0u);
+      D.b_ar_npart = impl_->capture_entry_ar_npart[d];
+      D.q8_src = nullptr;
+      norm_q8_invalidate(D.id, D.b_norm);
+      D.b_shexp_ev = false;
+    }
+    b_ar_pending_ = impl_->capture_entry_b_ar_pending;
+    b_norm_rows_ = impl_->capture_entry_b_norm_rows;
+    pending_pf0_ = -1;
+    pending_pf1_ = -1;
+    Impl::DraftGraphEntry fail_e{};
+    fail_e.key = impl_->capture_key;
+    fail_e.failed = true;
+    impl_->draft_graphs.push_back(fail_e);
+    return false;
+  }
+
+  Impl::DraftGraphEntry e{};
+  e.key = impl_->capture_key;
+  e.ready = true;
+  const Impl::Dev& D0 = impl_->dev[0];
+  e.exit_hc_parity = (D0.b_hc != D0.b_hc_alloc) ? 1u : 0u;
+  e.exit_pre_parity = (D0.b_pre != D0.b_pre_base) ? 1u : 0u;
+  e.exit_precollapsed = D0.b_ar_precollapsed ? 1u : 0u;
+  e.exit_ar_pending = b_ar_pending_;
+  e.exit_b_norm_rows = b_norm_rows_;
+  for (size_t d = 0; d < R; ++d) {
+    e.exit_ar_npart[d] = impl_->dev[d].b_ar_npart;
+    e.exec[d] = execs[d];
+  }
+  impl_->draft_graphs.push_back(e);
+  for (size_t d = 0; d < R; ++d) {
+    AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
+    AFF_HIP_CHECK(hipGraphLaunch(e.exec[d], impl_->dev[d].stream));
+  }
+  ++st_.calls;
+  return true;
 }
 
 std::vector<VramSample> vram_sample() {

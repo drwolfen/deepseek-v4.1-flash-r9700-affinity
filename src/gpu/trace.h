@@ -165,6 +165,7 @@ struct DenseTrace {
 // `inline`, so every translation unit that traces shares one instance: two copies would split the
 // table and each would print a partial run.
 inline DenseTrace g_trace;
+inline thread_local bool g_capturing = false;
 
 // Scoped: charges the enclosing block to slot `i`.
 struct TraceScope {
@@ -172,7 +173,7 @@ struct TraceScope {
   int r = -1;                                // ring entry this call was measured into, or -1
   std::chrono::steady_clock::time_point t0;
   explicit TraceScope(int slot) : i(slot) {
-    if (!g_trace.on) return;
+    if (!g_trace.on || g_capturing) { i = -1; return; }
     if (i >= DenseTrace::kDeepFirst && !g_trace.deep) { i = -1; return; }
     if (g_trace.events && g_trace.stream) {
       // Free the ring entry about to be reused. A query, not a wait: a pair still in flight leaves
@@ -315,7 +316,7 @@ struct XScope {
   int r = -1;                                  // ring entry this call was measured into, or -1
   std::chrono::steady_clock::time_point t0;
   XScope(int dev_idx, int slot, hipStream_t st) : d(dev_idx), i(slot) {
-    if (!g_xt.on) { i = -1; return; }
+    if (!g_xt.on || g_capturing) { i = -1; return; }
     if (g_xt.events && st) {
       const uint32_t h = g_xt.head[d][i];
       if (!g_xt.ev[d][i][h][0]) {              // lazy: the caller has already set the device

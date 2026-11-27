@@ -115,7 +115,8 @@ public:
   // replica: decode sends logits to the host for top-k either way, so each card produces half and
   // nothing is exchanged. `bias` is the aux-loss-free correction, kept in VRAM so the device top-k
   // never needs an H2D; null for hash-routed layers, which do not register at all.
-  int32_t reg_router(const uint16_t* w, const float* bias, uint32_t n_expert, uint64_t n_embd);
+  int32_t reg_router(const uint16_t* w, const float* bias, uint32_t n_expert, uint64_t n_embd,
+                     bool replicated = false);
   bool router(int32_t h, const float* x, uint32_t n_expert, uint64_t n_embd, float* logits);
 
 
@@ -164,6 +165,18 @@ public:
                             uint32_t n_head, uint32_t width, uint32_t qr_dim);
   static bool slice_tail_cb(void* ctx, uint32_t off, uint32_t keep, uint32_t n_embd,
                             uint32_t n_hc, uint32_t n_head, uint32_t width, uint32_t qr_dim);
+
+  // Unused decode tails of standalone prefill-sized batch buffers above the 64 MiB decode guard
+  // (excluding persistent decode sub-partitions such as i_q8/i_qs/i_w), loaned to StaticPlacement
+  // during decode when AFF_VRAM_LOAN=1 and reclaimed before any prefill chunk (nb > kNarrowTok).
+  struct VramLoanRange { void* ptr = nullptr; size_t bytes = 0; };
+  void     vram_loan_ranges(size_t rank, std::vector<VramLoanRange>* out) const;
+  void     set_prefill_reclaim_cb(void (*pre_cb)(void*), void (*post_cb)(void*), void* ctx);
+
+  // Per-(slot, B, stage, variant) HIP Graph capture/replay for DSpark FFN sublayers (+ collapse).
+  bool     draft_graph_begin(uint32_t B, uint32_t stage, bool with_collapse);
+  bool     draft_graph_end(uint32_t B, uint32_t stage, bool with_collapse);
+  void     invalidate_draft_graphs();
 
   // The router's selection as a CARD can read it, which is what a device-built dispatch needs and
   // the host path never did. `sel` and `wt` are [nb_tok][k] on rank `r`'s own memory — rank 0's own
@@ -394,6 +407,8 @@ private:
   static int32_t reg_vec_cb(void* ctx, const float* host, uint64_t n);
   static int32_t reg_router_cb(void* ctx, const uint16_t* w, const float* bias, uint32_t n_expert,
                                uint64_t n_embd);
+  static int32_t reg_router_rep_cb(void* ctx, const uint16_t* w, const float* bias,
+                                   uint32_t n_expert, uint64_t n_embd, bool replicated);
   static bool router_cb(void* ctx, int32_t h, const float* x, uint32_t n_expert, uint64_t n_embd,
                         float* logits);
   static bool attn_q_cb(void* ctx, int32_t qa, int32_t qb, int32_t qn, const float* x,
@@ -836,6 +851,9 @@ private:
   uint32_t b_qr_cap_ = 0, b_g_cap_ = 0, b_u_cap_ = 0, b_y_cap_ = 0, b_tm_cap_ = 0;
   uint32_t b_vocab_ = 0;                        // 0 until batch_init
   uint32_t b_tapin_ = 0;                        // 0 until draft_init
+  void (*prefill_reclaim_pre_cb_)(void*) = nullptr;
+  void (*prefill_reclaim_post_cb_)(void*) = nullptr;
+  void* prefill_reclaim_ctx_ = nullptr;
 };
 
 // Per-card VRAM as the driver reports it. Declared here rather than in hip_common.h so a caller

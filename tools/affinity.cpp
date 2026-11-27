@@ -419,6 +419,7 @@ int main(int argc, char** argv) {
   // The default is the largest chunk whose complement still fit the host pool on the machine this
   // was tuned on; re-sweep it on a machine with a different VRAM-to-RAM split.
   uint32_t prefill_chunk = 1408;
+  bool prefill_chunk_set = false;
   bool echo_prompt = true;
   // The live dashboard, on when stdout is a terminal and off when it is not. That condition is what
   // keeps a piped run byte-identical to what it has always been — every bench script parses these
@@ -582,8 +583,10 @@ int main(int argc, char** argv) {
         return 2;
       }
     }
-    else if (a == "--prefill-chunk-size")
+    else if (a == "--prefill-chunk-size") {
       prefill_chunk = (uint32_t)std::strtoul(nxt(), nullptr, 10);
+      prefill_chunk_set = true;
+    }
     else if (a == "--pin-numa0") {
       const char* v = nxt();
       ::setenv("AFF_PIN_NUMA0", (v && *v && std::strcmp(v, "0") != 0) ? "1" : "0", 1);
@@ -1197,9 +1200,51 @@ int main(int argc, char** argv) {
     // slabs are sized against rather than out from under them.
     std::string berr;
     if (prefill_chunk > 0) {
+      const uint32_t orig_prefill_chunk = prefill_chunk;
+      const char* loan_env = std::getenv("AFF_VRAM_LOAN");
+      const bool loan_on = !loan_env || !*loan_env || std::strcmp(loan_env, "0") != 0;
+      if (!prefill_chunk_set && loan_on) {
+        uint32_t want = 4096u;
+        if (const char* ce = std::getenv("AFF_PREFILL_CHUNK"); ce && *ce) {
+          const unsigned long v = std::strtoul(ce, nullptr, 10);
+          if (v > 0ul) {
+            const uint32_t r128 = (uint32_t)((v + 127ul) & ~127ul);
+            want = std::clamp<uint32_t>(r128, 128u, 4096u);
+          }
+        }
+        if (want > prefill_chunk) {
+          const size_t ranks = std::max<size_t>(1u, dense_gpu.ranks());
+          const std::vector<aff::VramSample> vs = aff::vram_sample();
+          uint64_t min_free = UINT64_MAX;
+          for (size_t i = 0; i < vs.size() && i < ranks; ++i) {
+            const double free_g = std::max(0.0, vs[i].total_gib - vs[i].used_gib);
+            min_free = std::min<uint64_t>(min_free, (uint64_t)(free_g * 1073741824.0));
+          }
+          const uint64_t nh_r = std::max<uint64_t>(1ull, c.n_head / ranks);
+          const uint64_t per_tok =
+              (uint64_t)c.n_embd * ((uint64_t)c.hc_mult * 4ull + 8ull) +
+              8ull * (uint64_t)c.o_lora_rank * 4ull + nh_r * c.head_dim * 6ull;
+          constexpr uint64_t kHeadroom = 1024ULL << 20;
+          uint32_t scaled = want;
+          if (min_free != UINT64_MAX) {
+            while (scaled > prefill_chunk &&
+                   ((uint64_t)scaled * per_tok + kHeadroom > min_free)) {
+              scaled = (scaled > prefill_chunk + 128u) ? (scaled - 128u) : prefill_chunk;
+            }
+          }
+          prefill_chunk = scaled;
+        }
+      }
       // max_mid is the widest intermediate that is not the query block: 8*o_lora_rank.
-      if (dense_gpu.batch_init(prefill_chunk, c.n_embd, c.hc_mult, c.n_head, c.head_dim,
-                               8 * c.o_lora_rank, c.vocab, c.index_topk, &berr)) {
+      bool batch_ok = dense_gpu.batch_init(prefill_chunk, c.n_embd, c.hc_mult, c.n_head, c.head_dim,
+                                           8 * c.o_lora_rank, c.vocab, c.index_topk, &berr);
+      if (!batch_ok && prefill_chunk > orig_prefill_chunk) {
+        prefill_chunk = orig_prefill_chunk;
+        berr.clear();
+        batch_ok = dense_gpu.batch_init(prefill_chunk, c.n_embd, c.hc_mult, c.n_head, c.head_dim,
+                                        8 * c.o_lora_rank, c.vocab, c.index_topk, &berr);
+      }
+      if (batch_ok) {
         model.set_batch_ops(dense_gpu.batch_ops());
         aff::ui::out("prefill: batched, up to %u tokens per chunk\n", dense_gpu.batch_cap());
       } else {
@@ -1782,6 +1827,23 @@ int main(int argc, char** argv) {
       placement.seed_heat(learned_profile.data(), learned_profile.size());
       aff::ui::out("placement engine: seeded from a learned heat plane (%zu entries)\n",
                   learned_profile.size());
+    }
+    if (placement.enabled()) {
+      std::vector<void*> cstreams(dense_gpu.ranks());
+      for (size_t d = 0; d < dense_gpu.ranks(); ++d) cstreams[d] = dense_gpu.stream(d);
+      placement.set_compute_streams(cstreams.data(), cstreams.size());
+      for (size_t d = 0; d < dense_gpu.ranks(); ++d) {
+        std::vector<aff::DenseGpu::VramLoanRange> dg_ranges;
+        dense_gpu.vram_loan_ranges(d, &dg_ranges);
+        std::vector<aff::StaticPlacement::LoanRange> sp_ranges;
+        sp_ranges.reserve(dg_ranges.size());
+        for (const auto& r : dg_ranges) sp_ranges.push_back({r.ptr, r.bytes});
+        placement.set_vram_loan_ranges(d, sp_ranges.data(), sp_ranges.size());
+      }
+      dense_gpu.set_prefill_reclaim_cb(
+          [](void* ctx) { static_cast<aff::StaticPlacement*>(ctx)->reclaim_vram_loan(); },
+          [](void* ctx) { static_cast<aff::StaticPlacement*>(ctx)->mark_vram_loan_eligible(true); },
+          &placement);
     }
   }
 

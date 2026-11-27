@@ -174,7 +174,7 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
     uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head, float scale,
     int q_bf16, float* __restrict__ part_o, float* __restrict__ part_ml, uint32_t part_tok,
     const uint32_t* __restrict__ adm, uint32_t adm_stride, uint32_t raw_floor,
-    const float* __restrict__ q_scales) {
+    const float* __restrict__ q_scales, uint32_t flat_win = 0u, uint32_t flat_raw0 = 0u) {
 
   constexpr uint32_t NH = NT * 16u;                   // query heads a block
   constexpr bool kLate = KLATE && RESOLVE_4W;
@@ -198,9 +198,9 @@ __global__ __launch_bounds__(kThreads) void flash_kernel(
   const uint32_t tk = blockIdx.x;
   const uint32_t pos = pos0 + tk;
   const uint32_t raw_avail = (pos >= raw_floor) ? (pos - raw_floor + 1u) : 0u;
-  const uint32_t n_raw = (raw_avail < sliding) ? raw_avail : sliding;
-  const uint32_t raw0 = (pos + 1u - n_raw) % ring;
-  const uint32_t n_comp = n_comp_v ? n_comp_v[tk] : n_comp1;
+  const uint32_t n_raw = flat_win ? flat_win : ((raw_avail < sliding) ? raw_avail : sliding);
+  const uint32_t raw0 = flat_win ? flat_raw0 : ((pos + 1u - n_raw) % ring);
+  const uint32_t n_comp = flat_win ? 0u : (n_comp_v ? n_comp_v[tk] : n_comp1);
   const uint32_t n_keys = n_raw + n_comp;
   const size_t qoff = (size_t)(b0 + tk) * n_head * kW + (size_t)h0 * kW;
 
@@ -726,6 +726,9 @@ static uint32_t flash_split_slices(uint32_t n_tok, uint32_t head_tiles, uint32_t
   const uint32_t nat = n_tok * head_tiles;
   if (!nat || nat >= kTargetBlocks) return 1u;
   const uint32_t tiles = (n_keys + kKT - 1u) / kKT;
+  const char* lowm = std::getenv("AFF_FLASH_LOWM_NOSPLIT");
+  const bool lowm_on = !lowm || !*lowm || std::strcmp(lowm, "0") != 0;
+  if (lowm_on && (tiles <= 2u || (n_tok >= 4u && tiles <= 4u))) return 1u;
   uint32_t s = std::min(kTargetBlocks / nat, sp->slots);
   s = std::min(s, kMaxSlices);
   s = std::min(s, tiles / min_tiles);
@@ -762,7 +765,8 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
                           uint32_t sliding, uint32_t ring, uint32_t max_comp, uint32_t n_head,
                           float scale, void* stream, bool q_bf16, const FlashSplit* split,
                           uint32_t n_comp_hint, const uint32_t* adm, uint32_t adm_stride,
-                          uint32_t raw_floor, const float* q_scales) {
+                          uint32_t raw_floor, const float* q_scales,
+                          uint32_t flat_win, uint32_t flat_raw0) {
   if (!n || !n_head) return;
   hipStream_t st = (hipStream_t)stream;
   const uint8_t* r8 = (const uint8_t*)raw;
@@ -771,9 +775,9 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
   while (nt > 1u && n_head % (nt * 16u) != 0u) nt >>= 1;
   const uint32_t ntiles = n_head / (nt * 16u);
   const uint32_t raw_avail0 = (pos0 >= raw_floor) ? (pos0 - raw_floor + 1u) : 0u;
-  const uint32_t nraw0 = (raw_avail0 < sliding) ? raw_avail0 : sliding;
-  const uint32_t nkeys = nraw0 + (n_comp_v ? n_comp_hint : n_comp1);
-  const uint32_t nsp = flash_split_slices(n, ntiles, nkeys, split);
+  const uint32_t nraw0 = flat_win ? flat_win : ((raw_avail0 < sliding) ? raw_avail0 : sliding);
+  const uint32_t nkeys = flat_win ? flat_win : (nraw0 + (n_comp_v ? n_comp_hint : n_comp1));
+  const uint32_t nsp = flat_win ? 1u : flash_split_slices(n, ntiles, nkeys, split);
   float* po = nsp > 1u ? split->o : nullptr;
   float* pm = nsp > 1u ? split->ml : nullptr;
   const uint32_t ptok = nsp > 1u ? split->tok_cap : 0u;
@@ -787,7 +791,8 @@ void mqa_attend_flash_hip(const void* q, const void* raw, const void* comp,
 #define AFF_LAUNCH(T, S, M, R4, NK, E2, KL)                                                        \
   hipLaunchKernelGGL((flash_kernel<T, S, M, R4, NK, E2, KL>), g, b, 0, st, q, r8, c8, allowed,     \
                      n_comp_v, n_comp1, sinks, out, b0, pos0, sliding, ring, max_comp, n_head,     \
-                     scale, q_bf16 ? 1 : 0, po, pm, ptok, adm, adm_stride, raw_floor, q_scales)
+                     scale, q_bf16 ? 1 : 0, po, pm, ptok, adm, adm_stride, raw_floor, q_scales,    \
+                     flat_win, flat_raw0)
 #define AFF_PICK_OPT(T, S, M, R4, NK)                                                              \
   do {                                                                                             \
     if (exp2 && klate && (R4))   AFF_LAUNCH(T, S, M, R4, NK, true, true);                          \

@@ -80,6 +80,31 @@ bool bonus_d2d_enabled() {
   return s && *s && std::strcmp(s, "0") != 0;
 }
 
+static inline bool sp_vram_loan_enabled() {
+  const char* s = std::getenv("AFF_VRAM_LOAN");
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
+
+static inline bool sp_prefill_stager_enabled() {
+  const char* s = std::getenv("AFF_PREFILL_STAGER");
+  return !s || !*s || std::strcmp(s, "0") != 0;
+}
+
+static inline uint32_t sp_prefill_stage_slots() {
+  const char* s = std::getenv("AFF_PREFILL_STAGE_SLOTS");
+  if (!s || !*s) return 32u;
+  const long v = std::strtol(s, nullptr, 10);
+  if (v <= 0) return 0u;
+  return (uint32_t)std::min<long>(v, 256l);
+}
+
+static inline bool sp_capturing(hipStream_t st) {
+  if (aff::trace::g_capturing) return true;
+  if (!st) return false;
+  hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+  return hipStreamIsCapturing(st, &cs) == hipSuccess && cs == hipStreamCaptureStatusActive;
+}
+
 struct StaticPlacement::Impl {
   // One big slab per card rather than 7000 small allocations: the expert stride is uniform, so a
   // slot index is arithmetic, and hipMalloc is slow enough that per-expert calls dominate load.
@@ -217,6 +242,37 @@ struct StaticPlacement::Impl {
   uint32_t plan_expect_total[8] = {};
   bool plan_any_inflight = false;
   std::vector<void*> pool_reg_chunks;
+
+  // W4: Decode-only VRAM loan slots carved in idle DenseGpu prefill tails.
+  struct LoanSlot {
+    uint8_t* ptr = nullptr;
+    uint32_t owner = UINT32_MAX;
+    bool copying = false;
+    bool published = false;
+    bool use_pending = false;
+    hipEvent_t ev_copy = nullptr;
+    hipEvent_t ev_use = nullptr;
+  };
+  std::vector<std::vector<LoanSlot>> loan_slots;
+  std::vector<hipStream_t> compute_streams;
+  std::vector<hipEvent_t> loan_prefill_barrier;
+  std::vector<uint8_t> loan_need_barrier;
+  uint64_t loan_calls = 0;
+
+  // W4: Bounded prefill SDMA staging slots overlapped across layers via mv[dv].
+  struct PStageSlot {
+    uint8_t* ptr = nullptr;
+    uint32_t owner_idx = UINT32_MAX;
+    int32_t  pool_slot = -1;
+    bool staged = false;
+    bool published = false;
+    bool mv_pending = false;
+    bool use_pending = false;
+    hipEvent_t ev_mv = nullptr;
+    hipEvent_t ev_use = nullptr;
+  };
+  std::vector<std::vector<PStageSlot>> pstage_slots;
+  std::vector<uint64_t> pstage_addr; // [dv * n_total + idx] -> ptr when published in plc_[dv]
 };
 
 static void unregister_host_chunks(std::vector<void*>& chunks) {
@@ -268,6 +324,24 @@ void StaticPlacement::free_batch_arenas() {
 }
 
 StaticPlacement::~StaticPlacement() {
+  drain_prefill_stager();
+  free_prefill_stager();
+  if (impl_) {
+    for (size_t dv = 0; dv < impl_->loan_slots.size(); ++dv) {
+      if (dv < devs_.size()) (void)hipSetDevice(devs_[dv]);
+      if (dv < impl_->mv.size() && impl_->mv[dv]) (void)hipStreamSynchronize(impl_->mv[dv]);
+      for (auto& ls : impl_->loan_slots[dv]) {
+        if (ls.ev_copy) (void)hipEventDestroy(ls.ev_copy);
+        if (ls.ev_use) (void)hipEventDestroy(ls.ev_use);
+      }
+    }
+    impl_->loan_slots.clear();
+    for (size_t dv = 0; dv < impl_->loan_prefill_barrier.size(); ++dv) {
+      if (dv < devs_.size()) (void)hipSetDevice(devs_[dv]);
+      if (impl_->loan_prefill_barrier[dv]) (void)hipEventDestroy(impl_->loan_prefill_barrier[dv]);
+    }
+    impl_->loan_prefill_barrier.clear();
+  }
   free_batch_arenas();
   if (!impl_) return;
   for (size_t i = 0; i < impl_->mv.size(); ++i) {
@@ -453,11 +527,18 @@ void StaticPlacement::publish_base(size_t idx, PlcPatch* sink) {
       std::lock_guard<std::mutex> lk(impl_->bonus_mu);
       boff = bonus_off_[dv * n + idx];
     }
+    const uint64_t laddr = (dv * n + idx < loan_addr_.size()) ? loan_addr_[dv * n + idx] : 0ull;
+    const uint64_t paddr =
+        (impl_ && dv * n + idx < impl_->pstage_addr.size()) ? impl_->pstage_addr[dv * n + idx] : 0ull;
     uint64_t a = 0;
     if (device_of_[idx] >= 0 && (tp_parts_ > 1 || device_of_[idx] == (int)dv))
       a = (uint64_t)(uintptr_t)(impl_->slab[dv] + offset_of_[idx]) | kPlcResident;
     else if (boff != UINT64_MAX)
       a = (uint64_t)(uintptr_t)(impl_->bonus_slab[dv] + boff) | kPlcResident;
+    else if (laddr != 0ull)
+      a = laddr | kPlcResident;
+    else if (paddr != 0ull)
+      a = paddr | kPlcResident;
     else if (const uint8_t* p = pool_shard_dev(layer, e, dv))
       a = (uint64_t)(uintptr_t)p;
     if (sink) {
@@ -1055,6 +1136,15 @@ bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
   }
 
   pool_registered_ = true;
+  // Detect whether the host pool covers every (layer, expert) pair immutably.
+  if (n_layer_ && n_expert_) {
+    bool all_in_pool = true;
+    for (uint32_t l = 0; l < n_layer_ && all_in_pool; ++l)
+      for (uint32_t e = 0; e < n_expert_; ++e)
+        if (p->slot_of(l, e) < 0) { all_in_pool = false; break; }
+    pool_full_ = all_in_pool;
+  }
+  init_prefill_stager();
   // Both tiers exist now, so every expert has an address. Idempotent, and the load path calls it too
   // for the case where no pool is attached at all.
   publish_all();
@@ -1235,7 +1325,13 @@ bool StaticPlacement::init(const AffReader* aff, const Codebook& cb, double budg
     // amdnas-fixes honest-reserve: the slab below is allocated as (per_gpu + shadow_slots_) slots + 4096, and the codebook
     // follows it — all taken AFTER this sizing, out of `keep`. On a 32 GiB card that turned the intended 262 MiB into
     // 122 MiB, which is inside the band where the runtime silently computes garbage (probe 16). Reserve them here.
-    const uint64_t engine_after = (uint64_t)shadow_slots_ * slot_stride + (uint64_t)cb_.v.size() * 4 + 4096;
+    const uint32_t ps_want =
+        (pref_cap_ == 0u && sp_prefill_stager_enabled() && route_tag_ != 'S' && tp_parts_ > 1 &&
+         (uint64_t)n_layer * n_expert > 512u)
+            ? sp_prefill_stage_slots()
+            : 0u;
+    const uint64_t engine_after = (uint64_t)(shadow_slots_ + ps_want) * slot_stride +
+                                  (uint64_t)cb_.v.size() * 4 + 4096;
     const uint64_t avail = freeb > keep + engine_after ? freeb - keep - engine_after : 0;
     const uint64_t cap = std::min<uint64_t>(want, avail);
     per_gpu[i] = cap / slot_stride;
@@ -1994,8 +2090,24 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
   Impl& I = *impl_;
   const size_t R = devs_.size();
   if (R > 8) return 0;
-  lead_gate(streams, nb_tok, R);
+  const bool capturing = aff::trace::g_capturing || (streams[0] && sp_capturing((hipStream_t)streams[0]));
+  if (!capturing) lead_gate(streams, nb_tok, R);
   inter = shard_inter(inter);
+  if (nb_tok <= 16u && pstage_active_) drain_prefill_stager();
+  if (!capturing && nb_tok > 16u && pstage_cap_ > 0u && pool_full_ && sp_prefill_stager_enabled() &&
+      !pstage_mover_drained_) {
+    if (ensure_loan_streams_and_stager()) {
+      for (size_t dv = 0; dv < R; ++dv) {
+        if (dv < I.mv.size() && I.mv[dv]) {
+          AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
+          AFF_HIP_CHECK(hipStreamSynchronize(I.mv[dv]));
+        }
+      }
+      if (engine_on_) engine_retire(streams);
+    }
+    pstage_mover_drained_ = true;
+    pstage_active_ = true;
+  }
 
   const size_t total = (size_t)nb_tok * k;
   // ---- scratch, allocated ONCE ----------------------------------------------------------------
@@ -2114,6 +2226,38 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
 
   for (size_t dv = 0; dv < R; ++dv) {
     if (!d_x[dv] || !d_block[dv] || !streams[dv]) continue;
+    if (dv < I.compute_streams.size()) I.compute_streams[dv] = (hipStream_t)streams[dv];
+    const size_t n_total = (size_t)n_layer_ * n_expert_;
+    std::vector<uint32_t> pstage_used_idx;
+    if (!capturing && nb_tok > 16u && pstage_cap_ > 0u && pool_full_ && sp_prefill_stager_enabled() &&
+        dv < I.pstage_slots.size() && !I.pstage_slots[dv].empty()) {
+      if (I.pstage_addr.size() != R * n_total) I.pstage_addr.assign(R * n_total, 0ull);
+      AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
+      hipStream_t pst = (hipStream_t)streams[dv];
+      PlcPatch sp[8];
+      auto flush_sp = [&] {
+        if (!sp[dv].n) return;
+        if (plc_[dv]) plc_publish_hip(plc_[dv], sp[dv], pst);
+        sp[dv].n = 0;
+      };
+      for (auto& ps : I.pstage_slots[dv]) {
+        if (!ps.staged || ps.owner_idx == UINT32_MAX) continue;
+        if ((ps.owner_idx / n_expert_) != layer) continue;
+        if (ps.mv_pending && ps.ev_mv) {
+          AFF_HIP_CHECK(hipStreamWaitEvent(pst, ps.ev_mv, 0));
+          ps.mv_pending = false;
+        }
+        I.pstage_addr[dv * n_total + ps.owner_idx] = (uint64_t)(uintptr_t)ps.ptr;
+        ps.published = true;
+        if (sp[dv].n == kPlcPatchMax) flush_sp();
+        publish_base(ps.owner_idx, sp);
+        // Only enqueue card `dv`'s patch on `pst`; clear other cards' temp patch counts.
+        for (size_t od = 0; od < R; ++od) if (od != dv) sp[od].n = 0;
+        pstage_used_idx.push_back(ps.owner_idx);
+        ++estats_.prefill_stage_hits;
+      }
+      flush_sp();
+    }
     // Opened here rather than at the top of the function so a card that is handed nothing does not
     // register a call. Stopped by hand just before the uploads.
     trace::XScope _xbucket((int)dv, 0, nullptr);
@@ -2187,16 +2331,49 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
     // Placed HERE, after the two membership passes and before anything is launched, because both
     // halves of the record have to describe the same instant: `sel` is what the router chose and
     // `uniq[n_res..]` is what placement had failed to have ready for it.
+    auto restore_pstage_used = [&] {
+      if (pstage_used_idx.empty()) return;
+      PlcPatch up[8];
+      hipStream_t ust = (hipStream_t)streams[dv];
+      auto flush_up = [&] {
+        if (!up[dv].n) return;
+        if (plc_[dv]) plc_publish_hip(plc_[dv], up[dv], ust);
+        up[dv].n = 0;
+      };
+      for (uint32_t idx : pstage_used_idx) {
+        if (dv * n_total + idx < I.pstage_addr.size()) I.pstage_addr[dv * n_total + idx] = 0ull;
+        if (up[dv].n == kPlcPatchMax) flush_up();
+        publish_base(idx, up);
+        for (size_t od = 0; od < R; ++od) if (od != dv) up[od].n = 0;
+      }
+      flush_up();
+      for (auto& ps : I.pstage_slots[dv]) {
+        if (!ps.published) continue;
+        ps.published = false;
+        ps.staged = false;
+        ps.owner_idx = UINT32_MAX;
+        ps.pool_slot = -1;
+        if (ps.ev_use) {
+          AFF_HIP_CHECK(hipEventRecord(ps.ev_use, ust));
+          ps.use_pending = true;
+        }
+      }
+      pstage_used_idx.clear();
+    };
     if (!plan_on) {
       if (dv == 0 && route_trace().on())
         route_trace().dispatch(route_tag_, layer, nb_tok, sel, (uint32_t)total, uniq.data() + n_res,
                                (uint32_t)(uniq.size() - n_res));
-      if (uniq.empty()) continue;
+      if (uniq.empty()) { restore_pstage_used(); continue; }
       for (size_t i = 0; i < total; ++i) {
         const uint32_t e = sel[i];
         if (e < n_expert_ && mark[e]) { ++counts[e]; ++taken; }
       }
-      if (!taken) { for (uint32_t e : uniq) { mark[e] = 0u; counts[e] = 0u; } continue; }
+      if (!taken) {
+        for (uint32_t e : uniq) { mark[e] = 0u; counts[e] = 0u; }
+        restore_pstage_used();
+        continue;
+      }
     }
 
     AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
@@ -2709,14 +2886,70 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
 
       taken_all += taken;
     }
+    restore_pstage_used();
+    // Cross-layer lookahead SDMA overlap on I.mv[dv] with grouped host-pool affinity.
+    if (!capturing && nb_tok > 16u && pstage_cap_ > 0u && pool_full_ && sp_prefill_stager_enabled() &&
+        dv < I.pstage_slots.size() && !I.pstage_slots[dv].empty() && dv < I.mv.size() && I.mv[dv]) {
+      const uint32_t next_l = (layer + 1u < n_layer_) ? (layer + 1u) : 0u;
+      struct Cand { uint32_t idx; int64_t pslot; float heat; };
+      static thread_local std::vector<Cand> cands;
+      cands.clear();
+      for (uint32_t e = 0; e < n_expert_; ++e) {
+        const uint32_t nidx = next_l * n_expert_ + e;
+        if (device_of_[nidx] >= 0) continue;
+        const int64_t ps = pool_->slot_of(next_l, e);
+        if (ps < 0) continue;
+        bool already = false;
+        for (const auto& s : I.pstage_slots[dv]) {
+          if (s.staged && s.owner_idx == nidx) { already = true; break; }
+        }
+        if (already) continue;
+        const float h = heat_.ready() ? heat_.heat(nidx) : 0.0f;
+        cands.push_back({nidx, ps, h});
+      }
+      if (!cands.empty()) {
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+          if (a.heat != b.heat) return a.heat > b.heat;
+          return a.idx < b.idx;
+        });
+        size_t avail_slots = 0;
+        for (const auto& s : I.pstage_slots[dv]) if (!s.staged) ++avail_slots;
+        if (avail_slots < cands.size() && avail_slots > 0) cands.resize(avail_slots);
+        if (avail_slots > 0) {
+          // Grouped host-pool affinity: sort selected lookahead copies by ascending pool_slot.
+          std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+            return a.pslot < b.pslot;
+          });
+          const uint64_t ss = shard_.stride;
+          size_t ci = 0;
+          for (auto& s : I.pstage_slots[dv]) {
+            if (s.staged || ci >= cands.size()) continue;
+            const Cand& c = cands[ci++];
+            const uint8_t* src = pool_->slot_base(c.pslot);
+            if (!src) continue;
+            if (s.use_pending && s.ev_use) {
+              AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], s.ev_use, 0));
+              s.use_pending = false;
+            }
+            AFF_HIP_CHECK(hipMemcpyAsync(s.ptr, src + (size_t)dv * ss, ss,
+                                         hipMemcpyHostToDevice, I.mv[dv]));
+            if (s.ev_mv) {
+              AFF_HIP_CHECK(hipEventRecord(s.ev_mv, I.mv[dv]));
+              s.mv_pending = true;
+            }
+            s.owner_idx = c.idx;
+            s.pool_slot = (int32_t)c.pslot;
+            s.staged = true;
+            estats_.prefill_stage_bytes += ss;
+          }
+        }
+      }
+    }
   }
 
-  // THE LAYER BOUNDARY, in the only sense that matters: every launch this layer will make has been
-  // issued, so an event recorded on the compute stream from here is downstream of every kernel that
-  // could still be reading a slab slot or a pool slot the mover wants to write. The staging ring
-  // needs exactly that guarantee, for the same reason.
-  ssd_stage_arm(streams);
-  if (engine_on_) {
+  // Also restore any staged slots if !plan_on skipped early (`uniq.empty()`): done safely if loop exited cleanly.
+  if (!capturing) ssd_stage_arm(streams);
+  if (engine_on_ && !capturing) {
     static const bool prefill_freeze_plc = [] {
       const char* s = std::getenv("AFF_PREFILL_FREEZE_PLC");
       return !s || !*s || std::strcmp(s, "0") != 0;
@@ -2724,9 +2957,13 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
     if (prefill_freeze_plc && nb_tok > 16u) {
       engine_retire(streams);
       if (plan_on) act_drain();
-    } else {
+    } else if (!pstage_active_) {
       engine_tick(layer, sel, total, streams, plan_on);
     }
+  }
+  if (!capturing && nb_tok <= 16u && loan_eligible_ && pool_full_ && sp_vram_loan_enabled() &&
+      route_tag_ != 'S') {
+    loan_tick_admit(streams);
   }
   I.last_ev_dn.clear();
 
@@ -2740,7 +2977,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
   // and one stale read costs at most another 512 layers before the next. The point is that the
   // process stops rather than emitting wrong text for a whole run — not that it stops on the exact
   // layer. Checking per layer is what the drain was for.
-  if (plan_on && impl_->plan_any_inflight) {
+  if (plan_on && !capturing && impl_->plan_any_inflight) {
     bool still = false;
     for (size_t dv = 0; dv < R && dv < 8; ++dv) {
       if (!impl_->plan_inflight[dv]) continue;
@@ -2770,7 +3007,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
     }
     impl_->plan_any_inflight = still;
   }
-  if (plan_on && (++plan_calls_ & 511u) == 0u) {
+  if (plan_on && !capturing && (++plan_calls_ & 511u) == 0u) {
     for (size_t dv = 0; dv < R && dv < 8; ++dv) {
       if (impl_->plan_inflight[dv] || !plan_st_[dv]) continue;
       if (hipSetDevice(devs_[dv]) != hipSuccess) continue;
@@ -2928,6 +3165,8 @@ bool StaticPlacement::placement_engine_init(HostExpertPool* pool,
   }
 
   engine_on_ = true;
+  if (pool_full_ && pref_cap_ == 0u && sp_prefill_stager_enabled() && pstage_cap_ == 0u)
+    init_prefill_stager();
   aff::ui::err(// The strategy BY NAME: a banner that says "heat" whatever is running is how a
                // measurement ends up attributed to the arm that did not produce it.
                "placement engine: %s, %u shadow slots, %u move%s a layer%s\n"
@@ -3313,6 +3552,7 @@ void StaticPlacement::engine_retire(void* const* streams) {
         }
         device_of_[M.idx] = 0;                        // sharded: "which card" is not a question
         offset_of_[M.idx] = M.slab_slot * ss;
+        loan_free_expert_on_promote(M.idx);
         {
           std::lock_guard<std::mutex> lk(I.bonus_mu);
           bool touched = false;
@@ -3683,6 +3923,18 @@ void StaticPlacement::engine_report() const {
                  (unsigned long long)estats_.bonus_d2d_demotes,
                  (double)estats_.bonus_d2d_bytes * gib, (unsigned long long)bonus_shards_);
   }
+  if (estats_.loan_promotes || estats_.loan_reclaims) {
+    aff::ui::err("  vram loan: %llu promotes, %llu evicts, %llu reclaims (%.2f GiB H2D)\n",
+                 (unsigned long long)estats_.loan_promotes,
+                 (unsigned long long)estats_.loan_evicts,
+                 (unsigned long long)estats_.loan_reclaims,
+                 (double)estats_.loan_bytes * gib);
+  }
+  if (estats_.prefill_stage_hits || estats_.prefill_stage_bytes) {
+    aff::ui::err("  prefill stager: %llu hits (%.2f GiB SDMA over %u slots/card)\n",
+                 (unsigned long long)estats_.prefill_stage_hits,
+                 (double)estats_.prefill_stage_bytes * gib, pstage_cap_);
+  }
   aff::ui::err("  %llu ticks declined on hysteresis, %llu starved of a slab slot, %llu of a pool "
               "slot; %llu resident now against %llu at load\n",
               (unsigned long long)estats_.refused, (unsigned long long)estats_.starved_slab,
@@ -3785,6 +4037,544 @@ void StaticPlacement::hint_preload(uint32_t layer, const uint32_t* experts, uint
   }
 }
 
+bool StaticPlacement::ensure_loan_streams_and_stager() {
+  if (!enabled_ || !impl_) return false;
+  Impl& I = *impl_;
+  const size_t R = devs_.size();
+  if (I.mv.size() < R) I.mv.resize(R, nullptr);
+  if (I.ev_layer.size() < R) I.ev_layer.resize(R, nullptr);
+  if (I.compute_streams.size() < R) I.compute_streams.resize(R, nullptr);
+  if (I.loan_prefill_barrier.size() < R) I.loan_prefill_barrier.resize(R, nullptr);
+  if (I.loan_need_barrier.size() < R) I.loan_need_barrier.resize(R, 0u);
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
+  for (size_t dv = 0; dv < R; ++dv) {
+    if (hipSetDevice(devs_[dv]) != hipSuccess) continue;
+    if (!I.mv[dv]) {
+      if (hipStreamCreateWithFlags(&I.mv[dv], hipStreamNonBlocking) != hipSuccess) {
+        if (have_prev) (void)hipSetDevice(prev);
+        return false;
+      }
+    }
+    if (!I.ev_layer[dv]) (void)hipEventCreateWithFlags(&I.ev_layer[dv], hipEventDisableTiming);
+    if (!I.loan_prefill_barrier[dv])
+      (void)hipEventCreateWithFlags(&I.loan_prefill_barrier[dv], hipEventDisableTiming);
+  }
+  if (have_prev) (void)hipSetDevice(prev);
+  return true;
+}
+
+void StaticPlacement::init_prefill_stager() {
+  if (!enabled_ || !impl_ || !pool_full_ || pref_cap_ > 0u || route_tag_ == 'S' ||
+      !sp_prefill_stager_enabled() || !shard_.stride || pstage_cap_ > 0u)
+    return;
+  const uint32_t want = sp_prefill_stage_slots();
+  if (!want) return;
+  const size_t R = devs_.size();
+  const uint64_t ss = shard_.stride;
+  uint32_t fit = want;
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
+  constexpr uint64_t kStagerReserve = 64ull << 20;
+  for (size_t dv = 0; dv < R && dv < 8; ++dv) {
+    if (hipSetDevice(devs_[dv]) != hipSuccess) { fit = 0u; break; }
+    size_t fb = 0, tb = 0;
+    if (!hip_free_vram_checked(devs_[dv], (uint64_t*)&fb, (uint64_t*)&tb))
+      (void)hipMemGetInfo(&fb, &tb);
+    const uint64_t card_slots = (fb > kStagerReserve) ? ((fb - kStagerReserve) / ss) : 0ull;
+    fit = std::min<uint32_t>(fit, (uint32_t)card_slots);
+  }
+  if (!fit) {
+    if (have_prev) (void)hipSetDevice(prev);
+    return;
+  }
+  if (!ensure_loan_streams_and_stager()) {
+    if (have_prev) (void)hipSetDevice(prev);
+    return;
+  }
+  Impl& I = *impl_;
+  I.pstage_slots.assign(R, {});
+  bool ok = true;
+  for (size_t dv = 0; dv < R && dv < 8; ++dv) {
+    if (hipSetDevice(devs_[dv]) != hipSuccess ||
+        hipMalloc((void**)&pstage_slab_[dv], (size_t)fit * ss) != hipSuccess) {
+      ok = false;
+      break;
+    }
+    I.pstage_slots[dv].resize(fit);
+    for (uint32_t s = 0; s < fit; ++s) {
+      auto& ps = I.pstage_slots[dv][s];
+      ps.ptr = pstage_slab_[dv] + (size_t)s * ss;
+      if (hipEventCreateWithFlags(&ps.ev_mv, hipEventDisableTiming) != hipSuccess ||
+          hipEventCreateWithFlags(&ps.ev_use, hipEventDisableTiming) != hipSuccess) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) break;
+  }
+  if (!ok) {
+    free_prefill_stager();
+    (void)hipGetLastError();
+    if (have_prev) (void)hipSetDevice(prev);
+    return;
+  }
+  pstage_cap_ = fit;
+  I.pstage_addr.assign(R * (size_t)n_layer_ * n_expert_, 0ull);
+  aff::ui::err("prefill stager: %u SDMA staging slots/card (%.1f MiB/card, immutable pool)\n",
+               pstage_cap_, (double)pstage_cap_ * (double)ss / 1048576.0);
+  if (have_prev) (void)hipSetDevice(prev);
+}
+
+void StaticPlacement::free_prefill_stager() {
+  if (!impl_) return;
+  Impl& I = *impl_;
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
+  for (size_t dv = 0; dv < devs_.size() && dv < 8; ++dv) {
+    (void)hipSetDevice(devs_[dv]);
+    if (dv < I.pstage_slots.size()) {
+      for (auto& ps : I.pstage_slots[dv]) {
+        if (ps.ev_mv) (void)hipEventDestroy(ps.ev_mv);
+        if (ps.ev_use) (void)hipEventDestroy(ps.ev_use);
+      }
+    }
+    if (pstage_slab_[dv]) {
+      (void)hipFree(pstage_slab_[dv]);
+      pstage_slab_[dv] = nullptr;
+    }
+  }
+  I.pstage_slots.clear();
+  I.pstage_addr.clear();
+  pstage_cap_ = 0u;
+  pstage_active_ = false;
+  pstage_mover_drained_ = false;
+  if (have_prev) (void)hipSetDevice(prev);
+}
+
+void StaticPlacement::drain_prefill_stager() {
+  if (!impl_ || !pstage_active_) return;
+  Impl& I = *impl_;
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
+  for (size_t dv = 0; dv < devs_.size(); ++dv) {
+    (void)hipSetDevice(devs_[dv]);
+    if (dv < I.mv.size() && I.mv[dv]) (void)hipStreamSynchronize(I.mv[dv]);
+    if (dv < I.pstage_slots.size()) {
+      for (auto& ps : I.pstage_slots[dv]) {
+        ps.staged = false;
+        ps.published = false;
+        ps.mv_pending = false;
+        ps.use_pending = false;
+        ps.owner_idx = UINT32_MAX;
+        ps.pool_slot = -1;
+      }
+    }
+  }
+  if (!I.pstage_addr.empty()) std::fill(I.pstage_addr.begin(), I.pstage_addr.end(), 0ull);
+  pstage_active_ = false;
+  pstage_mover_drained_ = false;
+  if (have_prev) (void)hipSetDevice(prev);
+}
+
+void StaticPlacement::set_compute_streams(void* const* streams, size_t n) {
+  if (!impl_ || !streams) return;
+  Impl& I = *impl_;
+  if (I.compute_streams.size() < devs_.size()) I.compute_streams.resize(devs_.size(), nullptr);
+  const size_t cnt = std::min(n, devs_.size());
+  for (size_t dv = 0; dv < cnt; ++dv) I.compute_streams[dv] = (hipStream_t)streams[dv];
+}
+
+bool StaticPlacement::set_vram_loan_ranges(size_t dv, const LoanRange* ranges, size_t n) {
+  if (!enabled_ || !impl_ || dv >= devs_.size()) return false;
+  if (loan_any_active_) reclaim_vram_loan();
+  Impl& I = *impl_;
+  const size_t R = devs_.size();
+  if (I.loan_slots.size() < R) I.loan_slots.resize(R);
+  if (loan_addr_.size() != R * (size_t)n_layer_ * n_expert_)
+    loan_addr_.assign(R * (size_t)n_layer_ * n_expert_, 0ull);
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
+  (void)hipSetDevice(devs_[dv]);
+  for (auto& ls : I.loan_slots[dv]) {
+    if (ls.ev_copy) (void)hipEventDestroy(ls.ev_copy);
+    if (ls.ev_use) (void)hipEventDestroy(ls.ev_use);
+  }
+  I.loan_slots[dv].clear();
+
+  if (!sp_vram_loan_enabled() || !ranges || !n || !shard_.stride) {
+    if (have_prev) (void)hipSetDevice(prev);
+    return true;
+  }
+
+  // Exclude any interior decode-active slices of DenseGpu external arenas (`bydn_`/`ba8_`).
+  struct Band { uintptr_t lo, hi; };
+  std::vector<Band> excl;
+  const size_t gu_guard = std::max<size_t>(
+      4u << 20,
+      (size_t)kSpecTok * kMoePlanMaxK * std::max<uint32_t>(1u, shard_.rows[0]) * sizeof(uint16_t) +
+          (1u << 20));
+  auto add_excl = [&](void* p, size_t len) {
+    if (!p || !len) return;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    excl.push_back({a, a + len});
+  };
+  if (dv < 8 && bydn_ext_[dv]) {
+    add_excl(bg_[dv], gu_guard);
+    add_excl(bu_[dv], gu_guard);
+    add_excl(bq8_[dv], 2u << 20);
+    add_excl(bqs_[dv], 1u << 20);
+  }
+  if (dv < 8 && ba8_ext_[dv]) {
+    add_excl(ba8_[dv], 4u << 20);
+    add_excl(bas_[dv], 1u << 20);
+  }
+  std::sort(excl.begin(), excl.end(), [](const Band& a, const Band& b) { return a.lo < b.lo; });
+
+  const uint64_t ss = (shard_.stride + 255ull) & ~255ull;
+  for (size_t i = 0; i < n; ++i) {
+    if (!ranges[i].ptr || ranges[i].bytes < ss) continue;
+    uintptr_t cur = (reinterpret_cast<uintptr_t>(ranges[i].ptr) + 255u) & ~uintptr_t(255u);
+    const uintptr_t end =
+        (reinterpret_cast<uintptr_t>(ranges[i].ptr) + ranges[i].bytes) & ~uintptr_t(255u);
+    while (cur + ss <= end) {
+      bool skipped = false;
+      for (const Band& ex : excl) {
+        if (cur < ex.hi && cur + ss > ex.lo) {
+          cur = (ex.hi + 255u) & ~uintptr_t(255u);
+          skipped = true;
+          break;
+        }
+      }
+      if (skipped) continue;
+      Impl::LoanSlot ls;
+      ls.ptr = reinterpret_cast<uint8_t*>(cur);
+      if (hipEventCreateWithFlags(&ls.ev_copy, hipEventDisableTiming) != hipSuccess ||
+          hipEventCreateWithFlags(&ls.ev_use, hipEventDisableTiming) != hipSuccess) {
+        if (ls.ev_copy) (void)hipEventDestroy(ls.ev_copy);
+        if (ls.ev_use) (void)hipEventDestroy(ls.ev_use);
+        break;
+      }
+      I.loan_slots[dv].push_back(ls);
+      cur += ss;
+    }
+  }
+  ensure_loan_streams_and_stager();
+  if (dv + 1 == R) {
+    size_t tot_slots = 0;
+    for (const auto& v : I.loan_slots) tot_slots += v.size();
+    if (tot_slots > 0) {
+      aff::ui::err("vram loan: %zu slot(s) across %zu card(s) (%.1f MiB/card, %llu KiB/slot)\n",
+                   tot_slots, R,
+                   (double)I.loan_slots[0].size() * (double)ss / 1048576.0,
+                   (unsigned long long)(ss >> 10));
+    }
+  }
+  if (have_prev) (void)hipSetDevice(prev);
+  return true;
+}
+
+size_t StaticPlacement::loan_slot_count(size_t dv) const {
+  if (!impl_ || dv >= impl_->loan_slots.size()) return 0u;
+  return impl_->loan_slots[dv].size();
+}
+
+size_t StaticPlacement::loan_active_count(size_t dv) const {
+  if (!impl_ || dv >= impl_->loan_slots.size()) return 0u;
+  size_t cnt = 0u;
+  for (const auto& ls : impl_->loan_slots[dv])
+    if (ls.published || ls.copying) ++cnt;
+  return cnt;
+}
+
+void StaticPlacement::loan_free_expert_on_promote(uint32_t idx) {
+  if (!impl_) return;
+  Impl& I = *impl_;
+  const size_t n_total = (size_t)n_layer_ * n_expert_;
+  for (size_t dv = 0; dv < I.loan_slots.size() && dv < devs_.size(); ++dv) {
+    if (dv * n_total + idx < loan_addr_.size()) loan_addr_[dv * n_total + idx] = 0ull;
+    for (auto& ls : I.loan_slots[dv]) {
+      if (ls.owner != idx) continue;
+      ls.owner = UINT32_MAX;
+      ls.published = false;
+      ls.copying = false;
+      if (ls.ev_use && dv < I.compute_streams.size() && I.compute_streams[dv]) {
+        (void)hipSetDevice(devs_[dv]);
+        (void)hipEventRecord(ls.ev_use, I.compute_streams[dv]);
+        ls.use_pending = true;
+      }
+    }
+  }
+}
+
+bool StaticPlacement::loan_admit_slot(size_t dv, uint32_t layer, uint32_t expert,
+                                      void* copy_stream) {
+  if (!enabled_ || !impl_ || !sp_vram_loan_enabled() || !loan_eligible_ || !pool_full_ || !pool_)
+    return false;
+  if (dv >= devs_.size() || dv >= impl_->loan_slots.size() || layer >= n_layer_ ||
+      expert >= n_expert_)
+    return false;
+  const uint32_t idx = layer * n_expert_ + expert;
+  if (device_of_[idx] >= 0) return false;
+  const size_t n_total = (size_t)n_layer_ * n_expert_;
+  if (dv * n_total + idx < loan_addr_.size() && loan_addr_[dv * n_total + idx] != 0ull)
+    return true;
+  const int64_t ps = pool_->slot_of(layer, expert);
+  const uint8_t* src = (ps >= 0) ? pool_->slot_base(ps) : nullptr;
+  if (!src) return false;
+  if (!ensure_loan_streams_and_stager()) return false;
+  Impl& I = *impl_;
+  for (auto& ls : I.loan_slots[dv]) {
+    if (ls.copying && ls.owner == idx) return true;
+  }
+  Impl::LoanSlot* slot = nullptr;
+  for (auto& ls : I.loan_slots[dv]) {
+    if (!ls.copying && !ls.published) { slot = &ls; break; }
+  }
+  if (!slot) return false;
+  const uint64_t ss = shard_.stride;
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
+  AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
+  hipStream_t mst = copy_stream ? (hipStream_t)copy_stream : I.mv[dv];
+  if (!mst) {
+    if (have_prev) (void)hipSetDevice(prev);
+    return false;
+  }
+  if (dv < I.loan_need_barrier.size() && I.loan_need_barrier[dv]) {
+    hipStream_t cst = (dv < I.compute_streams.size()) ? I.compute_streams[dv] : nullptr;
+    if (cst && I.loan_prefill_barrier[dv]) {
+      AFF_HIP_CHECK(hipEventRecord(I.loan_prefill_barrier[dv], cst));
+      AFF_HIP_CHECK(hipStreamWaitEvent(mst, I.loan_prefill_barrier[dv], 0));
+    }
+    I.loan_need_barrier[dv] = 0u;
+  }
+  if (slot->use_pending && slot->ev_use) {
+    AFF_HIP_CHECK(hipStreamWaitEvent(mst, slot->ev_use, 0));
+    slot->use_pending = false;
+  }
+  AFF_HIP_CHECK(hipMemcpyAsync(slot->ptr, src + (size_t)dv * ss, ss, hipMemcpyHostToDevice, mst));
+  if (slot->ev_copy) AFF_HIP_CHECK(hipEventRecord(slot->ev_copy, mst));
+  slot->owner = idx;
+  slot->copying = true;
+  loan_any_active_ = true;
+  estats_.loan_bytes += ss;
+  if (have_prev) (void)hipSetDevice(prev);
+  return true;
+}
+
+void StaticPlacement::loan_tick_admit(void* const* streams) {
+  if (!enabled_ || !impl_ || !pool_full_ || !pool_ || !loan_eligible_ || !sp_vram_loan_enabled())
+    return;
+  Impl& I = *impl_;
+  const size_t R = devs_.size();
+  const size_t n_total = (size_t)n_layer_ * n_expert_;
+  const uint64_t ss = shard_.stride;
+  if (loan_addr_.size() != R * n_total) loan_addr_.assign(R * n_total, 0ull);
+  if (!ensure_loan_streams_and_stager()) return;
+  const uint64_t tick = ++I.loan_calls;
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
+
+  for (size_t dv = 0; dv < R; ++dv) {
+    if (dv >= I.loan_slots.size() || I.loan_slots[dv].empty() || !streams[dv]) continue;
+    AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
+    hipStream_t cst = (hipStream_t)streams[dv];
+    hipStream_t mst = I.mv[dv];
+    if (!mst) continue;
+
+    // 1. Retire landed loan copies on mv[dv] and publish to plc_[dv] on cst.
+    PlcPatch patch[8];
+    auto flush_dv = [&] {
+      if (!patch[dv].n) return;
+      if (dv < plc_.size() && plc_[dv]) {
+        if (!plc_publish_hip(plc_[dv], patch[dv], cst)) std::abort();
+      }
+      patch[dv].n = 0;
+    };
+    size_t n_free = 0;
+    for (auto& ls : I.loan_slots[dv]) {
+      if (ls.copying) {
+        if (ls.ev_copy && hipEventQuery(ls.ev_copy) == hipSuccess) {
+          ls.copying = false;
+          if (ls.owner < n_total && device_of_[ls.owner] < 0) {
+            loan_addr_[dv * n_total + ls.owner] = (uint64_t)(uintptr_t)ls.ptr;
+            ls.published = true;
+            if (patch[dv].n == kPlcPatchMax) flush_dv();
+            publish_base(ls.owner, patch);
+            for (size_t od = 0; od < R; ++od) if (od != dv) patch[od].n = 0;
+            ++estats_.loan_promotes;
+          } else {
+            ls.owner = UINT32_MAX;
+          }
+        }
+      }
+      if (!ls.copying && !ls.published) ++n_free;
+    }
+    flush_dv();
+
+    if (dv < I.loan_need_barrier.size() && I.loan_need_barrier[dv]) {
+      if (I.loan_prefill_barrier[dv]) {
+        AFF_HIP_CHECK(hipEventRecord(I.loan_prefill_barrier[dv], cst));
+        AFF_HIP_CHECK(hipStreamWaitEvent(mst, I.loan_prefill_barrier[dv], 0));
+      }
+      I.loan_need_barrier[dv] = 0u;
+    }
+
+    // 2. Periodically admit hot pooled experts into free loan slots (or evict cold ones).
+    if (n_free == 0u && (tick & 15u) != 0u) continue;
+    constexpr size_t kMaxAdmitPerTick = 8u;
+    size_t issued = 0u;
+    const size_t bonus_limit = bonus_off_.size();
+    auto is_loan_cand = [&](uint32_t idx) -> bool {
+      if (device_of_[idx] >= 0 || loan_addr_[dv * n_total + idx] != 0ull) return false;
+      const size_t bpos = dv * n_total + idx;
+      if (bpos < bonus_limit && bonus_off_[bpos] != UINT64_MAX) return false;
+      for (const auto& ls : I.loan_slots[dv])
+        if (ls.copying && ls.owner == idx) return false;
+      return true;
+    };
+    if (n_free > 0u) {
+      struct Cand { uint32_t idx; float h; };
+      static thread_local std::vector<Cand> cands;
+      cands.clear();
+      {
+        std::lock_guard<std::mutex> bonus_lk(I.bonus_mu);
+        for (uint32_t idx = 0; idx < n_total; ++idx) {
+          if (!is_loan_cand(idx)) continue;
+          const float h = heat_.ready() ? heat_.heat(idx) : 0.0f;
+          cands.push_back({idx, h});
+        }
+      }
+      const size_t want = std::min(std::min(n_free, kMaxAdmitPerTick), cands.size());
+      if (want > 0u) {
+        std::partial_sort(cands.begin(), cands.begin() + want, cands.end(),
+                          [](const Cand& a, const Cand& b) {
+                            if (a.h != b.h) return a.h > b.h;
+                            return a.idx < b.idx;
+                          });
+        for (size_t ci = 0; ci < want; ++ci) {
+          const uint32_t idx = cands[ci].idx;
+          const uint32_t l = idx / n_expert_, e = idx % n_expert_;
+          if (loan_admit_slot(dv, l, e, mst)) ++issued;
+        }
+      }
+    } else if (heat_.ready()) {
+      // Check if top un-loaned pooled expert beats coldest published loan slot by hysteresis.
+      Impl::LoanSlot* cold_slot = nullptr;
+      float cold_h = 1e30f;
+      for (auto& ls : I.loan_slots[dv]) {
+        if (!ls.published || ls.owner >= n_total) continue;
+        const float h = heat_.heat(ls.owner);
+        if (h < cold_h) { cold_h = h; cold_slot = &ls; }
+      }
+      if (cold_slot) {
+        uint32_t hot_idx = UINT32_MAX;
+        float hot_h = cold_h * ecfg_.heat.hysteresis + ecfg_.heat.min_gain;
+        {
+          std::lock_guard<std::mutex> bonus_lk(I.bonus_mu);
+          for (uint32_t idx = 0; idx < n_total; ++idx) {
+            if (!is_loan_cand(idx)) continue;
+            const float h = heat_.heat(idx);
+            if (h > hot_h) { hot_h = h; hot_idx = idx; }
+          }
+        }
+        if (hot_idx != UINT32_MAX) {
+          const uint32_t old_idx = cold_slot->owner;
+          loan_addr_[dv * n_total + old_idx] = 0ull;
+          cold_slot->published = false;
+          cold_slot->owner = UINT32_MAX;
+          PlcPatch ep[8];
+          publish_base(old_idx, ep);
+          for (size_t od = 0; od < R; ++od) if (od != dv) ep[od].n = 0;
+          if (ep[dv].n && dv < plc_.size() && plc_[dv]) {
+            if (!plc_publish_hip(plc_[dv], ep[dv], cst)) std::abort();
+          }
+          if (cold_slot->ev_use) {
+            AFF_HIP_CHECK(hipEventRecord(cold_slot->ev_use, cst));
+            cold_slot->use_pending = true;
+          }
+          ++estats_.loan_evicts;
+          (void)loan_admit_slot(dv, hot_idx / n_expert_, hot_idx % n_expert_, mst);
+        }
+      }
+    }
+    (void)ss;
+    (void)issued;
+  }
+  if (have_prev) (void)hipSetDevice(prev);
+}
+
+void StaticPlacement::reclaim_vram_loan() {
+  loan_eligible_ = false;
+  if (!impl_) return;
+  Impl& I = *impl_;
+  const size_t R = devs_.size();
+  if (I.loan_need_barrier.size() != R) I.loan_need_barrier.assign(R, 1u);
+  else std::fill(I.loan_need_barrier.begin(), I.loan_need_barrier.end(), 1u);
+  if (!loan_any_active_) return;
+  const size_t n_total = (size_t)n_layer_ * n_expert_;
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
+  for (size_t dv = 0; dv < R; ++dv) {
+    if (dv >= I.loan_slots.size() || I.loan_slots[dv].empty()) continue;
+    bool any_copy = false, any_pub = false;
+    for (const auto& ls : I.loan_slots[dv]) {
+      any_copy |= ls.copying;
+      any_pub |= ls.published;
+    }
+    if (!any_copy && !any_pub) continue;
+    AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
+    if (any_copy && dv < I.mv.size() && I.mv[dv]) {
+      AFF_HIP_CHECK(hipStreamSynchronize(I.mv[dv]));
+    }
+    hipStream_t cst = (dv < I.compute_streams.size()) ? I.compute_streams[dv] : nullptr;
+    PlcPatch patch[8];
+    auto flush_dv = [&] {
+      if (!patch[dv].n) return;
+      if (dv < plc_.size() && plc_[dv]) {
+        if (cst) {
+          if (!plc_publish_hip(plc_[dv], patch[dv], cst)) std::abort();
+        } else {
+          for (uint32_t j = 0; j < patch[dv].n; ++j)
+            plc_[dv][patch[dv].idx[j]] = patch[dv].val[j];
+        }
+      }
+      patch[dv].n = 0;
+    };
+    for (auto& ls : I.loan_slots[dv]) {
+      if (ls.published && ls.owner < n_total) {
+        if (dv * n_total + ls.owner < loan_addr_.size())
+          loan_addr_[dv * n_total + ls.owner] = 0ull;
+        if (patch[dv].n == kPlcPatchMax) flush_dv();
+        publish_base(ls.owner, patch);
+        for (size_t od = 0; od < R; ++od) if (od != dv) patch[od].n = 0;
+      }
+      ls.owner = UINT32_MAX;
+      ls.copying = false;
+      ls.published = false;
+      ls.use_pending = false;
+    }
+    flush_dv();
+    AFF_HIP_CHECK(hipStreamSynchronize(cst));
+  }
+  loan_any_active_ = false;
+  ++estats_.loan_reclaims;
+  if (have_prev) (void)hipSetDevice(prev);
+}
+
+void StaticPlacement::mark_vram_loan_eligible(bool on) {
+  if (!sp_vram_loan_enabled() || !pool_full_) {
+    if (loan_any_active_) reclaim_vram_loan();
+    loan_eligible_ = false;
+    return;
+  }
+  if (!on) {
+    reclaim_vram_loan();
+    return;
+  }
+  loan_eligible_ = true;
+}
 
 } // namespace aff
 
