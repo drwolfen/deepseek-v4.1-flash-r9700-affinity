@@ -302,11 +302,13 @@ void StaticPlacement::free_batch_arenas() {
     ba8_[i] = bas_[i] = bydn_[i] = bpack_[i] = nullptr;
     btok_[i] = bwt_[i] = bord_[i] = brun_[i] = btiles_[i] = nullptr;
     barena_aliased_[i] = false;
+    barena_narrow_[i] = false;
     bydn_ext_[i] = false;
     ba8_ext_[i] = false;
     barena_bytes_[i] = 0;
     bpack_n_[i] = 0;
     bcap_slot_[i] = bcap_tile_[i] = bcap_nb_[i] = bcap_tok_[i] = 0;
+    bcap_prefill_slot_[i] = bcap_prefill_nb_[i] = 0;
     if (bpin_[i]) {
       (void)hipHostFree(bpin_[i]);
       bpin_[i] = nullptr;
@@ -1879,26 +1881,40 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
         }
       }
     }
+    constexpr uint32_t kDecodeSlotCap = kSpecTok * kMoePlanMaxK;
+    const bool narrow_ext = cross_alias && (nb_stride <= kSpecTok) && (taken <= kDecodeSlotCap) &&
+                            (ext_bydn_[dv] || ext_ba8_[dv]);
+    if (!narrow_ext && (loan_any_active_ || loan_eligible_)) {
+      reclaim_vram_loan();
+    }
+    const bool mode_switch = (barena_narrow_[dv] != narrow_ext);
     const bool need_slot_grow = (bcap_slot_[dv] < taken);
     const bool need_nb_grow = (bcap_nb_[dv] < nb_stride);
-    if (need_slot_grow || need_nb_grow || !barena_aliased_[dv] || !bydn_[dv]) {
-      const uint32_t slot_cap =
-          need_slot_grow ? (exact_cap ? taken : (taken + (taken >> 1) + 64u)) : bcap_slot_[dv];
-      const uint32_t nb_cap = need_nb_grow ? nb_stride : bcap_nb_[dv];
+    if (mode_switch || need_slot_grow || need_nb_grow || !barena_aliased_[dv] || !bydn_[dv]) {
+      if (!narrow_ext) {
+        if (bcap_prefill_slot_[dv] < taken) {
+          bcap_prefill_slot_[dv] = exact_cap ? taken : (taken + (taken >> 1) + 64u);
+        }
+        if (bcap_prefill_nb_[dv] < nb_stride) {
+          bcap_prefill_nb_[dv] = nb_stride;
+        }
+      }
+      const uint32_t slot_cap = narrow_ext ? kDecodeSlotCap : bcap_prefill_slot_[dv];
+      const uint32_t nb_cap = narrow_ext ? kSpecTok : bcap_prefill_nb_[dv];
       auto align256 = [](size_t n) { return (n + 255u) & ~(size_t)255u; };
 
-      if (need_slot_grow) {
-        const size_t ba8_bytes = (size_t)slot_cap * inter;
-        const size_t bas_bytes = (size_t)slot_cap * (inter / 128u) * sizeof(float);
-        const size_t off_bas = align256(ba8_bytes);
-        const size_t ba8_need = off_bas + bas_bytes;
+      const size_t ba8_bytes = (size_t)slot_cap * inter;
+      const size_t bas_bytes = (size_t)slot_cap * (inter / 128u) * sizeof(float);
+      const size_t off_bas = align256(ba8_bytes);
+      const size_t ba8_need = off_bas + bas_bytes;
+      if (mode_switch || need_slot_grow || !ba8_[dv]) {
         if (cross_alias && ext_ba8_[dv] && ba8_need <= ext_ba8_bytes_[dv]) {
           if (ba8_ext_[dv]) sync_all_devs();
           else free_ba8();
           ba8_[dv] = ext_ba8_[dv];
           bas_[dv] = reinterpret_cast<uint8_t*>(ext_ba8_[dv]) + off_bas;
           ba8_ext_[dv] = true;
-        } else {
+        } else if (ba8_ext_[dv] || !ba8_[dv] || bcap_slot_[dv] < slot_cap) {
           if (ba8_ext_[dv]) free_ba8();
           if (!grow(&ba8_[dv], ba8_bytes)) return false;
           if (!grow(&bas_[dv], bas_bytes)) return false;
@@ -1916,7 +1932,7 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
       const size_t off_bqs   = align256(off_bq8 + bq8_bytes);
       const size_t need_arena = std::max(dn_bytes, off_bqs + bqs_bytes);
 
-      if (!bydn_[dv] || need_arena > barena_bytes_[dv]) {
+      if (!bydn_[dv] || need_arena > barena_bytes_[dv] || (mode_switch && bydn_ext_[dv])) {
         // Clear interior aliases before freeing/repointing bydn_[dv] so OOM never leaves dangling aliases.
         if (barena_aliased_[dv]) {
           bg_[dv] = bu_[dv] = bq8_[dv] = bqs_[dv] = nullptr;
@@ -1934,12 +1950,36 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
             barena_bytes_[dv] = 0;
             bcap_slot_[dv] = 0;
             bcap_nb_[dv] = 0;
+            barena_narrow_[dv] = false;
             return false;
           }
           barena_bytes_[dv] = need_arena;
         }
       } else if (barena_aliased_[dv]) {
         sync_all_devs();
+        if (bydn_ext_[dv]) barena_bytes_[dv] = need_arena;
+      }
+
+      if (narrow_ext && impl_ && dv < impl_->loan_slots.size() && shard_.stride > 0u) {
+        auto check_no_loan_overlap = [&](const char* tag, void* ptr, size_t len) {
+          if (!ptr || !len) return;
+          const uintptr_t pa = reinterpret_cast<uintptr_t>(ptr);
+          const uintptr_t pb = pa + len;
+          for (const Impl::LoanSlot& ls : impl_->loan_slots[dv]) {
+            if (!ls.ptr) continue;
+            const uintptr_t la = reinterpret_cast<uintptr_t>(ls.ptr);
+            const uintptr_t lb = la + shard_.stride;
+            if (pa < lb && pb > la) {
+              aff::ui::fatal("fatal: decode ext arena %s [0x%llx, 0x%llx) overlaps vram_loan slot "
+                             "[0x%llx, 0x%llx) on dev %zu\n",
+                             tag, (unsigned long long)pa, (unsigned long long)pb,
+                             (unsigned long long)la, (unsigned long long)lb, dv);
+              std::abort();
+            }
+          }
+        };
+        if (bydn_ext_[dv]) check_no_loan_overlap("ext_bydn", bydn_[dv], need_arena);
+        if (ba8_ext_[dv]) check_no_loan_overlap("ext_ba8", ba8_[dv], ba8_need);
       }
 
       uint8_t* const base = (uint8_t*)bydn_[dv];
@@ -1948,10 +1988,12 @@ bool StaticPlacement::grow_w8a8(size_t dv, uint32_t taken, uint32_t n_tiles, uin
       bq8_[dv] = base + off_bq8;
       bqs_[dv] = base + off_bqs;
       barena_aliased_[dv] = true;
+      barena_narrow_[dv] = narrow_ext;
       bcap_slot_[dv] = slot_cap;
       bcap_nb_[dv] = nb_cap;
     }
   } else {
+    barena_narrow_[dv] = false;
     if (barena_aliased_[dv]) {
       // Never hipFree interior alias pointers when switching back to standalone allocations.
       sync_all_devs();
@@ -4219,6 +4261,8 @@ bool StaticPlacement::set_vram_loan_ranges(size_t dv, const LoanRange* ranges, s
     const uintptr_t a = reinterpret_cast<uintptr_t>(p);
     excl.push_back({a, a + len});
   };
+  if (dv < 8 && ext_bydn_[dv]) add_excl(ext_bydn_[dv], 8u << 20);
+  if (dv < 8 && ext_ba8_[dv])  add_excl(ext_ba8_[dv], 4u << 20);
   if (dv < 8 && bydn_ext_[dv]) {
     add_excl(bg_[dv], gu_guard);
     add_excl(bu_[dv], gu_guard);
@@ -4531,14 +4575,17 @@ void StaticPlacement::reclaim_vram_loan() {
   const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
   for (size_t dv = 0; dv < R; ++dv) {
     if (dv >= I.loan_slots.size() || I.loan_slots[dv].empty()) continue;
-    bool any_copy = false, any_pub = false;
+    const bool has_mv = (dv < I.mv.size() && I.mv[dv] != nullptr);
+    bool any_pub = false, any_state = false;
     for (const auto& ls : I.loan_slots[dv]) {
-      any_copy |= ls.copying;
       any_pub |= ls.published;
+      any_state |= (ls.published || ls.copying || ls.use_pending || ls.owner != UINT32_MAX);
     }
-    if (!any_copy && !any_pub) continue;
+    if (!has_mv && !any_state) continue;
     AFF_HIP_CHECK(hipSetDevice(devs_[dv]));
-    if (any_copy && dv < I.mv.size() && I.mv[dv]) {
+    // Always drain mv[dv] while loan_any_active_ is true so any loan_free_expert_on_promote()-
+    // detached in-flight DMA finishes before prefill overwrites loaned slices.
+    if (has_mv) {
       AFF_HIP_CHECK(hipStreamSynchronize(I.mv[dv]));
     }
     hipStream_t cst = (dv < I.compute_streams.size()) ? I.compute_streams[dv] : nullptr;
@@ -4568,8 +4615,10 @@ void StaticPlacement::reclaim_vram_loan() {
       ls.published = false;
       ls.use_pending = false;
     }
-    flush_dv();
-    AFF_HIP_CHECK(hipStreamSynchronize(cst));
+    if (any_pub) {
+      flush_dv();
+      if (cst) AFF_HIP_CHECK(hipStreamSynchronize(cst));
+    }
   }
   loan_any_active_ = false;
   ++estats_.loan_reclaims;

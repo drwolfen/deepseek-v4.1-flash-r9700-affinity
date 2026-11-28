@@ -570,6 +570,9 @@ private:
   void* bydn_[8] = {};
   size_t barena_bytes_[8] = {};
   bool   barena_aliased_[8] = {};
+  bool   barena_narrow_[8] = {};
+  uint32_t bcap_prefill_slot_[8] = {};
+  uint32_t bcap_prefill_nb_[8] = {};
   void*  ext_bydn_[8] = {};
   size_t ext_bydn_bytes_[8] = {};
   void*  ext_ba8_[8] = {};

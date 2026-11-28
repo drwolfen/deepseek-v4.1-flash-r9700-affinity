@@ -10662,10 +10662,12 @@ void DenseGpu::vram_loan_ranges(size_t rank, std::vector<VramLoanRange>* out) co
     push_tail(D.b_q, bq_hi, bq_guard);
   }
   {
-    const size_t u_dec_bytes =
-        align256(std::max<size_t>((size_t)b_u_cap_ * kNarrowTok * sizeof(float),
-                                  (size_t)b_vocab_ * kNarrowTok * sizeof(float)));
-    push_tail(D.b_qtm, D.b_qtm_bytes, std::max(kGuard, u_dec_bytes));
+    const size_t u_res = align256(std::max<size_t>((size_t)b_u_cap_ * b_cap_ * sizeof(float),
+                                                   (size_t)b_vocab_ * kNarrowTok * sizeof(float)));
+    // Reserve [u_res, u_res + 4 MiB) for StaticPlacement's decode-mode ext_ba8_ slice
+    // (<=256 decode slots need <0.3 MiB; 4 MiB gives >13x margin).
+    const size_t qtm_guard = std::max<size_t>(kGuard, u_res + (4u << 20));
+    push_tail(D.b_qtm, D.b_qtm_bytes, qtm_guard);
   }
   push_tail(D.b_norm, D.b_norm_bytes, kGuard);
   {

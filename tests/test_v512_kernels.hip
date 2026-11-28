@@ -1279,6 +1279,33 @@ int check_vram_loan_ranges_and_reclaim_invariants() {
   sp.reclaim_vram_loan();
   assert(!sp.vram_loan_eligible());
 
+  // Verify cap=4096 external arenas (`ext_bydn` / `ext_ba8`) are completely disjoint from
+  // DenseGpu::vram_loan_ranges (including `[u_res, u_res + 4 MiB)` decode tail on `b_qtm`).
+  {
+    aff::DenseGpu dg4k;
+    std::string err4k;
+    assert(dg4k.init(max_mid, n_embd, &err4k, 1u));
+    assert(dg4k.batch_init(4096u, n_embd, n_hc, n_head, width, max_mid, vocab, idx_topk, &err4k));
+    void *bydn = nullptr, *ba8 = nullptr;
+    size_t bydn_b = 0, ba8_b = 0;
+    dg4k.moe_ext_arenas(0u, &bydn, &bydn_b, &ba8, &ba8_b);
+    assert(bydn != nullptr && bydn_b > 0u);
+    assert(ba8 != nullptr && ba8_b > 0u);
+    std::vector<aff::DenseGpu::VramLoanRange> r4k;
+    dg4k.vram_loan_ranges(0u, &r4k);
+    assert(!r4k.empty());
+    const uintptr_t bydn_a = reinterpret_cast<uintptr_t>(bydn);
+    const uintptr_t bydn_e = bydn_a + std::min<size_t>(bydn_b, 8u << 20);
+    const uintptr_t ba8_a = reinterpret_cast<uintptr_t>(ba8);
+    const uintptr_t ba8_e = ba8_a + std::min<size_t>(ba8_b, 4u << 20);
+    for (const auto& lr : r4k) {
+      const uintptr_t la = reinterpret_cast<uintptr_t>(lr.ptr);
+      const uintptr_t lb = la + lr.bytes;
+      assert(!(bydn_a < lb && bydn_e > la));
+      assert(!(ba8_a < lb && ba8_e > la));
+    }
+  }
+
   ::unsetenv("AFF_VRAM_LOAN");
   std::printf("PASS: DenseGpu::vram_loan_ranges + reclaim callback + StaticPlacement invariants\n");
   return 0;
