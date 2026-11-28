@@ -4541,7 +4541,10 @@ int main(int argc, char** argv) {
     } else if (!pm.ok) {
       // A generation the parser cannot frame is still the model's output, and the client gets it
       // rather than an error: the alternative is discarding a turn because its markup was odd.
-      res->content = clean_raw;
+      split_thinking_fallback(clean_raw, tm, &res->reasoning_content, &res->content);
+      aff::ui::err("server: unframed completion (%s); preserved %s split\n",
+                   pm.error.c_str(),
+                   res->reasoning_content.empty() ? "raw" : "thinking");
       res->finish_reason = "stop";
     } else {
       res->content = pm.content;

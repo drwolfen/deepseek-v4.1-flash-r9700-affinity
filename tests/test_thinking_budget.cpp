@@ -550,7 +550,7 @@ void test_short_mantra_loop_and_short_novelty() {
   std::printf("PASS: test_short_mantra_loop_and_short_novelty\n");
 }
 
-void test_forced_close_prefix_cache_bpe_invariance() {
+void load_synthetic_tokenizer(Tokenizer* tok) {
   char tmpl[] = "/tmp/aff_tb_ckpt_tok_XXXXXX";
   int fd = ::mkstemp(tmpl);
   REQUIRE(fd >= 0);
@@ -582,10 +582,14 @@ void test_forced_close_prefix_cache_bpe_invariance() {
     std::fclose(f);
   }
 
-  Tokenizer tok;
   std::string err;
-  REQUIRE(tok.load(tok_path, &err));
+  REQUIRE(tok->load(tok_path, &err));
   std::remove(tok_path.c_str());
+}
+
+void test_forced_close_prefix_cache_bpe_invariance() {
+  Tokenizer tok;
+  load_synthetic_tokenizer(&tok);
 
   // (a) Forced-close sequence starts directly with </think> (128822), followed by \n\n (271).
   const std::vector<uint32_t> close_ids = tok.encode(std::string(kThinkEnd) + "\n\n", false);
@@ -672,6 +676,76 @@ void test_forced_close_prefix_cache_bpe_invariance() {
   std::printf("PASS: test_forced_close_prefix_cache_bpe_invariance\n");
 }
 
+void test_unframed_thinking_fallback_prefix_invariance() {
+  Tokenizer tok;
+  load_synthetic_tokenizer(&tok);
+  const std::vector<uint32_t> close_ids = tok.encode(std::string(kThinkEnd) + "\n\n", false);
+  REQUIRE((close_ids == std::vector<uint32_t>{128822, 271}));
+
+  ChatMsg sys_m;
+  sys_m.role = "system";
+  sys_m.content = "Check weather.";
+
+  ChatMsg usr_m;
+  usr_m.role = "user";
+  usr_m.content = "Zurich weather?";
+  usr_m.tools.push_back(ToolDef{
+      R"({"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}})"});
+
+  EncodeOpts eo;
+  eo.v41 = true;
+  eo.thinking_mode = ThinkingMode::Thinking;
+  eo.effort_budget = 75;
+
+  const std::string t1_prompt = encode_messages({sys_m, usr_m}, eo);
+  std::vector<uint32_t> t1_toks = tok.encode(t1_prompt, false);
+  const std::string t1_thought = "Analyze Zurich alpine microclimate.";
+  const std::vector<uint32_t> thought_toks = tok.encode(t1_thought, false);
+  t1_toks.insert(t1_toks.end(), thought_toks.begin(), thought_toks.end());
+  const size_t ckpt_len = t1_toks.size();
+  t1_toks.insert(t1_toks.end(), close_ids.begin(), close_ids.end());
+
+  const std::string trunc_dsml =
+      "<｜DSML｜ calls>\n"
+      "<｜DSML｜ invoke name=\"get_weather\">\n"
+      "<｜DSML｜ parameter name=\"location\" string=\"true\">Zurich";
+  const std::string raw = t1_thought + "</think>\n\n" + trunc_dsml;
+  const ParsedMessage pm = parse_completion(raw + kEosStr, ThinkingMode::Thinking);
+  REQUIRE(!pm.ok);
+
+  ChatMsg asst_m;
+  asst_m.role = "assistant";
+  split_thinking_fallback(raw, ThinkingMode::Thinking, &asst_m.reasoning_content, &asst_m.content);
+  REQUIRE(asst_m.reasoning_content == t1_thought);
+  REQUIRE(asst_m.content.rfind("\n\n<｜DSML｜ calls>", 0) == 0);
+  REQUIRE(asst_m.content.find(kThinkEnd) == std::string::npos);
+
+  ChatMsg tool_m;
+  tool_m.role = "tool";
+  tool_m.content = R"({"location":"Zurich"})";
+
+  const std::string t2_prompt = encode_messages({sys_m, usr_m, asst_m, tool_m}, eo);
+  const std::vector<uint32_t> t2_toks = tok.encode(t2_prompt, false);
+  REQUIRE(t2_toks.size() > ckpt_len + 2);
+  for (size_t i = 0; i <= ckpt_len; ++i) {
+    REQUIRE(t2_toks[i] == t1_toks[i]);
+  }
+  REQUIRE(t2_toks[ckpt_len] == 128822);
+
+  // Chat mode and unclosed thinking text both fall back cleanly to raw content.
+  std::string chat_r = "stale", chat_c;
+  split_thinking_fallback(raw, ThinkingMode::Chat, &chat_r, &chat_c);
+  REQUIRE(chat_r.empty());
+  REQUIRE(chat_c == raw);
+
+  std::string noclose_r = "stale", noclose_c;
+  split_thinking_fallback("plain thought without tag", ThinkingMode::Thinking, &noclose_r, &noclose_c);
+  REQUIRE(noclose_r.empty());
+  REQUIRE(noclose_c == "plain thought without tag");
+
+  std::printf("PASS: test_unframed_thinking_fallback_prefix_invariance\n");
+}
+
 }  // namespace
 
 int main() {
@@ -683,6 +757,7 @@ int main() {
   test_full_vocab_freeze_short_loop_low_novelty_and_clean_trace();
   test_short_mantra_loop_and_short_novelty();
   test_forced_close_prefix_cache_bpe_invariance();
+  test_unframed_thinking_fallback_prefix_invariance();
   std::printf("ALL thinking_budget tests passed\n");
   return 0;
 }

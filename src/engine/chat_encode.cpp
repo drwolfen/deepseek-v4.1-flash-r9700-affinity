@@ -1043,6 +1043,20 @@ ParsedMessage parse_completion(const std::string& text_in, ThinkingMode mode) {
   return out;
 }
 
+void split_thinking_fallback(const std::string& raw, ThinkingMode mode,
+                             std::string* reasoning_out, std::string* content_out) {
+  if (mode == ThinkingMode::Thinking) {
+    const size_t te = raw.find(kThinkEnd);
+    if (te != std::string::npos) {
+      if (reasoning_out) *reasoning_out = raw.substr(0, te);
+      if (content_out) *content_out = raw.substr(te + std::strlen(kThinkEnd));
+      return;
+    }
+  }
+  if (reasoning_out) reasoning_out->clear();
+  if (content_out) *content_out = raw;
+}
+
 size_t ToolBlockScanState::scan(const std::string& s, size_t at) {
   if (!initialized) {
     pos = at;

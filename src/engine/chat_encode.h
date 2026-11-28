@@ -85,6 +85,13 @@ struct ParsedMessage {
 // One assistant turn of model output, with or without its trailing EOS.
 ParsedMessage parse_completion(const std::string& text, ThinkingMode mode);
 
+// Fallback split for Thinking mode when parse_completion fails after `</think>` is present
+// (e.g. truncated or malformed post-think tool-call markup): preserves `reasoning_content`
+// before the first `</think>` and places the remainder in `content` so Turn-2 prefix-cache
+// tokens match up through the think-close checkpoint.
+void split_thinking_fallback(const std::string& raw, ThinkingMode mode,
+                             std::string* reasoning_out, std::string* content_out);
+
 // Incremental scanner for detecting the end of a DSML or bare `<invoke>` tool-call block
 // while ignoring embedded closing tags inside open `<parameter>` or `<invoke>` elements.
 struct ToolBlockScanState {
