@@ -4699,7 +4699,7 @@ bool DenseGpu::kv_part_save_async(KvPart part, uint32_t layer, uint32_t rank, ui
   const bool ok = kv_walk(b, nb, rb, re, row0, nrows,
                           [&](uint64_t off, void* src, uint64_t bytes) {
     if (e == hipSuccess)
-      e = hipMemcpyAsync((uint8_t*)dst + off, src, bytes, hipMemcpyDeviceToHost, D.stream);
+      e = hip_memcpy_d2h_pinchunk_async((uint8_t*)dst + off, src, bytes, D.stream);
   });
   AFF_HIP_CHECK(e);
   return ok;
@@ -4716,7 +4716,7 @@ bool DenseGpu::kv_part_load_async(KvPart part, uint32_t layer, uint32_t rank, ui
   const bool ok = kv_walk(b, nb, rb, re, row0, nrows,
                           [&](uint64_t off, void* dst, uint64_t bytes) {
     if (e == hipSuccess)
-      e = hipMemcpyAsync(dst, (const uint8_t*)src + off, bytes, hipMemcpyHostToDevice, D.stream);
+      e = hip_memcpy_h2d_pinchunk_async(dst, (const uint8_t*)src + off, bytes, D.stream);
   });
   AFF_HIP_CHECK(e);
   return ok;
@@ -4747,7 +4747,7 @@ std::unordered_map<void*, std::vector<void*>> g_pin_chunks;
 
 bool DenseGpu::pin_host(void* ptr, size_t bytes) {
   if (!ptr || !bytes) return false;
-  constexpr size_t kPinChunk = (size_t)1u << 30;
+  constexpr size_t kPinChunk = kHipPinChunkBytes;
   std::vector<void*> chunks;
   uint8_t* const base = static_cast<uint8_t*>(ptr);
   for (size_t off = 0; off < bytes; ) {

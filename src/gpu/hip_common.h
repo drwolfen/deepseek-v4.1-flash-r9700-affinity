@@ -28,6 +28,7 @@
 
 #include "ui/log.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -612,6 +613,46 @@ __host__ __device__ __forceinline__ uint32_t safe_grid_blocks(uint32_t blocks,
     if (w != 0u && w < kGfx12CliffWaves - kGfx12CliffWindow) return b;
   }
   return blocks;
+}
+
+// Piecewise host registration chunk size (1 GiB). ROCm libamdhip64 returns hipErrorInvalidValue
+// if a single hipMemcpyAsync span crosses two separate hipHostRegister chunks.
+inline constexpr size_t kHipPinChunkBytes = (size_t)1u << 30;
+
+namespace detail {
+inline hipError_t hip_memcpy_pinchunk_async(uint8_t* dst, const uint8_t* src, size_t bytes,
+                                            hipMemcpyKind kind, hipStream_t stream,
+                                            bool host_is_dst) {
+  size_t off = 0u;
+  while (off < bytes) {
+    const uintptr_t host_addr =
+        reinterpret_cast<uintptr_t>(host_is_dst ? (dst + off) : (src + off));
+    const size_t to_boundary =
+        kHipPinChunkBytes - (size_t)(host_addr & (kHipPinChunkBytes - 1u));
+    const size_t rem = bytes - off;
+    const size_t cur = rem < to_boundary ? rem : to_boundary;
+    const hipError_t e = hipMemcpyAsync(dst + off, src + off, cur, kind, stream);
+    if (e != hipSuccess) return e;
+    off += cur;
+  }
+  return hipSuccess;
+}
+} // namespace detail
+
+inline hipError_t hip_memcpy_h2d_pinchunk_async(void* dst, const void* src, size_t bytes,
+                                                hipStream_t stream) {
+  if (!bytes) return hipSuccess;
+  return detail::hip_memcpy_pinchunk_async(static_cast<uint8_t*>(dst),
+                                           static_cast<const uint8_t*>(src), bytes,
+                                           hipMemcpyHostToDevice, stream, /*host_is_dst=*/false);
+}
+
+inline hipError_t hip_memcpy_d2h_pinchunk_async(void* dst, const void* src, size_t bytes,
+                                                hipStream_t stream) {
+  if (!bytes) return hipSuccess;
+  return detail::hip_memcpy_pinchunk_async(static_cast<uint8_t*>(dst),
+                                           static_cast<const uint8_t*>(src), bytes,
+                                           hipMemcpyDeviceToHost, stream, /*host_is_dst=*/true);
 }
 
 } // namespace aff

@@ -25,6 +25,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <sys/mman.h>
 
 namespace {
 
@@ -1283,6 +1284,73 @@ int check_vram_loan_ranges_and_reclaim_invariants() {
   return 0;
 }
 
+int check_pinchunk_boundary_memcpy_parity() {
+  const auto devs = aff::gfx12_devices();
+  assert(!devs.empty());
+  assert(hipSetDevice(devs[0]) == hipSuccess);
+
+  constexpr size_t kHalf = 1u << 20;
+  constexpr size_t kSpan = 512u << 10;
+  constexpr size_t kTestBytes = 2u * kSpan;
+  const size_t map_len = aff::kHipPinChunkBytes + (2u << 20);
+  void* map = ::mmap(nullptr, map_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  assert(map != MAP_FAILED);
+
+  const uintptr_t map_lo = reinterpret_cast<uintptr_t>(map);
+  const uintptr_t bnd = (map_lo + kHalf + aff::kHipPinChunkBytes - 1u) &
+                        ~(aff::kHipPinChunkBytes - 1u);
+  assert(bnd >= map_lo + kHalf);
+  assert(bnd + kHalf <= map_lo + map_len);
+
+  uint8_t* const lo_chunk = reinterpret_cast<uint8_t*>(bnd - kHalf);
+  uint8_t* const hi_chunk = reinterpret_cast<uint8_t*>(bnd);
+  assert(::mprotect(lo_chunk, 2u * kHalf, PROT_READ | PROT_WRITE) == 0);
+
+  uint8_t* const host_span = reinterpret_cast<uint8_t*>(bnd - kSpan);
+  std::vector<uint8_t> ref(kTestBytes);
+  for (size_t i = 0; i < kTestBytes; ++i) {
+    const uint8_t v = (uint8_t)((i * 131u + 17u) ^ (i >> 8));
+    ref[i] = v;
+    host_span[i] = v;
+  }
+
+  const hipError_t reg_lo = hipHostRegister(lo_chunk, kHalf, hipHostRegisterDefault);
+  const hipError_t reg_hi = hipHostRegister(hi_chunk, kHalf, hipHostRegisterDefault);
+  if (reg_lo != hipSuccess || reg_hi != hipSuccess) {
+    if (reg_hi == hipSuccess) (void)hipHostUnregister(hi_chunk);
+    if (reg_lo == hipSuccess) (void)hipHostUnregister(lo_chunk);
+    (void)::munmap(map, map_len);
+    std::fprintf(stderr, "FAIL: hipHostRegister failed reg_lo=%d reg_hi=%d\n", (int)reg_lo,
+                 (int)reg_hi);
+    return 1;
+  }
+
+  uint8_t* d_buf = nullptr;
+  hipStream_t st = nullptr;
+  assert(hipMalloc(&d_buf, kTestBytes) == hipSuccess);
+  assert(hipStreamCreateWithFlags(&st, hipStreamNonBlocking) == hipSuccess);
+
+  const hipError_t e_h2d = aff::hip_memcpy_h2d_pinchunk_async(d_buf, host_span, kTestBytes, st);
+  assert(e_h2d == hipSuccess);
+  assert(hipStreamSynchronize(st) == hipSuccess);
+
+  std::memset(host_span, 0, kTestBytes);
+  const hipError_t e_d2h = aff::hip_memcpy_d2h_pinchunk_async(host_span, d_buf, kTestBytes, st);
+  assert(e_d2h == hipSuccess);
+  assert(hipStreamSynchronize(st) == hipSuccess);
+
+  const bool match = (std::memcmp(host_span, ref.data(), kTestBytes) == 0);
+  (void)hipStreamDestroy(st);
+  (void)hipFree(d_buf);
+  (void)hipHostUnregister(hi_chunk);
+  (void)hipHostUnregister(lo_chunk);
+  (void)::munmap(map, map_len);
+  assert(hipGetLastError() == hipSuccess);
+  assert(match);
+  std::printf("PASS: 1 GiB piecewise hipHostRegister boundary H2D/D2H round-trip parity\n");
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1306,6 +1374,7 @@ int main() {
   if (check_flash_lowm_nosplit_parity() != 0) return 1;
   if (check_hip_graph_capture_replay_parity() != 0) return 1;
   if (check_vram_loan_ranges_and_reclaim_invariants() != 0) return 1;
+  if (check_pinchunk_boundary_memcpy_parity() != 0) return 1;
   std::printf("PASS: test_v512_kernels\n");
   return 0;
 }

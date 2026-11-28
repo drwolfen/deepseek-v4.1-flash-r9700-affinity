@@ -951,7 +951,7 @@ bool StaticPlacement::set_host_pool(const HostExpertPool* p) {
   // stages later.
 
   const auto t0 = std::chrono::steady_clock::now();
-  constexpr size_t kPinChunk = (size_t)1u << 30;
+  constexpr size_t kPinChunk = kHipPinChunkBytes;
   std::vector<void*> reg_chunks;
   for (size_t off = 0; off < p->bytes(); ) {
     uint8_t* const cptr = const_cast<uint8_t*>(p->base()) + off;
@@ -2931,8 +2931,7 @@ uint32_t StaticPlacement::run_batch_device(uint32_t layer, const uint32_t* sel, 
               AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], s.ev_use, 0));
               s.use_pending = false;
             }
-            AFF_HIP_CHECK(hipMemcpyAsync(s.ptr, src + (size_t)dv * ss, ss,
-                                         hipMemcpyHostToDevice, I.mv[dv]));
+            AFF_HIP_CHECK(hip_memcpy_h2d_pinchunk_async(s.ptr, src + (size_t)dv * ss, ss, I.mv[dv]));
             if (s.ev_mv) {
               AFF_HIP_CHECK(hipEventRecord(s.ev_mv, I.mv[dv]));
               s.mv_pending = true;
@@ -3115,13 +3114,14 @@ bool StaticPlacement::placement_engine_init(HostExpertPool* pool,
   for (uint32_t s = 0; s < shadow_slots_; ++s) I.free_slab.push_back(resident_target_ + s);
   I.free_pool.clear();
 
-  I.mv.assign(R, nullptr);
-  I.ev_layer.assign(R, nullptr);
+  if (I.mv.size() < R) I.mv.resize(R, nullptr);
+  if (I.ev_layer.size() < R) I.ev_layer.resize(R, nullptr);
   for (size_t i = 0; i < R; ++i) {
     if (hipSetDevice(devs_[i]) != hipSuccess) return fail("hipSetDevice failed for the mover");
-    if (hipStreamCreateWithFlags(&I.mv[i], hipStreamNonBlocking) != hipSuccess)
+    if (!I.mv[i] && hipStreamCreateWithFlags(&I.mv[i], hipStreamNonBlocking) != hipSuccess)
       return fail("could not create the mover stream");
-    if (hipEventCreateWithFlags(&I.ev_layer[i], hipEventDisableTiming) != hipSuccess)
+    if (!I.ev_layer[i] &&
+        hipEventCreateWithFlags(&I.ev_layer[i], hipEventDisableTiming) != hipSuccess)
       return fail("could not create the mover's layer-boundary event");
   }
 
@@ -3365,8 +3365,8 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
         // zero means the mover is already hidden behind compute and there is nothing to win by
         // issuing it earlier.
         for (uint32_t rep = 0; rep < mover_dup(true); ++rep)
-          AFF_HIP_CHECK(hipMemcpyAsync(I.slab[dv] + M.slab_slot * ss, src + (size_t)dv * ss, ss,
-                                       hipMemcpyHostToDevice, I.mv[dv]));
+          AFF_HIP_CHECK(hip_memcpy_h2d_pinchunk_async(I.slab[dv] + M.slab_slot * ss,
+                                                      src + (size_t)dv * ss, ss, I.mv[dv]));
         estats_.h2d_bytes += ss;
       }
       AFF_HIP_CHECK(hipEventRecord(M.ev[dv], I.mv[dv]));
@@ -3430,8 +3430,8 @@ bool StaticPlacement::engine_issue(uint32_t idx, bool promote, void* const* stre
       if (do_d2h) {
         AFF_HIP_CHECK(hipStreamWaitEvent(I.mv[dv], I.ev_layer[dv], 0));
         for (uint32_t rep = 0; rep < mover_dup(false); ++rep)
-          AFF_HIP_CHECK(hipMemcpyAsync(dst + (size_t)dv * ss, I.slab[dv] + offset_of_[idx], ss,
-                                       hipMemcpyDeviceToHost, I.mv[dv]));
+          AFF_HIP_CHECK(hip_memcpy_d2h_pinchunk_async(dst + (size_t)dv * ss,
+                                                      I.slab[dv] + offset_of_[idx], ss, I.mv[dv]));
         estats_.d2h_bytes += ss;
       }
       if (do_d2d) {
@@ -4353,7 +4353,7 @@ bool StaticPlacement::loan_admit_slot(size_t dv, uint32_t layer, uint32_t expert
     AFF_HIP_CHECK(hipStreamWaitEvent(mst, slot->ev_use, 0));
     slot->use_pending = false;
   }
-  AFF_HIP_CHECK(hipMemcpyAsync(slot->ptr, src + (size_t)dv * ss, ss, hipMemcpyHostToDevice, mst));
+  AFF_HIP_CHECK(hip_memcpy_h2d_pinchunk_async(slot->ptr, src + (size_t)dv * ss, ss, mst));
   if (slot->ev_copy) AFF_HIP_CHECK(hipEventRecord(slot->ev_copy, mst));
   slot->owner = idx;
   slot->copying = true;
