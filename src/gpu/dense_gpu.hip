@@ -672,6 +672,7 @@ struct DenseGpu::Impl {
   struct DraftWarmKey { uint32_t slot = 0; uint32_t B = 0; uint32_t stage = 0; };
   std::vector<DraftGraphEntry> draft_graphs;
   std::vector<DraftWarmKey> draft_warms;
+  uint64_t draft_graphs_splitk_epoch = 0;
   bool capture_active = false;
   DraftGraphKey capture_key{};
   uint32_t capture_entry_ar_npart[kMaxRanks] = {};
@@ -5857,6 +5858,7 @@ bool DenseGpu::q_slot(size_t r, uint32_t dim) {
   Impl::Dev& D = impl_->dev[r];
   if (dim % 128u) return false;
   if (D.q_cap < dim) {
+    if (!impl_->draft_graphs.empty()) invalidate_draft_graphs();
     norm_q8_invalidate(D.id, D.b_norm);
     D.q8_src = nullptr;
     for (void** p : {(void**)&D.q8, (void**)&D.qs}) if (*p) { (void)hipFree(*p); *p = nullptr; }
@@ -5872,6 +5874,7 @@ bool DenseGpu::q_slot_sw(size_t r, uint32_t dim) {
   Impl::Dev& D = impl_->dev[r];
   if (dim % 128u) return false;
   if (D.q_sw_cap < dim) {
+    if (!impl_->draft_graphs.empty()) invalidate_draft_graphs();
     for (void** p : {(void**)&D.q8_sw, (void**)&D.qs_sw}) if (*p) { (void)hipFree(*p); *p = nullptr; }
     if (hipMalloc(&D.q8_sw, (size_t)kNarrowTok * dim) != hipSuccess) return false;
     if (hipMalloc(&D.qs_sw, (size_t)kNarrowTok * (dim / 128u) * sizeof(float)) != hipSuccess)
@@ -8331,6 +8334,7 @@ bool DenseGpu::router_scratch(size_t rank, uint32_t n_expert, uint32_t k) {
       (void)hipHostFree(hb_raw);
       return false;
     }
+    if (!first_alloc && !impl_->draft_graphs.empty()) invalidate_draft_graphs();
     if (D.h_rsel) (void)hipHostFree(D.h_rsel);
     if (D.b_rsel && !runtime_slab_owns(D, D.b_rsel)) (void)hipFree(D.b_rsel);
     if (need_bias) {
@@ -10680,6 +10684,8 @@ void DenseGpu::vram_loan_ranges(size_t rank, std::vector<VramLoanRange>* out) co
 
 void DenseGpu::invalidate_draft_graphs() {
   if (!impl_) return;
+  int prev = 0;
+  const bool have_prev = (hipGetDevice(&prev) == hipSuccess);
   if (impl_->capture_active) {
     for (size_t d = 0; d < impl_->dev.size(); ++d) {
       Impl::Dev& D = impl_->dev[d];
@@ -10707,6 +10713,7 @@ void DenseGpu::invalidate_draft_graphs() {
   }
   impl_->draft_graphs.clear();
   impl_->draft_warms.clear();
+  if (have_prev) (void)hipSetDevice(prev);
 }
 
 bool DenseGpu::draft_graph_begin(uint32_t B, uint32_t stage, bool with_collapse) {
@@ -10716,6 +10723,10 @@ bool DenseGpu::draft_graph_begin(uint32_t B, uint32_t stage, bool with_collapse)
   const size_t R = impl_->dev.size();
   if (R > kMaxRanks || (R > 1u && !dg_tp_ar_parity_enabled())) return false;
   if (impl_->capture_active) return false;
+  const uint64_t sk_ep = batch_splitk_epoch_hip();
+  if (!impl_->draft_graphs.empty() && sk_ep != impl_->draft_graphs_splitk_epoch) {
+    invalidate_draft_graphs();
+  }
   for (size_t d = 0; d < R; ++d) {
     if (impl_->dev[d].b_shexp_ev) return false;
   }
@@ -10888,6 +10899,7 @@ bool DenseGpu::draft_graph_end(uint32_t B, uint32_t stage, bool with_collapse, b
     e.exec[d] = execs[d];
   }
   impl_->draft_graphs.push_back(e);
+  impl_->draft_graphs_splitk_epoch = batch_splitk_epoch_hip();
   for (size_t d = 0; d < R; ++d) {
     AFF_HIP_CHECK(hipSetDevice(impl_->dev[d].id));
     AFF_HIP_CHECK(hipGraphLaunch(e.exec[d], impl_->dev[d].stream));

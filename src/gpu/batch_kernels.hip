@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
@@ -289,6 +290,7 @@ constexpr uint32_t kSplitCtrFloats = 1024u;
 constexpr uint32_t kMaxSplitKStreams = 4u;
 struct SplitKWs { hipStream_t stream = nullptr; float* p = nullptr; size_t n = 0; bool bound = false; };
 SplitKWs g_skws[kMaxGpuDevices][kMaxSplitKStreams];
+std::atomic<uint64_t> g_skws_epoch{0};
 
 
 // Blocks the split is aiming for. Both GEMMs use it: gemm_launch counts blocks, batch_gemm_fp8_hip
@@ -341,7 +343,10 @@ float* splitk_buf_with_ctr(size_t need, unsigned int** ctr_out, hipStream_t st =
   SplitKWs& w = *wp;
   const size_t total_need = (size_t)kSplitCtrFloats + need;
   if (w.n < total_need) {
-    if (w.p) (void)hipFree(w.p);
+    if (w.p) {
+      (void)hipFree(w.p);
+      g_skws_epoch.fetch_add(1u, std::memory_order_relaxed);
+    }
     w.p = nullptr;
     w.n = 0;
     if (hipMalloc(&w.p, total_need * sizeof(float)) != hipSuccess) return nullptr;
@@ -353,6 +358,7 @@ float* splitk_buf_with_ctr(size_t need, unsigned int** ctr_out, hipStream_t st =
     const hipError_t sync_err = st ? hipStreamSynchronize(st) : hipDeviceSynchronize();
     if (zero_err != hipSuccess || sync_err != hipSuccess) {
       (void)hipFree(w.p);
+      g_skws_epoch.fetch_add(1u, std::memory_order_relaxed);
       w.p = nullptr;
       return nullptr;
     }
@@ -5711,6 +5717,10 @@ bool batch_gemm_fp8_grouped_b32_q8_hip(const uint8_t* W, const uint8_t* Ws, cons
 
 bool batch_splitk_reserve_hip(size_t peak_floats, void* stream) {
   return splitk_buf_with_ctr(peak_floats, nullptr, (hipStream_t)stream) != nullptr;
+}
+
+uint64_t batch_splitk_epoch_hip() {
+  return g_skws_epoch.load(std::memory_order_relaxed);
 }
 
 void batch_splitk_release_hip(void* stream) {

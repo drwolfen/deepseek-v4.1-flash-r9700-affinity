@@ -4422,16 +4422,25 @@ void StaticPlacement::loan_tick_admit(void* const* streams) {
     }
 
     // 2. Periodically admit hot pooled experts into free loan slots (or evict cold ones).
-    if (n_free == 0u && (tick & 15u) != 0u) continue;
-    constexpr size_t kMaxAdmitPerTick = 8u;
+    if (n_free > 0u) {
+      if ((tick & 7u) != 0u) continue;
+    } else if ((tick & 31u) != 0u) {
+      continue;
+    }
+    if (!heat_.ready()) continue;
+    constexpr size_t kMaxAdmitPerTick = 2u;
     size_t issued = 0u;
     const size_t bonus_limit = bonus_off_.size();
+    static thread_local std::vector<uint8_t> copying_mask;
+    if (copying_mask.size() != n_total) copying_mask.assign(n_total, 0u);
+    for (const auto& ls : I.loan_slots[dv]) {
+      if (ls.copying && ls.owner < n_total) copying_mask[ls.owner] = 1u;
+    }
     auto is_loan_cand = [&](uint32_t idx) -> bool {
       if (device_of_[idx] >= 0 || loan_addr_[dv * n_total + idx] != 0ull) return false;
       const size_t bpos = dv * n_total + idx;
       if (bpos < bonus_limit && bonus_off_[bpos] != UINT64_MAX) return false;
-      for (const auto& ls : I.loan_slots[dv])
-        if (ls.copying && ls.owner == idx) return false;
+      if (copying_mask[idx]) return false;
       return true;
     };
     if (n_free > 0u) {
@@ -4442,7 +4451,8 @@ void StaticPlacement::loan_tick_admit(void* const* streams) {
         std::lock_guard<std::mutex> bonus_lk(I.bonus_mu);
         for (uint32_t idx = 0; idx < n_total; ++idx) {
           if (!is_loan_cand(idx)) continue;
-          const float h = heat_.ready() ? heat_.heat(idx) : 0.0f;
+          const float h = heat_.heat(idx);
+          if (h <= 0.0f) continue;
           cands.push_back({idx, h});
         }
       }
@@ -4459,7 +4469,7 @@ void StaticPlacement::loan_tick_admit(void* const* streams) {
           if (loan_admit_slot(dv, l, e, mst)) ++issued;
         }
       }
-    } else if (heat_.ready()) {
+    } else {
       // Check if top un-loaned pooled expert beats coldest published loan slot by hysteresis.
       Impl::LoanSlot* cold_slot = nullptr;
       float cold_h = 1e30f;
@@ -4476,7 +4486,7 @@ void StaticPlacement::loan_tick_admit(void* const* streams) {
           for (uint32_t idx = 0; idx < n_total; ++idx) {
             if (!is_loan_cand(idx)) continue;
             const float h = heat_.heat(idx);
-            if (h > hot_h) { hot_h = h; hot_idx = idx; }
+            if (h > 0.0f && h > hot_h) { hot_h = h; hot_idx = idx; }
           }
         }
         if (hot_idx != UINT32_MAX) {
@@ -4498,6 +4508,9 @@ void StaticPlacement::loan_tick_admit(void* const* streams) {
           (void)loan_admit_slot(dv, hot_idx / n_expert_, hot_idx % n_expert_, mst);
         }
       }
+    }
+    for (const auto& ls : I.loan_slots[dv]) {
+      if (ls.copying && ls.owner < n_total) copying_mask[ls.owner] = 0u;
     }
     (void)ss;
     (void)issued;

@@ -1381,8 +1381,29 @@ int check_draft_graph_per_stage_warmup_and_abort() {
   assert(!bops.draft_graph_begin(bops.ctx, 5u, 0u, false));
   assert(bops.draft_graph_end(bops.ctx, 5u, 0u, false, true));
 
+  // Verify split-K workspace growth bumps batch_splitk_epoch_hip and invalidates cached graphs.
+  assert(!bops.draft_graph_begin(bops.ctx, 5u, 1u, false));
+  assert(bops.draft_graph_end(bops.ctx, 5u, 1u, false, true));
+
+  void* d_dummy = nullptr;
+  assert(hipMalloc(&d_dummy, 256u) == hipSuccess);
+  hipStream_t st = static_cast<hipStream_t>(dg.stream(0u));
+  assert(st != nullptr);
+  assert(!bops.draft_graph_begin(bops.ctx, 5u, 1u, false));
+  assert(hipMemsetAsync(d_dummy, 1, 256u, st) == hipSuccess);
+  assert(bops.draft_graph_end(bops.ctx, 5u, 1u, false, true));
+  assert(bops.draft_graph_begin(bops.ctx, 5u, 1u, false));
+
+  const uint64_t ep_before = aff::batch_splitk_epoch_hip();
+  assert(aff::batch_splitk_reserve_hip(2u << 20, st));
+  assert(aff::batch_splitk_epoch_hip() > ep_before);
+  assert(!bops.draft_graph_begin(bops.ctx, 5u, 1u, false));
+  assert(bops.draft_graph_end(bops.ctx, 5u, 1u, false, true));
+  assert(hipStreamSynchronize(st) == hipSuccess);
+  (void)hipFree(d_dummy);
+
   ::unsetenv("AFF_DSPARK_HIP_GRAPH");
-  std::printf("PASS: DenseGpu DSpark per-stage HIP Graph warmup + abort fallback\n");
+  std::printf("PASS: DenseGpu DSpark per-stage HIP Graph warmup + abort + split-K invalidation\n");
   return 0;
 }
 

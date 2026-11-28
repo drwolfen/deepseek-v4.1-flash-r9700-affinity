@@ -203,6 +203,7 @@ bool batch_gemm_fp8_grouped_b32_q8_hip(const uint8_t* W, const uint8_t* Ws, cons
 // the current device for `stream`, eliminating mid-run hipMalloc + hipDeviceSynchronize pauses.
 // `batch_splitk_release_hip` unbinds the stream tag on teardown so another stream can reuse it.
 bool batch_splitk_reserve_hip(size_t peak_floats, void* stream = nullptr);
+uint64_t batch_splitk_epoch_hip();
 void batch_splitk_release_hip(void* stream);
 
 // ---- the elementwise half ---------------------------------------------------------------------
