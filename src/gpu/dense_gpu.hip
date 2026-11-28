@@ -956,7 +956,7 @@ inline bool vram_loan_enabled() {
 
 inline bool dspark_hip_graph_enabled() {
   const char* v = std::getenv("AFF_DSPARK_HIP_GRAPH");
-  return !v || !*v || std::strcmp(v, "0") != 0;
+  return v && *v && std::strcmp(v, "0") != 0;
 }
 
 inline bool dg_tp_ar_parity_enabled() {

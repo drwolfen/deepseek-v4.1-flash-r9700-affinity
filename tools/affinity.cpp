@@ -1201,9 +1201,7 @@ int main(int argc, char** argv) {
     std::string berr;
     if (prefill_chunk > 0) {
       const uint32_t orig_prefill_chunk = prefill_chunk;
-      const char* loan_env = std::getenv("AFF_VRAM_LOAN");
-      const bool loan_on = !loan_env || !*loan_env || std::strcmp(loan_env, "0") != 0;
-      if (!prefill_chunk_set && loan_on) {
+      if (!prefill_chunk_set) {
         uint32_t want = 4096u;
         if (const char* ce = std::getenv("AFF_PREFILL_CHUNK"); ce && *ce) {
           const unsigned long v = std::strtoul(ce, nullptr, 10);
@@ -1517,12 +1515,6 @@ int main(int argc, char** argv) {
   // moving strategies: the static arm has to be byte-for-byte the old configuration, or the A/B
   // compares two amounts of free VRAM as well as two placements.
   if (pcfg.strategy != PlacementEngineConfig::Strategy::Static) {
-    const bool pool_full_cfg = [] {
-      const char* s = std::getenv("AFF_POOL_FULL");
-      return !s || !*s || std::strcmp(s, "0") != 0;
-    }();
-    if (!placement_shadow_set && pool_full_cfg && host_pool_mib != 0.0)
-      placement_shadow = 12;
     placement.reserve_shadow_slots(placement_shadow);
   }
   if (!imatrix_out_path.empty())

@@ -87,7 +87,7 @@ static inline bool sp_vram_loan_enabled() {
 
 static inline bool sp_prefill_stager_enabled() {
   const char* s = std::getenv("AFF_PREFILL_STAGER");
-  return !s || !*s || std::strcmp(s, "0") != 0;
+  return s && *s && std::strcmp(s, "0") != 0;
 }
 
 static inline uint32_t sp_prefill_stage_slots() {
@@ -873,15 +873,15 @@ void StaticPlacement::ssd_stage_arm(void* const* streams) {
 }
 
 // How much of the card a hybrid dispatch may occupy, as a FRACTION of whatever the device reports.
-// On RDNA4 (gfx12xx, 4 SEs x 8 WGPs = 32 WGPs), 0.25 contiguous (0x000000ff, SE0 only) paired with
-// GPU_MAX_HW_QUEUES=1 confines the PCIe-bound hybrid stream to one Shader Engine while leaving
-// SE1-SE3 uncontended for resident MoE/dense work and avoiding the multi-SE CU-mask stall seen with
-// 16-WGP masks (0x0000ffff / 0x0f0f0f0f). Override with AFF_HYBRID_CU_FRAC / AFF_HYBRID_CU_STRIPE=1.
+// Default 1.0 uses an unmasked compute stream per card (6 KFD queues total across both GPUs),
+// avoiding the RDNA4 extra-KFD-queue CP-pipe wait penalty (ROCm/TheRock #9297) seen with
+// hipExtStreamCreateWithCUMask (e.g., opt-in AFF_HYBRID_CU_FRAC=0.25).
+// Override with AFF_HYBRID_CU_FRAC / AFF_HYBRID_CU_STRIPE=1.
 static double hybrid_cu_frac() {
   static const double f = [] {
     const char* v = std::getenv("AFF_HYBRID_CU_FRAC");
-    double d = (v && *v) ? std::strtod(v, nullptr) : 0.25;
-    if (!(d > 0.0)) d = 0.25;
+    double d = (v && *v) ? std::strtod(v, nullptr) : 1.0;
+    if (!(d > 0.0)) d = 1.0;
     if (d < 0.0625) d = 0.0625;
     if (d > 1.0) d = 1.0;
     return d;
