@@ -23,7 +23,7 @@ constexpr uint32_t kEngThreads = 256u;
 constexpr uint32_t kEngWaves = kEngThreads / 32u;
 constexpr uint32_t kEngMaxHc = 8u;
 
-// 256-thread-per-token kernel for narrow batches (nb <= 64: decode & DSpark verify), eliminating
+// 256-thread-per-token kernel for all batches (nb == 1 or nb > 16; nb in 2..16 uses tok_v2), eliminating
 // the 1-6 thread/WG stall while loading the shared `kv` value vector once across all `n_hc` copies.
 template <bool BF16>
 __global__ __launch_bounds__(kEngThreads) void engram_gate_tok_kernel(
@@ -267,7 +267,7 @@ void engram_gate_hip(void* hc, bool hc_bf16, const float* kv, const float* w, ui
     AFF_HIP_CHECK(hipGetLastError());
     return;
   }
-  if (nb <= 64u && n_hc <= kEngMaxHc) {
+  if (n_hc <= kEngMaxHc) {
     const dim3 g(nb), b(kEngThreads);
     if (hc_bf16)
       hipLaunchKernelGGL(engram_gate_tok_kernel<true>, g, b, 0, (hipStream_t)stream, hc, kv, w,
