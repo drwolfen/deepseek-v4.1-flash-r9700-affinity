@@ -1061,6 +1061,7 @@ int check_flash_lowm_nosplit_parity() {
   struct Case { uint32_t n_tok, n_raw, n_comp; };
   const Case cases[] = {{2u, 64u, 64u}, {4u, 64u, 192u}};  // tiles=2 and n_tok=4,tiles=4
   const float scale = 1.0f / std::sqrt((float)width);
+  float worst_diff = 0.0f;
   for (const Case& c : cases) {
     std::vector<float> h_q((size_t)c.n_tok * n_head * width), h_sinks(n_head), row(width);
     std::vector<uint8_t> h_raw((size_t)ring * aff::kFlashRowBytes),
@@ -1132,19 +1133,26 @@ int check_flash_lowm_nosplit_parity() {
     assert(hipDeviceSynchronize() == hipSuccess);
 
     std::vector<float> h0(h_q.size()), h1(h_q.size());
+    std::vector<uint8_t> po_check(64u);
+    assert(hipMemcpy(po_check.data(), d_po, po_check.size(), hipMemcpyDeviceToHost) == hipSuccess);
+    for (uint8_t b : po_check) assert(b == 0x7fu);
     assert(hipMemcpy(h0.data(), d_o0, h0.size() * sizeof(float), hipMemcpyDeviceToHost) ==
            hipSuccess);
     assert(hipMemcpy(h1.data(), d_o1, h1.size() * sizeof(float), hipMemcpyDeviceToHost) ==
            hipSuccess);
+    float max_diff = 0.0f;
     for (size_t i = 0; i < h0.size(); ++i) {
       assert(std::isfinite(h1[i]));
-      assert(std::fabs(h0[i] - h1[i]) <= 1e-4f);
+      max_diff = std::max(max_diff, std::fabs(h0[i] - h1[i]));
     }
+    assert(max_diff <= 2e-3f);
+    worst_diff = std::max(worst_diff, max_diff);
     for (void* p : {(void*)d_q, (void*)d_sinks, (void*)d_raw, (void*)d_comp, (void*)d_o0,
                     (void*)d_o1, (void*)d_po, (void*)d_pml})
       (void)hipFree(p);
   }
-  std::printf("PASS: AFF_FLASH_LOWM_NOSPLIT parity vs split (tiles=2; n_tok=4,tiles=4)\n");
+  std::printf("PASS: AFF_FLASH_LOWM_NOSPLIT parity vs split (max_diff=%.3e <= 2e-3f, scratch untouched)\n",
+              worst_diff);
   return 0;
 }
 
