@@ -3254,12 +3254,11 @@ bool Model::dspark_draft(uint32_t first_id, SeqState* s, uint32_t* out) const {
     const bool graph_hook = dev_plan_here && bops_.draft_graph_begin && bops_.draft_graph_end;
     if (graph_hook) {
       if (!bops_.draft_graph_begin(bops_.ctx, B, st, with_collapse)) {
-        if (!run_stage_ffn()) {
-          (void)bops_.draft_graph_end(bops_.ctx, B, st, with_collapse);
-          return false;
-        }
-        if (!bops_.draft_graph_end(bops_.ctx, B, st, with_collapse)) {
+        const bool body_ok = run_stage_ffn();
+        if (!bops_.draft_graph_end(bops_.ctx, B, st, with_collapse, body_ok)) {
           if (!run_stage_ffn()) return false;
+        } else if (!body_ok) {
+          return false;
         }
       }
     } else {

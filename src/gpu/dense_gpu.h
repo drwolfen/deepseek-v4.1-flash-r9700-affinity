@@ -175,7 +175,7 @@ public:
 
   // Per-(slot, B, stage, variant) HIP Graph capture/replay for DSpark FFN sublayers (+ collapse).
   bool     draft_graph_begin(uint32_t B, uint32_t stage, bool with_collapse);
-  bool     draft_graph_end(uint32_t B, uint32_t stage, bool with_collapse);
+  bool     draft_graph_end(uint32_t B, uint32_t stage, bool with_collapse, bool body_ok = true);
   void     invalidate_draft_graphs();
 
   // The router's selection as a CARD can read it, which is what a device-built dispatch needs and

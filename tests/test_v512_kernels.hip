@@ -1351,6 +1351,41 @@ int check_pinchunk_boundary_memcpy_parity() {
   return 0;
 }
 
+int check_draft_graph_per_stage_warmup_and_abort() {
+  ::setenv("AFF_DSPARK_HIP_GRAPH", "1", 1);
+  aff::DenseGpu dg;
+  std::string err;
+  const uint32_t cap = 64u, n_embd = 256u, n_hc = 4u, n_head = 16u, width = 192u,
+                 max_mid = 256u, vocab = 128u, idx_topk = 16u;
+  assert(dg.init(max_mid, n_embd, &err, 1u));
+  assert(dg.batch_init(cap, n_embd, n_hc, n_head, width, max_mid, vocab, idx_topk, &err));
+
+  const auto bops = dg.batch_ops();
+  std::vector<float> emb((size_t)5 * n_embd, 0.25f);
+  assert(bops.begin(bops.ctx, 5u, 0u, emb.data(), n_embd, n_hc));
+
+  // Warming stage 2 must not cause stage 0 to enter capture on its first dev_plan pass.
+  assert(!bops.draft_graph_begin(bops.ctx, 5u, 2u, true));
+  assert(bops.draft_graph_end(bops.ctx, 5u, 2u, true, true));
+
+  // First stage 0 pass: must warm cleanly without capture (`draft_graph_end` returns true).
+  assert(!bops.draft_graph_begin(bops.ctx, 5u, 0u, false));
+  assert(bops.draft_graph_end(bops.ctx, 5u, 0u, false, true));
+
+  // Second stage 0 pass: begins capture; body_ok=false must abort capture, return false,
+  // mark failed, and leave future stage 0 calls falling back uncaptured cleanly.
+  assert(!bops.draft_graph_begin(bops.ctx, 5u, 0u, false));
+  assert(!bops.draft_graph_end(bops.ctx, 5u, 0u, false, false));
+  assert(hipGetLastError() == hipSuccess);
+
+  assert(!bops.draft_graph_begin(bops.ctx, 5u, 0u, false));
+  assert(bops.draft_graph_end(bops.ctx, 5u, 0u, false, true));
+
+  ::unsetenv("AFF_DSPARK_HIP_GRAPH");
+  std::printf("PASS: DenseGpu DSpark per-stage HIP Graph warmup + abort fallback\n");
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1375,6 +1410,7 @@ int main() {
   if (check_hip_graph_capture_replay_parity() != 0) return 1;
   if (check_vram_loan_ranges_and_reclaim_invariants() != 0) return 1;
   if (check_pinchunk_boundary_memcpy_parity() != 0) return 1;
+  if (check_draft_graph_per_stage_warmup_and_abort() != 0) return 1;
   std::printf("PASS: test_v512_kernels\n");
   return 0;
 }

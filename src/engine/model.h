@@ -776,7 +776,8 @@ public:
     // graph ALREADY replayed (caller skips eager FFN/collapse kernels); `end` finalizes capture
     // and launches the newly instantiated graph (or clears failed capture so caller reruns eager).
     bool (*draft_graph_begin)(void* ctx, uint32_t B, uint32_t stage, bool with_collapse) = nullptr;
-    bool (*draft_graph_end)(void* ctx, uint32_t B, uint32_t stage, bool with_collapse) = nullptr;
+    bool (*draft_graph_end)(void* ctx, uint32_t B, uint32_t stage, bool with_collapse,
+                            bool body_ok) = nullptr;
     void* ctx = nullptr;
   };
   void set_batch_ops(const BatchOps& b) { bops_ = b; }

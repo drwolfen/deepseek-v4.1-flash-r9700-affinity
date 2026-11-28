@@ -669,7 +669,7 @@ struct DenseGpu::Impl {
     uint32_t exit_ar_pending = 0;
     uint32_t exit_b_norm_rows = 0;
   };
-  struct DraftWarmKey { uint32_t slot = 0; uint32_t B = 0; };
+  struct DraftWarmKey { uint32_t slot = 0; uint32_t B = 0; uint32_t stage = 0; };
   std::vector<DraftGraphEntry> draft_graphs;
   std::vector<DraftWarmKey> draft_warms;
   bool capture_active = false;
@@ -10611,8 +10611,8 @@ Model::BatchOps DenseGpu::batch_ops() {
   o.draft_graph_begin = [](void* c, uint32_t B, uint32_t stage, bool with_collapse) {
     return static_cast<DenseGpu*>(c)->draft_graph_begin(B, stage, with_collapse);
   };
-  o.draft_graph_end = [](void* c, uint32_t B, uint32_t stage, bool with_collapse) {
-    return static_cast<DenseGpu*>(c)->draft_graph_end(B, stage, with_collapse);
+  o.draft_graph_end = [](void* c, uint32_t B, uint32_t stage, bool with_collapse, bool body_ok) {
+    return static_cast<DenseGpu*>(c)->draft_graph_end(B, stage, with_collapse, body_ok);
   };
   return o;
 }
@@ -10762,7 +10762,7 @@ bool DenseGpu::draft_graph_begin(uint32_t B, uint32_t stage, bool with_collapse)
 
   bool warmed = false;
   for (const auto& w : impl_->draft_warms) {
-    if (w.slot == slot_ && w.B == B) { warmed = true; break; }
+    if (w.slot == slot_ && w.B == B && w.stage == stage) { warmed = true; break; }
   }
   if (!warmed) return false;
 
@@ -10801,15 +10801,15 @@ bool DenseGpu::draft_graph_begin(uint32_t B, uint32_t stage, bool with_collapse)
   return false;
 }
 
-bool DenseGpu::draft_graph_end(uint32_t B, uint32_t stage, bool with_collapse) {
-  (void)stage;
+bool DenseGpu::draft_graph_end(uint32_t B, uint32_t stage, bool with_collapse, bool body_ok) {
+  (void)with_collapse;
   if (!impl_) return false;
   if (!impl_->capture_active) {
-    if (with_collapse && b_nb_ == kNarrowTok && B && dspark_hip_graph_enabled()) {
+    if (body_ok && b_nb_ == kNarrowTok && B && dspark_hip_graph_enabled()) {
       bool found = false;
       for (const auto& w : impl_->draft_warms)
-        if (w.slot == slot_ && w.B == B) { found = true; break; }
-      if (!found) impl_->draft_warms.push_back({slot_, B});
+        if (w.slot == slot_ && w.B == B && w.stage == stage) { found = true; break; }
+      if (!found) impl_->draft_warms.push_back({slot_, B, stage});
     }
     return true;
   }
@@ -10820,7 +10820,7 @@ bool DenseGpu::draft_graph_end(uint32_t B, uint32_t stage, bool with_collapse) {
 
   hipGraph_t graphs[kMaxRanks] = {};
   hipGraphExec_t execs[kMaxRanks] = {};
-  bool ok = (R <= kMaxRanks);
+  bool ok = body_ok && (R <= kMaxRanks);
   for (size_t d = 0; d < R; ++d) {
     if (hipSetDevice(impl_->dev[d].id) != hipSuccess ||
         hipStreamEndCapture(impl_->dev[d].stream, &graphs[d]) != hipSuccess || !graphs[d]) {
