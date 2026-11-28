@@ -49,7 +49,7 @@ int check_batch_slice_tail_parity() {
   const uint32_t pos0 = 100u;
 
   std::vector<uint16_t> w_qa(qr_dim * n_embd), w_qb(n_head * width * qr_dim),
-      w_kv(width * n_embd), w_fn((n_hc * 2u + n_hc * n_hc) * n_embd);
+      w_kv(width * n_embd), w_fn((n_hc * 2u + n_hc * n_hc) * (n_embd * n_hc));
   auto fill_w = [](std::vector<uint16_t>& w, float scale, uint32_t seed) {
     uint32_t rng = seed;
     for (size_t i = 0; i < w.size(); ++i) {
@@ -77,7 +77,7 @@ int check_batch_slice_tail_parity() {
   auto run_once = [&](bool do_slice, std::vector<float>* out_hc, std::vector<float>* out_norm) {
     aff::DenseGpu dg;
     std::string err;
-    assert(dg.init(n_head * width, n_embd, &err, 1));
+    assert(dg.init(n_head * width, n_embd * n_hc, &err, 1));
     assert(dg.batch_init(n_live, n_embd, n_hc, n_head, width, 2048u, 256u, 32u, &err));
     aff::Model::DenseOps dops = dg.ops();
     aff::Model::BatchOps bops = dg.batch_ops();
@@ -89,7 +89,7 @@ int check_batch_slice_tail_parity() {
     const int32_t h_kv = dops.reg(dops.ctx, "blk.0.attn_kv", w_kv.data(), nullptr, aff::AFF_BF16,
                                   width, n_embd);
     const int32_t h_fn = dops.reg(dops.ctx, "blk.0.hc_fn", w_fn.data(), nullptr, aff::AFF_BF16,
-                                  n_hc * 2u + n_hc * n_hc, n_embd);
+                                  n_hc * 2u + n_hc * n_hc, n_embd * n_hc);
     const int32_t h_sv = dops.reg_vec(dops.ctx, v_sv.data(), v_sv.size());
     const int32_t h_bv = dops.reg_vec(dops.ctx, v_bv.data(), v_bv.size());
     const int32_t h_nw = dops.reg_vec(dops.ctx, v_nw.data(), v_nw.size());
@@ -123,9 +123,9 @@ int check_batch_slice_tail_parity() {
     *out_norm = tmp_norm;
 
     assert(bops.hc_post(bops.ctx, true, n_embd, n_hc));
-    out_hc->assign((size_t)keep * n_embd, 0.0f);
+    out_hc->assign((size_t)keep * n_embd * n_hc, 0.0f);
     for (uint32_t b = 0; b < keep; ++b) {
-      assert(bops.hc_read(bops.ctx, b, out_hc->data() + (size_t)b * n_embd, n_embd, n_hc));
+      assert(bops.hc_read(bops.ctx, b, out_hc->data() + (size_t)b * n_embd * n_hc, n_embd, n_hc));
     }
   };
 
@@ -348,7 +348,7 @@ int check_prefill_fuse_ar_hc_parity() {
     ::setenv("AFF_PREFILL_FUSE_AR_HC", fuse_env, 1);
     aff::DenseGpu dg;
     std::string err;
-    assert(dg.init(n_embd, n_embd, &err, 2));
+    assert(dg.init(n_embd * n_hc, n_embd * n_hc, &err, 2));
     assert(dg.batch_init(n_live, n_embd, n_hc, 16u, 128u, 512u, 256u, 32u, &err));
     aff::Model::DenseOps dops = dg.ops();
     aff::Model::BatchOps bops = dg.batch_ops();
@@ -365,9 +365,9 @@ int check_prefill_fuse_ar_hc_parity() {
     assert(bops.shexp(bops.ctx, hg, hu, hd, n_embd, inter, 0.0f));
     assert(bops.block_reduce(bops.ctx, n_embd));
     assert(bops.hc_post(bops.ctx, false, n_embd, n_hc));
-    out->assign((size_t)n_live * n_embd, 0.0f);
+    out->assign((size_t)n_live * n_embd * n_hc, 0.0f);
     for (uint32_t b = 0; b < n_live; ++b) {
-      assert(bops.hc_read(bops.ctx, b, out->data() + (size_t)b * n_embd, n_embd, n_hc));
+      assert(bops.hc_read(bops.ctx, b, out->data() + (size_t)b * n_embd * n_hc, n_embd, n_hc));
     }
   };
 

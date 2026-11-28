@@ -2805,11 +2805,8 @@ bool tp_ar_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
 }
 
 inline bool prefill_fuse_ar_hc_enabled() {
-  static const bool on = [] {
-    const char* v = std::getenv("AFF_PREFILL_FUSE_AR_HC");
-    return !v || !*v || !(v[0] == '0' && v[1] == '\0');
-  }();
-  return on;
+  const char* v = std::getenv("AFF_PREFILL_FUSE_AR_HC");
+  return !v || !*v || !(v[0] == '0' && v[1] == '\0');
 }
 
 bool tp_ar_fp8_batch_hc_expand(TpContext& ctx, uint16_t* const out_hc[kTpMaxRanks],
