@@ -6623,13 +6623,14 @@ __device__ __forceinline__ uint32_t router_topk_select_wave(
     uint64_t d = ~0ull;
 #pragma unroll
     for (uint32_t i = 0; i < MAXOWN; ++i) {
-      if (key[i] != 0ull) {
+      if (key[i] != 0ull && key[i] <= P) {
         const uint64_t t = P - key[i];
         if (t < d) d = t;
       }
     }
-    const uint64_t best = P - wave_min_u64_dpp(d);
-    if (best == 0ull) break;
+    const uint64_t md = wave_min_u64_dpp(d);
+    if (md == ~0ull) break;
+    const uint64_t best = P - md;
     const uint32_t win_e = (uint32_t)(~best) & 0xFFFFu;
     float my_sc = 0.0f;
     int my_prot = 0;
